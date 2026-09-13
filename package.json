@@ -1,0 +1,18 @@
+{
+  "name": "foreman",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A project-manager agent that tracks every Claude Code session on this machine and delegates all code work to session agents.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "node --experimental-strip-types server/main.ts",
+    "start": "node --experimental-strip-types server/main.ts",
+    "hooks:install": "node scripts/install-hooks.mjs",
+    "hooks:uninstall": "node scripts/install-hooks.mjs --uninstall",
+    "status": "node --experimental-strip-types server/cli-status.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.270"
+  }
+}
