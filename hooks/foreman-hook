@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# foreman-hook <event>
+# Claude Code hook: reads the hook JSON on stdin and records this session's state under
+# ~/.foreman/sessions/<session_id>.json, appending a line to ~/.foreman/events.jsonl.
+# Depends on jq only. Never exits non-zero (a failing hook must not disturb the session).
+set -u
+EVENT="${1:-unknown}"
+ROOT="${FOREMAN_HOME:-$HOME/.foreman}"
+DIR="$ROOT/sessions"
+mkdir -p "$DIR" 2>/dev/null || exit 0
+
+INPUT="$(cat 2>/dev/null)"
+[ -n "$INPUT" ] || exit 0
+SID="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
+[ -n "$SID" ] || exit 0
+
+NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+FILE="$DIR/$SID.json"
+HOST="$(hostname -s 2>/dev/null || echo unknown)"
+
+# Display name from Claude Code's own registry (~/.claude/sessions/<pid>.json), if present.
+NAME=""
+REG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions"
+if [ -d "$REG_DIR" ]; then
+  NAME="$(jq -r --arg sid "$SID" 'select(.sessionId == $sid) | .name // empty' "$REG_DIR"/*.json 2>/dev/null | head -n1)"
+fi
+
+PREV='{}'
+[ -f "$FILE" ] && PREV="$(cat "$FILE" 2>/dev/null || echo '{}')"
+
+# One jq program computes the new record from (prev, input, event).
+NEW="$(jq -n \
+  --argjson prev "$PREV" \
+  --argjson in "$INPUT" \
+  --arg event "$EVENT" \
+  --arg now "$NOW" \
+  --arg name "$NAME" \
+  --arg host "$HOST" '
+  def trunc(n): if type == "string" and length > n then .[0:n] + "…" else . end;
+  ($prev // {}) as $p
+  | ($in.notification_type // "") as $ntype
+  | ($in.reason // "") as $reason
+  | {
+      session_id: $in.session_id,
+      name: (if $name != "" then $name else ($p.name // null) end),
+      cwd: ($in.cwd // $p.cwd // null),
+      transcript_path: ($in.transcript_path // $p.transcript_path // null),
+      permission_mode: ($in.permission_mode // $p.permission_mode // null),
+      host: $host,
+      started_at: ($p.started_at // $now),
+      updated_at: $now,
+      ended_at: ($p.ended_at // null),
+      end_reason: ($p.end_reason // null),
+      source: ($p.source // null),
+      state: ($p.state // "idle"),
+      reason: ($p.reason // null),
+      current_tool: ($p.current_tool // null),
+      active_subagents: ($p.active_subagents // 0),
+      last_message: ($p.last_message // null),
+      last_error: ($p.last_error // null),
+      last_event: $event
+    }
+  | if   $event == "session-start" then
+        .state = "idle" | .reason = null | .source = ($in.source // .source) | .ended_at = null | .end_reason = null
+    elif $event == "prompt" then
+        .state = "working" | .reason = null | .current_tool = null
+    elif $event == "tool" then
+        .state = "working" | .reason = null | .current_tool = ($in.tool_name // null)
+    elif $event == "permission" then
+        .state = "needs_input" | .reason = "permission" | .current_tool = ($in.tool_name // .current_tool)
+    elif $event == "notification" then
+        if   $ntype == "permission_prompt"   then .state = "needs_input" | .reason = "permission"
+        elif $ntype == "elicitation_dialog" or $ntype == "elicitation_url_dialog" then .state = "needs_input" | .reason = "dialog"
+        elif $ntype == "idle_prompt"         then (if .state != "needs_input" then .state = "idle" | .reason = null else . end)
+        else . end
+    elif $event == "stop" then
+        .state = "turn_finished" | .reason = null | .current_tool = null
+        | .last_message = (($in.last_assistant_message // .last_message) | trunc(2000))
+        | .active_subagents = 0
+    elif $event == "tool-failed" then
+        .last_error = (($in.error // $in.tool_response // "tool failed") | tostring | trunc(500))
+    elif $event == "subagent-start" then
+        .active_subagents = (.active_subagents + 1) | .state = "working"
+    elif $event == "subagent-stop" then
+        .active_subagents = ([.active_subagents - 1, 0] | max)
+    elif $event == "session-end" then
+        .state = "ended" | .reason = null | .ended_at = $now | .end_reason = (if $reason != "" then $reason else null end) | .current_tool = null
+    else . end
+' 2>/dev/null)"
+[ -n "$NEW" ] || exit 0
+
+TMP="$FILE.tmp.$$"
+printf '%s\n' "$NEW" > "$TMP" 2>/dev/null && mv -f "$TMP" "$FILE" 2>/dev/null
+
+# Compact event line for the append-only log.
+printf '%s\n' "$NEW" | jq -c --arg ev "$EVENT" --arg t "$NOW" --argjson in "$INPUT" \
+  '{t: $t, event: $ev, session_id, name, state, reason, tool: ($in.tool_name // null), ntype: ($in.notification_type // null)}' \
+  >> "$ROOT/events.jsonl" 2>/dev/null
+
+# Rotate the log past ~20 MB.
+if [ -f "$ROOT/events.jsonl" ]; then
+  SIZE=$(stat -f %z "$ROOT/events.jsonl" 2>/dev/null || stat -c %s "$ROOT/events.jsonl" 2>/dev/null || echo 0)
+  if [ "${SIZE:-0}" -gt 20000000 ]; then mv -f "$ROOT/events.jsonl" "$ROOT/events.jsonl.1" 2>/dev/null; fi
+fi
+exit 0

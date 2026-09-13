@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Foreman</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="rail" id="rail" aria-label="Sessions">
+    <div class="rail-head">
+      <span class="rail-title">Sessions</span>
+      <span class="rail-count" id="rail-count">0</span>
+    </div>
+    <ul class="rail-list" id="rail-list"></ul>
+    <div class="rail-foot" id="rail-foot">connecting…</div>
+  </aside>
+
+  <main class="pm">
+    <header class="pm-head">
+      <div>
+        <div class="pm-title">Project manager</div>
+        <div class="pm-sub" id="pm-status">starting…</div>
+      </div>
+      <button class="btn ghost" id="btn-interrupt" title="Interrupt the PM's current turn">Stop</button>
+    </header>
+    <div class="chat" id="chat" aria-live="polite"></div>
+    <form class="composer" id="composer">
+      <textarea id="input" rows="1" placeholder="What are we working on? What needs me?  (Enter to send, Shift+Enter for newline)"></textarea>
+      <button class="btn" id="send" type="submit">Send</button>
+    </form>
+  </main>
+
+  <aside class="detail" id="detail" hidden>
+    <div class="detail-head">
+      <span id="detail-name" class="mono"></span>
+      <button class="btn ghost" id="detail-close" aria-label="Close">×</button>
+    </div>
+    <dl class="detail-body" id="detail-body"></dl>
+    <div class="detail-actions">
+      <button class="btn" id="detail-ask">Ask PM about this</button>
+      <button class="btn ghost" id="detail-tail">Show last turns</button>
+    </div>
+    <pre class="detail-tail" id="detail-tail-out" hidden></pre>
+  </aside>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
