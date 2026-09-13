@@ -21,11 +21,13 @@ Reviewed `web/index.html`, `web/app.js`, `web/style.css`, the MVP plan, and brow
 
 Changes should stay within browser presentation, local appearance preferences, and browser tests. Reuse existing APIs and authoritative state. Do not add agent tools, alter message ordering or delivery, change approvals or permissions, or change model selection behavior. Keep session contents rendered safely as text; no new raw-HTML rendering is needed.
 
+**Scope amendment (2026-09-13, owner request).** Two session-start stories (UX-11, UX-12) are in this epic even though they add behavior rather than presentation. They may add host-side project storage, new project and launch APIs, and a launcher agent turn. They still must not change message delivery, approval semantics, authentication, or how an already-running session executes work. Everything else in this epic remains presentation-only.
+
 Not part of this epic: native Android packaging, push notifications, background execution, transcript storage, persisted message drafts, new providers, model discovery changes, analytics infrastructure, session archiving/renaming, or automatic retries. Android packaging is a separate exploration, although mobile layout improvements will benefit it.
 
 ## Prioritized backlog
 
-P0 is the first polish release. P1 consists of independent follow-ups. Size is relative implementation effort, including browser verification: S is a small focused change; M involves interacting UI states.
+P0 is the first release: UX-01 through UX-04 are polish, UX-11 and UX-12 change how a session is started. P1 consists of independent follow-ups. Size is relative implementation effort, including browser verification: S is a small focused change; M involves interacting UI states.
 
 | ID | Priority | Improvement | Size | Developer benefit |
 | --- | --- | --- | --- | --- |
@@ -39,6 +41,8 @@ P0 is the first polish release. P1 consists of independent follow-ups. Size is r
 | UX-08 | P1 | Easier-to-scan receipts and approval cards | S | Spot the next action without decoding status text |
 | UX-09 | P1 | Conversation date separators | S | Understand resumed conversations across days |
 | UX-10 | P1 | More helpful empty and search states | S | Recover naturally when there is nothing to show |
+| UX-11 | P0 | Named projects instead of typed paths | M | Say "foreman" instead of retyping an absolute path |
+| UX-12 | P0 | Agentic session launch (Sonnet 5 by default) | L | Describe the work and let an agent set up the session |
 
 ## Stories and acceptance criteria
 
@@ -130,6 +134,29 @@ As a developer, I want an empty screen to explain my next available step.
 - For no search matches, offer a Clear search action and return focus to search. For no sessions, retain the existing Start a session action and its host-availability rules.
 - Keep copy short and specific. Avoid example buttons that immediately send a prompt, trigger paid work, or create a session.
 
+### UX-11 — Named projects instead of typed paths
+
+As a developer starting a session, I want to name the project I mean rather than retype an absolute path.
+
+- Keep a small project registry on the host (name, absolute path, optional aliases, last used). Seed it from the `cwd` values of existing and recent sessions so the first use is already populated; a developer can add, rename, and remove entries. The registry is owner-local host state, not browser storage, so phone and laptop see the same projects.
+- Replace the required free-text **Project directory** field with a project picker listing registered and recent projects, ordered by recent use, with search. Typing a full absolute path stays available for a directory that is not registered yet, and offers to remember it under a short name.
+- Resolve a spoken or typed reference such as `foreman` or `the personal repo` against registered names, aliases, and recent session paths. A single confident match resolves silently and shows the resolved absolute path before the session starts. Several plausible matches ask which one; no match asks rather than guessing. Never invent a path, and never create a directory.
+- Give the project manager `list_projects`, `resolve_project`, and `register_project` tools so `we are working on foreman now` records an alias, and so its `spawn_session` calls can pass a project name that the host resolves to a path. The existing absolute-path `cwd` argument keeps working unchanged.
+- Preserve the current validation boundary: a project only resolves to an existing directory the host can read, resolution is server-side, and a session still fails to start when the directory is missing. Do not follow symlinks out of the recorded path, and do not expose directory listings of unregistered locations to the browser.
+- Show the short project name wherever the crowded full path appears today (rail subtitle, conversation header), with the absolute path available on hover, focus, and touch. Mobile keeps the name readable per UX-04.
+
+### UX-12 — Agentic session launch (Sonnet 5 by default)
+
+As a developer, I want to describe the work in one box and have an agent set up the session, while keeping a manual path when I already know exactly what I want.
+
+- Make the default **Start a session** flow a single brief: the developer describes the work in their own words, optionally naming a project as in UX-11. A launcher agent reads it and proposes the session — project/`cwd`, provider, model, short kebab-case name, and the full first-task prompt.
+- The launcher runs on **Claude Sonnet 5 (`claude-sonnet-5`) by default**, chosen because setup is a short, cheap turn. The choice is visible and changeable, and it is independent of the model the new session will run — the launcher may propose a different provider and model for the work itself, with a one-line reason.
+- Show the proposal for confirmation before anything starts, with every field editable in place. The session is created only on explicit confirmation. Nothing is created while the developer is still typing, and one brief creates one session unless the developer confirms more.
+- Keep **Start manually** as a first-class option on the same dialog: the existing name/project/first-task form, pre-filled from the proposal when one exists. A developer who selects manual never spends a launcher turn.
+- Failure is honest and recoverable. If the launcher is unavailable, offline, slow, or returns something unusable, say so and fall back to the manual form with the typed brief preserved; never silently start a session with guessed values. An interrupted or cancelled launcher turn must not leave a partially created session.
+- The launcher only proposes. It cannot start work outside the confirmed session, change approval or permission policy, alter another session, or run project commands; its reads for name and model selection stay within the project registry and the existing model catalog. Creation continues to go through the existing session service, its validation, and its deduplication.
+- The whole flow is usable on a phone and with a keyboard: the brief box, the proposal review, per-field edits, confirm, and manual fallback all follow UX-04 sizing and focus rules, and the waiting state follows UX-01 and UX-03 rather than inventing a new spinner.
+
 ## Shared accessibility and responsive requirements
 
 - Normal text targets a minimum 4.5:1 contrast ratio; large text and essential control/focus boundaries target 3:1. Verify both themes, warnings, errors, and disabled-state explanations.
@@ -140,8 +167,8 @@ As a developer, I want an empty screen to explain my next available step.
 
 ## Delivery and verification
 
-Ship UX-01 through UX-04 first, then choose P1 stories independently. There is no need to wait for native packaging. Define shared appearance tokens and status styling while implementing UX-01/02 so subsequent stories reuse them.
+Ship UX-01 through UX-04 first, then UX-11 before UX-12 — the launcher depends on the project registry — then choose P1 stories independently. There is no need to wait for native packaging. Define shared appearance tokens and status styling while implementing UX-01/02 so subsequent stories reuse them.
 
-Use the existing browser fixtures to verify visible behavior: PM and worker activity transitions, stale/offline state, theme persistence and OS preference changes, loading-to-empty transitions, action errors, reduced motion, and mobile layout. Add focused coverage for each P1 story when it ships. Extend the existing scrolling, approval, provider-output safety, and model-selection cases where relevant rather than creating tests that duplicate CSS implementation.
+Use the existing browser fixtures to verify visible behavior: PM and worker activity transitions, stale/offline state, theme persistence and OS preference changes, loading-to-empty transitions, action errors, reduced motion, and mobile layout. Add focused coverage for each P1 story when it ships. For UX-11 and UX-12, cover project resolution (single match, ambiguous, no match, missing directory), registry persistence across restart, proposal confirmation and per-field editing, the manual fallback, launcher failure and cancellation, and that no session is created without confirmation. Extend the existing scrolling, approval, provider-output safety, and model-selection cases where relevant rather than creating tests that duplicate CSS implementation.
 
-Completion means a developer can identify whether the PM is working, select an appearance, recognize a pending or failed action, and operate the existing inbox comfortably on a phone. All current message-delivery, approval, authentication, and provider tests must remain green. No new telemetry is necessary to evaluate this release.
+Completion means a developer can identify whether the PM is working, select an appearance, recognize a pending or failed action, operate the existing inbox comfortably on a phone, start a session by naming a project instead of typing a path, and describe work in one box and get a reviewable session proposal with a manual fallback. All current message-delivery, approval, authentication, and provider tests must remain green. No new telemetry is necessary to evaluate this release.
