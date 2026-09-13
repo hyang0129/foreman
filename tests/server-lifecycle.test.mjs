@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
+import { get } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,6 +29,15 @@ test('local daemon shuts down on SIGTERM with an open SSE client and no provider
     }
     assert.equal(health?.ok, true);
     assert.equal(health?.pm_enabled, false);
+    const origin = `http://127.0.0.1:${port}`;
+    assert.deepEqual(await fetch(`${origin}/api/config`).then((r) => r.json()), { auth: { required: false } });
+    assert.equal((await fetch(`${origin}/api/host`).then((r) => r.json())).online, true);
+    assert.equal((await fetch(`${origin}/api/sessions`, { headers: { Origin: 'https://attacker.example' } })).status, 403);
+    const wrongHostStatus = await new Promise((resolve, reject) => {
+      get(`${origin}/api/sessions`, { headers: { Host: 'attacker.example' } }, (response) => { response.resume(); resolve(response.statusCode); }).on('error', reject);
+    });
+    assert.equal(wrongHostStatus, 403);
+    assert.equal((await fetch(`${origin}/api/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: '[]' })).status, 400);
     const events = await fetch(`http://127.0.0.1:${port}/api/events`);
     reader = events.body.getReader(); await reader.read();
     child.kill('SIGTERM');

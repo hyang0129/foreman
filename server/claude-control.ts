@@ -39,7 +39,7 @@ export class ClaudeControl extends EventEmitter {
   private approvals = new Map<string, { request: ClaudeApproval; resolve: (result: PermissionResult) => void; promise: Promise<PermissionResult> }>();
   readonly finished: Promise<void>;
 
-  constructor(options: Pick<Options, "cwd" | "resume" | "model" | "maxBudgetUsd" | "maxTurns" | "tools" | "settingSources" | "settings" | "systemPrompt" | "persistSession" | "pathToClaudeCodeExecutable">,
+  constructor(options: Pick<Options, "cwd" | "resume" | "model" | "maxBudgetUsd" | "maxTurns" | "tools" | "settingSources" | "settings" | "systemPrompt" | "persistSession" | "pathToClaudeCodeExecutable" | "mcpServers" | "allowedTools">,
     factory: QueryFactory = query) {
     super();
     // Defer startup so callers can subscribe before any process or error event.

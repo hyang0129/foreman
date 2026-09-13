@@ -1,0 +1,41 @@
+#!/usr/bin/env node
+// Deploy the relay and pair this Mac without putting the host credential in argv.
+import { randomBytes } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, lstatSync, renameSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const state = process.env.FOREMAN_HOME || join(homedir(), '.foreman');
+mkdirSync(state, { recursive: true, mode: 0o700 });
+const configPath = join(state, 'cloud.json');
+let previous;
+if (existsSync(configPath)) {
+  const stat = lstatSync(configPath);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid() || (stat.mode & 0o077)) throw new Error('cloud.json must be an owned regular file with mode 0600');
+  try { previous = JSON.parse(readFileSync(configPath, 'utf8')); } catch { throw new Error('Invalid cloud.json'); }
+  if (!previous || typeof previous.token !== 'string' || previous.token.length < 32 || previous.token.length > 512 || /\s/.test(previous.token)) throw new Error('Invalid existing cloud pairing');
+  let previousUrl;
+  try { previousUrl = new URL(previous.url); } catch { throw new Error('Invalid existing cloud pairing URL'); }
+  if (previousUrl.protocol !== 'https:' || previousUrl.username || previousUrl.password || previousUrl.search || previousUrl.hash || previousUrl.pathname !== '/') throw new Error('Invalid existing cloud pairing URL');
+}
+const token = previous?.token || randomBytes(32).toString('hex');
+const temporary = mkdtempSync(join(state, '.deploy-'));
+const secrets = join(temporary, 'secrets.json');
+writeFileSync(secrets, JSON.stringify({ HOST_TOKEN: token }), { mode: 0o600 });
+try {
+  const child = spawn(process.execPath, [join(root, 'node_modules/wrangler/bin/wrangler.js'), 'deploy', '--secrets-file', secrets], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; process.stdout.write(chunk); });
+  child.stderr.on('data', (chunk) => process.stderr.write(chunk));
+  const code = await new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', resolve); });
+  if (code !== 0) throw new Error(`Deployment failed (${code}); Mac pairing unchanged`);
+  const url = output.match(/https:\/\/[^\s/]+\.workers\.dev\b/)?.[0];
+  if (!url) throw new Error('Deployed but could not identify the Workers URL; configure cloud.json manually');
+  const next = join(temporary, 'cloud.json');
+  writeFileSync(next, JSON.stringify({ url, token }, null, 2) + '\n', { mode: 0o600 });
+  renameSync(next, configPath);
+  console.log(`Mac paired with ${url}. Restart Foreman to connect: npm run service:restart`);
+} finally { rmSync(temporary, { recursive: true, force: true }); }

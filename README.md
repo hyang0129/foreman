@@ -1,106 +1,80 @@
 # Foreman
 
-One agent to talk to, many agents doing the work.
+A private session inbox for a developer working with Claude and Codex on one Mac.
 
-Foreman tracks every Claude Code session on this machine through hooks and puts a **project
-manager** agent in front of them. The PM keeps the high-level picture, starts session agents for
-anything that touches code, watches them, and tells you what needs you. It never codes; the host
-denies it the tools.
+Start either provider in a project directory, follow its conversation, queue messages, answer approvals, and interrupt work from the browser. Managed sessions and the pinned project manager share tools for reading session state/history, sending messages, and requesting updates. Existing terminal sessions remain visible through hooks and are explicitly monitor-only.
 
-```
-left rail: sessions + state        center: the project manager        right: session detail
-```
+**Local app:** http://localhost:4177
 
-## Quick start
+**Cloudflare app:** https://foreman.hooong-yang.workers.dev — deployed and paired, with sign-in blocked until Firebase activation finishes. See [Cloud setup](docs/CLOUD_SETUP.md).
 
-```bash
+## Run locally
+
+```sh
 npm install
-npm run hooks:install      # registers hooks/foreman-hook in ~/.claude/settings.json (backup written)
-npm start                  # http://localhost:4177
-```
-
-Hooks apply to sessions started after the install. Sessions already running show as "untracked"
-with what Claude Code's own registry knows (name, directory, liveness).
-
-## What is where
-
-| Path | Role |
-|---|---|
-| `hooks/foreman-hook` | bash + jq; writes `~/.foreman/sessions/<id>.json` on every hook event |
-| `scripts/install-hooks.mjs` | idempotent installer / `--uninstall` |
-| `server/fleet.ts` | merges hook records, `~/.claude/sessions`, and `claude agents --json` |
-| `server/pm.ts` | the PM: Agent SDK session, `canUseTool` enforces the no-code contract |
-| `server/tools.ts` | PM's fleet tools: `list_sessions`, `spawn_session`, `session_tail`, `stop_session`, `log_note` |
-| `server/main.ts` | HTTP + SSE + static |
-| `agents/pm-system-prompt.md` | how the PM behaves |
-| `docs/DESIGN.md` | design and roadmap |
-
-State lives in `~/.foreman/` (sessions, events log, PM memory, PM session id). Override with
-`FOREMAN_HOME`. `FOREMAN_CLAUDE_BIN` picks the `claude` used for `--bg` spawns and `agents --json`.
-
-## Codex monitoring and session control
-
-```sh
+npm run hooks:install
 npm run hooks:codex:install
-# In Codex: /hooks → review and trust the Foreman entries, then start/resume a session.
-npm run status
+# In Codex: /hooks → review and trust the Foreman definitions.
+npm start
 ```
 
-The fleet and session detail UI distinguish Claude and Codex records. Use `session_key`
-(`claude:<id>` or `codex:<id>`) when routing a request; ambiguous names/IDs are rejected.
-Codex hooks serialize updates and preserve turn completion against late events. A stale hook
-record without process evidence is shown as unknown, not proof that a process died.
-Legacy Codex JSONL transcripts can be displayed; paginated history is available through the
-Codex app-server adapter. Monitoring begins when Codex actually runs the trusted hooks.
+Use installed provider logins. `FOREMAN_CODEX_BIN` selects a supported Codex executable; `FOREMAN_CLAUDE_BIN` overrides the SDK-bundled Claude binary. On this Mac, the launchd service already selects the newer VS Code Codex binary because the global 0.149 CLI cannot run the configured model.
 
-`server/claude-control.ts` provides queued SDK input, receipts, permission responses, and a
-stopped-session handoff. `server/codex-control.ts` supports stdio-owned sessions or attachment
-to a running app-server over a local Unix socket, including history, queueing, steering,
-interruption, and permission responses. These are integration modules; the web UI still sends
-messages only to the PM. Full session chat and the hosted relay are subsequent work.
-
-The live probes use disposable sessions and consume provider usage only with `--live`:
-
-```sh
-npm run probe:claude -- --live
-npm run probe:claude:peer -- --live
-npm run probe:codex -- --live
-```
-
-Set `FOREMAN_CODEX_BIN` to a Codex executable that supports your configured model. On this
-machine, the shell CLI 0.149.0 rejected the configured model; the live proof passed using the
-newer installed VS Code binary 0.154.0-alpha.6.2. A separate manual test also verified
-that a real Codex terminal connected to the shared app-server displays externally submitted turns. The installed Foreman service records that
-executable override. See [the blocker and proof report](docs/BLOCKERS.md) for tested boundaries.
-
-## Background service
-
-On this Mac, Foreman is installed as a user LaunchAgent on port 4177. It restarts automatically
-and prevents system sleep while on AC power. Keep the user logged in, the lid open, and power
-connected; battery operation, explicit sleep, and shutdown can take it offline.
+The service is already installed on this Mac, so do not also run `npm start` on the same port/state directory:
 
 ```sh
 npm run service:status
-npm run service:restart    # interrupts active PM work
-npm run service:uninstall
+npm run service:restart
+npm run status
 ```
 
-Do not start another `npm start` while the service owns the port. Configuration, logs,
-installation on another host, and availability limits are in [Execution host](docs/EXECUTION_HOST.md).
+Restart interrupts managed sessions and active PM work. The LaunchAgent restarts automatically and holds an AC-only sleep assertion. Keep the Mac awake, network-connected, and logged in. [Execution host details](docs/EXECUTION_HOST.md).
 
-Run `npm test` and `npm run typecheck` for local verification. These do not call models.
+## Developer workflow
 
-## The PM's contract
+1. Open Foreman and choose **New session**. Pick Claude or Codex, a name, an existing absolute project directory, and the first task.
+2. Open the session conversation. Follow-up messages queue while it works; saved receipts distinguish queued, running, completed, failed, and uncertain delivery.
+3. Answer inline tool approvals or supported questions. Permission responses apply once. **Interrupt** also cancels queued follow-ups.
+4. Ask a managed session to use Foreman peer tools: `list_sessions`, `session_state`, `session_tail`, `send_message`, `request_update`, and `message_status`. Sender identity is supplied by Foreman. An update is recorded in the target conversation; read it after completion.
+5. Use the pinned **Project manager** to coordinate work. Its default spawns use the same managed Claude/Codex service.
 
-- Reads only documentation-shaped paths (docs, issues, markdown, README, ADRs) and `~/.foreman`.
-- Writes only under `~/.foreman/memory` (`PROJECTS.md`, `LOG.md`).
-- Bash limited to read-only `gh`, `git log/status`, `claude agents`.
-- No subagents. Work goes to tracked sessions via `spawn_session` (`claude --bg --name …`, or a
-  visible Warp tab with mode `tab`).
-- Hears back through cross-session messaging (`SendMessage` with `notify_when_idle`).
+The responsive inbox groups work needing your attention and shows provider, project, activity, host availability, and control limitations. Observed external sessions have readable available transcripts and no message controls. Trusting Codex hooks enables additional external-session monitoring; managed Codex sessions also report state directly through their controller.
 
-## Status
+## Persistence and boundaries
 
-Local only, with Claude/Codex control proofs and a background service. Cloudflare hosting,
-Firebase sign-in, session chat, and shared cross-provider tools are not deployed yet.
-See `docs/BLOCKERS.md` for current readiness and `docs/DESIGN.md` for the original design.
+State lives under `~/.foreman` (override `FOREMAN_HOME`): managed snapshots/receipts, hook observations, PM history/memory, and the private cloud pairing. An exclusive service lock prevents simultaneous writers. Browser refresh restores history. Reusing a managed creation/message ID with identical input returns the existing result; different input is rejected.
+
+After daemon restart, unfinished receipts become uncertain and recovered sessions become read-only. Nothing is automatically replayed or resumed. Start a new session to continue. The legacy PM conversation has separate history and does not yet share managed message deduplication. Arbitrary takeover of a live terminal/desktop, multiple users/hosts, and background push notifications are deferred.
+
+The PM is a coordinator: specific existing document reads and memory reads only; no Bash, Glob, Grep, code, or subagent tools. Memory writes resolve parent symlinks and stay in its memory directory. It cannot directly read Foreman configuration. Sessions perform implementation work through their provider's normal permission flow.
+
+## Verify
+
+```sh
+npm test
+npm run typecheck
+npm run cloud:test
+npm run cloud:typecheck
+npm run test:ui
+```
+
+Browser tests may require `npx playwright install chromium`. Automated tests use mocks/disposable state and do not call providers. The explicit integration probe makes small real provider calls in sessions it creates:
+
+```sh
+FOREMAN_CODEX_BIN=/absolute/path/to/supported/codex npm run probe:mvp -- --live
+```
+
+## Code map
+
+| Path | Purpose |
+| --- | --- |
+| `server/session-service.ts` | Durable managed sessions, queues, history, approvals, recovery |
+| `server/claude-control.ts`, `server/codex-control.ts` | Provider process/protocol adapters |
+| `server/peer-tools.ts` | Shared Claude MCP, Codex dynamic tools, and PM interface |
+| `server/fleet.ts`, `hooks/` | External-session discovery and hook monitoring |
+| `server/main.ts`, `server/host-bridge.ts` | Loopback API and outbound authenticated relay |
+| `cloud/worker.ts`, `cloud/auth.ts` | Cloudflare relay and Firebase verification |
+| `web/` | Vanilla browser inbox and Google sign-in |
+| `server/pm.ts`, `server/tools.ts` | Pinned PM and delegation tools |
+
+[MVP plan](docs/MVP_PLAN.md) · [Readiness and remaining blockers](docs/BLOCKERS.md) · [Original design](docs/DESIGN.md)

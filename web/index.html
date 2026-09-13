@@ -1,51 +1,213 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Foreman</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="style.css">
-</head>
-<body>
-<div class="app">
-  <aside class="rail" id="rail" aria-label="Sessions">
-    <div class="rail-head">
-      <span class="rail-title">Sessions</span>
-      <span class="rail-count" id="rail-count">0</span>
-    </div>
-    <ul class="rail-list" id="rail-list"></ul>
-    <div class="rail-foot" id="rail-foot">connecting…</div>
-  </aside>
-
-  <main class="pm">
-    <header class="pm-head">
-      <div>
-        <div class="pm-title">Project manager</div>
-        <div class="pm-sub" id="pm-status">starting…</div>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#142b24" />
+    <title>Foreman · Session inbox</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <section id="auth-screen" class="auth-screen" aria-labelledby="auth-title">
+      <div class="auth-card">
+        <div class="brand-mark" aria-hidden="true">f.</div>
+        <p class="eyebrow">YOUR SESSION INBOX</p>
+        <h1 id="auth-title">A clear view of the work.</h1>
+        <p>
+          Claude and Codex, together. Pick up a conversation, unblock an agent,
+          and keep building.
+        </p>
+        <p id="auth-status" role="status">Connecting to Foreman…</p>
+        <button id="sign-in" class="btn" hidden>Continue with Google</button>
       </div>
-      <button class="btn ghost" id="btn-interrupt" title="Interrupt the PM's current turn">Stop</button>
-    </header>
-    <div class="chat" id="chat" aria-live="polite"></div>
-    <form class="composer" id="composer">
-      <textarea id="input" rows="1" placeholder="What are we working on? What needs me?  (Enter to send, Shift+Enter for newline)"></textarea>
-      <button class="btn" id="send" type="submit">Send</button>
-    </form>
-  </main>
-
-  <aside class="detail" id="detail" hidden>
-    <div class="detail-head">
-      <span id="detail-name" class="mono"></span>
-      <button class="btn ghost" id="detail-close" aria-label="Close">×</button>
+    </section>
+    <div class="app" id="app" hidden>
+      <aside class="rail" id="rail" aria-label="Session navigation">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">f.</span
+          ><span>Foreman<small>SESSION INBOX</small></span
+          ><button
+            class="icon-btn mobile-only"
+            id="close-nav"
+            aria-label="Close session navigation"
+          >
+            ×
+          </button>
+        </div>
+        <button class="btn new-session" id="new-session">
+          <span aria-hidden="true">＋</span> New session
+        </button>
+        <button class="pm-row" id="select-pm">
+          <span class="pm-icon" aria-hidden="true">◈</span
+          ><span>Project manager<small>Plan and delegate</small></span
+          ><span class="pinned">PINNED</span>
+        </button>
+        <div class="rail-heading">
+          <span>Sessions</span><span id="session-count">0</span>
+        </div>
+        <label class="search"
+          ><span class="sr-only">Find a session</span
+          ><input
+            id="search"
+            type="search"
+            placeholder="Find a session…"
+            autocomplete="off"
+        /></label>
+        <nav class="session-list" id="session-list" aria-label="Sessions"></nav>
+        <footer class="rail-footer">
+          <div class="host-line">
+            <span id="host-dot" class="dot"></span
+            ><span id="host-status" role="status">Checking host…</span>
+          </div>
+          <div class="account-line">
+            <span id="account">Local connection</span
+            ><button id="sign-out" class="text-btn" hidden>Sign out</button>
+          </div>
+        </footer>
+      </aside>
+      <button
+        id="nav-backdrop"
+        class="nav-backdrop"
+        aria-label="Close session navigation"
+        hidden
+      ></button>
+      <main class="conversation">
+        <header class="conversation-head">
+          <button
+            class="icon-btn mobile-only"
+            id="open-nav"
+            aria-label="Open session navigation"
+            aria-controls="rail"
+            aria-expanded="false"
+          >
+            ☰
+          </button>
+          <div class="conversation-heading">
+            <div class="title-line">
+              <h1 id="conversation-title">Your session inbox</h1>
+              <span id="provider" class="badge" hidden></span>
+            </div>
+            <p id="conversation-subtitle">
+              Choose a session or start something new.
+            </p>
+          </div>
+          <button id="interrupt" class="btn ghost small" disabled>
+            Interrupt
+          </button>
+        </header>
+        <div
+          id="connection-banner"
+          class="banner warning"
+          role="status"
+          hidden
+        ></div>
+        <div id="error-banner" class="banner error" role="alert" hidden>
+          <span id="error-text"></span
+          ><button
+            id="dismiss-error"
+            class="icon-btn"
+            aria-label="Dismiss error"
+          >
+            ×
+          </button>
+        </div>
+        <div
+          class="timeline"
+          id="timeline"
+          tabindex="0"
+          aria-label="Conversation history"
+        >
+          <div id="messages" class="messages"></div>
+          <section
+            id="approvals"
+            class="approvals"
+            aria-label="Requests needing your response"
+          ></section>
+        </div>
+        <div id="control-note" class="control-note" role="status"></div>
+        <form id="composer" class="composer">
+          <label class="sr-only" for="message-input">Message this session</label
+          ><textarea
+            id="message-input"
+            rows="2"
+            placeholder="Choose a session to start a conversation"
+            maxlength="60000"
+            disabled
+          ></textarea>
+          <div class="composer-footer">
+            <span id="composer-hint"
+              >Enter to send · Shift + Enter for a new line</span
+            ><button id="send" class="btn" type="submit" disabled>
+              Send <span aria-hidden="true">↑</span>
+            </button>
+          </div>
+        </form>
+      </main>
     </div>
-    <dl class="detail-body" id="detail-body"></dl>
-    <div class="detail-actions">
-      <button class="btn" id="detail-ask">Ask PM about this</button>
-      <button class="btn ghost" id="detail-tail">Show last turns</button>
-    </div>
-    <pre class="detail-tail" id="detail-tail-out" hidden></pre>
-  </aside>
-</div>
-<script src="app.js"></script>
-</body>
+    <dialog id="new-dialog" aria-labelledby="new-title">
+      <form id="new-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">START SOMETHING</p>
+            <h2 id="new-title">New session</h2>
+          </div>
+          <button
+            id="close-dialog"
+            type="button"
+            class="icon-btn"
+            aria-label="Close new session"
+          >
+            ×
+          </button>
+        </div>
+        <p class="dialog-intro">
+          Give an agent a project and a clear first task. It runs on your
+          connected Mac.
+        </p>
+        <label
+          >Agent<select id="new-provider" name="provider">
+            <option value="claude">Claude</option>
+            <option value="codex">Codex</option>
+          </select></label
+        ><label
+          >Session name<input
+            id="new-name"
+            name="name"
+            required
+            maxlength="80"
+            placeholder="e.g. Fix the sign-in flow"
+            autocomplete="off" /></label
+        ><label
+          >Project directory<input
+            id="new-cwd"
+            name="cwd"
+            required
+            placeholder="/Users/you/code/project"
+            autocomplete="off"
+            spellcheck="false"
+        /></label>
+        <p class="field-hint">
+          Use the full path to an existing directory on your Mac.
+        </p>
+        <label
+          >First task<textarea
+            id="new-prompt"
+            name="text"
+            required
+            rows="4"
+            maxlength="60000"
+            placeholder="What should the agent work on?"
+          ></textarea>
+        </label>
+        <p id="new-error" class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn ghost" id="cancel-new">Cancel</button
+          ><button type="submit" class="btn" id="create-session">
+            Start session
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <script type="module" src="/app.js"></script>
+  </body>
 </html>

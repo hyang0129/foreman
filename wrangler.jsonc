@@ -1,0 +1,18 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "foreman",
+  "main": "cloud/worker.ts",
+  "compatibility_date": "2026-09-13",
+  "account_id": "b107d26298de0cc01f30edf0db8e92b1",
+  "workers_dev": true,
+  "secrets": { "required": ["HOST_TOKEN"] },
+  "assets": { "directory": "./web", "binding": "ASSETS", "run_worker_first": ["/api/*"] },
+  "durable_objects": { "bindings": [{ "name": "RELAY", "class_name": "HostRelay" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HostRelay"] }],
+  "vars": {
+    "FIREBASE_PROJECT_ID": "foreman-hong-2026",
+    "ALLOWED_EMAIL": "hooong.yang@gmail.com",
+    "FIREBASE_CONFIG": "{}"
+  },
+  "observability": { "enabled": true, "logs": { "enabled": true, "invocation_logs": true }, "traces": { "enabled": true } }
+}

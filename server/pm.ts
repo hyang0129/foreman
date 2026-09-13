@@ -1,12 +1,13 @@
 // The project manager: one long-lived Claude Agent SDK session in streaming-input mode.
 // Tool access is enforced here (canUseTool), not just prompted.
-import { query, type SDKUserMessage, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKUserMessage, type Query, type HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { EventEmitter } from "node:events";
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, realpathSync, statSync } from "node:fs";
+import { join, resolve, sep, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { Fleet } from "./fleet.ts";
-import { makeFleetServer } from "./tools.ts";
+import { makeFleetServer, type ManagedFleetService } from "./tools.ts";
+import { makePeerMcpServer, PEER_ALLOWED_TOOLS, PEER_INSTRUCTIONS } from "./peer-tools.ts";
 import { FOREMAN_HOME, MEMORY_DIR, PM_SESSION_FILE, PM_HISTORY_FILE, REPO_ROOT } from "./paths.ts";
 
 export type PmEvent =
@@ -18,12 +19,22 @@ export type PmEvent =
   | { type: "status"; text: string }
   | { type: "peer"; text: string };
 
-const DOC_PATH = /(^|\/)(docs?|documentation|issues?|adrs?|rfcs?|specs?|notes?|plans?|\.github)(\/|$)|\.(md|mdx|markdown|txt|rst|adoc)$|(^|\/)(readme|changelog|contributing|license|todo|roadmap)[^/]*$/i;
-const BASH_ALLOW = /^\s*(gh\s+(issue|pr|repo|run)\s+(list|view|status|checks|diff\s+--stat)\b|git\s+(log|status|branch|remote|show\s+--stat|diff\s+--stat)\b|claude\s+(agents|logs)\b|ls\b|date\b|pwd\b|cat\s+\S+\.(md|txt|rst)\b|head\s+\S+\.(md|txt|rst)\b)/;
+const DOC_FILE = /\.(md|mdx|markdown|txt|rst|adoc)$|^(readme|changelog|contributing|license|todo|roadmap)$/i;
 
 const home = homedir();
 const under = (p: string, dir: string) => { const a = resolve(p); const d = resolve(dir); return a === d || a.startsWith(d + sep); };
-const expand = (p: string) => (p.startsWith("~") ? join(home, p.slice(1)) : p);
+const expand = (p: string) => (p === '~' ? home : p.startsWith("~/") ? join(home, p.slice(2)) : p);
+const canonical = (p: string) => realpathSync(resolve(FOREMAN_HOME, p));
+function memoryWritePath(p: string): boolean {
+  try {
+    const target = resolve(FOREMAN_HOME, p);
+    if (existsSync(target)) return under(canonical(target), canonical(MEMORY_DIR));
+    // Check the nearest existing parent too, so a symlink cannot escape the memory directory.
+    let parent = dirname(target);
+    while (!existsSync(parent) && parent !== dirname(parent)) parent = dirname(parent);
+    return under(target, MEMORY_DIR) && under(canonical(parent), canonical(MEMORY_DIR));
+  } catch { return false; }
+}
 
 class Inbox {
   private q: SDKUserMessage[] = [];
@@ -50,7 +61,8 @@ export class ProjectManager extends EventEmitter {
   private closed = false;
 
   private fleet: Fleet;
-  constructor(fleet: Fleet) { super(); this.fleet = fleet; }
+  private sessions?: ManagedFleetService;
+  constructor(fleet: Fleet, sessions?: ManagedFleetService) { super(); this.fleet = fleet; this.sessions = sessions; }
 
   history(): any[] {
     if (!existsSync(PM_HISTORY_FILE)) return [];
@@ -74,25 +86,37 @@ export class ProjectManager extends EventEmitter {
     const allow = () => ({ behavior: "allow" as const, updatedInput: input });
     const deny = (message: string) => ({ behavior: "deny" as const, message });
     const delegate = "Denied: the project manager does not touch code. Brief a session agent with spawn_session instead.";
-    if (name.startsWith("mcp__fleet__") || ["ListAgents", "SendMessage", "WebFetch", "WebSearch", "TodoWrite", "TaskCreate", "TaskList", "TaskUpdate", "TaskGet"].includes(name)) return allow();
-    if (name === "Read" || name === "Glob" || name === "Grep") {
-      const p = expand(String(input.file_path ?? input.path ?? input.pattern ?? ""));
-      if (!p) return name === "Read" ? deny("Read needs a file_path.") : allow();
-      if (under(p, FOREMAN_HOME) || under(p, REPO_ROOT + "/docs") || DOC_PATH.test(p)) return allow();
-      return deny(`${delegate} (${name} is limited to docs, issues, markdown, and ~/.foreman.)`);
+    if (name.startsWith("mcp__fleet__") || PEER_ALLOWED_TOOLS.includes(name) || ["ListAgents", "SendMessage", "WebFetch", "WebSearch", "TodoWrite", "TaskCreate", "TaskList", "TaskUpdate", "TaskGet"].includes(name)) return allow();
+    if (name === "Read") {
+      const p = expand(String(input.file_path ?? ""));
+      if (!p) return deny("Read needs a file_path.");
+      try {
+        const actual = canonical(p);
+        if (!statSync(actual).isFile()) return deny('Read requires an existing document file.');
+        if (under(actual, canonical(MEMORY_DIR))) return allow();
+        if (under(actual, canonical(FOREMAN_HOME))) return deny('Use session tools for session history. Foreman configuration and credentials are unavailable to the PM.');
+        if (DOC_FILE.test(basename(actual))) return allow();
+      } catch { return deny('Read requires an existing document file.'); }
+      return deny(`${delegate} (Read is limited to document files and PM memory.)`);
     }
     if (name === "Write" || name === "Edit" || name === "MultiEdit" || name === "NotebookEdit") {
       const p = expand(String(input.file_path ?? ""));
-      if (p && under(p, MEMORY_DIR)) return allow();
+      if (p && memoryWritePath(p)) return allow();
       return deny(`${delegate} (Writes are limited to ~/.foreman/memory.)`);
     }
-    if (name === "Bash") {
-      const cmd = String(input.command ?? "");
-      if (BASH_ALLOW.test(cmd) && !/[;&|`$(]/.test(cmd.replace(/\|\|/g, ""))) return allow();
-      return deny(`${delegate} (Bash is limited to read-only gh/git/claude agents commands.)`);
-    }
+    if (["Bash", "Glob", "Grep"].includes(name)) return deny(`${delegate} (Use the fleet and peer tools to inspect sessions, and Read for a specific document.)`);
     if (name === "Agent") return deny("Denied: no subagents for the PM; spawn a tracked session with spawn_session so the user can see it.");
     return deny(`Denied: ${name} is not available to the project manager.`);
+  };
+
+  // Permission callbacks alone can be bypassed by provider defaults or user allow rules.
+  // Enforce the PM role before every tool invocation, including auto-approved reads.
+  private enforceToolBoundary: HookCallback = async (input) => {
+    if (input.hook_event_name !== 'PreToolUse') return {};
+    const decision = await this.canUseTool(input.tool_name, (input.tool_input ?? {}) as Record<string, any>);
+    return decision.behavior === 'deny'
+      ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: decision.message } }
+      : {};
   };
 
   async start(): Promise<void> {
@@ -106,14 +130,15 @@ export class ProjectManager extends EventEmitter {
         options: {
           cwd: FOREMAN_HOME,
           resume,
-          systemPrompt: { type: "preset", preset: "claude_code", append: base + this.memoryBlock() },
+          systemPrompt: { type: "preset", preset: "claude_code", append: base + this.memoryBlock() + (this.sessions ? '\n\n' + PEER_INSTRUCTIONS + '\nFor Foreman-managed sessions, use peer tools to request updates and read outcomes. Native SendMessage subscriptions apply only to legacy Claude background sessions. You still must not read or edit source code or bypass your PM tool restrictions.' : '') },
           settingSources: ["user"],
           permissionMode: "default",
           canUseTool: this.canUseTool,
+          hooks: { PreToolUse: [{ hooks: [this.enforceToolBoundary] }] },
           includePartialMessages: true,
-          mcpServers: { fleet: makeFleetServer(this.fleet) },
-          allowedTools: ["mcp__fleet__list_sessions", "mcp__fleet__session_tail", "mcp__fleet__log_note", "ListAgents", "WebFetch", "WebSearch"],
-          disallowedTools: ["Agent"],
+          mcpServers: { fleet: makeFleetServer(this.fleet, this.sessions), ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, 'foreman-pm') } : {}) },
+          allowedTools: ["mcp__fleet__list_sessions", "mcp__fleet__session_tail", "mcp__fleet__log_note", "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : [])],
+          disallowedTools: ["Agent", "Bash", "Glob", "Grep"],
           extraArgs: { name: "foreman-pm" },
           maxTurns: 60,
           effort: (process.env.FOREMAN_PM_EFFORT as any) || "medium",

@@ -1,10 +1,25 @@
 # Foreman readiness and blockers
 
-Updated September 13, 2026 after orchestrating session-control proofs, local-host setup, and Codex monitoring. Cloudflare/Firebase logins were verified in the prior step. No cloud resources have been created or deployed.
+Updated September 13, 2026 after implementing and testing the developer MVP. Cloudflare is deployed at https://foreman.hooong-yang.workers.dev and the Mac relay is connected. The local app is usable at http://localhost:4177. Google sign-in remains blocked by Firebase project activation.
+
+## MVP release state
+
+Implemented: session-first responsive browser, managed Claude/Codex creation, direct conversations, durable message queues/receipts, approvals/questions, interruption, peer tools, private Cloudflare relay, Google-token verification, and explicit offline/restart behavior. [Plan](MVP_PLAN.md) · [Cloud setup](CLOUD_SETUP.md).
+
+**Remaining external actions:**
+
+1. **Firebase activation:** Google Cloud project `foreman-hong-2026` exists. All four required IAM permissions are verified and Firebase Management API is enabled, but `addFirebase` returns HTTP403. The user has been asked to open Firebase Console and complete terms/project activation. After that, deploy the checked-in Google auth configuration, retrieve the public web SDK config, authorize the Workers domain, redeploy, and verify actual Google login. Hosted APIs remain locked while this is pending.
+2. **Codex hook trust:** review/trust the installed Foreman hooks in `/hooks`. Managed Codex sessions work through controller events already; live monitoring of external sessions depends on this trust gate.
+
+**Intentional MVP limits:** one user/one Mac; discovered external sessions are monitor-only. On daemon restart, managed history/receipts remain but sessions become read-only and unfinished delivery becomes uncertain. Start a new session to continue; automatic resume is deferred. The pinned legacy PM conversation lacks managed message deduplication. Unsupported provider dialogs require interruption/local action. Actual Google sign-in and the full authenticated cloud-to-provider journey cannot be verified until Firebase activation completes.
+
+## New MVP live proof
+
+`scripts/probe-mvp.ts --live` passed with disposable sessions: both providers completed queued follow-ups with retained context; Claude invoked peer MCP to request a Codex update with an attributed durable receipt and response; Codex invoked dynamic tools to read Claude state/history; Claude tool approval was denied through the shared service; reopening the store retained history/receipts without replay. Supported question handling is covered by mocked provider and browser tests, not a live model question proof. No existing user working session was messaged or stopped.
 
 ## 1. Existing-session control
 
-Implemented reusable controllers in `server/claude-control.ts` and `server/codex-control.ts`. The web UI still sends messages only to the PM; wiring full session chat to these modules is subsequent work.
+Implemented reusable controllers in `server/claude-control.ts` and `server/codex-control.ts`. The session service now connects these adapters to direct browser chat and peer tools; historical lower-level proofs are retained below.
 
 | Proof | Result | Boundary |
 | --- | --- | --- |
@@ -47,19 +62,11 @@ The fleet and UI now distinguish providers with `session_key` values such as `co
 
 **Remaining user action:** Codex `hooks/list` finds the 12 enabled Foreman hooks but reports them as **untrusted**. Open `/hooks` in Codex, review and trust those definitions, then start or resume a session. This is Codex's runtime trust gate; the installer does not bypass it. End-to-end live hook delivery remains pending that action. Lifecycle, concurrency, path validation, and installation tests pass in temporary directories.
 
-## Remaining product work
-
-| Requirement | Status |
-| --- | --- |
-| Cloudflare hosting | Login and write scopes verified. Worker configuration, authenticated outbound relay, host heartbeat/offline state, and deployment remain. |
-| Firebase Google sign-in | Login verified as `hooong.yang@gmail.com`; project listing succeeded with no projects. User authorized project creation. Project/web-app creation, Google provider setup, allowed domain, server token verification, and identity allowlist remain. Project-creation rights/quota have not yet been exercised. |
-| Happy-style UI | Source inspected at `slopus/happy` commit `4b7d763ee3afda04985f3210b9cb9acf9359c7d9`. Its Expo UI and Fastify/Socket.IO/Prisma server are not a drop-in Workers app. Adapt its session/chat interaction design. |
-| Web session chat | Controllers exist; HTTP/cloud routing, user-facing approval/question controls, persisted receipts, and reconnect behavior still need integration. |
-| Cross-provider collaboration | Native Claude peer delivery is proven. Claude↔Codex shared MCP/API tools, sender identity, update subscriptions, routing, access boundaries, and loop prevention remain. |
-
 ## Verification
 
-24 automated tests passed across controller, fleet, hook installer/observer, launchd configuration, and process-shutdown checks, including a review regression for delayed Codex turn completion preserving a newer approval. Type checking passes for server code, TypeScript probes, and tests. Live provider proofs are listed separately above; unit tests are not substituted for live evidence.
+The final automated suites pass **98 tests: 51 Node, 36 Workers, and 11 browser**. They cover local controllers/service/PM guards/hooks/bridge, Workers JWT and Durable Object routing, and browser flows, including a large-fleet layout regression. Typechecks pass for Node, Workers, and Workers tests. The explicit live MVP proof above is separate from mocked tests. The deployed static page and unauthenticated API rejection were checked over HTTPS; the installed daemon reports its cloud relay connected. A separate real-browser journey through the local HTTP API created a disposable Codex session, sent a follow-up, and displayed two completed receipts with retained context and no browser errors. Test daemon/provider processes were stopped and temporary state removed.
+
+The review also removed PM shell/search execution and unrestricted Foreman-state reads. A PreToolUse guard applies before provider auto-approval, preventing the PM from reading the relay credential through file tools or symlink aliases.
 
 ## References
 

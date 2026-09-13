@@ -2,7 +2,7 @@
   "name": "foreman",
   "version": "0.1.0",
   "private": true,
-  "description": "A project-manager agent that tracks every Claude Code session on this machine and delegates all code work to session agents.",
+  "description": "Private Claude and Codex session inbox with Cloudflare hosting and a local execution host",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -23,16 +23,28 @@
     "service:restart": "node scripts/service.mjs restart",
     "probe:claude": "node --experimental-strip-types scripts/probe-claude-control.ts",
     "probe:claude:peer": "node --experimental-strip-types scripts/probe-claude-peer.ts",
-    "probe:codex": "node --experimental-strip-types scripts/probe-codex-control.ts"
+    "probe:codex": "node --experimental-strip-types scripts/probe-codex-control.ts",
+    "cloud:dev": "wrangler dev",
+    "cloud:deploy": "node scripts/deploy-cloud.mjs",
+    "cloud:types": "wrangler types cloud/worker-configuration.d.ts",
+    "cloud:typecheck": "tsc -p cloud/tsconfig.json && tsc -p cloud/tests/tsconfig.json",
+    "cloud:test": "vitest run",
+    "test:ui": "playwright test",
+    "probe:mvp": "node --experimental-strip-types scripts/probe-mvp.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.270",
+    "jose": "^6.2.12",
     "ws": "^8.21.3",
     "zod": "^4.6.4"
   },
   "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.8",
+    "@playwright/test": "^1.63.0",
     "@types/node": "^26.5.1",
     "@types/ws": "^8.18.1",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.131.1"
   }
 }

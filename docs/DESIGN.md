@@ -1,5 +1,6 @@
 # Foreman — design
 
+> Historical initial design. The current session-first Claude/Codex MVP, hosted relay, and PM restrictions are documented in [MVP plan](MVP_PLAN.md) and [README](../README.md).
 Foreman is a local control room for Claude Code sessions. You talk to one agent, the **project
 manager (PM)**. The PM never codes. It keeps a high-level memory of what you are working on, starts
 **session agents** to do the actual work, watches them through hooks, and tells you what needs your

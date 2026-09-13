@@ -149,8 +149,8 @@ export class CodexControl extends EventEmitter {
   history(threadId: string, cursor?: string) {
     return this.request<{ data: Json[]; nextCursor: string | null }>('thread/turns/list', { threadId, limit: 10, itemsView: 'full', ...(cursor ? { cursor } : {}) });
   }
-  async start(cwd: string) {
-    const result = await this.request<{ thread: CodexThread }>('thread/start', { cwd, sandbox: 'workspace-write', approvalPolicy: 'on-request' });
+  async start(cwd: string, extra: Record<string, Json> = {}) {
+    const result = await this.request<{ thread: CodexThread }>('thread/start', { ...extra, cwd, sandbox: 'workspace-write', approvalPolicy: 'on-request' });
     this.attached.add(result.thread.id);
     return result.thread;
   }
@@ -191,6 +191,11 @@ export class CodexControl extends EventEmitter {
     return this.request('turn/interrupt', { threadId, turnId });
   }
   pendingRequests() { return [...this.requests.values()]; }
+  respondTool(id: string | number, result: Record<string, Json>) {
+    const request = this.requests.get(id);
+    if (!request || request.method !== 'item/tool/call') throw new Error('Tool request is no longer pending');
+    this.write({ id, result }); this.requests.delete(id);
+  }
   respond(id: string | number, result: Record<string, Json>) {
     const request = this.requests.get(id);
     if (!request) throw new Error('Request is no longer pending');

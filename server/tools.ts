@@ -6,6 +6,13 @@ import { existsSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { Fleet, transcriptTail } from "./fleet.ts";
 import { CLAUDE_BIN, WARP_SPAWN, MEMORY_DIR } from "./paths.ts";
+import { bindPeerTools, type PeerService } from "./peer-tools.ts";
+import { randomUUID } from "node:crypto";
+
+export interface ManagedFleetService extends PeerService {
+  create(input: { id: string; provider: 'claude' | 'codex'; name: string; cwd: string; text: string }): any;
+  interrupt(id: string): any;
+}
 
 const fmt = (o: unknown) => ({ content: [{ type: "text" as const, text: typeof o === "string" ? o : JSON.stringify(o, null, 2) }] });
 const err = (m: string) => ({ content: [{ type: "text" as const, text: m }], isError: true });
@@ -18,13 +25,15 @@ export function runClaude(args: string[], cwd?: string): Promise<{ code: number;
   });
 }
 
-export function makeFleetServer(fleet: Fleet) {
+export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
+  const peers = sessions ? bindPeerTools(sessions, 'foreman-pm') : undefined;
   const list_sessions = tool(
     "list_sessions",
     "List tracked Claude Code and Codex sessions on this machine with its state (needs_input, working, turn_finished, idle, ended, dead), name, directory, last message and last error. Same data the user sees in the session rail.",
     { include_ended: z.boolean().optional().describe("Include ended and dead sessions (default false)") },
     async ({ include_ended }) => {
       await fleet.refresh();
+      if (peers) return fmt(await peers.call('list_sessions', { include_ended }));
       const rows = fleet.list()
         .filter((s) => include_ended || (s.state !== "ended" && s.state !== "dead"))
         .map((s) => ({
@@ -39,17 +48,25 @@ export function makeFleetServer(fleet: Fleet) {
 
   const spawn_session = tool(
     "spawn_session",
-    "Start a new Claude Code session agent to do work. mode 'bg' (default) runs it under the background supervisor so it is tracked in the agent view and restarts on crash; mode 'tab' opens a visible Warp tab. The prompt should state goal, definition of done, constraints, and ask for a one-paragraph outcome summary at the end. After spawning, subscribe with SendMessage notify_when_idle so you hear when it finishes.",
+    "Start a tracked session agent. Default mode 'managed' creates a Claude or Codex conversation in Foreman's durable service, controllable in the webapp and through peer tools. Legacy mode 'bg' uses the Claude supervisor; 'tab' opens Warp. State the goal, definition of done, and constraints in the prompt. Read managed outcomes with peers.session_tail and request_update; managed sessions do not support native SendMessage subscriptions.",
     {
       name: z.string().regex(/^[a-z0-9][a-z0-9-]{1,40}$/).describe("Short kebab-case task name, e.g. auth-refactor"),
       cwd: z.string().describe("Absolute path of the project directory"),
       prompt: z.string().min(20).describe("The full brief for the worker"),
-      mode: z.enum(["bg", "tab"]).optional().describe("bg (default) or tab"),
+      mode: z.enum(["managed", "bg", "tab"]).optional().describe("managed (default), bg, or tab"),
+      provider: z.enum(["claude", "codex"]).optional().describe("Managed provider (default claude)"),
       permission_mode: z.enum(["default", "acceptEdits", "bypassPermissions"]).optional().describe("Worker permission mode; default is the user's setting"),
       model: z.string().optional().describe("Model override, e.g. sonnet or opus"),
     },
-    async ({ name, cwd, prompt, mode, permission_mode, model }) => {
+    async ({ name, cwd, prompt, mode, provider, permission_mode, model }) => {
       if (!existsSync(cwd)) return err(`cwd does not exist: ${cwd}`);
+      if (mode === 'managed' || (!mode && sessions)) {
+        if (!sessions) return err('Managed session service is unavailable');
+        if (permission_mode || model) return err('Managed sessions use the service permission policy and default model; omit permission_mode and model.');
+        try { return fmt(await sessions.create({ id: randomUUID(), provider: provider ?? 'claude', name, cwd, text: prompt })); }
+        catch (error) { return err(error instanceof Error ? error.message : String(error)); }
+      }
+      if (provider === 'codex') return err('Codex requires managed mode');
       if (mode === "tab") {
         if (!existsSync(WARP_SPAWN)) return err(`warp-spawn not found at ${WARP_SPAWN}`);
         const line = prompt.replace(/\s+/g, " ").trim();
@@ -75,6 +92,10 @@ export function makeFleetServer(fleet: Fleet) {
     { session: z.string().describe("Session name, session_id, or bg id"), turns: z.number().int().min(1).max(30).optional() },
     async ({ session, turns }) => {
       await fleet.refresh();
+      if (peers) {
+        try { return fmt(await peers.call('session_tail', { session, limit: turns ?? 10 })); }
+        catch (error) { return err(error instanceof Error ? error.message : String(error)); }
+      }
       const s = fleet.get(session);
       if (!s) return err(`No session matches "${session}".`);
       if (s.transcript_path) return fmt(transcriptTail(s.transcript_path, turns ?? 10, s.provider));
