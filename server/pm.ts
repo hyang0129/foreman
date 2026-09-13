@@ -47,6 +47,7 @@ export class ProjectManager extends EventEmitter {
   busy = false;
   tools: string[] = [];
   private running = false;
+  private closed = false;
 
   private fleet: Fleet;
   constructor(fleet: Fleet) { super(); this.fleet = fleet; }
@@ -62,6 +63,7 @@ export class ProjectManager extends EventEmitter {
     this.inbox.push(text, this.sessionId ?? "");
   }
   async interrupt() { await this.q?.interrupt(); }
+  close() { this.closed = true; this.q?.close(); this.q = null; }
 
   private memoryBlock(): string {
     const read = (f: string) => (existsSync(join(MEMORY_DIR, f)) ? readFileSync(join(MEMORY_DIR, f), "utf8").trim() : "(empty)");
@@ -93,8 +95,8 @@ export class ProjectManager extends EventEmitter {
     return deny(`Denied: ${name} is not available to the project manager.`);
   };
 
-  async start() {
-    if (this.running) return;
+  async start(): Promise<void> {
+    if (this.running || this.closed) return;
     this.running = true;
     const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
     const resumeId = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
@@ -156,6 +158,7 @@ export class ProjectManager extends EventEmitter {
     };
     try { await run(resumeId); }
     catch (e: any) {
+      if (this.closed) return;
       const msg = String(e?.message ?? e);
       this.emit("event", { type: "status", text: `PM stopped: ${msg.slice(0, 300)}` } as PmEvent);
       if (resumeId && /resume|session/i.test(msg)) { writeFileSync(PM_SESSION_FILE, ""); this.running = false; return this.start(); }

@@ -1,7 +1,7 @@
 // Fleet store: merges hook records, Claude Code's live session registry, and `claude agents --json`
 // into one list, and emits "change" whenever the merged view differs.
 import { EventEmitter } from "node:events";
-import { readdirSync, readFileSync, watch, existsSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, watch, existsSync, statSync, openSync, readSync, closeSync, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { SESSIONS_DIR, CLAUDE_REGISTRY_DIR, CLAUDE_BIN, HOST, CLAUDE_CONFIG_DIR } from "./paths.ts";
@@ -10,6 +10,8 @@ export type State = "needs_input" | "working" | "turn_finished" | "idle" | "ende
 
 export interface Session {
   session_id: string;
+  session_key: string;
+  provider: "claude" | "codex";
   name: string | null;
   cwd: string | null;
   state: State;
@@ -36,7 +38,7 @@ export interface Session {
 }
 
 interface HookRecord {
-  session_id: string; name?: string | null; cwd?: string | null; state?: string; reason?: string | null;
+  provider?: "claude" | "codex"; session_id: string; name?: string | null; cwd?: string | null; state?: string; reason?: string | null;
   current_tool?: string | null; active_subagents?: number; last_message?: string | null; last_error?: string | null;
   started_at?: string; updated_at?: string; ended_at?: string | null; end_reason?: string | null;
   permission_mode?: string | null; transcript_path?: string | null; host?: string; source?: string | null;
@@ -81,28 +83,44 @@ export class Fleet extends EventEmitter {
   private timer: NodeJS.Timeout | null = null;
   private av: AgentViewEntry[] = [];
   private avAt = 0;
+  private watchers: FSWatcher[] = [];
+  private refreshing: Promise<void> | null = null;
 
   list(): Session[] { return this.sessions; }
-  get(id: string): Session | undefined { return this.sessions.find((s) => s.session_id === id || s.bg_id === id || s.name === id); }
+  get(id: string): Session | undefined {
+    const exact = this.sessions.find((s) => s.session_key === id);
+    if (exact) return exact;
+    const matches = this.sessions.filter((s) => s.session_id === id || s.bg_id === id || s.name === id);
+    return matches.length === 1 ? matches[0] : undefined;
+  }
 
   start() {
+    if (this.timer) return;
     const kick = () => this.refresh().catch(() => {});
     for (const d of [SESSIONS_DIR, CLAUDE_REGISTRY_DIR]) {
-      if (existsSync(d)) { try { watch(d, { persistent: false }, () => kick()); } catch { /* fs.watch unsupported; polling covers it */ } }
+      if (existsSync(d)) { try { this.watchers.push(watch(d, { persistent: false }, () => kick())); } catch { /* fs.watch unsupported; polling covers it */ } }
     }
     this.timer = setInterval(kick, 4000);
     kick();
   }
-  stop() { if (this.timer) clearInterval(this.timer); }
+  stop() {
+    if (this.timer) clearInterval(this.timer); this.timer = null;
+    for (const watcher of this.watchers) watcher.close(); this.watchers = [];
+  }
 
-  async refresh() {
+  refresh(): Promise<void> {
+    if (!this.refreshing) this.refreshing = this.refreshOnce().finally(() => { this.refreshing = null; });
+    return this.refreshing;
+  }
+
+  private async refreshOnce() {
     if (Date.now() - this.avAt > 10_000) { this.av = await agentView(); this.avAt = Date.now(); }
     const hooks = readJsonDir<HookRecord>(SESSIONS_DIR);
     const registry = readJsonDir<RegistryEntry>(CLAUDE_REGISTRY_DIR);
     const bySid = new Map<string, Session>();
 
-    const base = (sid: string): Session => ({
-      session_id: sid, name: null, cwd: null, state: "unknown", reason: null, kind: "unknown", entrypoint: null, pid: null,
+    const base = (sid: string, provider: "claude" | "codex" = "claude"): Session => ({
+      session_id: sid, provider, session_key: `${provider}:${sid}`, name: null, cwd: null, state: "unknown", reason: null, kind: "unknown", entrypoint: null, pid: null,
       alive: false, tracked: false, current_tool: null, active_subagents: 0, last_message: null, last_error: null,
       started_at: null, updated_at: null, ended_at: null, end_reason: null, permission_mode: null, bg_id: null,
       bg_state: null, bg_waiting_for: null, host: HOST, transcript_path: null,
@@ -110,29 +128,31 @@ export class Fleet extends EventEmitter {
 
     for (const h of hooks) {
       if (!h.session_id) continue;
-      const s = bySid.get(h.session_id) ?? base(h.session_id);
+      const provider = h.provider === "codex" ? "codex" : "claude";
+      const key = `${provider}:${h.session_id}`;
+      const s = bySid.get(key) ?? base(h.session_id, provider);
       s.tracked = true;
-      s.name = h.name ?? s.name; s.cwd = h.cwd ?? s.cwd; s.state = (h.state as State) ?? "unknown"; s.reason = h.reason ?? null;
+      s.name = h.name ?? s.name; s.cwd = h.cwd ?? s.cwd; s.state = h.state && Object.hasOwn(STATE_ORDER, h.state) ? h.state as State : "unknown"; s.reason = h.reason ?? null;
       s.current_tool = h.current_tool ?? null; s.active_subagents = h.active_subagents ?? 0;
       s.last_message = h.last_message ?? null; s.last_error = h.last_error ?? null;
       s.started_at = h.started_at ?? null; s.updated_at = h.updated_at ?? null; s.ended_at = h.ended_at ?? null;
       s.end_reason = h.end_reason ?? null; s.permission_mode = h.permission_mode ?? null; s.transcript_path = h.transcript_path ?? null;
       s.host = h.host ?? HOST;
-      bySid.set(h.session_id, s);
+      bySid.set(s.session_key, s);
     }
     for (const r of registry) {
       if (!r.sessionId) continue;
-      const s = bySid.get(r.sessionId) ?? base(r.sessionId);
+      const s = bySid.get(`claude:${r.sessionId}`) ?? base(r.sessionId);
       s.pid = r.pid; s.alive = pidAlive(r.pid);
       s.name = s.name ?? r.name ?? null; s.cwd = s.cwd ?? r.cwd ?? null;
       s.kind = r.entrypoint === "sdk-ts" || r.entrypoint === "sdk-py" ? "sdk" : (r.kind as any) ?? "interactive";
       s.entrypoint = r.entrypoint ?? null;
       s.started_at = s.started_at ?? (r.startedAt ? new Date(r.startedAt).toISOString() : null);
-      bySid.set(r.sessionId, s);
+      bySid.set(s.session_key, s);
     }
     for (const a of this.av) {
       if (!a.sessionId) continue;
-      const s = bySid.get(a.sessionId) ?? base(a.sessionId);
+      const s = bySid.get(`claude:${a.sessionId}`) ?? base(a.sessionId);
       s.bg_id = a.id ?? null; s.bg_state = a.state ?? a.status ?? null; s.bg_waiting_for = a.waitingFor ?? null;
       if (a.kind === "background") s.kind = "background";
       s.name = s.name ?? a.name ?? null; s.cwd = s.cwd ?? a.cwd ?? null;
@@ -144,12 +164,12 @@ export class Fleet extends EventEmitter {
         else if (a.state === "done") s.state = "turn_finished";
         else if (a.state === "failed" || a.state === "stopped") s.state = "ended";
       }
-      bySid.set(a.sessionId, s);
+      bySid.set(s.session_key, s);
     }
 
     // Fallback for sessions that predate the hooks: infer from the transcript.
     for (const s of bySid.values()) {
-      if (s.tracked || s.state !== "unknown") continue;
+      if (s.provider !== "claude" || s.tracked || s.state !== "unknown") continue;
       const t = s.transcript_path ?? guessTranscript(s.cwd, s.session_id);
       if (!t) { if (s.alive) s.state = "idle"; continue; }
       s.transcript_path = t;
@@ -163,7 +183,9 @@ export class Fleet extends EventEmitter {
       const known = s.pid !== null;
       if (s.state === "ended") continue;
       if (known && !s.alive && s.kind !== "background") s.state = "dead";
-      if (!known && s.tracked && s.updated_at && Date.now() - Date.parse(s.updated_at) > 12 * 3600_000) s.state = "dead";
+      if (!known && s.tracked && s.updated_at && Date.now() - Date.parse(s.updated_at) > 12 * 3600_000) {
+        s.state = "unknown"; s.reason = "no recent hook events; liveness unverified";
+      }
     }
 
     const list = [...bySid.values()].sort((a, b) => {
@@ -186,8 +208,7 @@ export function guessTranscript(cwd: string | null, sid: string): string | null 
 }
 export function inferFromTranscript(path: string): { state: State; updated_at: string | null; last_message: string | null; current_tool: string | null } | null {
   try {
-    const size = statSync(path).size;
-    const buf = readFileSync(path, "utf8").slice(Math.max(0, size - 200_000));
+    const buf = readTail(path, 200_000);
     const lines = buf.split("\n").filter(Boolean);
     for (let i = lines.length - 1; i >= 0; i--) {
       let rec: any; try { rec = JSON.parse(lines[i]); } catch { continue; }
@@ -212,14 +233,23 @@ export function inferFromTranscript(path: string): { state: State; updated_at: s
   return null;
 }
 
-export function transcriptTail(path: string | null, n = 12): string {
+export function transcriptTail(path: string | null, n = 12, provider: "claude" | "codex" = "claude"): string {
   if (!path || !existsSync(path)) return "(no transcript on disk)";
-  const size = statSync(path).size;
-  const fd = readFileSync(path, { encoding: "utf8", flag: "r" });
-  const lines = fd.slice(Math.max(0, size - 400_000)).split("\n").filter(Boolean);
+  const lines = readTail(path, 400_000).split("\n").filter(Boolean);
   const out: string[] = [];
   for (let i = lines.length - 1; i >= 0 && out.length < n; i--) {
     let rec: any; try { rec = JSON.parse(lines[i]); } catch { continue; }
+    if (provider === "codex") {
+      // Legacy Codex JSONL message records. Paginated history uses app-server.history().
+      if (rec.type !== "response_item" || rec.payload?.type !== "message") continue;
+      const message = rec.payload;
+      if (!["user", "assistant"].includes(message.role)) continue;
+      const text = (Array.isArray(message.content) ? message.content : [])
+        .filter((block: any) => ["input_text", "output_text", "text"].includes(block.type))
+        .map((block: any) => block.text ?? "").join(" ");
+      if (text.trim()) out.push(`${message.role} (${rec.timestamp ?? "?"}): ${text.slice(0, 600)}`);
+      continue;
+    }
     if (rec.type !== "user" && rec.type !== "assistant") continue;
     if (rec.isSidechain) continue;
     const c = rec.message?.content;
@@ -230,4 +260,17 @@ export function transcriptTail(path: string | null, n = 12): string {
     out.push(`${rec.type === "user" ? "user" : "assistant"} (${rec.timestamp ?? "?"}): ${text.slice(0, 600)}`);
   }
   return out.reverse().join("\n\n") || "(no message records found)";
+}
+
+// Read bounded bytes, not the entire transcript; skip an incomplete leading JSON line.
+function readTail(path: string, limit: number): string {
+  const size = statSync(path).size;
+  const start = Math.max(0, size - limit);
+  const file = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(Math.min(size, limit));
+    const bytes = readSync(file, buffer, 0, buffer.length, start);
+    const text = buffer.subarray(0, bytes).toString("utf8");
+    return start ? text.slice(text.indexOf("\n") + 1) : text;
+  } finally { closeSync(file); }
 }

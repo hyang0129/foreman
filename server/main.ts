@@ -38,6 +38,7 @@ function json(res: ServerResponse, code: number, data: unknown) {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   try {
+    if (url.pathname === "/api/health" && req.method === "GET") return json(res, 200, { ok: true, pid: process.pid, uptime: process.uptime(), pm_enabled: process.env.FOREMAN_PM_DISABLED !== "1" });
     if (url.pathname === "/api/events") {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
       res.write(": hello\n\n");
@@ -52,7 +53,7 @@ const server = createServer(async (req, res) => {
     if (url.pathname === "/api/session/tail") {
       const s = fleet.get(url.searchParams.get("id") ?? "");
       if (!s) return json(res, 404, { error: "no such session" });
-      if (s.transcript_path) return json(res, 200, { text: transcriptTail(s.transcript_path, 10) });
+      if (s.transcript_path) return json(res, 200, { text: transcriptTail(s.transcript_path, 10, s.provider) });
       if (s.bg_id) { const r = await runClaude(["logs", s.bg_id]); return json(res, 200, { text: r.stdout.slice(-6000) || r.stderr }); }
       return json(res, 200, { text: "(no transcript yet)" });
     }
@@ -81,6 +82,17 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`foreman: http://localhost:${PORT}`);
   fleet.start();
-  pm.start().catch((e) => console.error("pm:", e));
+  if (process.env.FOREMAN_PM_DISABLED !== "1") pm.start().catch((e: unknown) => console.error("pm:", e));
 });
-process.on("SIGINT", () => { fleet.stop(); server.close(); process.exit(0); });
+let stopping = false;
+function shutdown() {
+  if (stopping) return;
+  stopping = true;
+  fleet.stop(); pm.close();
+  for (const client of clients) client.end();
+  clients.clear();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

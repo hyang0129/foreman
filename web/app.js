@@ -25,10 +25,10 @@ function renderRail() {
     const g = document.createElement("li"); g.className = "rail-group"; g.textContent = `${label} · ${rows.length}`; railList.appendChild(g);
     for (const s of rows) {
       n++;
-      const li = document.createElement("li"); li.className = "row" + (selected === s.session_id ? " selected" : ""); li.dataset.id = s.session_id;
+      const li = document.createElement("li"); li.className = "row" + (selected === s.session_key ? " selected" : ""); li.dataset.id = s.session_key;
       const sub = s.state === "needs_input" ? (s.reason || "waiting") : s.state === "working" ? (s.current_tool ? `${s.current_tool}${s.active_subagents ? ` · ${s.active_subagents} agents` : ""}` : "thinking") : (s.last_message ? s.last_message.replace(/\s+/g, " ").slice(0, 60) : shortCwd(s.cwd));
       li.innerHTML = `<span class="dot ${s.state}"></span><span class="name">${esc(s.name || s.session_id.slice(0, 8))}</span><span class="age">${age(s.updated_at || s.started_at)}</span><span class="sub">${esc(sub)}</span>`;
-      li.addEventListener("click", () => select(s.session_id));
+      li.addEventListener("click", () => select(s.session_key));
       railList.appendChild(li);
     }
   }
@@ -37,22 +37,22 @@ function renderRail() {
 
 function select(id) {
   selected = id; renderRail();
-  const s = sessions.find((x) => x.session_id === id); if (!s) return;
+  const s = sessions.find((x) => x.session_key === id); if (!s) return;
   detail.hidden = false; tailOut.hidden = true;
   detailName.textContent = s.name || s.session_id.slice(0, 8);
   const rows = [
     ["state", `<span class="pill ${s.state}">${STATE_LABEL[s.state] || s.state}</span>${s.reason ? ` ${esc(s.reason)}` : ""}`],
-    ["dir", esc(shortCwd(s.cwd))], ["kind", esc(s.kind + (s.entrypoint ? ` · ${s.entrypoint}` : ""))],
+    ["provider", esc(s.provider)], ["dir", esc(shortCwd(s.cwd))], ["kind", esc(s.kind + (s.entrypoint ? ` · ${s.entrypoint}` : ""))],
     ["updated", s.updated_at ? `${age(s.updated_at)} ago` : "—"], ["started", s.started_at ? `${age(s.started_at)} ago` : "—"],
     ["pid", s.pid ? `${s.pid}${s.alive ? "" : " (gone)"}` : "—"], ["tracked", s.tracked ? "yes (hooks)" : "no (started before hooks)"],
     ["last message", s.last_message ? esc(s.last_message) : "—"], ["last error", s.last_error ? esc(s.last_error) : "—"],
-    ["session", `<span class="mono">${s.session_id}</span>`],
+    ["session", `<span class="mono">${esc(s.session_id)}</span>`],
   ];
   if (s.bg_id) rows.push(["attach", `<span class="mono">claude attach ${s.bg_id}</span>`]);
   detailBody.innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 }
 $("#detail-close").addEventListener("click", () => { detail.hidden = true; selected = null; renderRail(); });
-$("#detail-ask").addEventListener("click", () => { const s = sessions.find((x) => x.session_id === selected); if (!s) return; input.value = `What is the status of session "${s.name || s.session_id.slice(0, 8)}" and does it need anything from me?`; input.focus(); });
+$("#detail-ask").addEventListener("click", () => { const s = sessions.find((x) => x.session_key === selected); if (!s) return; input.value = `What is the status of session "${s.name || s.session_id.slice(0, 8)}" and does it need anything from me?`; input.focus(); });
 $("#detail-tail").addEventListener("click", async () => { const r = await fetch(`/api/session/tail?id=${encodeURIComponent(selected)}`).then((r) => r.json()); tailOut.textContent = r.text || r.error; tailOut.hidden = false; });
 
 // --- chat ---

@@ -12,10 +12,27 @@
     "start": "node --experimental-strip-types server/main.ts",
     "hooks:install": "node scripts/install-hooks.mjs",
     "hooks:uninstall": "node scripts/install-hooks.mjs --uninstall",
-    "status": "node --experimental-strip-types server/cli-status.ts"
+    "status": "node --experimental-strip-types server/cli-status.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs tests/*.test.ts",
+    "typecheck": "tsc --noEmit --allowImportingTsExtensions --module nodenext --target es2022 --skipLibCheck server/*.ts scripts/*.ts tests/*.ts",
+    "hooks:codex:install": "node scripts/install-codex-hooks.mjs",
+    "hooks:codex:uninstall": "node scripts/install-codex-hooks.mjs --uninstall",
+    "service:install": "node scripts/service.mjs install",
+    "service:uninstall": "node scripts/service.mjs uninstall",
+    "service:status": "node scripts/service.mjs status",
+    "service:restart": "node scripts/service.mjs restart",
+    "probe:claude": "node --experimental-strip-types scripts/probe-claude-control.ts",
+    "probe:claude:peer": "node --experimental-strip-types scripts/probe-claude-peer.ts",
+    "probe:codex": "node --experimental-strip-types scripts/probe-codex-control.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.270",
+    "ws": "^8.21.3",
     "zod": "^4.6.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^7.0.2"
   }
 }

@@ -21,14 +21,14 @@ export function runClaude(args: string[], cwd?: string): Promise<{ code: number;
 export function makeFleetServer(fleet: Fleet) {
   const list_sessions = tool(
     "list_sessions",
-    "List every Claude Code session on this machine with its state (needs_input, working, turn_finished, idle, ended, dead), name, directory, last message and last error. Same data the user sees in the session rail.",
+    "List tracked Claude Code and Codex sessions on this machine with its state (needs_input, working, turn_finished, idle, ended, dead), name, directory, last message and last error. Same data the user sees in the session rail.",
     { include_ended: z.boolean().optional().describe("Include ended and dead sessions (default false)") },
     async ({ include_ended }) => {
       await fleet.refresh();
       const rows = fleet.list()
         .filter((s) => include_ended || (s.state !== "ended" && s.state !== "dead"))
         .map((s) => ({
-          name: s.name, session_id: s.session_id, state: s.state, reason: s.reason, kind: s.kind, cwd: s.cwd,
+          name: s.name, session_id: s.session_id, session_key: s.session_key, provider: s.provider, state: s.state, reason: s.reason, kind: s.kind, cwd: s.cwd,
           current_tool: s.current_tool, active_subagents: s.active_subagents, updated_at: s.updated_at,
           last_message: s.last_message ? s.last_message.slice(0, 400) : null, last_error: s.last_error, bg_id: s.bg_id,
         }));
@@ -77,7 +77,7 @@ export function makeFleetServer(fleet: Fleet) {
       await fleet.refresh();
       const s = fleet.get(session);
       if (!s) return err(`No session matches "${session}".`);
-      if (s.transcript_path) return fmt(transcriptTail(s.transcript_path, turns ?? 10));
+      if (s.transcript_path) return fmt(transcriptTail(s.transcript_path, turns ?? 10, s.provider));
       if (s.bg_id) { const r = await runClaude(["logs", s.bg_id]); return fmt(r.stdout.slice(-6000) || r.stderr); }
       return err("No transcript path known for this session yet (it may not have been prompted).");
     },
