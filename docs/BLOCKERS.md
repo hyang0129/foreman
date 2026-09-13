@@ -1,6 +1,6 @@
 # Foreman readiness and blockers
 
-Updated September 13, 2026 after implementing and testing the developer MVP. Cloudflare is deployed at https://foreman.hooong-yang.workers.dev and the Mac relay is connected. The local app is usable at http://localhost:4177. Google sign-in remains blocked by Firebase project activation.
+Updated September 13, 2026 after implementing and testing the developer MVP. Cloudflare is deployed at https://foreman.hooong-yang.workers.dev and the Mac relay is connected. The local app is usable at http://localhost:4177. Firebase is active and Google sign-in is configured and deployed.
 
 ## MVP release state
 
@@ -8,10 +8,10 @@ Implemented: session-first responsive browser, managed Claude/Codex creation, di
 
 **Remaining external actions:**
 
-1. **Firebase activation:** Google Cloud project `foreman-hong-2026` exists. All four required IAM permissions are verified and Firebase Management API is enabled, but `addFirebase` returns HTTP403. The user has been asked to open Firebase Console and complete terms/project activation. After that, deploy the checked-in Google auth configuration, retrieve the public web SDK config, authorize the Workers domain, redeploy, and verify actual Google login. Hosted APIs remain locked while this is pending.
+1. **First hosted sign-in:** Firebase activation, Google provider setup, public web config, and authorized domain are complete. Billing is disabled. The deployed sign-in button reaches Google Accounts; complete account selection as `hooong.yang@gmail.com` to verify the authenticated hosted session view.
 2. **Codex hook trust:** review/trust the installed Foreman hooks in `/hooks`. Managed Codex sessions work through controller events already; live monitoring of external sessions depends on this trust gate.
 
-**Intentional MVP limits:** one user/one Mac; discovered external sessions are monitor-only. On daemon restart, managed history/receipts remain but sessions become read-only and unfinished delivery becomes uncertain. Start a new session to continue; automatic resume is deferred. The pinned legacy PM conversation lacks managed message deduplication. Unsupported provider dialogs require interruption/local action. Actual Google sign-in and the full authenticated cloud-to-provider journey cannot be verified until Firebase activation completes.
+**Intentional MVP limits:** one user/one Mac; discovered external sessions are monitor-only. On daemon restart, managed history/receipts remain but sessions become read-only and unfinished delivery becomes uncertain. Start a new session to continue; automatic resume is deferred. The pinned legacy PM conversation lacks managed message deduplication. Unsupported provider dialogs require interruption/local action. The full authenticated cloud-to-provider journey still needs the user’s first completed browser sign-in; Firebase setup itself is no longer blocked.
 
 ## New MVP live proof
 

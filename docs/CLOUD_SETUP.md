@@ -2,20 +2,22 @@
 
 The Cloudflare app is deployed at **https://foreman.hooong-yang.workers.dev**. Its Worker serves the browser and verifies Firebase ID tokens; a per-owner Durable Object relays allowlisted JSON API requests to the Mac over an outbound WebSocket. No inbound router port or public local server is required.
 
-## Current Firebase activation blocker
+## Firebase configuration
 
-Google Cloud project **foreman-hong-2026** (number `1070263755050`) was created under `hooong.yang@gmail.com`. The account has all four documented permissions for adding Firebase, and the Firebase Management API is enabled. Adding Firebase still returns `403 PERMISSION_DENIED`. Google documents missing Firebase terms acceptance as another cause of this error.
+Firebase project **foreman-hong-2026** (number `1070263755050`) is active. Google sign-in is enabled, the web app is registered, and the public SDK configuration is deployed. Google Cloud billing is disabled; no paid plan was enabled.
 
-Open [Firebase Console](https://console.firebase.google.com/) as that account, accept any Firebase terms prompt, and add Firebase to the **existing** Google Cloud project. CLI login alone does not complete Firebase activation.
+Authorized domains are `foreman-hong-2026.firebaseapp.com`, `foreman-hong-2026.web.app`, and `foreman.hooong-yang.workers.dev`. The Worker allows verified Google identity `hooong.yang@gmail.com` only.
 
-After activation:
+Open the hosted app and choose **Continue with Google**. The deployed browser flow was checked through the Google Accounts sign-in page with no browser errors. Completing account selection in the user's browser remains the final end-to-end identity check; unauthenticated and malformed-token API requests were verified to fail with 401/403.
+
+To reproduce configuration on this project:
 
 1. Run `npx --yes firebase-tools deploy --only auth --project foreman-hong-2026`. The checked-in `firebase.json` enables Google sign-in and creates the default web app when absent.
-2. Run `npx --yes firebase-tools apps:sdkconfig WEB --project foreman-hong-2026 --json`. Copy the result's public `sdkConfig` object into `wrangler.jsonc`'s `FIREBASE_CONFIG` string. The public web API key is configuration, not an admin credential.
-3. In Firebase Authentication → Settings → Authorized domains, append `foreman.hooong-yang.workers.dev` while preserving existing Firebase domains.
-4. Run `npm run cloud:types`, `npm run cloud:typecheck`, and `npm run cloud:deploy`. Sign in with the allowed Google account to verify the complete deployed journey.
+2. Retrieve public web configuration with `npx --yes firebase-tools apps:sdkconfig WEB --project foreman-hong-2026 --json` and update `FIREBASE_CONFIG` in `wrangler.jsonc`. This browser API key is public configuration, not an admin credential.
+3. Preserve the authorized domains in Firebase Authentication settings, including the hosted Foreman domain.
+4. Run `npm run cloud:types`, `npm run cloud:typecheck`, and `npm run cloud:deploy`.
 
-Until these steps complete, the deployed page explains that sign-in is unconfigured and session APIs remain inaccessible. There is no auth bypass. The local app at http://localhost:4177 is usable.
+The earlier activation403 was resolved after Firebase Console setup. Firebase terms acceptance is a console-only step for a new account; it cannot be completed with the CLI.
 
 ## Deploy and pair the Mac
 

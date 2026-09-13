@@ -48,7 +48,7 @@ For work that continues when the laptop is off, use a dedicated powered Mac with
 
 An always-on host runs sessions started on that host. It cannot keep the laptop's existing processes alive; a handoff needs synchronized repository changes, required files, and a resumable provider session or a new session with supplied context. Do not blindly copy account credential stores between hosts.
 
-The authenticated outbound Cloudflare relay, host identity, heartbeat/offline state, and reconnect handling are implemented and paired on this Mac. The daemon loads its private pairing from `~/.foreman/cloud.json`; the service installer itself does not provision cloud resources. Hosted Google login awaits Firebase project activation; see [Cloud setup](CLOUD_SETUP.md). Keep the local HTTP server bound to loopback. Managed histories/receipts survive daemon restart, but recovered sessions are read-only and unfinished delivery is marked uncertain without replay.
+The authenticated outbound Cloudflare relay, host identity, heartbeat/offline state, and reconnect handling are implemented and paired on this Mac. The daemon loads its private pairing from `~/.foreman/cloud.json`; the service installer itself does not provision cloud resources. Hosted Firebase Google login is configured; see [Cloud setup](CLOUD_SETUP.md). Keep the local HTTP server bound to loopback. Managed histories/receipts survive daemon restart, but recovered sessions are read-only and unfinished delivery is marked uncertain without replay.
 
 ## Validation
 

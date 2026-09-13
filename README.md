@@ -6,7 +6,7 @@ Start either provider in a project directory, follow its conversation, queue mes
 
 **Local app:** http://localhost:4177
 
-**Cloudflare app:** https://foreman.hooong-yang.workers.dev — deployed and paired, with sign-in blocked until Firebase activation finishes. See [Cloud setup](docs/CLOUD_SETUP.md).
+**Cloudflare app:** https://foreman.hooong-yang.workers.dev — deployed and paired, with Firebase Google sign-in configured for `hooong.yang@gmail.com`. See [Cloud setup](docs/CLOUD_SETUP.md).
 
 ## Run locally
 
