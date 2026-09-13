@@ -36,7 +36,7 @@ export const PEER_INSTRUCTIONS = `Foreman peer tools expose the same session sta
 
 function publicSession(row: any) {
   const result: Record<string, unknown> = {};
-  for (const key of ['session_key', 'session_id', 'provider', 'name', 'cwd', 'state', 'reason', 'managed', 'capabilities', 'control_reason', 'updated_at', 'last_error']) {
+  for (const key of ['session_key', 'session_id', 'provider', 'model', 'name', 'cwd', 'state', 'reason', 'managed', 'capabilities', 'control_reason', 'updated_at', 'last_error']) {
     if (row[key] !== undefined) result[key] = typeof row[key] === 'string' ? row[key].slice(0, 2000) : row[key];
   }
   if (row.last_message) result.last_message = String(row.last_message).slice(0, 400);

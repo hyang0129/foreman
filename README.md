@@ -32,11 +32,11 @@ Restart interrupts managed sessions and active PM work. The LaunchAgent restarts
 
 ## Developer workflow
 
-1. Open Foreman and choose **New session**. Pick Claude or Codex, a name, an existing absolute project directory, and the first task.
+1. Open Foreman and choose **New session**. Pick Claude or Codex, a model (or provider default), a name, an existing absolute project directory, and the first task.
 2. Open the session conversation. Follow-up messages queue while it works; saved receipts distinguish queued, running, completed, failed, and uncertain delivery.
 3. Answer inline tool approvals or supported questions. Permission responses apply once. **Interrupt** also cancels queued follow-ups.
 4. Ask a managed session to use Foreman peer tools: `list_sessions`, `session_state`, `session_tail`, `send_message`, `request_update`, and `message_status`. Sender identity is supplied by Foreman. An update is recorded in the target conversation; read it after completion.
-5. Use the pinned **Project manager** to coordinate work. Its default spawns use the same managed Claude/Codex service.
+5. Use the pinned **Project manager** to coordinate work. Its default spawns use the same managed Claude/Codex service. Choose its Claude model below the conversation while it is idle; the choice is saved in `~/.foreman/pm/settings.json` and applies to subsequent turns. Before the first saved choice, `FOREMAN_PM_MODEL` supplies the optional default. The PM can discover worker models with `list_models` and pass a model to `spawn_session`. Worker model selection is made when starting a new session.
 
 The responsive inbox groups work needing your attention and shows provider, project, activity, host availability, and control limitations. Observed external sessions have readable available transcripts and no message controls. Trusting Codex hooks enables additional external-session monitoring; managed Codex sessions also report state directly through their controller.
 

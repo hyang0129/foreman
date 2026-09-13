@@ -46,6 +46,8 @@ async function fixture(
     ],
     receipts: [] as any[],
     calls: [] as { path: string; body: any; headers: any }[],
+    pmModel: null as string | null,
+    pmBusy: false,
     failMessages: 0,
     failCreates: 0,
     deny: false,
@@ -113,10 +115,15 @@ async function fixture(
       );
       result = { ok: true };
     } else if (path === "/api/session/interrupt") result = { ok: true };
+    else if (path === "/api/models") result = { models: url.searchParams.get("provider") === "codex"
+      ? [{ value: "gpt-6-astra", displayName: "GPT-6-Astra" }]
+      : [{ value: "haiku", displayName: "Haiku" }, { value: "sonnet", displayName: "Sonnet" }] };
+    else if (path === "/api/pm/model") { state.pmModel = body.model; result = { model: state.pmModel }; }
     else if (path === "/api/pm/history")
       result = {
         history: [{ role: "assistant", text: "How can I help the fleet?" }],
-        busy: false,
+        busy: state.pmBusy,
+        model: state.pmModel,
       };
     else if (path === "/api/pm/message") result = { ok: true };
     else {
@@ -480,4 +487,40 @@ test("large fleets and long conversations scroll independently inside the viewpo
     timelinePosition: 500,
     pagePosition: 0,
   });
+});
+
+
+test("model selections follow the provider and reach session creation", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  await page.locator("#new-session").click();
+  await expect(page.locator("#new-model option[value=haiku]")).toHaveCount(1);
+  await page.locator("#new-model").selectOption("haiku");
+  await page.locator("#new-provider").selectOption("codex");
+  await expect(page.locator("#new-model option[value=gpt-6-astra]")).toHaveCount(1);
+  await expect(page.locator("#new-model")).toHaveValue("");
+  await expect(page.locator("#new-model option[value=haiku]")).toHaveCount(0);
+  await page.locator("#new-model").selectOption("gpt-6-astra");
+  await page.locator("#new-name").fill("Model selection");
+  await page.locator("#new-cwd").fill("/Users/dev/code/app");
+  await page.locator("#new-prompt").fill("Inspect this project");
+  await page.locator("#create-session").click();
+  await expect.poll(() => state.calls.find((c) => c.path === "/api/sessions" && c.body)?.body.model).toBe("gpt-6-astra");
+});
+
+test("project manager model persists across reload and is locked while busy", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  await page.locator("#select-pm").click();
+  await expect(page.locator("#pm-model option[value=haiku]")).toHaveCount(1);
+  await page.locator("#pm-model").selectOption("haiku");
+  await expect.poll(() => state.pmModel).toBe("haiku");
+  await page.reload();
+  await expect(page.locator("#pm-model")).toHaveValue("haiku");
+  state.pmBusy = true;
+  await expect(page.locator("#pm-model")).toBeDisabled();
+  state.pmBusy = false;
+  await expect(page.locator("#pm-model")).toBeEnabled({ timeout: 10000 });
+  await page.locator("#pm-model").selectOption("");
+  await expect.poll(() => state.pmModel).toBe(null);
 });

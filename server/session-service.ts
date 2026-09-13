@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, statSync, realpathSync, unlinkSync, rmdirSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { ClaudeControl, type ClaudeReceipt } from './claude-control.ts';
+import { normalizeModel } from './models.ts';
 import { CodexControl } from './codex-control.ts';
 import { Fleet, transcriptTail, type Session } from './fleet.ts';
 import { CLAUDE_BIN, FOREMAN_HOME, HOST } from './paths.ts';
@@ -11,8 +12,8 @@ export type Source = 'user' | { sender: string; chain: string[] };
 export interface Receipt { id: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'uncertain'; text: string; at: string; error?: string; source: Source }
 export interface History { id: string; role: 'user' | 'assistant' | 'system' | 'tool'; text: string; at: string; source?: Source }
 export interface Approval { id: string; kind: 'permission' | 'question' | 'unsupported'; tool: string; input: Record<string, any>; reason?: string; questions?: { id: string; question: string; options?: string[] }[] }
-export type SessionRow = Session & { managed: boolean; capabilities: { message: boolean; interrupt: boolean; approvals: boolean }; control_reason?: string };
-interface RecordData { version: 1; creation: { id: string; provider: string; name: string; cwd: string; text: string }; session: SessionRow; history: History[]; receipts: Receipt[] }
+export type SessionRow = Session & { managed: boolean; model?: string; capabilities: { message: boolean; interrupt: boolean; approvals: boolean }; control_reason?: string };
+interface RecordData { version: 1; creation: { id: string; provider: string; name: string; cwd: string; text: string; model?: string }; session: SessionRow; history: History[]; receipts: Receipt[] }
 export interface ProviderSetup {
   claude?: Pick<ConstructorParameters<typeof ClaudeControl>[0], 'mcpServers' | 'allowedTools' | 'systemPrompt'>;
   codexArgs?: string[];
@@ -106,7 +107,7 @@ export class SessionService extends EventEmitter {
   }
   receipt(id: string, messageId: string) { const result = this.records.get(id)?.receipts.find((r) => r.id === messageId); if (!result) throw new Error('No such receipt'); return clone(result); }
   activeSource(id: string): Source { const runtime = this.runtime.get(id); return clone(this.records.get(id)?.receipts.find((r) => r.id === runtime?.active)?.source ?? 'user'); }
-  async create(input: { id: string; provider: 'claude' | 'codex'; name?: string; cwd: string; text: string }) {
+  async create(input: { id: string; provider: 'claude' | 'codex'; name?: string; cwd: string; text: string; model?: string }) {
     if (this.closed) throw new Error('Session service is closed');
     const id = textValue(input.id, 'Creation id', 200);
     if (!['claude', 'codex'].includes(input.provider)) throw new Error('Unsupported provider');
@@ -114,12 +115,13 @@ export class SessionService extends EventEmitter {
     if (!isAbsolute(cwdInput) || !statSync(cwdInput).isDirectory()) throw new Error('Project directory must be an existing absolute directory');
     const cwd = realpathSync(cwdInput), text = textValue(input.text, 'Message', 64 * 1024);
     const name = input.name === undefined || input.name === '' ? `${input.provider} session` : textValue(input.name, 'Name', 200);
-    const creation = { id, provider: input.provider, name, cwd, text };
+    const model = normalizeModel(input.model);
+    const creation = { id, provider: input.provider, name, cwd, text, ...(model ? { model } : {}) };
     const previous = [...this.records.values()].find((data) => data.creation.id === id);
     if (previous) { if (JSON.stringify(previous.creation) !== JSON.stringify(creation)) throw new Error('Creation id was already used for different input'); return this.row(previous); }
     if (this.records.size >= 500) throw new Error('Session limit reached');
     const key = `fm:${randomUUID()}`;
-    const session: SessionRow = { session_key: key, session_id: '', provider: input.provider, name, cwd, state: 'working', reason: 'starting', kind: 'sdk', entrypoint: 'foreman', pid: null, alive: false, tracked: true, current_tool: null, active_subagents: 0, last_message: null, last_error: null, started_at: now(), updated_at: now(), ended_at: null, end_reason: null, permission_mode: 'default', bg_id: null, bg_state: null, bg_waiting_for: null, host: HOST, transcript_path: null, managed: true, capabilities: { message: false, interrupt: false, approvals: false } };
+    const session: SessionRow = { session_key: key, session_id: '', provider: input.provider, name, cwd, ...(model ? { model } : {}), state: 'working', reason: 'starting', kind: 'sdk', entrypoint: 'foreman', pid: null, alive: false, tracked: true, current_tool: null, active_subagents: 0, last_message: null, last_error: null, started_at: now(), updated_at: now(), ended_at: null, end_reason: null, permission_mode: 'default', bg_id: null, bg_state: null, bg_waiting_for: null, host: HOST, transcript_path: null, managed: true, capabilities: { message: false, interrupt: false, approvals: false } };
     const receipt: Receipt = { id, status: 'queued', text, at: now(), source: 'user' };
     const data: RecordData = { version: 1, creation, session, receipts: [receipt], history: [{ id, role: 'user', text, at: receipt.at, source: 'user' }] };
     this.save(data); this.records.set(key, data);
@@ -145,7 +147,7 @@ export class SessionService extends EventEmitter {
       runtime.setup = await this.options.prepare?.(this.row(data));
       if (this.closed) { runtime.setup?.cleanup?.(); return; }
       if (data.session.provider === 'claude') {
-        const control = (this.options.claudeFactory ?? ((options) => new ClaudeControl(options)))({ cwd: data.session.cwd!, pathToClaudeCodeExecutable: CLAUDE_BIN, settingSources: ['user', 'project'], ...runtime.setup?.claude });
+        const control = (this.options.claudeFactory ?? ((options) => new ClaudeControl(options)))({ cwd: data.session.cwd!, pathToClaudeCodeExecutable: CLAUDE_BIN, settingSources: ['user', 'project'], ...runtime.setup?.claude, ...(data.session.model ? { model: data.session.model } : {}) });
         runtime.claude = control;
         control.on('receipt', (receipt: ClaudeReceipt) => {
           const stored = data.receipts.find((r) => r.id === receipt.id); if (!stored || this.closed) return;
@@ -184,7 +186,7 @@ export class SessionService extends EventEmitter {
         });
         await control.connect();
         if (this.closed) { control.close(); return; }
-        const thread = await control.start(data.session.cwd!, runtime.setup?.codexTools ? { dynamicTools: runtime.setup.codexTools.dynamicTools, ...(runtime.setup.codexTools.developerInstructions ? { developerInstructions: runtime.setup.codexTools.developerInstructions } : {}) } : {});
+        const thread = await control.start(data.session.cwd!, { ...(data.session.model ? { model: data.session.model } : {}), ...(runtime.setup?.codexTools ? { dynamicTools: runtime.setup.codexTools.dynamicTools, ...(runtime.setup.codexTools.developerInstructions ? { developerInstructions: runtime.setup.codexTools.developerInstructions } : {}) } : {}) });
         data.session.session_id = thread.id;
       }
       runtime.ready = true; data.session.alive = true; data.session.state = 'idle'; data.session.reason = null;

@@ -892,3 +892,9 @@ label textarea {
     transition: none !important;
   }
 }
+
+.model-control { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 24px; flex-shrink: 0; border-top: 1px solid var(--line); }
+.model-control[hidden] { display: none; }
+.model-control label { font-size: 12px; }
+.model-control select { max-width: 100%; min-width: 140px; padding: 6px; }
+.model-control .field-hint { margin: 0; font-size: 12px; }

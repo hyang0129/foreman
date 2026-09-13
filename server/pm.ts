@@ -1,8 +1,10 @@
 // The project manager: one long-lived Claude Agent SDK session in streaming-input mode.
 // Tool access is enforced here (canUseTool), not just prompted.
 import { query, type SDKUserMessage, type Query, type HookCallback } from "@anthropic-ai/claude-agent-sdk";
+import { normalizeModel } from "./models.ts";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFileSync, writeFileSync, existsSync, appendFileSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, realpathSync, statSync, renameSync } from "node:fs";
 import { join, resolve, sep, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { Fleet } from "./fleet.ts";
@@ -59,10 +61,38 @@ export class ProjectManager extends EventEmitter {
   tools: string[] = [];
   private running = false;
   private closed = false;
+  private pendingTurns = 0;
+  private changingModel = false;
+  model: string | undefined;
+  private settingsPath: string;
+  get modelBusy() { return this.busy || this.pendingTurns > 0 || this.changingModel; }
 
   private fleet: Fleet;
   private sessions?: ManagedFleetService;
-  constructor(fleet: Fleet, sessions?: ManagedFleetService) { super(); this.fleet = fleet; this.sessions = sessions; }
+  constructor(fleet: Fleet, sessions?: ManagedFleetService, settingsPath = join(FOREMAN_HOME, 'pm', 'settings.json')) {
+    super(); this.fleet = fleet; this.sessions = sessions; this.settingsPath = settingsPath;
+    this.model = normalizeModel(existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf8')).model : process.env.FOREMAN_PM_MODEL);
+  }
+  async setModel(value: unknown) {
+    const model = normalizeModel(value);
+    if (this.modelBusy) throw new Error('Wait for the project manager to finish before changing its model');
+    if (!this.q || this.closed || !this.running) throw new Error('Project manager is unavailable');
+    this.changingModel = true;
+    const previous = this.model;
+    try {
+      await this.q.setModel(model);
+      try {
+        const tmp = `${this.settingsPath}.${randomUUID()}.tmp`;
+        writeFileSync(tmp, JSON.stringify({ model: model ?? null }), { flag: 'wx', mode: 0o600 });
+        renameSync(tmp, this.settingsPath);
+        this.model = model;
+      } catch (error) {
+        // If persistence fails, restore the previous live selection before accepting more messages.
+        try { await this.q.setModel(previous); } catch { this.close(); }
+        throw error;
+      }
+    } finally { this.changingModel = false; }
+  }
 
   history(): any[] {
     if (!existsSync(PM_HISTORY_FILE)) return [];
@@ -71,7 +101,10 @@ export class ProjectManager extends EventEmitter {
   private record(entry: any) { appendFileSync(PM_HISTORY_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"); }
 
   send(text: string) {
+    if (this.changingModel) throw new Error('Model change in progress; retry your message');
+    if (!this.running || this.closed) throw new Error('Project manager is unavailable');
     this.record({ role: "user", text });
+    this.pendingTurns++;
     this.inbox.push(text, this.sessionId ?? "");
   }
   async interrupt() { await this.q?.interrupt(); }
@@ -137,12 +170,12 @@ export class ProjectManager extends EventEmitter {
           hooks: { PreToolUse: [{ hooks: [this.enforceToolBoundary] }] },
           includePartialMessages: true,
           mcpServers: { fleet: makeFleetServer(this.fleet, this.sessions), ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, 'foreman-pm') } : {}) },
-          allowedTools: ["mcp__fleet__list_sessions", "mcp__fleet__session_tail", "mcp__fleet__log_note", "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : [])],
+          allowedTools: ["mcp__fleet__list_sessions", "mcp__fleet__list_models", "mcp__fleet__session_tail", "mcp__fleet__log_note", "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : [])],
           disallowedTools: ["Agent", "Bash", "Glob", "Grep"],
           extraArgs: { name: "foreman-pm" },
           maxTurns: 60,
           effort: (process.env.FOREMAN_PM_EFFORT as any) || "medium",
-          ...(process.env.FOREMAN_PM_MODEL ? { model: process.env.FOREMAN_PM_MODEL } : {}),
+          ...(this.model ? { model: this.model } : {}),
           stderr: (chunk: string) => { if (/error|warn/i.test(chunk)) this.emit("event", { type: "status", text: chunk.trim().slice(0, 300) } as PmEvent); },
         },
       });
@@ -173,6 +206,7 @@ export class ProjectManager extends EventEmitter {
             this.emit("event", { type: "peer", text: txt.slice(0, 600) } as PmEvent);
           }
         } else if (m.type === "result") {
+          this.pendingTurns = Math.max(0, this.pendingTurns - 1);
           this.busy = false;
           if (text.trim()) this.record({ role: "assistant", text });
           this.emit("event", { type: "assistant_text", text } as PmEvent);
@@ -186,8 +220,8 @@ export class ProjectManager extends EventEmitter {
       if (this.closed) return;
       const msg = String(e?.message ?? e);
       this.emit("event", { type: "status", text: `PM stopped: ${msg.slice(0, 300)}` } as PmEvent);
-      if (resumeId && /resume|session/i.test(msg)) { writeFileSync(PM_SESSION_FILE, ""); this.running = false; return this.start(); }
+      if (resumeId && /resume|session/i.test(msg)) { writeFileSync(PM_SESSION_FILE, ""); await run(); return; }
       this.running = false;
-    }
+    } finally { this.running = false; this.busy = false; this.pendingTurns = 0; }
   }
 }

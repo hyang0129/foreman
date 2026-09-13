@@ -146,3 +146,23 @@ test('Codex completion before the send response cannot revive an old turn or dou
   ordinary.emit('notification', { method: 'turn/completed', params: { threadId: 'native-codex', turn: { id: 'turn-1', status: 'completed' } } });
   assert.equal(other.service.receipt(secondRow.session_key, 'active').status, 'running');
 });
+
+test('model choice reaches both providers, survives restart, and participates in creation idempotency', async (t) => {
+  const claude = new FakeClaude(), codex = new FakeCodex();
+  let claudeOptions: any, codexOptions: any;
+  (codex as any).start = async (_cwd: string, options: any) => { codexOptions = options; return { id: 'native-codex' }; };
+  const { home, service, input } = fixture(t, {
+    claudeFactory: (options: any) => { claudeOptions = options; return claude; },
+    codexFactory: () => codex,
+  });
+  const session = await service.create({ ...input, model: 'haiku' }); await tick();
+  assert.equal(claudeOptions.model, 'haiku');
+  assert.equal(service.detail(session.session_key).session.model, 'haiku');
+  await assert.rejects(service.create({ ...input, model: 'sonnet' }), /different input/);
+  await service.create({ ...input, id: 'codex-model', provider: 'codex', model: 'gpt-6-astra' }); await tick();
+  assert.equal(codexOptions.model, 'gpt-6-astra');
+  service.close();
+  const restored = new SessionService({ home });
+  t.after(() => restored.close());
+  assert.equal(restored.detail(session.session_key).session.model, 'haiku');
+});

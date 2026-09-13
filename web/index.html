@@ -124,6 +124,11 @@
             aria-label="Requests needing your response"
           ></section>
         </div>
+        <div id="pm-model-control" class="model-control" hidden>
+          <label for="pm-model">Project manager model · Claude</label>
+          <select id="pm-model" disabled><option value="">Provider default</option></select>
+          <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn.</span>
+        </div>
         <div id="control-note" class="control-note" role="status"></div>
         <form id="composer" class="composer">
           <label class="sr-only" for="message-input">Message this session</label
@@ -169,7 +174,9 @@
             <option value="claude">Claude</option>
             <option value="codex">Codex</option>
           </select></label
-        ><label
+        ><label>Model<select id="new-model" name="model"><option value="">Provider default</option></select></label>
+        <p id="new-model-hint" class="field-hint" role="status">Uses your provider settings unless you choose a model.</p>
+        <label
           >Session name<input
             id="new-name"
             name="name"

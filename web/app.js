@@ -66,6 +66,8 @@ let messageSignature = "",
   approvalSignature = "",
   creationAttempt,
   pmBusy = false;
+let pmModel = "", pmModelSaving = false, pmModelLoading = false, pmModelReady = false,
+  pmModelLoaded = false, modelRevision = 0, newModelRequest = 0;
 const drafts = new Map(),
   sendAttempts = new Map();
 
@@ -167,6 +169,8 @@ function post(path, body) {
 function revokeAccess(message) {
   authEpoch++;
   authorized = false;
+  pmModel = ""; pmModelLoaded = false; pmModelReady = false;
+  modelOptions($("#pm-model"), []);
   clearTimeout(pollTimer);
   sessions = [];
   detail = null;
@@ -288,7 +292,9 @@ function updateControls() {
   const isPm = selected === "pm";
   const session = detail?.session;
   const canMessage =
-    authorized && host.online && (isPm || !!session?.capabilities?.message);
+    authorized && host.online && ((isPm && !pmModelSaving) || (!isPm && !!session?.capabilities?.message));
+  $("#pm-model-control").hidden = !isPm;
+  $("#pm-model").disabled = !authorized || !host.online || !pmModelReady || pmBusy || pmModelSaving || pmModelLoading;
   ui.newButton.disabled = !authorized || !host.online || creating;
   ui.messages.querySelectorAll("[data-new-session]").forEach((button) => {
     button.disabled = !authorized || !host.online;
@@ -341,7 +347,7 @@ function renderHeading() {
     ui.title.textContent = s.name || "Session";
     ui.provider.hidden = false;
     ui.provider.textContent = s.provider === "codex" ? "Codex" : "Claude";
-    ui.subtitle.textContent = `${LABEL[s.state] || s.state || "Unknown"}${!host.online ? " · Last known" : ""} · ${shortPath(s.cwd)}${!s.managed ? " · Monitoring only" : ""}`;
+    ui.subtitle.textContent = `${LABEL[s.state] || s.state || "Unknown"}${!host.online ? " · Last known" : ""} · ${shortPath(s.cwd)}${s.managed ? ` · ${s.model || "Provider default"}` : " · Monitoring only"}`;
   } else {
     ui.title.textContent = selected ? "Loading session…" : "Your session inbox";
     ui.provider.hidden = true;
@@ -617,6 +623,7 @@ async function selectSession(key) {
   selectionEpoch++;
   detail = null;
   pmBusy = false;
+  pmModelReady = false;
   messageSignature = "";
   approvalSignature = "";
   try {
@@ -644,7 +651,7 @@ async function refreshSelected() {
   if (!selected || !authorized || !host.online) return;
   const key = selected,
     epoch = selectionEpoch,
-    loginEpoch = authEpoch;
+    loginEpoch = authEpoch, revision = modelRevision;
   const result = await api(
     key === "pm"
       ? "/api/pm/history"
@@ -659,6 +666,12 @@ async function refreshSelected() {
     return;
   if (key === "pm") {
     pmBusy = !!result.busy;
+    pmModelReady = true;
+    if (!pmModelSaving && revision === modelRevision) {
+      pmModel = result.model || "";
+      retainModel($("#pm-model"), pmModel);
+    }
+    if (!pmModelLoaded) void loadPmModels();
     renderMessages(result.history || [], []);
     renderApprovals([]);
   } else {
@@ -781,12 +794,80 @@ ui.interrupt.addEventListener("click", async () => {
     updateControls();
   }
 });
+function retainModel(select, value) {
+  if (![...select.options].some((option) => option.value === value)) {
+    select.add(new Option(value, value));
+  }
+  select.value = value;
+}
+function modelOptions(select, models, value = "") {
+  select.replaceChildren(new Option("Provider default", ""));
+  for (const model of models) {
+    const option = new Option(model.displayName, model.value);
+    option.title = model.description || model.value;
+    select.add(option);
+  }
+  retainModel(select, value);
+}
+async function loadNewModels() {
+  const request = ++newModelRequest, epoch = authEpoch;
+  const provider = $("#new-provider").value, select = $("#new-model");
+  modelOptions(select, []);
+  select.disabled = true;
+  $("#new-model-hint").textContent = "Loading available models…";
+  try {
+    const result = await api(`/api/models?provider=${provider}`);
+    if (request !== newModelRequest || epoch !== authEpoch || !authorized) return;
+    modelOptions(select, result.models || []);
+    $("#new-model-hint").textContent = "Uses your provider settings unless you choose a model.";
+  } catch (error) {
+    if (request !== newModelRequest || epoch !== authEpoch || !authorized) return;
+    $("#new-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen this dialog to retry, or use the provider default.`;
+  } finally { if (request === newModelRequest) select.disabled = false; }
+}
+async function loadPmModels() {
+  pmModelLoaded = true;
+  pmModelLoading = true;
+  const epoch = authEpoch;
+  updateControls();
+  try {
+    const result = await api("/api/models?provider=claude");
+    if (epoch !== authEpoch || !authorized) return;
+    modelOptions($("#pm-model"), result.models || [], pmModel);
+    $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved on your Mac.";
+  } catch (error) {
+    if (epoch !== authEpoch || !authorized) return;
+    $("#pm-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen the project manager to retry.`;
+  } finally { pmModelLoading = false; updateControls(); }
+}
+$("#pm-model").addEventListener("change", async () => {
+  const value = $("#pm-model").value;
+  if (pmModelSaving || pmBusy || !host.online) { retainModel($("#pm-model"), pmModel); return; }
+  pmModelSaving = true;
+  modelRevision++;
+  const epoch = authEpoch;
+  updateControls();
+  try {
+    const result = await post("/api/pm/model", { model: value || null });
+    if (epoch !== authEpoch || !authorized) return;
+    pmModel = result.model || "";
+    $("#pm-model-hint").textContent = "Saved. Applies to the next turn.";
+  } catch (error) { if (epoch === authEpoch && authorized) showError(error); }
+  finally {
+    pmModelSaving = false;
+    retainModel($("#pm-model"), pmModel);
+    updateControls();
+    if (epoch === authEpoch && authorized) await refreshSelected().catch(showError);
+  }
+});
+$("#new-provider").addEventListener("change", loadNewModels);
 function openNew() {
   if (!authorized || !host.online) return;
   if (!$("#new-cwd").value && detail?.session?.cwd)
     $("#new-cwd").value = detail.session.cwd;
   $("#new-error").hidden = true;
   ui.dialog.showModal();
+  void loadNewModels();
   $("#new-name").focus();
 }
 ui.newButton.addEventListener("click", openNew);
@@ -797,6 +878,7 @@ ui.newForm.addEventListener("submit", async (event) => {
   if (creating || !host.online || !ui.newForm.reportValidity()) return;
   const values = {
     provider: $("#new-provider").value,
+    ...($("#new-model").value ? { model: $("#new-model").value } : {}),
     name: $("#new-name").value.trim(),
     cwd: $("#new-cwd").value.trim(),
     text: $("#new-prompt").value.trim(),
@@ -833,7 +915,7 @@ ui.newForm.addEventListener("submit", async (event) => {
     updateControls();
   }
 });
-$("#select-pm").addEventListener("click", () => selectSession("pm"));
+$("#select-pm").addEventListener("click", () => { if (!pmModelLoading) pmModelLoaded = false; return selectSession("pm"); });
 ui.search.addEventListener("input", renderRail);
 $("#dismiss-error").addEventListener("click", clearError);
 $("#open-nav").addEventListener("click", () => setNav(true));

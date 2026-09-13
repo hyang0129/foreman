@@ -7,10 +7,11 @@ import { join } from "node:path";
 import { Fleet, transcriptTail } from "./fleet.ts";
 import { CLAUDE_BIN, WARP_SPAWN, MEMORY_DIR } from "./paths.ts";
 import { bindPeerTools, type PeerService } from "./peer-tools.ts";
+import { modelCatalog } from "./models.ts";
 import { randomUUID } from "node:crypto";
 
 export interface ManagedFleetService extends PeerService {
-  create(input: { id: string; provider: 'claude' | 'codex'; name: string; cwd: string; text: string }): any;
+  create(input: { id: string; provider: 'claude' | 'codex'; name: string; cwd: string; text: string; model?: string }): any;
   interrupt(id: string): any;
 }
 
@@ -46,6 +47,11 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
     { annotations: { readOnlyHint: true } },
   );
 
+  const list_models = tool('list_models', 'List available models for a provider before choosing a model for spawn_session. Omit model to use provider settings.',
+    { provider: z.enum(['claude', 'codex']) }, async ({ provider }) => {
+      try { return fmt({ provider, models: await modelCatalog.list(provider) }); }
+      catch (error) { return err(error instanceof Error ? error.message : String(error)); }
+    });
   const spawn_session = tool(
     "spawn_session",
     "Start a tracked session agent. Default mode 'managed' creates a Claude or Codex conversation in Foreman's durable service, controllable in the webapp and through peer tools. Legacy mode 'bg' uses the Claude supervisor; 'tab' opens Warp. State the goal, definition of done, and constraints in the prompt. Read managed outcomes with peers.session_tail and request_update; managed sessions do not support native SendMessage subscriptions.",
@@ -56,14 +62,14 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
       mode: z.enum(["managed", "bg", "tab"]).optional().describe("managed (default), bg, or tab"),
       provider: z.enum(["claude", "codex"]).optional().describe("Managed provider (default claude)"),
       permission_mode: z.enum(["default", "acceptEdits", "bypassPermissions"]).optional().describe("Worker permission mode; default is the user's setting"),
-      model: z.string().optional().describe("Model override, e.g. sonnet or opus"),
+      model: z.string().optional().describe("Optional model identifier from list_models for the selected provider; omit to use provider settings"),
     },
     async ({ name, cwd, prompt, mode, provider, permission_mode, model }) => {
       if (!existsSync(cwd)) return err(`cwd does not exist: ${cwd}`);
       if (mode === 'managed' || (!mode && sessions)) {
         if (!sessions) return err('Managed session service is unavailable');
-        if (permission_mode || model) return err('Managed sessions use the service permission policy and default model; omit permission_mode and model.');
-        try { return fmt(await sessions.create({ id: randomUUID(), provider: provider ?? 'claude', name, cwd, text: prompt })); }
+        if (permission_mode) return err('Managed sessions use the service permission policy; omit permission_mode.');
+        try { return fmt(await sessions.create({ id: randomUUID(), provider: provider ?? 'claude', name, cwd, text: prompt, model })); }
         catch (error) { return err(error instanceof Error ? error.message : String(error)); }
       }
       if (provider === 'codex') return err('Codex requires managed mode');
@@ -129,5 +135,5 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
     },
   );
 
-  return createSdkMcpServer({ name: "fleet", version: "0.1.0", tools: [list_sessions, spawn_session, session_tail, stop_session, log_note] });
+  return createSdkMcpServer({ name: "fleet", version: "0.1.0", tools: [list_sessions, list_models, spawn_session, session_tail, stop_session, log_note] });
 }
