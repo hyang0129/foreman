@@ -63,7 +63,7 @@ function md(text) {
   while (i < lines.length) {
     const l = lines[i];
     if (/^```/.test(l)) { const buf = []; i++; while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]); i++; out.push(`<pre><code>${esc(buf.join("\n"))}</code></pre>`); continue; }
-    if (/^\s*\|/.test(l)) { const rows = []; while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(lines[i++]); const cells = rows.filter((r) => !/^\s*\|[\s:-]+\|\s*$/.test(r)).map((r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => inline(c.trim()))); if (cells.length) out.push(`<table><tr>${cells[0].map((c) => `<th>${c}</th>`).join("")}</tr>${cells.slice(1).map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</table>`); continue; }
+    if (/^\s*\|/.test(l)) { const rows = []; while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(lines[i++]); const cells = rows.filter((r) => !/^[\s|:-]+$/.test(r)).map((r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => inline(c.trim()))); if (cells.length) out.push(`<table><tr>${cells[0].map((c) => `<th>${c}</th>`).join("")}</tr>${cells.slice(1).map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</table>`); continue; }
     if (/^\s*[-*] /.test(l)) { const items = []; while (i < lines.length && /^\s*[-*] /.test(lines[i])) items.push(lines[i++].replace(/^\s*[-*] /, "")); out.push(`<ul>${items.map((t) => `<li>${inline(t)}</li>`).join("")}</ul>`); continue; }
     if (/^\s*\d+\. /.test(l)) { const items = []; while (i < lines.length && /^\s*\d+\. /.test(lines[i])) items.push(lines[i++].replace(/^\s*\d+\. /, "")); out.push(`<ol>${items.map((t) => `<li>${inline(t)}</li>`).join("")}</ol>`); continue; }
     if (!l.trim()) { i++; continue; }
@@ -100,7 +100,7 @@ $("#btn-interrupt").addEventListener("click", () => fetch("/api/pm/interrupt", {
 
 // --- boot ---
 fetch("/api/pm/history").then((r) => r.json()).then(({ history }) => {
-  for (const h of history) { if (h.role === "user") addUser(h.text); else if (h.role === "assistant") addAssistant(h.text); else if (h.role === "tool") add("tool", `<b>${esc(h.name.replace(/^mcp__fleet__/, "fleet."))}</b> ${esc(h.summary)}`); }
+  for (const h of history) { if (h.role === "user") addUser(h.text); else if (h.role === "assistant") addAssistant(h.text); else if (h.role === "peer") add("peer", esc(h.text)); else if (h.role === "tool") add("tool", `<b>${esc(h.name.replace(/^mcp__fleet__/, "fleet."))}</b> ${esc(h.summary)}`); }
 });
 const es = new EventSource("/api/events");
 es.addEventListener("fleet", (e) => { sessions = JSON.parse(e.data); renderRail(); if (selected) select(selected); const pmRow = sessions.find((s) => s.name === "foreman-pm"); railFoot.textContent = `${sessions.filter((s) => s.tracked && s.name !== "foreman-pm").length} tracked by hooks · pm ${pmRow ? pmRow.state.replace("_", " ") : "off"} · ${new Date().toLocaleTimeString()}`; });

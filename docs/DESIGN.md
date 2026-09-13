@@ -11,14 +11,15 @@ model is designed so a remote host can push the same records.
 ## The three parts
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Browser  http://localhost:4177                                          │
-│  ┌──────────────┐  ┌──────────────────────────────────────────────────┐  │
-│  │ session rail │  │ PM chat                                          │  │
-│  │ ● name  st.  │  │ you ⇄ project manager                            │  │
-│  │ ● name  st.  │  │                                                  │  │
-│  └──────────────┘  └──────────────────────────────────────────────────┘  │
-└───────────▲───────────────────────────▲──────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  Browser  http://localhost:4177                                                    │
+│  ┌──────────────┐  ┌───────────────────────────────────────┐  ┌────────────────┐  │
+│  │ session rail │  │ PM chat                               │  │ session detail │  │
+│  │ ● name  st.  │  │ you ⇄ project manager                 │  │ (on click)     │  │
+│  │ ● name  st.  │  │                                       │  │ state, cwd,    │  │
+│  └──────────────┘  └───────────────────────────────────────┘  │ last turns     │  │
+│                                                               └────────────────┘  │
+└───────────▲───────────────────────────▲───────────────────────────────────────────┘
             │ SSE                       │ SSE / POST
 ┌───────────┴───────────────────────────┴──────────────────────────────────┐
 │  server/  (Node)                                                          │
@@ -66,7 +67,9 @@ mechanism Imbue's mngr uses internally.
 
 1. `~/.foreman/sessions/*.json` — hook records (authoritative for state).
 2. `~/.claude/sessions/<pid>.json` — Claude Code's own live registry: display name, cwd, pid,
-   messaging socket. Used for names and liveness (`kill -0 pid`).
+   messaging socket. Used for names and liveness (`kill -0 pid`). For sessions that predate the
+   hooks, the store locates the transcript from cwd + session id and infers a coarse state from
+   its last message record (best effort; the format is undocumented).
 3. `claude agents --json --all` — background sessions run by the supervisor, with native state.
 
 Derived states shown in the rail:
@@ -80,8 +83,8 @@ Derived states shown in the rail:
 | `ended` | exited cleanly | hook `SessionEnd` |
 | `dead` | pid gone without a `SessionEnd` | store, liveness pass |
 
-Sessions that predate the hook install have no record and show as `unknown` with whatever the
-registry knows (name, cwd, age). The store emits an SSE stream so the rail updates live.
+Sessions that predate the hook install have no record; the transcript fallback above fills in
+`working` / `turn_finished` / `idle` for them. The store emits an SSE stream so the rail updates live.
 
 ### 3. The PM agent
 
@@ -105,6 +108,7 @@ gets the cross-session tools: it can `ListAgents`, `SendMessage` a session agent
     `cwd` (mode `bg`, default), or `warp-spawn` (mode `tab`) for a visible tab.
   - `session_transcript_tail({session_id, n})` — last n turns of a session, for review.
   - `stop_session({id})` — `claude stop`.
+  - `log_note({note})` — append a dated line to `LOG.md`.
 - Memory: it maintains `~/.foreman/memory/PROJECTS.md` (one paragraph per active project: goal,
   current state, open questions, owning sessions) and `~/.foreman/memory/LOG.md` (dated decisions).
   These are injected at session start. Implementation detail never goes in them.

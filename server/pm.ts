@@ -138,8 +138,13 @@ export class ProjectManager extends EventEmitter {
               this.record({ role: "tool", name: b.name, summary });
             }
           }
-        } else if (m.type === "user" && typeof m.message?.content === "string" && /^<cross-session-message|^\[Cross-session idle notice\]/.test(m.message.content)) {
-          this.emit("event", { type: "peer", text: m.message.content.slice(0, 600) } as PmEvent);
+        } else if (m.type === "user") {
+          const c = m.message?.content;
+          const txt = typeof c === "string" ? c : Array.isArray(c) ? c.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n") : "";
+          if (/Cross-session (idle notice|message)|<cross-session-message/i.test(txt.slice(0, 200))) {
+            this.record({ role: "peer", text: txt.slice(0, 600) });
+            this.emit("event", { type: "peer", text: txt.slice(0, 600) } as PmEvent);
+          }
         } else if (m.type === "result") {
           this.busy = false;
           if (text.trim()) this.record({ role: "assistant", text });
