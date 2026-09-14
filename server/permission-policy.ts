@@ -21,7 +21,7 @@ export function canonical(path: string): string {
     return join(canonical(parent), basename(path));
   }
 }
-export const SECRET_COMPONENT = /^(?:foreman-policy-[^/]+|\.claude|\.ssh|\.aws|\.gnupg|\.env(?:\..*)?|.*\.env|secrets?(?:\..*)?|credentials?(?:\..*)?|.*\.(?:pem|key|p12|pfx)|(?:.*[-_])?relay[-_](?:credentials?|tokens?)(?:\..*)?|wrangler\.jsonc?|cloud\.json)$/i;
+export const SECRET_COMPONENT = /^(?:foreman-policy-[^/]+|\.claude|\.ssh|\.aws|\.gnupg|\.env(?:\..*)?|.*\.env|secrets?(?:\..*)?|\.?credentials?(?:\..*)?|.*\.(?:pem|key|p12|pfx)|(?:.*[-_])?relay[-_](?:credentials?|tokens?)(?:\..*)?|wrangler\.jsonc?|cloud\.json)$/i;
 export function protectedPath(path: string, home = homedir(), foreman = process.env.FOREMAN_HOME ?? join(home, '.foreman')) {
   return path.split(sep).some((part) => SECRET_COMPONENT.test(part)) || under(path, foreman) || under(path, join(home, '.config/gh')) || under(path, join(home, 'Library/Keychains'));
 }
@@ -34,7 +34,7 @@ const sb = (value: string) => JSON.stringify(value);
 // fail closed rather than pretending a regex is a sandbox.
 export function shellSandbox(command: string, cwd: string, mode: PermissionMode, network: boolean, home = homedir(), foreman = process.env.FOREMAN_HOME ?? join(home, '.foreman'), oneTimeAccess = false): string {
   const authenticatedVcs = ['gh', 'git'].includes(shellWords(command)?.[0] ?? '') && trustedNetworkCommand(command);
-  const secretRegex = '(^|/)(foreman-policy-[^/]+|[.]claude|[.]ssh|[.]aws|[.]gnupg|[.]env([.][^/]*)?|[^/]*[.]env|secrets?([.][^/]*)?|credentials?([.][^/]*)?|[^/]*[.](pem|key|p12|pfx)|([^/]*[-_])?relay[-_](credentials?|tokens?)([.][^/]*)?|wrangler[.]jsonc?|cloud[.]json)(/|$)'.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
+  const secretRegex = '(^|/)(foreman-policy-[^/]+|[.]claude|[.]ssh|[.]aws|[.]gnupg|[.]env([.][^/]*)?|[^/]*[.]env|secrets?([.][^/]*)?|[.]?credentials?([.][^/]*)?|[^/]*[.](pem|key|p12|pfx)|([^/]*[-_])?relay[-_](credentials?|tokens?)([.][^/]*)?|wrangler[.]jsonc?|cloud[.]json)(/|$)'.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
   const rules = ['(version 1)', '(allow default)',
     `(deny file-read* file-write* (regex #${sb(secretRegex)}) (subpath ${sb(foreman)}))`,
   ];

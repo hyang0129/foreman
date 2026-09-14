@@ -13,6 +13,8 @@ function fixture(t: test.TestContext) {
   const outside = join(dir, 'outside.txt'); writeFileSync(outside, 'outside');
   const secret = join(project, '.env'); writeFileSync(secret, 'synthetic-test-secret');
   writeFileSync(join(project, 'CREDENTIALS.JSON'), 'synthetic-uppercase-secret');
+  writeFileSync(join(project, '.credentials.json'), 'synthetic-dot-credential');
+  symlinkSync(join(project, '.credentials.json'), join(project, 'credential-alias'));
   symlinkSync(secret, join(project, 'alias.txt'));
   symlinkSync(dir, join(project, 'escape'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -29,7 +31,7 @@ for (const mode of PERMISSION_MODES) {
     assert.equal(check('Read', { file_path: safe }), 'allow');
     assert.equal(check('Write', { file_path: join(project, 'new.txt') }), mode === 'read-only' ? 'deny' : 'allow');
     assert.equal(check('Read', { file_path: outside }), mode === 'full' ? 'allow' : mode === 'workspace' ? 'ask' : 'deny');
-    for (const path of [secret, join(project, 'alias.txt'), join(project, 'secrets.json'), join(project, '.claude', 'x'), join(project, 'relay-credentials.json'), join(project, 'wrangler.jsonc'), join(project, '.ENV')]) {
+    for (const path of [secret, join(project, 'alias.txt'), join(project, 'secrets.json'), join(project, '.claude', 'x'), join(project, 'relay-credentials.json'), join(project, 'wrangler.jsonc'), join(project, '.ENV'), join(project, '.credentials.json'), join(project, '.CREDENTIALS.JSON'), join(project, 'credential-alias')]) {
       assert.equal(check('Read', { file_path: path }), 'deny', path);
       assert.equal(check('Write', { file_path: path }), 'deny', path);
     }
@@ -45,6 +47,12 @@ for (const mode of PERMISSION_MODES) {
     assert.notEqual(denied.status, 0); assert.equal(denied.stdout, '');
     assert.notEqual(run('cat alias.txt').status, 0);
     assert.notEqual(run('cat CREDENTIALS.JSON').status, 0);
+    for (const command of ['cat .credentials.json', 'cat credential-alias', `p='.creden'; cat "$p"tials.json`]) {
+      const result = run(command);
+      assert.notEqual(result.status, 0, command);
+      assert.equal(result.stdout, '', command);
+      assert.match(result.stderr, /Operation not permitted|Permission denied/);
+    }
     assert.notEqual(run(`printf changed > '${secret}'`).status, 0);
     assert.equal(readFileSync(secret, 'utf8'), 'synthetic-test-secret');
     const write = run('printf changed > new.txt');
