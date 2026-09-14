@@ -61,3 +61,20 @@ test('command network access and long-running process ownership remain bounded',
   await assert.rejects(trusted.call('foreman_process',{process_id:long.process_id}), /No such process/);
   await full.call('foreman_process',{process_id:long.process_id,terminate:true,yield_ms:1000});
 });
+
+test('disconnect kills the owned process group including grandchildren', { skip: process.platform !== 'darwin' }, async (t) => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-process-test-')));
+  const runner = new PolicyCommands('full', cwd, async () => false);
+  t.after(() => { runner.close(); rmSync(cwd, { recursive: true, force: true }); });
+  const result = await runner.call('foreman_exec', { command: 'sleep 60 & echo $!; wait', yield_ms: 250 });
+  assert.ok(result.process_id);
+  const pid = Number(result.output.trim()); assert.ok(Number.isInteger(pid) && pid > 1);
+  process.kill(pid, 0);
+  runner.close();
+  let alive = true;
+  for (let i = 0; i < 100 && alive; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    try { process.kill(pid, 0); } catch (error: any) { if (error.code !== 'ESRCH') throw error; alive = false; }
+  }
+  assert.equal(alive, false, 'grandchild survived controller disconnect');
+});

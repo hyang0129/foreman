@@ -195,3 +195,18 @@ for (const provider of ['claude', 'codex'] as const) {
     finally { loaded.close(); }
   });
 }
+
+test('legacy default rows display Workspace without launching a provider', async (t) => {
+  const { home, service, input } = fixture(t);
+  const row = await service.create(input); await tick(); service.close();
+  const { writeFileSync } = await import('node:fs');
+  const file = join(home, 'managed', `${row.session_key.slice(3)}.json`);
+  const data = JSON.parse(readFileSync(file, 'utf8')); data.session.permission_mode = 'default';
+  writeFileSync(file, JSON.stringify(data));
+  const loaded = new SessionService({ home, claudeFactory: () => { throw new Error('must not launch'); } });
+  t.after(() => loaded.close());
+  assert.equal(loaded.detail(row.session_key).session.permission_mode, 'workspace');
+  assert.equal(loaded.detail(row.session_key).session.alive, false);
+  assert.equal(loaded.detail(row.session_key).session.capabilities.message, false);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).session.permission_mode, 'workspace');
+});

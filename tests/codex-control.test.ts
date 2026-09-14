@@ -174,3 +174,32 @@ test('Codex host commands use exact one-time approvals and retain the deny list 
   client.close();
   assert.equal(client.pendingRequests().length, 0);
 });
+
+for (const mismatch of [
+  { approvalPolicy: 'never' },
+  { sandbox: { type: 'dangerFullAccess' } },
+  { sandbox: { type: 'workspaceWrite', networkAccess: true } },
+]) test(`Codex fails closed before a turn on native policy mismatch ${JSON.stringify(mismatch)}`, async (t) => {
+  const { client, sent } = await fixture(t);
+  const request = client.request.bind(client);
+  client.request = (async (method: string, params: any) => {
+    const result: any = await request(method, params);
+    return method === 'thread/start' ? { ...result, ...mismatch } : result;
+  }) as typeof client.request;
+  await assert.rejects(client.start('/tmp', {}, 'workspace'), /did not apply the requested launch policy/);
+  await assert.rejects(client.send('live', 'must never reach provider'), /Attach/);
+  assert.equal(sent.some((m) => m.method === 'turn/start'), false);
+  assert.equal((client as any).commands.size, 0);
+});
+
+test('native recursive searches and unified execution are refused by the executable snapshot', async (t) => {
+  const { client, sent, dir } = await fixture(t);
+  await client.start(dir, {}, 'full');
+  const command = sent.find((m) => m.method === 'thread/start').params.config['hooks.PreToolUse'][0].hooks[0].command;
+  const { spawnSync } = await import('node:child_process');
+  for (const tool_name of ['exec_command', 'shell_command', 'unified_exec', 'Glob', 'Grep']) {
+    const result = spawnSync('/bin/sh', ['-c', command], { input: JSON.stringify({ tool_name, tool_input: { command: 'cat .env', path: dir, pattern: '*' } }), encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, 'deny', tool_name);
+  }
+});
