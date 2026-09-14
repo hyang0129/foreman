@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, expect } from '@playwright/test';
+import { bootstrapClaudeCredentials } from './credentials.mjs';
 
 export const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
 export const labels = { 'read-only': 'Read-only', workspace: 'Workspace', trusted: 'Trusted', full: 'Full' };
@@ -24,9 +25,18 @@ export class Harness {
   responses = new Map();
   sequence = 0;
   async start() {
+    try { return await this.startIsolated(); }
+    catch (error) { await this.close(); throw error; }
+  }
+  async startIsolated() {
     this.dir ??= realpathSync(mkdtempSync(join(tmpdir(), 'foreman-conformance-')));
     this.home = join(this.dir, 'state');
     mkdirSync(this.home, { recursive: true });
+    this.claudeConfig = join(this.dir, 'claude-config');
+    mkdirSync(this.claudeConfig, { recursive: true, mode: 0o700 });
+    // Explicit opt-in reads only Keychain, never the developer's real ~/.claude.
+    // Keep the same isolated credentials across the test-owned server restart.
+    this.credentialsPath ??= bootstrapClaudeCredentials(this.claudeConfig);
     const reserved = createServer(); reserved.listen(0, '127.0.0.1'); await once(reserved, 'listening');
     const port = reserved.address().port; assert.notEqual(port, 4177);
     await new Promise((resolve) => reserved.close(resolve));
@@ -34,10 +44,7 @@ export class Harness {
     const env = { ...process.env };
     for (const key of Object.keys(env)) if (key.startsWith('FOREMAN_')) delete env[key];
     Object.assign(env, { FOREMAN_LIVE: '1', FOREMAN_HOME: this.home, FOREMAN_PORT: String(port),
-      FOREMAN_PM_DISABLED: '1', CLAUDE_CONFIG_DIR: join(this.dir, 'claude-config') });
-    // Existing provider login may be used, but never copy/read credentials in the harness.
-    // Claude's config is isolated to honor the no-.claude requirement.
-    mkdirSync(env.CLAUDE_CONFIG_DIR, { recursive: true });
+      FOREMAN_PM_DISABLED: '1', CLAUDE_CONFIG_DIR: this.claudeConfig });
     this.child = fork(fileURLToPath(new URL('./observe.mjs', import.meta.url)), [], {
       cwd: root, env, execArgv: ['--experimental-strip-types'], detached: true,
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -74,6 +81,7 @@ export class Harness {
     const token = `synthetic-${randomUUID()}`;
     writeFileSync(join(project, 'readable.txt'), token);
     writeFileSync(join(project, '.env'), `DENIED_${token}`);
+    writeFileSync(join(project, '.credentials.json'), `DENIED_${token}`, { mode: 0o600 });
     writeFileSync(join(project, 'secrets', 'fixture.txt'), `DENIED_${token}`);
     writeFileSync(join(dir, '.ssh', 'fixture.txt'), `DENIED_${token}`);
     writeFileSync(join(outside, 'readable.txt'), `OUTSIDE_${token}`);
@@ -163,7 +171,17 @@ export class Harness {
     try { process.kill(-child.pid, 'SIGKILL'); } catch (e) { if (e.code !== 'ESRCH') throw e; }
     if (child.exitCode === null && child.signalCode === null) await once(child, 'exit');
   }
-  async close() { await this.stop(); await this.browser?.close(); if (this.dir) rmSync(this.dir, { recursive: true, force: true }); }
+  async close() {
+    try { await this.stop(); }
+    finally {
+      try { await this.browser?.close(); }
+      finally {
+        // Explicit credential removal still runs if setup, a test, or shutdown fails.
+        try { if (this.credentialsPath) rmSync(this.credentialsPath, { force: true }); }
+        finally { if (this.dir) rmSync(this.dir, { recursive: true, force: true }); }
+      }
+    }
+  }
 }
 
 // Only guard/tool results may prove refusal; model prose is deliberately excluded.

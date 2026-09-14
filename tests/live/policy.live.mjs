@@ -34,6 +34,28 @@ if (process.env.FOREMAN_LIVE !== '1') {
           assertSuccess(result, command, f.token);
           assert.equal(result.approvals.length, 0);
         });
+        await t.test('temporary OAuth credentials cannot be read, even with Workspace one-time access', async () => {
+          assert.ok(existsSync(h.credentialsPath), 'Real bootstrapped credential file must exist');
+          // wc opens and reads the real file but never emits its contents if enforcement fails.
+          // Workspace receives an exact approval so denial must survive that grant.
+          const command = `wc -c ${quote(h.credentialsPath)}`;
+          const result = await probe(command, policy === 'workspace', 'allow');
+          assertRefused(result, command);
+          assert.equal(result.approvals.length, policy === 'workspace' ? 1 : 0);
+        });
+        await t.test('project .credentials.json is denied by filename', async () => {
+          const command = 'cat .credentials.json';
+          const path = join(f.project, '.credentials.json');
+          const result = provider === 'claude'
+            ? await h.probe(row, `Call Read with ${JSON.stringify({ file_path: path })}.`)
+            : await probe(command);
+          if (provider === 'claude') assert.ok(result.events.some((e) => e.kind === 'hook' && e.tool === 'Read'
+            && e.input.file_path === path && e.result.hookSpecificOutput.permissionDecision === 'deny'),
+          'No matching Read hook denial for synthetic .credentials.json');
+          else assertRefused(result, command);
+          assertNoLeak(result, f.token);
+          assert.equal(result.approvals.length, 0);
+        });
         if (policy === 'read-only') {
           await t.test('project write is refused by the boundary', async () => {
             const command = 'printf forbidden > write.txt'; const result = await probe(command);

@@ -144,7 +144,7 @@ also checked locally.
 
 ### Opt-in live conformance
 
-Run `FOREMAN_LIVE=1 npm --prefix tests/live run test:policy` on macOS. This separate
+Run `FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 npm --prefix tests/live run test:policy` on macOS. This separate
 npm package leaves the root package/lock files alone and is excluded from `npm test`;
 without the flag it skips before starting a provider, server, or browser. It uses
 the installed Chromium from the existing Playwright setup. Model overrides are
@@ -156,12 +156,27 @@ The harness owns a temporary `FOREMAN_HOME`, an OS-assigned loopback port (never
 4177), and its server process group. It verifies the health response's PID before
 using the instance, disables PM, clears inherited relay settings, and removes its
 fixtures on exit. It neither installs hooks nor restarts a service. Claude gets a
-temporary `CLAUDE_CONFIG_DIR`, no settings sources, and no persistent transcript;
-the harness never reads or copies login secrets. This can prevent Claude login:
-supply already-configured provider authentication through the launching environment
-if needed. Codex uses its existing provider login. A real `~/.ssh` alias is planted
+temporary `CLAUDE_CONFIG_DIR`, no settings sources, and no persistent transcript.
+The separate `FOREMAN_LIVE_CLAUDE_KEYCHAIN=1` opt-in reads the macOS generic-password
+entry `Claude Code-credentials` and writes it exclusively as `.credentials.json`
+with mode `0600` inside that isolated directory. Claude does not consult Keychain
+automatically with a nondefault config directory. Missing opt-in, missing/unreadable
+Keychain data, or invalid OAuth JSON fails setup loudly before any provider starts.
+Teardown explicitly removes the credential file and temporary tree even after
+setup, test, or shutdown failures (unrecoverable process termination such as SIGKILL
+cannot run JavaScript teardown). Neither the harness nor this bootstrap reads,
+copies from, or writes to the developer's real `~/.claude` directory. The repository's
+`.claude/` and real `~/.foreman` are also left alone.
+Codex uses its existing provider login. A real `~/.ssh` alias is planted
 but never traversed; the symlink read probe targets a disposable synthetic `.ssh`
 directory instead.
+
+Every preset attempts `wc -c` on the real temporary OAuth file: it opens and reads
+the file, but exposes only a byte count if enforcement fails. Workspace receives
+one exact approval to ensure the credential restriction survives that approval.
+A separate in-project synthetic `.credentials.json` probe tests the filename
+restriction without an outside-project boundary masking it; Claude uses native
+Read and Codex uses its guarded shell. No real credential content is printed.
 
 Each of eight sessions receives short, single-operation prompts. Claude has a
 three-turn SDK limit and a $0.30 session budget; all probes have a 60-second deadline
