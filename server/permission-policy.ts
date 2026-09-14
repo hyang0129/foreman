@@ -21,9 +21,18 @@ export function canonical(path: string): string {
     return join(canonical(parent), basename(path));
   }
 }
-export const SECRET_COMPONENT = /^(?:foreman-policy-[^/]+|\.claude|\.ssh|\.aws|\.gnupg|\.env(?:\..*)?|.*\.env|secrets?(?:\..*)?|\.?credentials?(?:\..*)?|.*\.(?:pem|key|p12|pfx)|(?:.*[-_])?relay[-_](?:credentials?|tokens?)(?:\..*)?|wrangler\.jsonc?|cloud\.json)$/i;
+// PEM is still a private-key family everywhere except these OS trust anchors.
+// Keep other credential names (even secrets.pem) protected inside the CA tree.
+const SECRET_NON_PEM_COMPONENT = /^(?:foreman-policy-[^/]+|\.claude|\.ssh|\.aws|\.gnupg|\.env(?:\..*)?|.*\.env|secrets?(?:\..*)?|\.?credentials?(?:\..*)?|.*\.(?:key|p12|pfx)|(?:.*[-_])?relay[-_](?:credentials?|tokens?)(?:\..*)?|wrangler\.jsonc?|cloud\.json)$/i;
+export const SECRET_COMPONENT = new RegExp(`(?:${SECRET_NON_PEM_COMPONENT.source}|^.*\\.pem$)`, 'i');
+const SYSTEM_CA_FILES = ['/etc/ssl/cert.pem', '/private/etc/ssl/cert.pem'];
+const SYSTEM_CA_DIRS = ['/etc/ssl/certs', '/private/etc/ssl/certs'];
+function systemTrustAnchor(path: string) {
+  return resolve(path) === path && (SYSTEM_CA_FILES.includes(path) || SYSTEM_CA_DIRS.some((root) => under(path, root)));
+}
 export function protectedPath(path: string, home = homedir(), foreman = process.env.FOREMAN_HOME ?? join(home, '.foreman')) {
-  return path.split(sep).some((part) => SECRET_COMPONENT.test(part)) || under(path, foreman) || under(path, join(home, '.config/gh')) || under(path, join(home, 'Library/Keychains'));
+  const component = systemTrustAnchor(path) ? SECRET_NON_PEM_COMPONENT : SECRET_COMPONENT;
+  return path.split(sep).some((part) => component.test(part)) || under(path, foreman) || under(path, join(home, '.config/gh')) || under(path, join(home, 'Library/Keychains'));
 }
 export const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 const sb = (value: string) => JSON.stringify(value);
@@ -34,9 +43,15 @@ const sb = (value: string) => JSON.stringify(value);
 // fail closed rather than pretending a regex is a sandbox.
 export function shellSandbox(command: string, cwd: string, mode: PermissionMode, network: boolean, home = homedir(), foreman = process.env.FOREMAN_HOME ?? join(home, '.foreman'), oneTimeAccess = false): string {
   const authenticatedVcs = ['gh', 'git'].includes(shellWords(command)?.[0] ?? '') && trustedNetworkCommand(command);
-  const secretRegex = '(^|/)(foreman-policy-[^/]+|[.]claude|[.]ssh|[.]aws|[.]gnupg|[.]env([.][^/]*)?|[^/]*[.]env|secrets?([.][^/]*)?|[.]?credentials?([.][^/]*)?|[^/]*[.](pem|key|p12|pfx)|([^/]*[-_])?relay[-_](credentials?|tokens?)([.][^/]*)?|wrangler[.]jsonc?|cloud[.]json)(/|$)'.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
+  const insensitive = (pattern: string) => pattern.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
+  const secretRegex = insensitive('(^|/)(foreman-policy-[^/]+|[.]claude|[.]ssh|[.]aws|[.]gnupg|[.]env([.][^/]*)?|[^/]*[.]env|secrets?([.][^/]*)?|[.]?credentials?([.][^/]*)?|[^/]*[.](key|p12|pfx)|([^/]*[-_])?relay[-_](credentials?|tokens?)([.][^/]*)?|wrangler[.]jsonc?|cloud[.]json)(/|$)');
+  const pemRegex = insensitive('(^|/)[^/]*[.]pem(/|$)');
+  const trustPaths = [...SYSTEM_CA_FILES.map((p) => `(literal ${sb(p)})`), ...SYSTEM_CA_DIRS.map((p) => `(subpath ${sb(p)})`)];
   const rules = ['(version 1)', '(allow default)',
     `(deny file-read* file-write* (regex #${sb(secretRegex)}) (subpath ${sb(foreman)}))`,
+    // Narrow only the PEM read denial; never override the other deny families.
+    `(deny file-read* (require-all (regex #${sb(pemRegex)}) (require-not (require-any ${trustPaths.join(' ')}))))`,
+    `(deny file-write* (regex #${sb(pemRegex)}) ${trustPaths.join(' ')})`,
   ];
   if (!authenticatedVcs) rules.push(`(deny file-read* file-write* (subpath ${sb(join(home, '.config/gh'))}) (subpath ${sb(join(home, 'Library/Keychains'))}))`);
   if (!network) rules.push('(deny network*)');
@@ -53,8 +68,9 @@ export function shellSandbox(command: string, cwd: string, mode: PermissionMode,
     rules.push(`(deny file-read-data (require-all (require-not (literal "/")) ${readable.map((p) => `(require-not (subpath ${sb(p)}))`).join(' ')}))`);
   }
   if (mode === 'trusted') {
+    // Apple's xcrun uses its own cache override and ignores TMPDIR on this host.
     const temp = join(cwd, '.foreman-tmp');
-    command = `mkdir -p ${quote(temp)} && export TMPDIR=${quote(temp + '/')} npm_config_cache=${quote(join(temp, 'npm-cache'))} YARN_CACHE_FOLDER=${quote(join(temp, 'yarn-cache'))}; ${command}`;
+    command = `mkdir -p ${quote(temp)} && export TMPDIR=${quote(temp + '/')} xcrun_db=${quote(join(temp, 'xcrun_db'))} npm_config_cache=${quote(join(temp, 'npm-cache'))} YARN_CACHE_FOLDER=${quote(join(temp, 'yarn-cache'))}; ${command}`;
   }
   if (mode === 'read-only') {
     const words = shellWords(command);
@@ -137,9 +153,11 @@ export function toolDecision(mode: PermissionMode, cwd: string, tool: string, or
   const pathDecision = (value: string) => {
     const expanded = value.startsWith('~/') ? join(homedir(), value.slice(2)) : value;
     const lexical = resolve(root, expanded);
-    if (protectedPath(lexical)) return 'deny';
+    const write = WRITE_TOOLS.includes(tool);
+    if (protectedPath(lexical) || (write && systemTrustAnchor(lexical))) return 'deny';
     const actual = canonical(lexical);
-    if (protectedPath(actual)) return 'deny';
+    if (protectedPath(actual) || (write && systemTrustAnchor(actual))) return 'deny';
+    if (!write && READ_TOOLS.includes(tool) && systemTrustAnchor(actual)) return 'allow';
     if (!under(actual, root)) return mode === 'full' ? 'allow' : mode === 'workspace' ? 'ask' : 'deny';
     return 'allow';
   };

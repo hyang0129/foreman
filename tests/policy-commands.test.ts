@@ -78,3 +78,17 @@ test('disconnect kills the owned process group including grandchildren', { skip:
   }
   assert.equal(alive, false, 'grandchild survived controller disconnect');
 });
+
+test('Trusted xcrun writes its project cache while outside temp writes remain denied', { skip: process.platform !== 'darwin' }, async (t) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-xcrun-test-')));
+  const cwd = join(dir, 'project'); mkdirSync(cwd);
+  const runner = new PolicyCommands('trusted', cwd, async () => { throw new Error('Must not prompt'); });
+  t.after(() => { runner.close(); rmSync(dir, { recursive: true, force: true }); });
+  const result = await runner.call('foreman_exec', { command: '/usr/bin/xcrun --find git', yield_ms: 10000 });
+  assert.equal(result.exit_code, 0, result.output);
+  assert.match(result.output, /^\/.*\/git\n$/);
+  assert.ok(readFileSync(join(cwd, '.foreman-tmp/xcrun_db')).length > 0);
+  const denied = await runner.call('foreman_exec', { command: `printf outside > ${join(dir, 'outside-cache')}`, yield_ms: 5000 });
+  assert.notEqual(denied.exit_code, 0);
+  assert.match(denied.output, /Operation not permitted|Permission denied/);
+});
