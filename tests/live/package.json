@@ -1,0 +1,8 @@
+{
+  "name": "foreman-live-policy-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:policy": "node --experimental-strip-types --test --test-concurrency=1 policy.live.mjs"
+  }
+}

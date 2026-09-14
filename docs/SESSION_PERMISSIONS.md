@@ -141,3 +141,58 @@ Provider references: [Codex App Server](https://developers.openai.com/codex/app-
 and the installed Claude Agent SDK `Options`, `PreToolUseHookSpecificOutput`, and
 `SDKSystemMessage` declarations. Codex CLI 0.149.0's generated protocol schema was
 also checked locally.
+
+### Opt-in live conformance
+
+Run `FOREMAN_LIVE=1 npm --prefix tests/live run test:policy` on macOS. This separate
+npm package leaves the root package/lock files alone and is excluded from `npm test`;
+without the flag it skips before starting a provider, server, or browser. It uses
+the installed Chromium from the existing Playwright setup. Model overrides are
+`FOREMAN_LIVE_CLAUDE_MODEL` and `FOREMAN_LIVE_CODEX_MODEL` (defaults: `haiku` and
+`gpt-5.6-luna`, the small model in this host's Codex catalog). Availability depends
+on the provider account; an unavailable model is a failure, not a skipped proof.
+
+The harness owns a temporary `FOREMAN_HOME`, an OS-assigned loopback port (never
+4177), and its server process group. It verifies the health response's PID before
+using the instance, disables PM, clears inherited relay settings, and removes its
+fixtures on exit. It neither installs hooks nor restarts a service. Claude gets a
+temporary `CLAUDE_CONFIG_DIR`, no settings sources, and no persistent transcript;
+the harness never reads or copies login secrets. This can prevent Claude login:
+supply already-configured provider authentication through the launching environment
+if needed. Codex uses its existing provider login. A real `~/.ssh` alias is planted
+but never traversed; the symlink read probe targets a disposable synthetic `.ssh`
+directory instead.
+
+Each of eight sessions receives short, single-operation prompts. Claude has a
+three-turn SDK limit and a $0.30 session budget; all probes have a 60-second deadline
+and a six-tool-attempt limit. Allow several minutes for the full matrix (up to 30
+minutes before the outer timeout). Small-model calls are intended to cost cents,
+but actual provider billing and availability vary; the aggregate Claude budget is
+$1.20 and Codex has no equivalent USD cap. The test does perform real read-only
+GitHub requests (`gh issue view` and a shallow `git fetch` into a throwaway project).
+
+Test-only observers record actual hook decisions and correlated tool results; they
+do not replace the SDK, provider binary, policy, or HTTP handlers. Controller source
+is copied byte-for-byte into each disposable project before loading, so the
+source-edit probe changes the actual loaded guard's source while leaving the running
+module and private Codex hook snapshot intact. Row and browser checks use real HTTP;
+peer reporting uses the same bound peer projection over private parent/child IPC.
+These private controller taps are intentionally isolated in `tests/live/observe.mjs`.
+
+A negative probe passes only with an attempted operation and enforcement evidence:
+a matching guard denial, exact approval denial, or a failed guarded command with a
+permission error. Network checks also verify a healthy local listener and absence
+of the attempted request. Missing tool calls, model abstention, missing files,
+provider/login errors, and timeouts are failures, not evidence of authorization
+refusal. Native tools that the provider cannot be induced to call therefore leave
+an explicit live-coverage failure; executable-hook tests separately cover them.
+`tests/live-evidence.test.mjs` ensures unrelated errors and model prose cannot pass.
+
+Existing non-live tests retain deterministic coverage of policy and peer-tool
+mutation rejection, native-policy fault injection, process-group cleanup on
+controller close, and foreign-platform refusal. The live suite adds provider
+conformance, source edits, inherited execution, exact approvals across turns,
+reported policy, and a real server restart including a legacy row. It proves only
+the operations actually observed on the installed providers and host, not universal
+model behavior or resistance to a compromised provider binary. See
+[the recorded run](LIVE_POLICY_RESULTS.md) for results and remaining gaps.
