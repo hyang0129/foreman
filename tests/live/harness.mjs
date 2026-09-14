@@ -200,9 +200,22 @@ export function claudeResults(probe, command) {
   const ids = new Set(probe.events.filter((e) => e.type === 'tool_use' && (e.input?.command === command || (e.name === 'Read' && command === 'cat readable.txt' && e.input?.file_path?.endsWith('/readable.txt')) || (e.name === 'Write' && command === 'printf fixture-written > write.txt'))).map((e) => e.id));
   return probe.events.filter((e) => e.type === 'tool_result' && ids.has(e.tool_use_id));
 }
+export function claudeOutput(result) {
+  return typeof result.content === 'string' ? result.content
+    : (result.content ?? []).filter((block) => block.type === 'text').map((block) => block.text).join('\n');
+}
+// Caller must independently prove the exact local listener is healthy and was not hit.
+// curl's exit 7 by itself is not proof of a network boundary.
+export function assertNetworkFailure(probe, command) {
+  const host = commandResults(probe, command).some((r) => r.exit_code === 7);
+  const wrapped = probe.events.some((e) => e.kind === 'hook' && e.tool === 'Bash' && e.input?.command === command
+    && e.result.hookSpecificOutput?.updatedInput?.command?.includes('(deny network*)'));
+  const claude = wrapped && claudeResults(probe, command).some((e) => e.is_error && /curl: \(7\)/.test(claudeOutput(e)));
+  assert.ok(host || claude, `No correlated guarded curl exit 7: ${JSON.stringify(probe)}`);
+}
 export function assertSuccess(probe, command, token) {
   const host = commandResults(probe, command).some((r) => r.exit_code === 0 && (!token || r.output.includes(token)));
-  const claude = claudeResults(probe, command).some((e) => !e.is_error && (!token || JSON.stringify(e.content).includes(token)));
+  const claude = claudeResults(probe, command).some((e) => !e.is_error && (!token || claudeOutput(e).includes(token)));
   assert.ok(host || claude, `No successful tool result for ${command}: ${JSON.stringify(probe)}`);
 }
 export function assertNoLeak(probe, token) {

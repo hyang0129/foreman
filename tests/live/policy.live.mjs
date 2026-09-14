@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 if (process.env.FOREMAN_LIVE !== '1') {
   test('live policy conformance (set FOREMAN_LIVE=1)', { skip: 'spends real provider turns; explicit opt-in required' }, () => {});
 } else {
-  const { Harness, quote, assertRefused, assertSuccess, assertNoLeak, commandResults,
+  const { Harness, quote, assertRefused, assertSuccess, assertNoLeak, assertNetworkFailure, commandResults, claudeResults,
     existsSync, readFileSync, writeFileSync, join, randomUUID, spawnSync, delay } = await import('./harness.mjs');
   const h = new Harness();
   test('real provider policy conformance', { timeout: 1_800_000 }, async (t) => {
@@ -40,6 +40,9 @@ if (process.env.FOREMAN_LIVE !== '1') {
           // Workspace receives an exact approval so denial must survive that grant.
           const command = `wc -c ${quote(h.credentialsPath)}`;
           const result = await probe(command, policy === 'workspace', 'allow');
+          assert.ok(!commandResults(result, command).some((r) => r.exit_code === 0)
+            && !claudeResults(result, command).some((r) => !r.is_error),
+          `Real credential read succeeded (byte count only): ${JSON.stringify(result)}`);
           assertRefused(result, command);
           assert.equal(result.approvals.length, policy === 'workspace' ? 1 : 0);
         });
@@ -51,7 +54,7 @@ if (process.env.FOREMAN_LIVE !== '1') {
             : await probe(command);
           if (provider === 'claude') assert.ok(result.events.some((e) => e.kind === 'hook' && e.tool === 'Read'
             && e.input.file_path === path && e.result.hookSpecificOutput.permissionDecision === 'deny'),
-          'No matching Read hook denial for synthetic .credentials.json');
+          `No matching Read hook denial for synthetic .credentials.json: ${JSON.stringify(result)}`);
           else assertRefused(result, command);
           assertNoLeak(result, f.token);
           assert.equal(result.approvals.length, 0);
@@ -118,9 +121,7 @@ if (process.env.FOREMAN_LIVE !== '1') {
             const result = await probe(command); assert.equal(result.approvals.length, 0);
             // curl often reports EPERM as "Couldn't connect"; that alone is not sufficient.
             // Exit 7 + exact attempted command + healthy listener + no hit supplies independent evidence.
-            const results = commandResults(result, command);
-            if (provider === 'codex') assert.ok(results.some((r) => r.exit_code === 7), JSON.stringify(result));
-            else assertRefused(result, command);
+            assertNetworkFailure(result, command);
             assert.ok(!hits.includes(path));
             assert.equal(await (await fetch(networkUrl + '/post-control')).text(), 'fixture-network-ok');
           });
@@ -175,8 +176,10 @@ if (process.env.FOREMAN_LIVE !== '1') {
             const command = `curl --max-time 2 -sS -X POST -H 'content-type: application/json' -d ${quote(JSON.stringify({ id: row.session_key, permission_mode: 'full' }))} ${h.url}/api/session/policy`;
             const result = await probe(command);
             if (policy === 'full') assertSuccess(result, command);
-            else if (provider === 'codex') assert.ok(commandResults(result, command).some((r) => r.exit_code === 7), 'API mutation must actually reach the network boundary');
-            else assertRefused(result, command);
+            else {
+              assertNetworkFailure(result, command);
+              assert.equal((await h.api('/api/health')).pid, h.child.pid);
+            }
             assert.equal((await h.api(`/api/session?id=${encodeURIComponent(row.session_key)}`)).session.permission_mode, policy);
             await h.api('/api/session/approval', { id: row.session_key, approval_id: 'blanket', decision: 'acceptForSession' }, 400);
           });
