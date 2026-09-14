@@ -1,5 +1,11 @@
+import { PolicyCommands, POLICY_COMMAND_TOOLS, POLICY_COMMAND_INSTRUCTIONS } from './policy-commands.ts';
 // Small app-server client. stdio owns a server; socket attaches to an existing one.
 // Never resumes an arbitrary disk transcript implicitly or changes a session's permissions.
+import { permissionMode, codexPolicy, type PermissionMode } from './permission-policy.ts';
+import { mkdtempSync, copyFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -29,6 +35,9 @@ export class CodexControl extends EventEmitter {
   private attached = new Set<string>();
   private turns = new Map<string, string>();
   private options: Options;
+  private policySnapshots: string[] = [];
+  private commands = new Map<string, PolicyCommands>();
+  private commandApprovals = new Map<string, (allowed: boolean) => void>();
   constructor(options: Options = {}) { super(); this.options = options; }
 
   async connect() {
@@ -108,20 +117,32 @@ export class CodexControl extends EventEmitter {
       } else if (typeof message.method === 'string') {
         const p = message.params ?? {};
         if (message.id !== undefined) {
+          if (message.method === 'item/permissions/requestApproval') {
+            this.write({ id: message.id, result: { permissions: {}, scope: 'turn' } });
+            continue;
+          }
           this.requests.set(message.id, message);
-          this.emit('request', message); // The host/user must decide; never auto-approve.
+          const commands = this.commands.get(p.threadId);
+          if (message.method === 'item/tool/call' && ['foreman_exec', 'foreman_process'].includes(p.tool) && !p.namespace && commands) {
+            void commands.call(p.tool, p.arguments).then(
+              (result) => this.respondTool(message.id, { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(result) }] }),
+              (error) => this.respondTool(message.id, { success: false, contentItems: [{ type: 'inputText', text: String(error) }] }),
+            ).catch(() => {});
+          } else this.emit('request', message);
         } else {
           const completedActiveTurn = message.method === 'turn/completed' && this.turns.get(p.threadId) === p.turn?.id;
           if (message.method === 'turn/started' && p.threadId && p.turn?.id) this.turns.set(p.threadId, p.turn.id);
           if (completedActiveTurn) this.turns.delete(p.threadId);
           if (message.method === 'serverRequest/resolved') this.requests.delete(p.requestId);
-          if (message.method === 'thread/closed') { this.attached.delete(p.threadId); this.turns.delete(p.threadId); }
+          if (message.method === 'thread/closed') { this.attached.delete(p.threadId); this.turns.delete(p.threadId); this.commands.get(p.threadId)?.close(); this.commands.delete(p.threadId); }
           if (message.method === 'turn/completed' || message.method === 'thread/closed') {
             for (const [id, req] of this.requests) {
               if (req.params.threadId !== p.threadId) continue;
               // A delayed completion must not discard a newer turn's approval.
               if (message.method === 'thread/closed' ||
-                (req.params.turnId ? req.params.turnId === p.turn?.id : completedActiveTurn)) this.requests.delete(id);
+                (req.params.turnId ? req.params.turnId === p.turn?.id : completedActiveTurn)) {
+                this.commandApprovals.get(String(id))?.(false); this.commandApprovals.delete(String(id)); this.requests.delete(id);
+              }
             }
           }
           this.emit('notification', message);
@@ -133,6 +154,10 @@ export class CodexControl extends EventEmitter {
     const wasConnected = this.ready || this.pending.size > 0;
     this.ready = false;
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error); }
+    for (const resolve of this.commandApprovals.values()) resolve(false);
+    this.commandApprovals.clear();
+    for (const commands of this.commands.values()) commands.close();
+    this.commands.clear();
     this.pending.clear(); this.requests.clear(); this.attached.clear(); this.turns.clear();
     if (wasConnected) this.emit('disconnect', error);
   }
@@ -140,6 +165,8 @@ export class CodexControl extends EventEmitter {
     this.disconnected(new Error('Codex client closed'));
     this.child?.stdin.end(); this.child?.kill('SIGTERM');
     this.socket?.terminate();
+    for (const directory of this.policySnapshots) rmSync(directory, { recursive: true, force: true });
+    this.policySnapshots = [];
     // Closing a socket disconnects this client, not the shared app-server.
   }
   list(cursor?: string) {
@@ -149,8 +176,42 @@ export class CodexControl extends EventEmitter {
   history(threadId: string, cursor?: string) {
     return this.request<{ data: Json[]; nextCursor: string | null }>('thread/turns/list', { threadId, limit: 10, itemsView: 'full', ...(cursor ? { cursor } : {}) });
   }
-  async start(cwd: string, extra: Record<string, Json> = {}) {
-    const result = await this.request<{ thread: CodexThread }>('thread/start', { ...extra, cwd, sandbox: 'workspace-write', approvalPolicy: 'on-request' });
+  async start(cwd: string, extra: Record<string, Json> = {}, policy?: PermissionMode) {
+    const mode = permissionMode(policy);
+    for (const key of ['sandbox', 'approvalPolicy', 'permissions', 'config', 'approvalsReviewer']) {
+      if (key in extra) throw new Error('Provider permission overrides are forbidden; choose a launch preset');
+    }
+    const directory = mkdtempSync(join(tmpdir(), 'foreman-policy-'));
+    this.policySnapshots.push(directory);
+    for (const name of ['permission-policy.ts', 'permission-hook.ts']) copyFileSync(fileURLToPath(new URL(name, import.meta.url)), join(directory, name));
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const command = [process.execPath, '--experimental-strip-types', join(directory, 'permission-hook.ts'), mode, cwd].map(quote).join(' ');
+    const result = await this.request<{ thread: CodexThread; approvalPolicy: string; sandbox: { type: string; networkAccess?: boolean } }>('thread/start', {
+      ...extra, cwd, ...codexPolicy(mode), approvalsReviewer: 'user',
+      dynamicTools: [...(Array.isArray(extra.dynamicTools) ? extra.dynamicTools : []), ...POLICY_COMMAND_TOOLS] as Json,
+      developerInstructions: [extra.developerInstructions ?? '', POLICY_COMMAND_INSTRUCTIONS].join('\n'),
+      config: {
+        'features.hooks': true,
+        'features.shell_tool': false,
+        'features.unified_exec': false,
+        'hooks.PreToolUse': [{ hooks: [{ type: 'command', command }] }],
+        'sandbox_workspace_write.network_access': mode === 'trusted',
+        'web_search': mode === 'read-only' || mode === 'trusted' ? 'disabled' : mode === 'full' ? 'live' : 'cached',
+        'shell_environment_policy.exclude': ['FOREMAN_*', '*SECRET*', '*PASSWORD*', '*CREDENTIAL*'],
+      },
+    });
+    const expectedSandbox = mode === 'full' ? 'dangerFullAccess' : mode === 'read-only' ? 'readOnly' : 'workspaceWrite';
+    if (result.approvalPolicy !== codexPolicy(mode).approvalPolicy || result.sandbox?.type !== expectedSandbox ||
+      (mode !== 'full' && !!result.sandbox.networkAccess !== (mode === 'trusted'))) {
+      throw new Error('Codex did not apply the requested launch policy; session was not activated');
+    }
+    this.commands.set(result.thread.id, new PolicyCommands(mode, cwd, (command, workdir) => {
+      const id = `foreman-command:${randomUUID()}`;
+      const request: CodexRequest = { id, method: 'item/commandExecution/requestApproval', params: { threadId: result.thread.id, ...(this.turns.get(result.thread.id) ? { turnId: this.turns.get(result.thread.id)! } : {}), command, cwd: workdir, reason: 'One-time network or outside-project access. The deny list and session policy stay in force.' } };
+      return new Promise<boolean>((resolve) => {
+        this.commandApprovals.set(id, resolve); this.requests.set(id, request); this.emit('request', request);
+      });
+    }));
     this.attached.add(result.thread.id);
     return result.thread;
   }
@@ -186,6 +247,8 @@ export class CodexControl extends EventEmitter {
   }
   interrupt(threadId: string) {
     this.requireAttached(threadId);
+    this.commands.get(threadId)?.interrupt();
+    for (const [id, resolve] of this.commandApprovals) if (this.requests.get(id)?.params.threadId === threadId) { resolve(false); this.commandApprovals.delete(id); this.requests.delete(id); }
     const turnId = this.turns.get(threadId);
     if (!turnId) throw new Error('No known active turn');
     return this.request('turn/interrupt', { threadId, turnId });
@@ -204,6 +267,12 @@ export class CodexControl extends EventEmitter {
     } else if (request.method === 'item/tool/requestUserInput') {
       if (!result.answers || typeof result.answers !== 'object' || Array.isArray(result.answers)) throw new Error('answers required');
     } else throw new Error(`Unsupported request type: ${request.method}. Respond in the original client.`);
+    const commandApproval = this.commandApprovals.get(String(id));
+    if (commandApproval) {
+      this.commandApprovals.delete(String(id)); this.requests.delete(id);
+      commandApproval(result.decision === 'accept');
+      return;
+    }
     this.write({ id, result }); this.requests.delete(id);
   }
 }

@@ -166,3 +166,32 @@ test('model choice reaches both providers, survives restart, and participates in
   t.after(() => restored.close());
   assert.equal(restored.detail(session.session_key).session.model, 'haiku');
 });
+
+for (const provider of ['claude', 'codex'] as const) {
+  test(`${provider}: launch policy reaches the controller, is reported, immutable, and durable`, async (t) => {
+    let received: any;
+    class PolicyCodex extends FakeCodex {
+      async start(...args: any[]) { received = args[2]; return { id: 'native-codex' }; }
+    }
+    const { service, input, home } = fixture(t, {
+      claudeFactory: (options: any) => { received = options.permission_mode; return new FakeClaude(); },
+      codexFactory: () => new PolicyCodex(),
+    });
+    for (const mode of ['read-only', 'workspace', 'trusted', 'full'] as const) {
+      const launch = { ...input, provider, id: mode, permission_mode: mode };
+      const row = await service.create(launch); await tick();
+      assert.equal(received, mode); assert.equal(row.permission_mode, mode);
+      row.permission_mode = 'full';
+      assert.equal(service.detail(row.session_key).session.permission_mode, mode);
+      await assert.rejects(service.create({ ...launch, permission_mode: mode === 'full' ? 'trusted' : 'full' }), /different input/);
+    }
+    const omitted = await service.create({ ...input, provider, id: 'omitted' }); await tick();
+    assert.equal(received, 'workspace'); assert.equal(omitted.permission_mode, 'workspace');
+    assert.equal((await service.create({ ...input, provider, id: 'omitted', permission_mode: 'workspace' })).session_key, omitted.session_key);
+    await assert.rejects(service.create({ ...input, provider, id: 'bad', permission_mode: 'bypassPermissions' as any }), /permission_mode/);
+    service.close();
+    const loaded = new SessionService({ home });
+    try { assert.deepEqual(loaded.list().map((s) => s.permission_mode).sort(), ['full','read-only','trusted','workspace','workspace']); }
+    finally { loaded.close(); }
+  });
+}

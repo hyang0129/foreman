@@ -1,3 +1,4 @@
+import { PERMISSION_MODES, type PermissionMode } from './permission-policy.ts';
 // In-process MCP tools the PM uses to see and steer the fleet.
 import { tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
@@ -11,7 +12,7 @@ import { modelCatalog } from "./models.ts";
 import { randomUUID } from "node:crypto";
 
 export interface ManagedFleetService extends PeerService {
-  create(input: { id: string; provider: 'claude' | 'codex'; name: string; cwd: string; text: string; model?: string }): any;
+  create(input: { id: string; provider: 'claude' | 'codex'; name: string; cwd: string; text: string; model?: string; permission_mode?: PermissionMode }): any;
   interrupt(id: string): any;
 }
 
@@ -61,17 +62,18 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
       prompt: z.string().min(20).describe("The full brief for the worker"),
       mode: z.enum(["managed", "bg", "tab"]).optional().describe("managed (default), bg, or tab"),
       provider: z.enum(["claude", "codex"]).optional().describe("Managed provider (default claude)"),
-      permission_mode: z.enum(["default", "acceptEdits", "bypassPermissions"]).optional().describe("Worker permission mode; default is the user's setting"),
+      permission_mode: z.enum([...PERMISSION_MODES, "default", "acceptEdits", "bypassPermissions"]).optional().describe("Managed launch preset: read-only, workspace (default), trusted, full. Above Workspace requires developer approval of this exact spawn call. Legacy modes accept only default, acceptEdits, bypassPermissions."),
       model: z.string().optional().describe("Optional model identifier from list_models for the selected provider; omit to use provider settings"),
     },
     async ({ name, cwd, prompt, mode, provider, permission_mode, model }) => {
       if (!existsSync(cwd)) return err(`cwd does not exist: ${cwd}`);
       if (mode === 'managed' || (!mode && sessions)) {
         if (!sessions) return err('Managed session service is unavailable');
-        if (permission_mode) return err('Managed sessions use the service permission policy; omit permission_mode.');
-        try { return fmt(await sessions.create({ id: randomUUID(), provider: provider ?? 'claude', name, cwd, text: prompt, model })); }
+        if (permission_mode && !PERMISSION_MODES.includes(permission_mode as PermissionMode)) return err('Managed permission_mode must be read-only, workspace, trusted, or full');
+        try { return fmt(await sessions.create({ id: randomUUID(), provider: provider ?? 'claude', name, cwd, text: prompt, model, permission_mode: permission_mode as PermissionMode | undefined })); }
         catch (error) { return err(error instanceof Error ? error.message : String(error)); }
       }
+      if (permission_mode && PERMISSION_MODES.includes(permission_mode as PermissionMode)) return err('Launch presets require managed mode');
       if (provider === 'codex') return err('Codex requires managed mode');
       if (mode === "tab") {
         if (!existsSync(WARP_SPAWN)) return err(`warp-spawn not found at ${WARP_SPAWN}`);

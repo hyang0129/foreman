@@ -1,3 +1,4 @@
+import { permissionMode, toolDecision, type PermissionMode } from "./permission-policy.ts";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { query, type Options, type Query, type SDKUserMessage, type PermissionResult, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
@@ -36,22 +37,52 @@ export class ClaudeControl extends EventEmitter {
   private active?: Pending;
   private receipts = new Map<string, ClaudeReceipt>();
   private sentText = new Map<string, string>();
-  private approvals = new Map<string, { request: ClaudeApproval; resolve: (result: PermissionResult) => void; promise: Promise<PermissionResult> }>();
+  private approvals = new Map<string, { request: ClaudeApproval; approvedInput: Record<string, unknown>; resolve: (result: PermissionResult) => void; promise: Promise<PermissionResult> }>();
   readonly finished: Promise<void>;
+  private readonly policy: PermissionMode;
+  get permission_mode() { return this.policy; }
+  private cwd: string;
 
-  constructor(options: Pick<Options, "cwd" | "resume" | "model" | "maxBudgetUsd" | "maxTurns" | "tools" | "settingSources" | "settings" | "systemPrompt" | "persistSession" | "pathToClaudeCodeExecutable" | "mcpServers" | "allowedTools">,
+  constructor(options: Pick<Options, "cwd" | "resume" | "model" | "maxBudgetUsd" | "maxTurns" | "tools" | "settingSources" | "settings" | "systemPrompt" | "persistSession" | "pathToClaudeCodeExecutable" | "mcpServers" | "allowedTools"> & { permission_mode?: PermissionMode },
     factory: QueryFactory = query) {
     super();
+    this.policy = permissionMode(options.permission_mode);
+    this.cwd = options.cwd ?? process.cwd();
+    const { permission_mode: _policy, ...providerOptions } = options;
     // Defer startup so callers can subscribe before any process or error event.
     this.finished = Promise.resolve().then(async () => {
       if (this.isClosed()) return;
       try {
         this.stream = factory({ prompt: this.input.stream(), options: {
-          ...options, permissionMode: "default", includePartialMessages: true,
-          canUseTool: (tool, input, context) => this.requestApproval(tool, input, context),
+          ...providerOptions,
+          permissionMode: this.permission_mode === 'full' ? 'bypassPermissions' : this.permission_mode === 'workspace' ? 'default' : 'dontAsk',
+          allowDangerouslySkipPermissions: this.permission_mode === 'full',
+          includePartialMessages: true,
+          sandbox: { enabled: false }, // Foreman supplies the mandatory inherited command sandbox.
+          disallowedTools: ['Agent', 'ExitPlanMode', 'EnterWorktree'],
+          hooks: { PreToolUse: [{ hooks: [async (event) => {
+            if (event.hook_event_name !== 'PreToolUse') return {};
+            const decision = toolDecision(this.permission_mode, this.cwd, event.tool_name, event.tool_input as Record<string, any>);
+            return { hookSpecificOutput: { hookEventName: 'PreToolUse',
+              permissionDecision: decision.behavior === 'ask' ? 'ask' : decision.behavior,
+              permissionDecisionReason: decision.message,
+              ...(decision.behavior === 'allow' ? { updatedInput: decision.input } : {}),
+            } };
+          }] }] },
+          canUseTool: (tool, input, context) => {
+            if (this.state === 'closed' || this.state === 'failed' || context.signal.aborted) return Promise.resolve({ behavior: 'deny', message: 'Session is unavailable' });
+            const decision = toolDecision(this.permission_mode, this.cwd, tool, input);
+            if (decision.behavior === 'deny') return Promise.resolve({ behavior: 'deny', message: decision.message });
+            if (decision.behavior === 'allow') return Promise.resolve({ behavior: 'allow', updatedInput: decision.input });
+            return this.requestApproval(tool, input, context, decision.input);
+          },
         } });
         for await (const message of this.stream) {
-          if (message.type === "system" && message.subtype === "init") this.sessionId = message.session_id;
+          if (message.type === "system" && message.subtype === "init") {
+            const expected = this.permission_mode === 'full' ? 'bypassPermissions' : this.permission_mode === 'workspace' ? 'default' : 'dontAsk';
+            if (message.permissionMode !== expected) throw new Error('Claude did not apply the requested launch policy');
+            this.sessionId = message.session_id;
+          }
           this.emit("message", message);
           if (message.type === "result" && this.active) {
             const echoed = message.user_message_uuids ?? (message.user_message_uuid ? [message.user_message_uuid] : []);
@@ -112,13 +143,14 @@ export class ClaudeControl extends EventEmitter {
   respondApproval(id: string, decision: "allow" | "deny", updatedInput?: Record<string, unknown>): boolean {
     const approval = this.approvals.get(id);
     if (!approval) return false;
+    if (updatedInput && approval.request.tool !== 'AskUserQuestion') throw new Error('Approval cannot change the approved tool input or launch policy');
     approval.resolve(decision === "allow"
-      ? { behavior: "allow", updatedInput: updatedInput ?? approval.request.input }
+      ? { behavior: "allow", updatedInput: updatedInput ?? approval.approvedInput }
       : { behavior: "deny", message: "Denied by the user in Foreman" });
     return true;
   }
 
-  private requestApproval(tool: string, input: Record<string, unknown>, context: PermissionContext): Promise<PermissionResult> {
+  private requestApproval(tool: string, input: Record<string, unknown>, context: PermissionContext, approvedInput = input): Promise<PermissionResult> {
     if (this.state === "closed" || this.state === "failed" || context.signal.aborted)
       return Promise.resolve({ behavior: "deny", message: "Session is unavailable" });
     const id = context.requestId || context.toolUseID;
@@ -135,7 +167,7 @@ export class ClaudeControl extends EventEmitter {
     };
     const { signal, ...displayContext } = context;
     const request = { id, tool, input, reason: context.decisionReason, context: displayContext };
-    this.approvals.set(id, { request, resolve: finish, promise });
+    this.approvals.set(id, { request, approvedInput, resolve: finish, promise });
     context.signal.addEventListener("abort", abort, { once: true });
     this.setState("input-needed");
     this.emit("approval", request);

@@ -1,3 +1,4 @@
+import { permissionMode, protectedPath, type PermissionMode } from './permission-policy.ts';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, statSync, realpathSync, unlinkSync, rmdirSync } from 'node:fs';
@@ -13,7 +14,7 @@ export interface Receipt { id: string; status: 'queued' | 'running' | 'completed
 export interface History { id: string; role: 'user' | 'assistant' | 'system' | 'tool'; text: string; at: string; source?: Source }
 export interface Approval { id: string; kind: 'permission' | 'question' | 'unsupported'; tool: string; input: Record<string, any>; reason?: string; questions?: { id: string; question: string; options?: string[] }[] }
 export type SessionRow = Session & { managed: boolean; model?: string; capabilities: { message: boolean; interrupt: boolean; approvals: boolean }; control_reason?: string };
-interface RecordData { version: 1; creation: { id: string; provider: string; name: string; cwd: string; text: string; model?: string }; session: SessionRow; history: History[]; receipts: Receipt[] }
+interface RecordData { version: 1; creation: { id: string; provider: string; name: string; cwd: string; text: string; model?: string; permission_mode?: PermissionMode }; session: SessionRow; history: History[]; receipts: Receipt[] }
 export interface ProviderSetup {
   claude?: Pick<ConstructorParameters<typeof ClaudeControl>[0], 'mcpServers' | 'allowedTools' | 'systemPrompt'>;
   codexArgs?: string[];
@@ -69,6 +70,7 @@ export class SessionService extends EventEmitter {
       const data: RecordData = JSON.parse(readFileSync(join(this.directory, file), 'utf8'));
       if (data.version !== 1 || data.session.session_key !== `fm:${file.slice(0, -5)}`) throw new Error(`Invalid managed session file: ${file}`);
       for (const receipt of data.receipts) if (['queued', 'running'].includes(receipt.status)) { receipt.status = 'uncertain'; receipt.error = 'Foreman restarted; delivery cannot be confirmed. Message was not replayed.'; }
+      if (data.session.permission_mode === 'default') data.session.permission_mode = 'workspace';
       data.session.state = 'unknown'; data.session.alive = false;
       data.session.control_reason = 'Foreman restarted. History is retained; start a new session to continue safely.';
       this.records.set(data.session.session_key, data); this.save(data);
@@ -107,7 +109,7 @@ export class SessionService extends EventEmitter {
   }
   receipt(id: string, messageId: string) { const result = this.records.get(id)?.receipts.find((r) => r.id === messageId); if (!result) throw new Error('No such receipt'); return clone(result); }
   activeSource(id: string): Source { const runtime = this.runtime.get(id); return clone(this.records.get(id)?.receipts.find((r) => r.id === runtime?.active)?.source ?? 'user'); }
-  async create(input: { id: string; provider: 'claude' | 'codex'; name?: string; cwd: string; text: string; model?: string }) {
+  async create(input: { id: string; provider: 'claude' | 'codex'; name?: string; cwd: string; text: string; model?: string; permission_mode?: PermissionMode }) {
     if (this.closed) throw new Error('Session service is closed');
     const id = textValue(input.id, 'Creation id', 200);
     if (!['claude', 'codex'].includes(input.provider)) throw new Error('Unsupported provider');
@@ -116,12 +118,14 @@ export class SessionService extends EventEmitter {
     const cwd = realpathSync(cwdInput), text = textValue(input.text, 'Message', 64 * 1024);
     const name = input.name === undefined || input.name === '' ? `${input.provider} session` : textValue(input.name, 'Name', 200);
     const model = normalizeModel(input.model);
-    const creation = { id, provider: input.provider, name, cwd, text, ...(model ? { model } : {}) };
+    const policy = permissionMode(input.permission_mode);
+    if (protectedPath(cwd)) throw new Error('Project directory is on the deny list');
+    const creation = { id, provider: input.provider, name, cwd, text, ...(model ? { model } : {}), permission_mode: policy };
     const previous = [...this.records.values()].find((data) => data.creation.id === id);
-    if (previous) { if (JSON.stringify(previous.creation) !== JSON.stringify(creation)) throw new Error('Creation id was already used for different input'); return this.row(previous); }
+    if (previous) { if (JSON.stringify({ ...previous.creation, permission_mode: previous.creation.permission_mode ?? 'workspace' }) !== JSON.stringify(creation)) throw new Error('Creation id was already used for different input'); return this.row(previous); }
     if (this.records.size >= 500) throw new Error('Session limit reached');
     const key = `fm:${randomUUID()}`;
-    const session: SessionRow = { session_key: key, session_id: '', provider: input.provider, name, cwd, ...(model ? { model } : {}), state: 'working', reason: 'starting', kind: 'sdk', entrypoint: 'foreman', pid: null, alive: false, tracked: true, current_tool: null, active_subagents: 0, last_message: null, last_error: null, started_at: now(), updated_at: now(), ended_at: null, end_reason: null, permission_mode: 'default', bg_id: null, bg_state: null, bg_waiting_for: null, host: HOST, transcript_path: null, managed: true, capabilities: { message: false, interrupt: false, approvals: false } };
+    const session: SessionRow = { session_key: key, session_id: '', provider: input.provider, name, cwd, ...(model ? { model } : {}), state: 'working', reason: 'starting', kind: 'sdk', entrypoint: 'foreman', pid: null, alive: false, tracked: true, current_tool: null, active_subagents: 0, last_message: null, last_error: null, started_at: now(), updated_at: now(), ended_at: null, end_reason: null, permission_mode: policy, bg_id: null, bg_state: null, bg_waiting_for: null, host: HOST, transcript_path: null, managed: true, capabilities: { message: false, interrupt: false, approvals: false } };
     const receipt: Receipt = { id, status: 'queued', text, at: now(), source: 'user' };
     const data: RecordData = { version: 1, creation, session, receipts: [receipt], history: [{ id, role: 'user', text, at: receipt.at, source: 'user' }] };
     this.save(data); this.records.set(key, data);
@@ -147,7 +151,7 @@ export class SessionService extends EventEmitter {
       runtime.setup = await this.options.prepare?.(this.row(data));
       if (this.closed) { runtime.setup?.cleanup?.(); return; }
       if (data.session.provider === 'claude') {
-        const control = (this.options.claudeFactory ?? ((options) => new ClaudeControl(options)))({ cwd: data.session.cwd!, pathToClaudeCodeExecutable: CLAUDE_BIN, settingSources: ['user', 'project'], ...runtime.setup?.claude, ...(data.session.model ? { model: data.session.model } : {}) });
+        const control = (this.options.claudeFactory ?? ((options) => new ClaudeControl(options)))({ cwd: data.session.cwd!, pathToClaudeCodeExecutable: CLAUDE_BIN, settingSources: ['user', 'project'], ...runtime.setup?.claude, permission_mode: permissionMode(data.creation.permission_mode), ...(data.session.model ? { model: data.session.model } : {}) });
         runtime.claude = control;
         control.on('receipt', (receipt: ClaudeReceipt) => {
           const stored = data.receipts.find((r) => r.id === receipt.id); if (!stored || this.closed) return;
@@ -186,7 +190,7 @@ export class SessionService extends EventEmitter {
         });
         await control.connect();
         if (this.closed) { control.close(); return; }
-        const thread = await control.start(data.session.cwd!, { ...(data.session.model ? { model: data.session.model } : {}), ...(runtime.setup?.codexTools ? { dynamicTools: runtime.setup.codexTools.dynamicTools, ...(runtime.setup.codexTools.developerInstructions ? { developerInstructions: runtime.setup.codexTools.developerInstructions } : {}) } : {}) });
+        const thread = await control.start(data.session.cwd!, { ...(data.session.model ? { model: data.session.model } : {}), ...(runtime.setup?.codexTools ? { dynamicTools: runtime.setup.codexTools.dynamicTools, ...(runtime.setup.codexTools.developerInstructions ? { developerInstructions: runtime.setup.codexTools.developerInstructions } : {}) } : {}) }, permissionMode(data.creation.permission_mode));
         data.session.session_id = thread.id;
       }
       runtime.ready = true; data.session.alive = true; data.session.state = 'idle'; data.session.reason = null;

@@ -119,6 +119,10 @@ export class ProjectManager extends EventEmitter {
     const allow = () => ({ behavior: "allow" as const, updatedInput: input });
     const deny = (message: string) => ({ behavior: "deny" as const, message });
     const delegate = "Denied: the project manager does not touch code. Brief a session agent with spawn_session instead.";
+    // A model may propose a preset, but only the developer approves an elevated
+    // launch. Do not auto-allow this via the broad fleet-tool rule below.
+    if (name === 'mcp__fleet__spawn_session' && ['trusted', 'full'].includes(input.permission_mode))
+      return deny('Trusted and Full must be launched by the developer in the New session dialog. Propose the settings in your reply; you cannot grant an elevated policy.');
     if (name.startsWith("mcp__fleet__") || PEER_ALLOWED_TOOLS.includes(name) || ["ListAgents", "SendMessage", "WebFetch", "WebSearch", "TodoWrite", "TaskCreate", "TaskList", "TaskUpdate", "TaskGet"].includes(name)) return allow();
     if (name === "Read") {
       const p = expand(String(input.file_path ?? ""));

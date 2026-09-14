@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ClaudeControl } from "../server/claude-control.ts";
 
-function harness() {
+function harness(policy?: "read-only" | "workspace" | "trusted" | "full") {
   let opts: any;
   let input: AsyncIterator<any>;
   let wake: (() => void) | undefined;
@@ -17,7 +17,7 @@ function harness() {
       }
     }, close() { closed = true; wake?.(); }, async interrupt() {} };
   };
-  const control = new ClaudeControl({ cwd: "/tmp", tools: [] }, factory as any);
+  const control = new ClaudeControl({ cwd: "/tmp", tools: [], permission_mode: policy }, factory as any);
   return { control, options: () => opts, nextInput: () => input.next(), emit(message: any) { messages.push(message); wake?.(); } };
 }
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -47,7 +47,10 @@ test("approval waits for a matching response and never stores permanent permissi
   assert.equal(h.control.respondApproval("wrong", "allow"), false);
   assert.equal(h.control.pendingApprovals().length, 1);
   assert.equal(h.control.respondApproval("request", "allow"), true);
-  assert.deepEqual(await request, { behavior: "allow", updatedInput: { command: "pwd" } });
+  const allowed = await request;
+  assert.equal(allowed.behavior, "allow");
+  assert.match(allowed.updatedInput.command, /sandbox-exec/);
+  assert.match(allowed.updatedInput.command, /pwd/);
   assert.equal(h.control.state, "working");
   assert.equal(h.control.respondApproval("request", "allow"), false);
   h.control.close(); await h.control.finished;
@@ -94,4 +97,31 @@ test("does not acknowledge a result correlated to another prompt", async () => {
   h.emit({ type: "result", is_error: false, user_message_uuid: input.uuid }); await tick();
   assert.equal(receipt.status, "completed");
   h.control.close(); await h.control.finished;
+});
+
+for (const policy of ['read-only', 'workspace', 'trusted', 'full'] as const) {
+  test(`Claude ${policy} guards auto-approved tools and never widens its policy`, async () => {
+    const h = harness(policy); await tick();
+    try {
+      assert.equal(h.control.permission_mode, policy);
+      assert.equal(h.options().permissionMode, policy === 'full' ? 'bypassPermissions' : policy === 'workspace' ? 'default' : 'dontAsk');
+      const hook = h.options().hooks.PreToolUse[0].hooks[0];
+      const check = async (tool_name: string, tool_input: any) => (await hook({ hook_event_name: 'PreToolUse', tool_name, tool_input })).hookSpecificOutput;
+      assert.equal((await check('Read', { file_path: '/tmp/ordinary.txt' })).permissionDecision, 'allow');
+      for (const tool of ['Read', 'Write']) assert.equal((await check(tool, { file_path: '/tmp/.claude/settings.json' })).permissionDecision, 'deny');
+      assert.equal((await check('ExitPlanMode', {})).permissionDecision, 'deny');
+      const command = await check('Bash', { command: 'pwd' });
+      assert.equal(command.permissionDecision, policy === 'workspace' ? 'ask' : 'allow');
+      if (policy !== 'workspace') assert.match(command.updatedInput.command, /sandbox-exec/);
+      if (policy === 'read-only') assert.equal((await check('Write', { file_path: '/tmp/new.txt' })).permissionDecision, 'deny');
+      assert.equal(h.control.pendingApprovals().length, 0);
+    } finally { h.control.close(); await h.control.finished; }
+  });
+}
+
+test('Claude refuses an effective provider mode different from its launch policy', async () => {
+  const h = harness('workspace'); await tick();
+  h.emit({type:'system',subtype:'init',session_id:'test',permissionMode:'bypassPermissions'});
+  await h.control.finished;
+  assert.equal(h.control.state, 'failed');
 });
