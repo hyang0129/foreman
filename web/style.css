@@ -898,3 +898,6 @@ label textarea {
 .model-control label { font-size: 12px; }
 .model-control select { max-width: 100%; min-width: 140px; padding: 6px; }
 .model-control .field-hint { margin: 0; font-size: 12px; }
+
+#full-confirmation { color: var(--warning, #d3983c); }
+#confirm-full { width: auto; margin-right: .5rem; }

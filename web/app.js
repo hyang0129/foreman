@@ -1,3 +1,11 @@
+const POLICY_LABEL = { 'read-only': 'Read-only', workspace: 'Workspace', trusted: '⚠ Trusted', full: '⚠ Full · no permission prompts' };
+const POLICY_DESCRIPTION = {
+  'read-only': 'Inspect the project. No file changes, network, or commands with side effects. Secrets remain denied. Fixed for this session.',
+  workspace: 'Write in the project; ask for network or access outside it. Secrets remain denied. Fixed for this session.',
+  trusted: '⚠ Write in the project and run gh, git push/fetch/pull, and package installs without prompting. Other network operations and outside paths are refused. Secrets remain denied. Fixed for this session.',
+  full: '⚠ Commands, network, and files outside the project without permission prompts. Secrets and protected paths remain denied. Fixed for this session.',
+};
+const policyLabel = (session) => POLICY_LABEL[session.permission_mode] || (session.permission_mode === 'default' ? 'Workspace' : 'Policy unknown');
 // Authoritative JSON polling keeps authentication tokens out of URLs and reconnects simple.
 // Firebase browser-module setup: https://firebase.google.com/docs/web/alt-setup
 const $ = (selector) => document.querySelector(selector);
@@ -266,7 +274,7 @@ function renderRail() {
         node(
           "span",
           "session-meta",
-          `${s.provider === "codex" ? "Codex" : "Claude"} · ${s.managed ? "Managed" : "Monitoring"}${!host.online ? " · Last known" : ""}`,
+          `${s.provider === "codex" ? "Codex" : "Claude"} · ${s.managed ? `Managed · ${policyLabel(s)}` : "Monitoring"}${!host.online ? " · Last known" : ""}`,
         ),
       );
       row.addEventListener("click", () => selectSession(s.session_key));
@@ -347,7 +355,7 @@ function renderHeading() {
     ui.title.textContent = s.name || "Session";
     ui.provider.hidden = false;
     ui.provider.textContent = s.provider === "codex" ? "Codex" : "Claude";
-    ui.subtitle.textContent = `${LABEL[s.state] || s.state || "Unknown"}${!host.online ? " · Last known" : ""} · ${shortPath(s.cwd)}${s.managed ? ` · ${s.model || "Provider default"}` : " · Monitoring only"}`;
+    ui.subtitle.textContent = `${LABEL[s.state] || s.state || "Unknown"}${!host.online ? " · Last known" : ""} · ${shortPath(s.cwd)}${s.managed ? ` · ${s.model || "Provider default"} · ${policyLabel(s)}` : " · Monitoring only"}`;
   } else {
     ui.title.textContent = selected ? "Loading session…" : "Your session inbox";
     ui.provider.hidden = true;
@@ -861,11 +869,21 @@ $("#pm-model").addEventListener("change", async () => {
   }
 });
 $("#new-provider").addEventListener("change", loadNewModels);
+function updateNewPolicy() {
+  const mode = $("#new-policy").value;
+  $("#new-policy-hint").textContent = POLICY_DESCRIPTION[mode];
+  $("#full-confirmation").hidden = mode !== 'full';
+  $("#confirm-full").required = mode === 'full';
+  $("#confirm-full").checked = false;
+}
+$("#new-policy").addEventListener("change", updateNewPolicy);
 function openNew() {
   if (!authorized || !host.online) return;
   if (!$("#new-cwd").value && detail?.session?.cwd)
     $("#new-cwd").value = detail.session.cwd;
   $("#new-error").hidden = true;
+  $("#new-policy").value = "workspace";
+  updateNewPolicy();
   ui.dialog.showModal();
   void loadNewModels();
   $("#new-name").focus();
@@ -878,6 +896,7 @@ ui.newForm.addEventListener("submit", async (event) => {
   if (creating || !host.online || !ui.newForm.reportValidity()) return;
   const values = {
     provider: $("#new-provider").value,
+    permission_mode: $("#new-policy").value,
     ...($("#new-model").value ? { model: $("#new-model").value } : {}),
     name: $("#new-name").value.trim(),
     cwd: $("#new-cwd").value.trim(),

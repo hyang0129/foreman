@@ -32,7 +32,7 @@ Restart interrupts managed sessions and active PM work. The LaunchAgent restarts
 
 ## Developer workflow
 
-1. Open Foreman and choose **New session**. Pick Claude or Codex, a model (or provider default), a name, an existing absolute project directory, and the first task.
+1. Open Foreman and choose **New session**. Pick Claude or Codex, a model (or provider default), a name, an existing absolute project directory, a permission policy (Workspace by default), and the first task. Trusted and Full are visibly marked; Full requires confirmation. See [Session permissions](docs/SESSION_PERMISSIONS.md) for the fixed launch grants and provider mapping.
 2. Open the session conversation. Follow-up messages queue while it works; saved receipts distinguish queued, running, completed, failed, and uncertain delivery.
 3. Answer inline tool approvals or supported questions. Permission responses apply once. **Interrupt** also cancels queued follow-ups.
 4. Ask a managed session to use Foreman peer tools: `list_sessions`, `session_state`, `session_tail`, `send_message`, `request_update`, and `message_status`. Sender identity is supplied by Foreman. An update is recorded in the target conversation; read it after completion.
@@ -46,7 +46,7 @@ State lives under `~/.foreman` (override `FOREMAN_HOME`): managed snapshots/rece
 
 After daemon restart, unfinished receipts become uncertain and recovered sessions become read-only. Nothing is automatically replayed or resumed. Start a new session to continue. The legacy PM conversation has separate history and does not yet share managed message deduplication. Arbitrary takeover of a live terminal/desktop, multiple users/hosts, and background push notifications are deferred.
 
-The PM is a coordinator: specific existing document reads and memory reads only; no Bash, Glob, Grep, code, or subagent tools. Memory writes resolve parent symlinks and stay in its memory directory. It cannot directly read Foreman configuration. Sessions perform implementation work through their provider's normal permission flow.
+The PM is a coordinator: specific existing document reads and memory reads only; no Bash, Glob, Grep, code, or subagent tools. Memory writes resolve parent symlinks and stay in its memory directory. It cannot directly read Foreman configuration. Managed sessions perform implementation work under their immutable launch preset and the mandatory protected-path guard.
 
 ## Verify
 
