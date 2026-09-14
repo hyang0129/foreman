@@ -41,3 +41,20 @@ test('Claude evidence must correlate the tool result to the requested operation'
   assertRefused({ events }, 'cat readable.txt');
   assert.throws(() => assertRefused({ events }, 'cat .env'), /No boundary refusal/);
 });
+
+test('TLS success requires the actual correlated shell exit, including Claude', async () => {
+  const { assertShellExit } = await import('./live/harness.mjs');
+  const command = 'git fetch origin main';
+  const hook = { kind: 'hook', tool: 'Bash', input: { command }, exitMarker: 'FOREMAN_EXIT_fixture=' };
+  const use = { type: 'tool_use', name: 'Bash', id: 'fetch', input: { command } };
+  const result = { type: 'tool_result', tool_use_id: 'fetch', is_error: false, content: '\nFOREMAN_EXIT_fixture=0\n' };
+  assertShellExit({ events: [hook, use, result] }, command);
+  const host = { kind: 'command_result', input: { command }, result: { exit_code: 0 } };
+  assertShellExit({ events: [host] }, command);
+  for (const events of [[], [use, result], [hook, result], [hook, use, { ...result, content: 'looks successful' }],
+    [hook, use, { ...result, content: '\nFOREMAN_EXIT_fixture=128\n' }],
+    [hook, use, { ...result, tool_use_id: 'unrelated' }],
+    [{ ...host, result: { exit_code: null } }], [{ ...host, result: { exit_code: 128 } }],
+    [{ ...host, input: { command: 'git status' } }],
+  ]) assert.throws(() => assertShellExit({ events }, command), /shell exit/);
+});

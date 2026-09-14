@@ -74,8 +74,9 @@ The command sandbox is a kernel boundary inherited by child processes. It applie
 to indirect reads, scripts, interpreters, redirections, and symlink aliases, not
 just paths mentioned in a command string. Native file tools check both lexical
 and canonical paths, including the nearest existing parent for new files and
-dangling symlinks. Read-only/Trusted reject paths escaping the project; Workspace
-requires approval; Full permits outside paths but never protected targets.
+dangling symlinks. Read-only/Trusted reject paths escaping the project except the
+public system trust anchors below; Workspace requires approval for other outside paths; Full
+permits outside paths but never protected targets.
 
 Protected families are `.env`/`.env.*`/`*.env`, `secret(s)` and `credential(s)`
 files/directories (including extensions), private-key files (`pem`, `key`, `p12`,
@@ -84,6 +85,17 @@ files/directories (including extensions), private-key files (`pem`, `key`, `p12`
 `~/.foreman/cloud.json` or configured `FOREMAN_HOME`) and private policy snapshots
 are protected as well. They cannot be read or written through either file tools
 or command execution, even with Full or an approved Workspace escape.
+
+The PEM read rule has one exception, matched by anchored absolute path:
+`/etc/ssl/cert.pem`, `/etc/ssl/certs/` and its descendants, and their
+`/private/etc/...` equivalents. These are public, OS-owned TLS trust anchors,
+not user credentials. Both native path checks (lexical and canonical) and the
+Seatbelt policy permit their reads and explicitly forbid their writes at every
+preset, including Full and approved Workspace access. Only the PEM read rule is
+narrowed: `.key`/`.p12`/`.pfx`, credential names such as `secrets.pem`, and all
+other protected families still apply within the trust directory. A PEM in a
+project, `.foreman-tmp`, another temporary directory, or a home directory remains
+protected; a path merely ending in `etc/ssl/cert.pem` acquires no exception.
 
 System runtime directories remain readable so binaries and libraries can run;
 these are not writable project roots. A simple Git command can consume Git
@@ -106,7 +118,10 @@ Trusted's agreed network operations are:
 - `git push`, `git fetch`, and `git pull` (without executable override flags).
 - `npm`, `pnpm`, or `yarn` install/ci/add. Package scripts inherit the same project
   and deny boundaries. Temporary files and package caches use `.foreman-tmp/`
-  inside the project rather than gaining an outside write grant.
+  inside the project rather than gaining an outside write grant. Trusted also sets
+  `xcrun_db` to `.foreman-tmp/xcrun_db`: Apple's Git shim ignores the redirected
+  `TMPDIR` for this cache on the verified host. The per-user OS temporary directory
+  retains its existing restrictions.
 
 The parser accepts a single command with quoted arguments. Shell composition,
 substitution, environment assignments, aliases, `gh auth`, `gh api`, extensions,
@@ -128,8 +143,12 @@ temporary fixtures. `tests/policy-commands.test.ts` executes commands at every
 preset, verifies one-time approvals do not persist, checks networking and process
 ownership, and installs an empty temporary npm fixture. Provider adapter tests
 check hooks, flags, denial at Full, effective-mode rejection, and host approval
-routing. Service/tool tests check defaults, persistence, deduplication, reporting,
-and inability to self-escalate. Playwright checks Full confirmation, default reset,
+routing. `tests/system-trust.test.ts` verifies private-material denial in project,
+temporary, and home-like fixtures at every preset, including approved Workspace
+shell access, plus actual CA reads and kernel-reported write denials. The kernel
+check has an unsandboxed control so OS file ownership cannot masquerade as policy
+enforcement; no system trust data is opened for writing. Service/tool tests check
+defaults, persistence, deduplication, reporting, and inability to self-escalate. Playwright checks Full confirmation, default reset,
 and the running-policy marker.
 
 Run all five project checks: `npm test`, `npm run typecheck`,
@@ -211,3 +230,18 @@ reported policy, and a real server restart including a legacy row. It proves onl
 the operations actually observed on the installed providers and host, not universal
 model behavior or resistance to a compromised provider binary. See
 [the recorded run](LIVE_POLICY_RESULTS.md) for results and remaining gaps.
+
+### Focused Trusted Git TLS regression
+
+```sh
+FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 node --experimental-strip-types --test tests/live/git-fetch.live.mjs
+```
+
+This uses the same isolated harness for Claude Trusted and Codex Trusted, without
+restarting any service. It checks real HTTPS `git fetch`, `git pull --ff-only`, and
+`gh issue view`, with no approvals. Fetch must return exit 0, populate `FETCH_HEAD`,
+and create the project-local xcrun cache. Pull uses a disposable sparse checkout
+to avoid replacing the harness fixtures. A test-only Claude observer reports the
+actual guarded shell exit and returns the same status to the SDK; Codex supplies
+its command exit directly. Missing exits, unrelated successes, and model abstention
+fail. The regular live matrix's fetch row uses the same exit-status assertion.

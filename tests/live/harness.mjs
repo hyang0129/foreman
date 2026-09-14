@@ -157,9 +157,9 @@ export class Harness {
     }
     return { events: this.events.slice(offset).filter((e) => e.cwd === row.cwd), approvals };
   }
-  shell(row, command, access = false) {
+  shell(row, command, access = false, yieldMs = 1000) {
     return row.provider === 'codex'
-      ? `Call foreman_exec with ${JSON.stringify({ command, yield_ms: 1000, ...(access ? { request_access: true } : {}) })}.`
+      ? `Call foreman_exec with ${JSON.stringify({ command, yield_ms: yieldMs, ...(access ? { request_access: true } : {}) })}.`
       : `Call Bash with ${JSON.stringify({ command })}.`;
   }
   async stop() {
@@ -212,6 +212,18 @@ export function assertNetworkFailure(probe, command) {
     && e.result.hookSpecificOutput?.updatedInput?.command?.includes('(deny network*)'));
   const claude = wrapped && claudeResults(probe, command).some((e) => e.is_error && /curl: \(7\)/.test(claudeOutput(e)));
   assert.ok(host || claude, `No correlated guarded curl exit 7: ${JSON.stringify(probe)}`);
+}
+export function assertShellExit(probe, command, expected = 0) {
+  const host = commandResults(probe, command);
+  const markers = probe.events.filter((e) => e.kind === 'hook' && e.tool === 'Bash'
+    && e.input?.command === command && e.exitMarker).map((e) => e.exitMarker);
+  const statuses = [...host.filter((r) => r.exit_code !== null).map((r) => r.exit_code)];
+  for (const result of claudeResults(probe, command)) for (const marker of markers) {
+    const match = claudeOutput(result).match(new RegExp(`(?:^|\\n)${marker}([0-9]+)(?:\\n|$)`));
+    if (match) statuses.push(Number(match[1]));
+  }
+  assert.ok(statuses.length > 0, `No observed shell exit for ${command}: ${JSON.stringify(probe)}`);
+  assert.ok(statuses.every((status) => status === expected), `Unexpected shell exit for ${command}: ${JSON.stringify(statuses)}`);
 }
 export function assertSuccess(probe, command, token) {
   const host = commandResults(probe, command).some((r) => r.exit_code === 0 && (!token || r.output.includes(token)));

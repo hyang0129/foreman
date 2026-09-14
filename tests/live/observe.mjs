@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { SessionService } from '../../server/session-service.ts';
 import { bindPeerTools } from '../../server/peer-tools.ts';
@@ -31,7 +32,13 @@ SessionService.prototype.launch = async function (data, runtime) {
       const opts = params.options;
       for (const matcher of opts.hooks.PreToolUse) matcher.hooks = matcher.hooks.map((hook) => async (...args) => {
         const result = await hook(...args);
-        record({ cwd, kind: 'hook', tool: args[0].tool_name, input: args[0].tool_input, result });
+        // Capture the actual guarded shell's status for TLS compatibility probes.
+        // The audited command/profile stays intact; the observer only reports its
+        // exit and returns that same status to the SDK.
+        const updated = result.hookSpecificOutput?.updatedInput;
+        const exitMarker = args[0].tool_name === 'Bash' && updated?.command ? `FOREMAN_EXIT_${randomUUID()}=` : undefined;
+        if (exitMarker) updated.command += `; foreman_test_status=$?; printf '\\n${exitMarker}%s\\n' "$foreman_test_status"; exit "$foreman_test_status"`;
+        record({ cwd, kind: 'hook', tool: args[0].tool_name, input: args[0].tool_input, result, exitMarker });
         return result;
       });
       return query(params);

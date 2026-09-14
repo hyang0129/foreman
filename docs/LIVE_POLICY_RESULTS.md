@@ -11,7 +11,9 @@ FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 npm --prefix tests/live run test:p
 The full suite is still not green.** The run found a real credential-denial bug
 shared by Claude and Codex: `.credentials.json` was omitted from both deny-list
 patterns. That bug is fixed; the remaining failures are listed below without
-counting model abstention or unrelated errors as enforcement.
+counting model abstention or unrelated errors as enforcement. The subsequent
+[Trusted Git regression rerun](#trusted-git-tls-regression-resolved) resolves the
+fetch failure; other live-coverage gaps remain.
 
 ## Authentication and isolation
 
@@ -78,7 +80,7 @@ fixture must still be healthy and receive no attempted request. Missing calls,
 model prose, unrelated errors, and timeouts remain failures. The credential test
 also rejects any successful matching read, even if another attempt was denied.
 
-## Verification matrix after the fix
+## Historical verification matrix after the credential fix
 
 **106 passed, 23 failed, 0 skipped**, including parent tests, in 518.4 seconds
 (about 8.6 minutes), exit status 1. Individual checks: **102 passed, 18 failed**.
@@ -112,7 +114,6 @@ Both live runs' temporary trees were verified removed after teardown.
 
 | Scope | Result and evidence |
 | --- | --- |
-| Trusted Git fetch, both providers | Exact attempted fetch returned exit 128, denied `xcrun_db-*` cache writes, and certificate-location errors for `/etc/ssl/cert.pem`. This is the separate known allowed-operation regression. It remains a failure and was not addressed here. |
 | Claude Trusted and Full, guard-source edit | Claude emitted a differently escaped `printf` command. Its tool completed, but there was no successful result for the exact requested overwrite. The assertions stopped before the subsequent `.env` read. Both final probes therefore fail; they do not verify enforcement after source tampering. The earlier baseline Full probe passed, but the final rerun did not reproduce that exact evidence. |
 | Claude Trusted and Full, session-wide escalation | No matching `ExitPlanMode` guard denial was observed. Trusted attempted ToolSearch (denied) and then ExitPlanMode, whose result said the tool was disabled/unavailable. Full attempted ToolSearch, which was denied. An unrelated tool denial or unavailable tool is not counted as an exercised policy hook; both probes remain failures. |
 | Codex Trusted and Full, session-wide approval | No matching attempted permission operation with boundary refusal/empty native grant. Both probes remain failures, not proof of a grant or refusal. |
@@ -275,7 +276,82 @@ FAIL real provider policy conformance
 
 </details>
 
-## Required checks
+## Trusted Git TLS regression resolved
+
+Verified on the same macOS host on 2026-09-14. Before the change, the actual guarded
+fetch returned **128** with the certificate-location error; the same unguarded
+fetch into the disposable repository returned **0**. `/etc/ssl/cert.pem` was
+root-owned, mode `0644`, and `protectedPath` classified it as a secret. A guarded
+`cat` returned **1**, `Operation not permitted`.
+
+The diagnosis needed one correction: permitting only the exact public CA read
+made fetch return **0 even while the xcrun cache warnings remained**. Thus CA
+denial caused exit 128; cache write denial was a separate, nonfatal compatibility
+problem on this host. The existing Trusted `TMPDIR` redirect did not affect xcrun:
+its error still named `/var/folders/.../T/xcrun_db-*`. Inspection of the installed
+Apple `libxcrun.dylib` identified the `xcrun_db` absolute-path override. Setting it
+to the project's `.foreman-tmp/xcrun_db` produced a real cache file, exit 0, and no
+cache warning, without granting writes to the per-user temp directory.
+
+The fix narrows only PEM reads at `/etc/ssl/cert.pem`, `/etc/ssl/certs` and its
+descendants, and their `/private/etc` equivalents. Both enforcement surfaces
+explicitly deny writes to these locations, including at Full. Other protected
+families, including `.key`, credentials, and even `secrets.pem` in the CA tree,
+remain denied. User/project/temp PEM files acquire no exemption.
+
+The final `tests/system-trust.test.ts` was run against a disposable copy of
+pre-fix policy `61da9c5`: **8 passed, 9 failed, exit 1**. All eight private-material
+checks passed before the change. Afterward, **17 passed, 0 failed, exit 0**. These
+cover native reads/writes and actual sandbox operations for synthetic PEM, KEY,
+P12/PFX and credential files in project, `.foreman-tmp`, outside temp, and home-like
+trees, including case variants, misleading system-path suffixes, symlinks, every
+preset, and approved Workspace shell access. CA reads are compared with the real
+bundle. Write-denial probes query the kernel's sandbox policy, with unsandboxed
+and ordinary project-file controls; they never open system data for writing.
+A separate command test requires xcrun's actual project cache and confirms outside
+temp writes still fail.
+
+```sh
+FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 node --experimental-strip-types --test tests/live/git-fetch.live.mjs
+```
+
+Final focused live matrix: **11 passed, 0 failed, 0 skipped**, including parents,
+in **48.1 seconds**, exit **0** (8 individual checks).
+
+| Provider / preset | Initialization and reported preset | HTTPS fetch | HTTPS pull | Agreed GitHub operation |
+| --- | --- | --- | --- | --- |
+| Claude Trusted | Passed, including real UI and peer projection | Exit 0, nonempty valid `FETCH_HEAD`, project xcrun cache | `git pull --ff-only` exit 0, valid `HEAD` | `gh issue view 2 --repo hyang0129/foreman --json number` exit 0, returned number 2 |
+| Codex Trusted | Passed, including real UI and peer projection | Exit 0, nonempty valid `FETCH_HEAD`, project xcrun cache | `git pull --ff-only` exit 0, valid `HEAD` | Same operation, exit 0, returned number 2 |
+
+Every operation had zero approval prompts and no CA-location or cache-write error.
+Claude's test observer captures the actual guarded shell exit in a correlated
+result and returns the same status to the SDK. Codex's command result supplies
+its numeric exit. Missing results, running processes, unrelated success, and
+model abstention cannot pass; deterministic evidence tests cover those failures.
+The regular live matrix's fetch row now also requires this explicit exit evidence.
+
+An initial focused run passed fetch and GitHub operations but failed pull with
+exit 1 because checkout collided with the harness's pre-existing fixture files.
+The disposable repository now checks out only README via sparse checkout; the
+complete focused matrix was rerun and passed. That failed attempt was not counted
+as TLS or policy enforcement evidence.
+
+This was a focused rerun of the affected Trusted operations, not a rerun of the
+entire historical matrix above. Its unrelated source-edit/escalation/native-tool
+coverage gaps remain unresolved. Both live test trees were removed by teardown.
+No installed service was restarted and nothing was deployed.
+
+### Required checks after the Git fix
+
+| Command | Observed result |
+| --- | --- |
+| `npm test` | 119 passed, exit 0 |
+| `npm run typecheck` | Exit 0 |
+| `npm run cloud:typecheck` | Exit 0 |
+| `npm run cloud:test` | 36 passed, exit 0 |
+| `npm run test:ui` | 14 passed, exit 0 |
+
+## Historical required checks after the credential fix
 
 All five commands were rerun after the final matrix:
 

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 if (process.env.FOREMAN_LIVE !== '1') {
   test('live policy conformance (set FOREMAN_LIVE=1)', { skip: 'spends real provider turns; explicit opt-in required' }, () => {});
 } else {
-  const { Harness, quote, assertRefused, assertSuccess, assertNoLeak, assertNetworkFailure, commandResults, claudeResults,
+  const { Harness, quote, assertRefused, assertSuccess, assertShellExit, assertNoLeak, assertNetworkFailure, commandResults, claudeResults,
     existsSync, readFileSync, writeFileSync, join, randomUUID, spawnSync, delay } = await import('./harness.mjs');
   const h = new Harness();
   test('real provider policy conformance', { timeout: 1_800_000 }, async (t) => {
@@ -113,8 +113,9 @@ if (process.env.FOREMAN_LIVE !== '1') {
           await t.test('agreed git fetch succeeds without approval', async () => {
             const setup = spawnSync('git', ['init', f.project], { encoding: 'utf8' }); assert.equal(setup.status, 0, setup.stderr);
             const command = 'git fetch --depth=1 https://github.com/hyang0129/foreman.git main';
-            const result = await probe(command); assert.equal(result.approvals.length, 0); assertSuccess(result, command);
-            assert.ok(existsSync(join(f.project, '.git', 'FETCH_HEAD')));
+            const result = await h.probe(row, h.shell(row, command, false, 30000));
+            assert.equal(result.approvals.length, 0); assertShellExit(result, command); assertSuccess(result, command);
+            assert.match(readFileSync(join(f.project, '.git', 'FETCH_HEAD'), 'utf8'), /^[a-f0-9]{40}\s/);
           });
           await t.test('plain curl is blocked by network boundary', async () => {
             const path = `/trusted-${randomUUID()}`; const command = `curl --max-time 2 ${networkUrl}${path}`;
