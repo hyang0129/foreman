@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ClaudeControl } from "../server/claude-control.ts";
 
-function harness(policy?: "read-only" | "workspace" | "trusted" | "full") {
+function harness(policy?: "native" | "bypass") {
   let opts: any;
   let input: AsyncIterator<any>;
   let wake: (() => void) | undefined;
@@ -49,8 +49,7 @@ test("approval waits for a matching response and never stores permanent permissi
   assert.equal(h.control.respondApproval("request", "allow"), true);
   const allowed = await request;
   assert.equal(allowed.behavior, "allow");
-  assert.match(allowed.updatedInput.command, /sandbox-exec/);
-  assert.match(allowed.updatedInput.command, /pwd/);
+  assert.deepEqual(allowed.updatedInput, {command: "pwd"});
   assert.equal(h.control.state, "working");
   assert.equal(h.control.respondApproval("request", "allow"), false);
   h.control.close(); await h.control.finished;
@@ -99,57 +98,70 @@ test("does not acknowledge a result correlated to another prompt", async () => {
   h.control.close(); await h.control.finished;
 });
 
-for (const policy of ['read-only', 'workspace', 'trusted', 'full'] as const) {
-  test(`Claude ${policy} guards auto-approved tools and never widens its policy`, async () => {
+for (const policy of ['native', 'bypass'] as const) {
+  test(`Claude ${policy} uses provider permissions without a custom guard`, async () => {
     const h = harness(policy); await tick();
     try {
       assert.equal(h.control.permission_mode, policy);
-      assert.equal(h.options().permissionMode, policy === 'full' ? 'bypassPermissions' : policy === 'workspace' ? 'default' : 'dontAsk');
-      const hook = h.options().hooks.PreToolUse[0].hooks[0];
-      const check = async (tool_name: string, tool_input: any) => (await hook({ hook_event_name: 'PreToolUse', tool_name, tool_input })).hookSpecificOutput;
-      assert.equal((await check('Read', { file_path: '/tmp/ordinary.txt' })).permissionDecision, 'allow');
-      for (const tool of ['Read', 'Write']) assert.equal((await check(tool, { file_path: '/tmp/.claude/settings.json' })).permissionDecision, 'deny');
-      assert.equal((await check('ExitPlanMode', {})).permissionDecision, 'deny');
-      const command = await check('Bash', { command: 'pwd' });
-      assert.equal(command.permissionDecision, policy === 'workspace' ? 'ask' : 'allow');
-      if (policy !== 'workspace') assert.match(command.updatedInput.command, /sandbox-exec/);
-      if (policy === 'read-only') assert.equal((await check('Write', { file_path: '/tmp/new.txt' })).permissionDecision, 'deny');
-      assert.equal(h.control.pendingApprovals().length, 0);
+      assert.equal(h.options().permissionMode, policy === 'bypass' ? 'bypassPermissions' : 'default');
+      assert.equal(h.options().allowDangerouslySkipPermissions, policy === 'bypass');
+      assert.deepEqual(h.options().sandbox, policy === 'bypass' ? {enabled:false} : undefined);
+      assert.equal(h.options().hooks, undefined);
+      assert.equal(h.options().disallowedTools, undefined);
     } finally { h.control.close(); await h.control.finished; }
   });
 }
 
 test('Claude refuses an effective provider mode different from its launch policy', {timeout:1000}, async (t) => {
-  const h = harness('workspace'); await tick();
+  const h = harness('native'); await tick();
   t.after(() => h.control.close());
   h.emit({type:'system',subtype:'init',session_id:'test',permissionMode:'bypassPermissions'});
   await h.control.finished;
   assert.equal(h.control.state, 'failed');
 });
 
-test('approval responses cannot swap guarded Bash input for raw commands', async (t) => {
+test('approval responses cannot replace the pending command', async (t) => {
   const h = harness(); t.after(() => h.control.close()); await tick();
   const pending = h.options().canUseTool('Bash', {command:'pwd'}, {signal:new AbortController().signal,toolUseID:'immutable'});
   assert.throws(() => h.control.respondApproval('immutable','allow',{command:'touch /tmp/swapped'}), /cannot change/);
   assert.equal(h.control.pendingApprovals().length, 1);
   h.control.respondApproval('immutable','allow');
-  assert.match((await pending).updatedInput.command, /sandbox-exec/);
+  assert.deepEqual((await pending).updatedInput, {command:'pwd'});
 });
 
-test('Claude Workspace escape is explicit, described, and effective only after exact approval', {timeout:5000}, async (t) => {
-  const {mkdtempSync,mkdirSync,existsSync,rmSync} = await import('node:fs');
-  const {tmpdir} = await import('node:os'); const {join} = await import('node:path');
-  const {spawnSync} = await import('node:child_process');
-  const dir=mkdtempSync(join(tmpdir(),'foreman-claude-grant-')), project=join(dir,'project');mkdirSync(project);
-  const h=harness('workspace'); (h.control as any).cwd=project;
-  t.after(()=>{h.control.close();rmSync(dir,{recursive:true,force:true});});await tick();
-  const target=join(dir,'outside');
-  const pending=h.options().canUseTool('Bash',{command:`touch '${target}'`,dangerouslyDisableSandbox:true},{signal:new AbortController().signal,toolUseID:'escape'});
-  assert.equal(existsSync(target),false);
-  const request=h.control.pendingApprovals()[0];assert.match(request.reason!,/outside-project read\/write/);
-  assert.match(String(request.input.requested_access),/Outside-project/);
-  h.control.respondApproval('escape','allow');
-  const granted=await pending;
-  assert.equal(spawnSync('/bin/sh',['-c',granted.updatedInput.command]).status,0);
-  assert.equal(existsSync(target),true);
+test('approval input is a snapshot and interruption cancels it', async (t) => {
+  const h = harness(); t.after(() => h.control.close()); await tick();
+  const input = {command:'pwd'};
+  const pending = h.options().canUseTool('Bash', input, {signal:new AbortController().signal,toolUseID:'snapshot'});
+  input.command = 'changed';
+  h.control.pendingApprovals()[0].input.command = 'changed again';
+  h.control.respondApproval('snapshot', 'allow');
+  assert.deepEqual((await pending).updatedInput, {command:'pwd'});
+  const next = h.options().canUseTool('Bash', {command:'ls'}, {signal:new AbortController().signal,toolUseID:'cancel'});
+  await h.control.interrupt();
+  assert.equal((await next).behavior, 'deny');
+  assert.equal(h.control.pendingApprovals().length, 0);
+  assert.equal(h.control.respondApproval('cancel', 'allow'), false);
+});
+
+test('reused approval id cannot change the operation awaiting approval', async (t) => {
+  const h = harness(); t.after(() => h.control.close()); await tick();
+  const context = {signal:new AbortController().signal,toolUseID:'same'};
+  const original = h.options().canUseTool('Bash', {command:'pwd'}, context);
+  const changed = await h.options().canUseTool('Bash', {command:'rm file'}, context);
+  assert.equal(changed.behavior, 'deny');
+  h.control.respondApproval('same', 'allow');
+  assert.deepEqual((await original).updatedInput, {command:'pwd'});
+});
+
+test('Bypass task questions still require an answer and completed turns cancel pending requests', async (t) => {
+  const h = harness('bypass'); t.after(() => h.control.close()); await tick();
+  h.control.send('Ask me a question');
+  const pending = h.options().canUseTool('AskUserQuestion', {questions:[{question:'Which project?'}]},
+    {signal:new AbortController().signal,toolUseID:'question'});
+  assert.equal(h.control.pendingApprovals()[0].tool, 'AskUserQuestion');
+  h.emit({type:'result',is_error:false}); await tick();
+  assert.equal((await pending).behavior,'deny');
+  assert.equal(h.control.pendingApprovals().length,0);
+  assert.equal(h.control.respondApproval('question','allow',{answers:{'Which project?':'A'}}),false);
 });

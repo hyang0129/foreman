@@ -1,4 +1,4 @@
-import { permissionMode, protectedPath, type PermissionMode } from './permission-policy.ts';
+import { permissionMode, type PermissionMode } from './permission-policy.ts';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, statSync, realpathSync, unlinkSync, rmdirSync } from 'node:fs';
@@ -70,7 +70,6 @@ export class SessionService extends EventEmitter {
       const data: RecordData = JSON.parse(readFileSync(join(this.directory, file), 'utf8'));
       if (data.version !== 1 || data.session.session_key !== `fm:${file.slice(0, -5)}`) throw new Error(`Invalid managed session file: ${file}`);
       for (const receipt of data.receipts) if (['queued', 'running'].includes(receipt.status)) { receipt.status = 'uncertain'; receipt.error = 'Foreman restarted; delivery cannot be confirmed. Message was not replayed.'; }
-      if (data.session.permission_mode === 'default') data.session.permission_mode = 'workspace';
       data.session.state = 'unknown'; data.session.alive = false;
       data.session.control_reason = 'Foreman restarted. History is retained; start a new session to continue safely.';
       this.records.set(data.session.session_key, data); this.save(data);
@@ -119,10 +118,9 @@ export class SessionService extends EventEmitter {
     const name = input.name === undefined || input.name === '' ? `${input.provider} session` : textValue(input.name, 'Name', 200);
     const model = normalizeModel(input.model);
     const policy = permissionMode(input.permission_mode);
-    if (protectedPath(cwd)) throw new Error('Project directory is on the deny list');
     const creation = { id, provider: input.provider, name, cwd, text, ...(model ? { model } : {}), permission_mode: policy };
     const previous = [...this.records.values()].find((data) => data.creation.id === id);
-    if (previous) { if (JSON.stringify({ ...previous.creation, permission_mode: previous.creation.permission_mode ?? 'workspace' }) !== JSON.stringify(creation)) throw new Error('Creation id was already used for different input'); return this.row(previous); }
+    if (previous) { if (JSON.stringify(previous.creation) !== JSON.stringify(creation)) throw new Error('Creation id was already used for different input'); return this.row(previous); }
     if (this.records.size >= 500) throw new Error('Session limit reached');
     const key = `fm:${randomUUID()}`;
     const session: SessionRow = { session_key: key, session_id: '', provider: input.provider, name, cwd, ...(model ? { model } : {}), state: 'working', reason: 'starting', kind: 'sdk', entrypoint: 'foreman', pid: null, alive: false, tracked: true, current_tool: null, active_subagents: 0, last_message: null, last_error: null, started_at: now(), updated_at: now(), ended_at: null, end_reason: null, permission_mode: policy, bg_id: null, bg_state: null, bg_waiting_for: null, host: HOST, transcript_path: null, managed: true, capabilities: { message: false, interrupt: false, approvals: false } };

@@ -38,7 +38,7 @@ test('local daemon shuts down on SIGTERM with an open SSE client and no provider
     assert.match(login.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
     assert.equal((await fetch(`${origin}/api/host`, {headers:{cookie:login.headers.get('set-cookie').split(';')[0]}})).status,200);
     assert.equal((await fetch(`${origin}/api/sessions`, {headers:{authorization:'Bearer wrong'}})).status,401);
-    assert.equal((await fetch(`${origin}/api/sessions`, {method:'POST',body:JSON.stringify({permission_mode:'full'})})).status,401);
+    assert.equal((await fetch(`${origin}/api/sessions`, {method:'POST',body:JSON.stringify({permission_mode:'bypass'})})).status,401);
     assert.equal((await fetch(`${origin}/api/host`, {headers}).then((r) => r.json())).online, true);
     assert.equal((await fetch(`${origin}/api/sessions`, { headers: { Origin: 'https://attacker.example' } })).status, 403);
     const wrongHostStatus = await new Promise((resolve, reject) => {

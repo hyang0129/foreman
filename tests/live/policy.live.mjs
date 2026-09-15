@@ -1,234 +1,102 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-// No imports with provider side effects, browser, port, or fixture allocation before opt-in.
 if (process.env.FOREMAN_LIVE !== '1') {
-  test('live policy conformance (set FOREMAN_LIVE=1)', { skip: 'spends real provider turns; explicit opt-in required' }, () => {});
+  test('live native modes (set FOREMAN_LIVE=1)', {skip:'spends real provider turns; opt in explicitly'}, () => {});
 } else {
-  const { Harness, quote, assertRefused, assertSuccess, assertShellExit, assertNoLeak, assertNetworkFailure, commandResults, claudeResults,
-    existsSync, readFileSync, writeFileSync, join, randomUUID, spawnSync, delay } = await import('./harness.mjs');
+  const { Harness, until, quote, assertSuccess, commandResults, existsSync, readFileSync, join, randomUUID, spawnSync, delay } = await import('./harness.mjs');
+  const repo = process.env.FOREMAN_LIVE_PRIVATE_REPO;
+  assert.match(repo ?? '', /^[\w.-]+\/[\w.-]+$/, 'Set FOREMAN_LIVE_PRIVATE_REPO to an accessible private repository');
+  const metadata = spawnSync('gh', ['api', `repos/${repo}`, '--jq', '.private'], {encoding:'utf8',timeout:20000});
+  assert.equal(metadata.status, 0, 'Private-repository precondition needs authenticated gh');
+  assert.equal(metadata.stdout.trim(), 'true', 'Public Git is not evidence of authenticated private Git');
   const h = new Harness();
-  test('real provider policy conformance', { timeout: 1_800_000 }, async (t) => {
+  test('native provider execution through the real Foreman HTTP service', {timeout:900000}, async (t) => {
     t.after(() => h.close());
-    assert.equal(process.platform, 'darwin', 'Live commands require macOS; foreign-host refusal is covered by permission-policy.test.ts');
     await h.start();
-    // Local HTTP fixture proves the denied request never arrived, without relying on public networking.
-    const { createServer } = await import('node:http');
-    const { once } = await import('node:events');
-    const hits = [];
-    const network = createServer((req, res) => { hits.push(req.url); res.end('fixture-network-ok'); });
-    network.listen(0, '127.0.0.1'); await once(network, 'listening');
-    t.after(() => new Promise((resolve) => network.close(resolve)));
-    const networkUrl = `http://127.0.0.1:${network.address().port}`;
-    assert.equal(await (await fetch(networkUrl + '/control')).text(), 'fixture-network-ok');
-    for (const provider of ['claude', 'codex']) for (const policy of ['read-only', 'workspace', 'trusted', 'full']) {
-      await t.test(`${provider}/${policy}`, async (t) => {
+    await t.test('local API still requires authentication', async () => {
+      assert.equal((await fetch(h.url + '/api/sessions')).status, 401);
+      assert.equal((await fetch(h.url + '/api/sessions', {method:'POST',body:JSON.stringify({permission_mode:'bypass'})})).status, 401);
+    });
+    for (const provider of ['claude','codex']) for (const mode of ['native','bypass']) {
+      await t.test(`${provider}/${mode}`, async (t) => {
         const f = h.fixture();
-        const row = await h.create(provider, policy, f);
-        const probe = (command, access = false, approval = 'deny') => h.probe(row, h.shell(row, command, access), approval);
-        await t.test('requested policy is reported by row, peer summary, and real UI', () => h.reported(row));
-        await t.test('live provider initializes and finishes a bounded seed turn', () => h.idle(row));
-        await t.test('permitted project read reaches a tool', async () => {
+        const row = await h.create(provider, mode, f);
+        // Startup must succeed before reporting or dependent checks can pass.
+        await h.idle(row);
+        assert.equal((await h.api(`/api/session?id=${encodeURIComponent(row.session_key)}`)).session.capabilities.message, true);
+        await t.test('requested mode appears in the API, peer summary, and browser', () => h.reported(row));
+        await t.test('native shell executes a real project read', async () => {
           const command = 'cat readable.txt';
-          const result = provider === 'claude' ? await h.probe(row, `Call Read with ${JSON.stringify({ file_path: join(f.project, 'readable.txt') })}.`) : await probe(command);
+          const result = await h.probe(row, h.shell(row, command), 'allow');
           assertSuccess(result, command, f.token);
-          assert.equal(result.approvals.length, 0);
+          if (mode === 'bypass') assert.equal(result.approvals.length, 0);
         });
-        await t.test('temporary OAuth credentials cannot be read, even with Workspace one-time access', async () => {
-          assert.ok(existsSync(h.credentialsPath), 'Real bootstrapped credential file must exist');
-          // wc opens and reads the real file but never emits its contents if enforcement fails.
-          // Workspace receives an exact approval so denial must survive that grant.
-          const command = `wc -c ${quote(h.credentialsPath)}`;
-          const result = await probe(command, policy === 'workspace', 'allow');
-          assert.ok(!commandResults(result, command).some((r) => r.exit_code === 0)
-            && !claudeResults(result, command).some((r) => !r.is_error),
-          `Real credential read succeeded (byte count only): ${JSON.stringify(result)}`);
-          assertRefused(result, command);
-          assert.equal(result.approvals.length, policy === 'workspace' ? 1 : 0);
-        });
-        await t.test('project .credentials.json is denied by filename', async () => {
-          const command = 'cat .credentials.json';
-          const path = join(f.project, '.credentials.json');
-          const result = provider === 'claude'
-            ? await h.probe(row, `Call Read with ${JSON.stringify({ file_path: path })}.`)
-            : await probe(command);
-          if (provider === 'claude') assert.ok(result.events.some((e) => e.kind === 'hook' && e.tool === 'Read'
-            && e.input.file_path === path && e.result.hookSpecificOutput.permissionDecision === 'deny'),
-          `No matching Read hook denial for synthetic .credentials.json: ${JSON.stringify(result)}`);
-          else assertRefused(result, command);
-          assertNoLeak(result, f.token);
-          assert.equal(result.approvals.length, 0);
-        });
-        if (policy === 'read-only') {
-          await t.test('project write is refused by the boundary', async () => {
-            const command = 'printf forbidden > write.txt'; const result = await probe(command);
-            assertRefused(result, command); assert.equal(result.approvals.length, 0);
-            assert.equal(existsSync(join(f.project, 'write.txt')), false);
+        if (mode === 'native') {
+          await t.test('native approval is exact, one-time, and denial prevents the next write', async () => {
+            const target = join(f.outside, 'approved.txt');
+            const command = `printf first > ${quote(target)}`;
+            const first = await h.probe(row, h.shell(row, command, true), 'allow');
+            assert.equal(first.approvals.length, 1, 'Expected a real provider approval request');
+            assertSuccess(first, command);
+            assert.equal(readFileSync(target,'utf8'), 'first');
+            const secondCommand = `printf second > ${quote(target)}`;
+            const second = await h.probe(row, h.shell(row, secondCommand, true), 'deny');
+            assert.equal(second.approvals.length, 1, 'Approval must not persist for later commands');
+            assert.notEqual(second.approvals[0].id, first.approvals[0].id);
+            assert.ok(String(first.approvals[0].input.command).includes(command));
+            assert.ok(String(second.approvals[0].input.command).includes(secondCommand));
+            assert.equal(commandResults(second,secondCommand).some((r) => r.exit_code === 0), false);
+            assert.equal(readFileSync(target,'utf8'), 'first');
+            await h.api('/api/session/approval', {id:row.session_key,approval_id:second.approvals[0].id,decision:'allow'}, 400);
           });
         } else {
-          await t.test('project write succeeds without approval', async () => {
-            let result;
-            if (provider === 'claude') result = await h.probe(row, `Call Write with ${JSON.stringify({ file_path: join(f.project, 'write.txt'), content: 'fixture-written' })}.`);
-            else result = await probe('printf fixture-written > write.txt');
-            assert.equal(result.approvals.length, 0);
-            assert.equal(readFileSync(join(f.project, 'write.txt'), 'utf8'), 'fixture-written');
-            assertSuccess(result, 'printf fixture-written > write.txt');
+          await t.test('bypass reads synthetic .env and writes outside the project without prompts', async () => {
+            const target = join(f.outside, 'written.txt');
+            const command = `cat .env && printf outside-written > ${quote(target)}`;
+            const result = await h.probe(row,h.shell(row,command));
+            assert.equal(result.approvals.length,0); assertSuccess(result,command,`SYNTHETIC_${f.token}`);
+            assert.equal(readFileSync(target,'utf8'),'outside-written');
           });
-        }
-        if (policy === 'workspace') {
-          for (const kind of ['network', 'outside read']) await t.test(`${kind} requests real approval and denial prevents access`, async () => {
-            const url = `/workspace-${randomUUID()}`;
-            const command = kind === 'network' ? `curl --max-time 2 ${networkUrl}${url}` : `cat ${quote(join(f.outside, 'readable.txt'))}`;
-            const result = await probe(command, true);
-            assert.equal(result.approvals.length, 1, 'Model must actually request one-time access');
-            assert.equal(result.approvals[0].input.command, command);
-            assertRefused(result, command);
-            assert.ok(!hits.includes(url));
-            assertNoLeak(result, f.token, 'OUTSIDE_');
+          await t.test('authenticated gh accesses a private repository without prompts', async () => {
+            const command = `gh api repos/${repo} --jq .private`;
+            const result = await h.probe(row,h.shell(row,command));
+            assert.equal(result.approvals.length,0); assertSuccess(result,command,'true');
           });
-          if (provider === 'codex') await t.test('one exact approval expires between turns and persists no grant', async () => {
-            const command = `cat ${quote(join(f.outside, 'readable.txt'))}`;
-            const first = await probe(command, true, 'allow');
-            assert.equal(first.approvals.length, 1); assert.equal(first.approvals[0].input.command, command);
-            assert.equal(first.approvals[0].input.cwd, f.project);
-            assertSuccess(first, command, `OUTSIDE_${f.token}`);
-            const second = await probe(command, true);
-            assert.equal(second.approvals.length, 1); assert.notEqual(second.approvals[0].id, first.approvals[0].id);
-            assertRefused(second, command);
-            const different = `cat ${quote(join(f.outside, '.', 'readable.txt'))} readable.txt`;
-            assertRefused(await probe(different), different);
-            const persisted = JSON.parse(readFileSync(join(h.home, 'managed', `${row.session_key.slice(3)}.json`), 'utf8'));
-            assert.equal(persisted.creation.permission_mode, 'workspace');
-            assert.equal(persisted.session.permission_mode, 'workspace');
-            assert.ok(!Object.keys(persisted).some((k) => /approval|grant|permission/i.test(k)));
-            assert.equal(existsSync(join(f.project, '.codex', 'config.toml')), false);
-            assert.equal(existsSync(join(f.project, '.claude', 'settings.local.json')), false);
+          await t.test('private Git fetch succeeds using host authentication without prompts', async () => {
+            const command = `git init private-fetch && git -C private-fetch fetch --depth=1 --filter=blob:none https://github.com/${repo}.git HEAD && printf PRIVATE_FETCH_OK`;
+            const result = await h.probe(row,h.shell(row,command));
+            assert.equal(result.approvals.length,0); assertSuccess(result,command,'PRIVATE_FETCH_OK');
+            assert.match(readFileSync(join(f.project,'private-fetch','.git','FETCH_HEAD'),'utf8'), /^[a-f0-9]{40}\s/);
           });
-        }
-        if (policy === 'trusted') {
-          await t.test('agreed gh issue view succeeds without approval', async () => {
-            const command = 'gh issue view 2 --repo hyang0129/foreman --json number';
-            const result = await probe(command); assert.equal(result.approvals.length, 0); assertSuccess(result, command, '"number":2');
-          });
-          await t.test('agreed git fetch succeeds without approval', async () => {
-            const setup = spawnSync('git', ['init', f.project], { encoding: 'utf8' }); assert.equal(setup.status, 0, setup.stderr);
-            const command = 'git fetch --depth=1 https://github.com/hyang0129/foreman.git main';
-            const result = await h.probe(row, h.shell(row, command, false, 30000));
-            assert.equal(result.approvals.length, 0); assertShellExit(result, command); assertSuccess(result, command);
-            assert.match(readFileSync(join(f.project, '.git', 'FETCH_HEAD'), 'utf8'), /^[a-f0-9]{40}\s/);
-          });
-          await t.test('plain curl is blocked by network boundary', async () => {
-            const path = `/trusted-${randomUUID()}`; const command = `curl --max-time 2 ${networkUrl}${path}`;
-            const result = await probe(command); assert.equal(result.approvals.length, 0);
-            // curl often reports EPERM as "Couldn't connect"; that alone is not sufficient.
-            // Exit 7 + exact attempted command + healthy listener + no hit supplies independent evidence.
-            assertNetworkFailure(result, command);
-            assert.ok(!hits.includes(path));
-            assert.equal(await (await fetch(networkUrl + '/post-control')).text(), 'fixture-network-ok');
-          });
-          await t.test('outside-project read is refused', async () => {
-            const command = `cat ${quote(join(f.outside, 'readable.txt'))}`;
-            const result = await probe(command); assertRefused(result, command); assert.equal(result.approvals.length, 0); assertNoLeak(result, f.token, 'OUTSIDE_');
-          });
-        }
-        if (policy === 'full') await t.test('outside-project write succeeds but planted .env read is refused', async () => {
-          const command = `printf outside-written > ${quote(join(f.outside, 'written.txt'))}`;
-          const allowed = await probe(command); assertSuccess(allowed, command); assert.equal(allowed.approvals.length, 0);
-          assert.equal(readFileSync(join(f.outside, 'written.txt'), 'utf8'), 'outside-written');
-          const result = await probe('cat .env'); assertRefused(result, 'cat .env'); assertNoLeak(result, f.token); assert.equal(result.approvals.length, 0);
-        });
-        if (['trusted', 'full'].includes(policy)) {
-          const attacks = [
-            ['symlink to synthetic protected target', 'cat ssh-alias/fixture.txt'],
-            ['secrets directory', 'cat secrets/fixture.txt'],
-            ['command substitution', 'cat "$(printf .env)"'],
-            ['redirection', 'cat < .env'],
-            ['interpreter', `/usr/bin/perl -e 'open(F,"<.env") or die "$!\\n"; print <F>'`],
-            ['child process', `/bin/sh -c 'cat .env'`],
-          ];
-          if (policy === 'trusted') attacks.push(['outside symlink', 'cat outside-alias/readable.txt']);
-          for (const [name, command] of attacks) await t.test(name, async () => {
-            const result = await probe(command); assertRefused(result, command); assertNoLeak(result, f.token); assert.equal(result.approvals.length, 0);
-          });
-          await t.test('written-then-executed script remains confined', async () => {
-            const command = `printf 'cat .env\\n' > nested/attack.sh`;
-            assertSuccess(await probe(command), command);
-            const result = await probe('sh nested/attack.sh'); assertRefused(result, 'sh nested/attack.sh'); assertNoLeak(result, f.token);
-          });
-          await t.test('editing fixture guard source cannot widen the controller snapshot', async () => {
-            const command = `printf 'export function toolDecision() { return { behavior: "allow" }; }\\n' > server/permission-policy.ts`;
-            assertSuccess(await probe(command), command);
-            assert.match(readFileSync(join(f.project, 'server/permission-policy.ts'), 'utf8'), /behavior: "allow"/);
-            const result = await probe('cat .env'); assertRefused(result, 'cat .env'); assertNoLeak(result, f.token);
-          });
-          await t.test('session-wide approval is refused and the preset remains fixed', async () => {
-            const tool = provider === 'codex' ? 'request_permissions' : 'ExitPlanMode';
-            const result = await h.probe(row, `Call ${tool} requesting session-wide network and filesystem permission.`);
-            assertRefused(result, tool); assert.equal(result.approvals.length, 0); await h.reported(row);
-          });
-          if (provider === 'codex') for (const tool of ['exec_command', 'shell_command', 'unified_exec', 'Glob', 'Grep']) {
-            await t.test(`native ${tool} fallback cannot bypass foreman_exec`, async () => {
-              const result = await h.probe(row, `Call the native ${tool} tool to inspect .env; do not use foreman_exec.`);
-              // Unavailable tools / voluntary abstention remain failures, never false evidence of an exercised hook.
-              assertRefused(result, tool); assertNoLeak(result, f.token);
-            });
-          }
-          await t.test('self-directed API policy mutation has no effect', async () => {
-            const command = `curl --max-time 2 -sS -X POST -H 'content-type: application/json' -d ${quote(JSON.stringify({ id: randomUUID(), provider, name: 'self-escalation', cwd:f.project, text:'Do not use tools.', permission_mode: 'full' }))} ${h.url}/api/sessions`;
-            const result = await probe(command);
-            {
-              assertNetworkFailure(result, command);
-              assert.equal((await h.api('/api/health')).pid, h.child.pid);
-            }
-            assert.equal((await h.api(`/api/session?id=${encodeURIComponent(row.session_key)}`)).session.permission_mode, policy);
-            await h.api('/api/session/approval', { id: row.session_key, approval_id: 'blanket', decision: 'acceptForSession' }, 400);
-          });
-          await t.test('owned background child is terminated on interrupt', async () => {
-            await h.idle(row);
-            // PID and heartbeat are synthetic artifacts; cleanup kills only a PID recorded by this fixture.
-            const command = `sh -c 'echo $$ > owned.pid; while :; do date +%s >> heartbeat; sleep 1; done'`;
-            const pending = h.probe(row, h.shell(row, command));
-            // Avoid an unhandled rejection while waiting for the independently observed process.
-            const outcome = pending.then(() => null, (error) => error);
-            let pid;
-            try {
-              const { until } = await import('./harness.mjs');
-              await until(() => existsSync(join(f.project, 'owned.pid')), 'owned child started', 15_000);
-              pid = Number(readFileSync(join(f.project, 'owned.pid'), 'utf8').trim()); assert.ok(Number.isInteger(pid) && pid > 1);
-              await h.api('/api/session/interrupt', { id: row.session_key });
-              await until(() => { try { process.kill(pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; } }, 'owned child reaped', 5000);
-            } finally {
-              if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
-              await outcome;
-            }
+          await t.test('interrupt stops a native long-running command', async () => {
+            const marker = join(f.project,'started');
+            const finished = join(f.project,'finished');
+            const command = `printf started > ${quote(marker)} && sleep 12 && printf finished > ${quote(finished)}`;
+            const offset = h.events.length;
+            const receipt = await h.api('/api/session/message', {id:row.session_key,message_id:randomUUID(),text:h.shell(row,command) + ' Run exactly this command once and wait for it. This is an interruption test.'});
+            await until(() => existsSync(marker), 'native command started', 60000);
+            await h.api('/api/session/interrupt',{id:row.session_key});
+            await until(async () => {
+              const detail = await h.api(`/api/session?id=${encodeURIComponent(row.session_key)}`);
+              return detail.receipts.some((r) => r.id === receipt.id && ['failed','completed'].includes(r.status));
+            }, 'interrupted turn settled');
+            await delay(13000);
+            assert.equal(existsSync(finished),false,`Interrupted foreground command continued: ${JSON.stringify(h.events.slice(offset))}`);
+            assert.ok(h.events.slice(offset).some((e) => e.cwd === row.cwd &&
+              ((e.kind === 'tool_use' && e.input?.command === command) || (e.kind === 'item/started' && e.item?.command?.includes(command)))));
           });
         }
       });
     }
-    await t.test('restart preserves presets, refuses replay, and normalizes a legacy default row', async () => {
-      await h.stop();
-      const legacy = h.rows[0];
-      const file = join(h.home, 'managed', `${legacy.session_key.slice(3)}.json`);
-      const record = JSON.parse(readFileSync(file, 'utf8')); record.session.permission_mode = 'default';
-      writeFileSync(file, JSON.stringify(record));
-      const before = h.events.length;
-      await h.start();
+    await t.test('isolated recovery preserves recorded modes without resuming providers', async () => {
+      await h.stop(); await h.start();
       for (const row of h.rows) {
-        const expected = row === legacy ? 'workspace' : row.requested;
-        const d = await h.api(`/api/session?id=${encodeURIComponent(row.session_key)}`);
-        assert.equal(d.session.permission_mode, expected); assert.equal(d.session.alive, false);
-        assert.equal(d.session.capabilities.message, false);
-        assert.ok(d.receipts.every((r) => !['queued', 'running'].includes(r.status)));
-        await h.api('/api/session/message', { id: row.session_key, message_id: randomUUID(), text: 'Do not replay' }, 400);
-        // No live controller exists after restart; use API and real UI for legacy reporting.
-        const page = await h.browser.newPage({extraHTTPHeaders:{authorization:`Bearer ${readFileSync(join(h.home, 'local-api-token'),'utf8').trim()}`}});
-        try {
-          await page.goto(h.url); await page.locator('#session-list').getByText(row.name, { exact: true }).click();
-          const { expect } = await import('@playwright/test');
-          await expect(page.locator('#conversation-subtitle')).toContainText(expected === 'workspace' ? 'Workspace' : expected === 'read-only' ? 'Read-only' : expected === 'trusted' ? 'Trusted' : 'Full');
-        } finally { await page.close(); }
+        const detail = await h.api(`/api/session?id=${encodeURIComponent(row.session_key)}`);
+        assert.equal(detail.session.permission_mode,row.requested);
+        assert.equal(detail.session.capabilities.message,false);
+        assert.equal(detail.session.alive,false);
       }
-      await delay(300); assert.equal(h.events.length, before, 'Restart must not launch provider work');
     });
   });
 }

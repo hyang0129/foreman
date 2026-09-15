@@ -177,36 +177,38 @@ for (const provider of ['claude', 'codex'] as const) {
       claudeFactory: (options: any) => { received = options.permission_mode; return new FakeClaude(); },
       codexFactory: () => new PolicyCodex(),
     });
-    for (const mode of ['read-only', 'workspace', 'trusted', 'full'] as const) {
+    for (const mode of ['native', 'bypass'] as const) {
       const launch = { ...input, provider, id: mode, permission_mode: mode };
       const row = await service.create(launch); await tick();
       assert.equal(received, mode); assert.equal(row.permission_mode, mode);
-      row.permission_mode = 'full';
+      row.permission_mode = 'bypass';
       assert.equal(service.detail(row.session_key).session.permission_mode, mode);
-      await assert.rejects(service.create({ ...launch, permission_mode: mode === 'full' ? 'trusted' : 'full' }), /different input/);
+      await assert.rejects(service.create({ ...launch, permission_mode: mode === 'bypass' ? 'native' : 'bypass' }), /different input/);
     }
     const omitted = await service.create({ ...input, provider, id: 'omitted' }); await tick();
-    assert.equal(received, 'workspace'); assert.equal(omitted.permission_mode, 'workspace');
-    assert.equal((await service.create({ ...input, provider, id: 'omitted', permission_mode: 'workspace' })).session_key, omitted.session_key);
+    assert.equal(received, 'native'); assert.equal(omitted.permission_mode, 'native');
+    assert.equal((await service.create({ ...input, provider, id: 'omitted', permission_mode: 'native' })).session_key, omitted.session_key);
     await assert.rejects(service.create({ ...input, provider, id: 'bad', permission_mode: 'bypassPermissions' as any }), /permission_mode/);
     service.close();
     const loaded = new SessionService({ home });
-    try { assert.deepEqual(loaded.list().map((s) => s.permission_mode).sort(), ['full','read-only','trusted','workspace','workspace']); }
+    try { assert.deepEqual(loaded.list().map((s) => s.permission_mode).sort(), ['bypass','native','native']); }
     finally { loaded.close(); }
   });
 }
 
-test('legacy default rows display Workspace without launching a provider', async (t) => {
+test('legacy presets remain historical and cannot be relaunched or silently widened', async (t) => {
   const { home, service, input } = fixture(t);
   const row = await service.create(input); await tick(); service.close();
   const { writeFileSync } = await import('node:fs');
   const file = join(home, 'managed', `${row.session_key.slice(3)}.json`);
-  const data = JSON.parse(readFileSync(file, 'utf8')); data.session.permission_mode = 'default';
+  const data = JSON.parse(readFileSync(file, 'utf8')); data.session.permission_mode = 'trusted'; data.creation.permission_mode = 'trusted';
   writeFileSync(file, JSON.stringify(data));
   const loaded = new SessionService({ home, claudeFactory: () => { throw new Error('must not launch'); } });
   t.after(() => loaded.close());
-  assert.equal(loaded.detail(row.session_key).session.permission_mode, 'workspace');
+  assert.equal(loaded.detail(row.session_key).session.permission_mode, 'trusted');
   assert.equal(loaded.detail(row.session_key).session.alive, false);
   assert.equal(loaded.detail(row.session_key).session.capabilities.message, false);
-  assert.equal(JSON.parse(readFileSync(file, 'utf8')).session.permission_mode, 'workspace');
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).session.permission_mode, 'trusted');
+  await assert.rejects(loaded.create(input), /different input/);
+  await assert.rejects(loaded.create({...input, permission_mode:'trusted' as any}), /permission_mode/);
 });

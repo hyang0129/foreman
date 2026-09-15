@@ -1,11 +1,9 @@
-const POLICY_LABEL = { 'read-only': 'Read-only', workspace: 'Workspace', trusted: '⚠ Trusted', full: '⚠ Full · no permission prompts' };
+const POLICY_LABEL = { native: 'Native', bypass: '⚠ Bypass · no permission prompts' };
 const POLICY_DESCRIPTION = {
-  'read-only': 'Inspect the project. No file changes, network, or commands with side effects. Secrets remain denied. Fixed for this session.',
-  workspace: 'Write in the project; ask for network or access outside it. Secrets remain denied. Fixed for this session.',
-  trusted: '⚠ Write in the project and use public Git networking without prompts. Package installs get no network grant. Host credentials and outside paths stay protected. Fixed for this session.',
-  full: '⚠ Commands, external network, and files outside the project without permission prompts. Secrets and protected paths remain denied. Fixed for this session.',
+  native: 'Use the provider’s normal permissions and approval prompts. Claude and Codex have different native boundaries. Foreman adds no credential deny list.',
+  bypass: '⚠ Commands, network, credentials, and files outside the project without permission prompts. Foreman adds no sandbox or credential protection.',
 };
-const policyLabel = (session) => POLICY_LABEL[session.permission_mode] || (session.permission_mode === 'default' ? 'Workspace' : 'Policy unknown');
+const policyLabel = (session) => POLICY_LABEL[session.permission_mode] || (session.permission_mode ? `Legacy policy: ${session.permission_mode}` : 'Policy unknown');
 // Authoritative JSON polling keeps authentication tokens out of URLs and reconnects simple.
 // Firebase browser-module setup: https://firebase.google.com/docs/web/alt-setup
 const $ = (selector) => document.querySelector(selector);
@@ -875,9 +873,9 @@ $("#new-provider").addEventListener("change", loadNewModels);
 function updateNewPolicy() {
   const mode = $("#new-policy").value;
   $("#new-policy-hint").textContent = POLICY_DESCRIPTION[mode];
-  $("#full-confirmation").hidden = mode !== 'full';
-  $("#confirm-full").required = mode === 'full';
-  $("#confirm-full").checked = false;
+  $("#bypass-confirmation").hidden = mode !== 'bypass';
+  $("#confirm-bypass").required = mode === 'bypass';
+  $("#confirm-bypass").checked = false;
 }
 $("#new-policy").addEventListener("change", updateNewPolicy);
 function openNew() {
@@ -885,7 +883,7 @@ function openNew() {
   if (!$("#new-cwd").value && detail?.session?.cwd)
     $("#new-cwd").value = detail.session.cwd;
   $("#new-error").hidden = true;
-  $("#new-policy").value = "workspace";
+  $("#new-policy").value = "native";
   updateNewPolicy();
   ui.dialog.showModal();
   void loadNewModels();

@@ -526,27 +526,27 @@ test("project manager model persists across reload and is locked while busy", as
   await expect.poll(() => state.pmModel).toBe(null);
 });
 
-test('launch policy defaults to Workspace, Full requires confirmation, and running sessions show it', async ({ page }) => {
+test('launch policy defaults to Native, Bypass requires confirmation, and running sessions show it', async ({ page }) => {
   const state = await fixture(page);
   await page.goto('/');
   await page.getByRole('button', { name: 'New session', exact: true }).click();
-  await expect(page.getByLabel('Permission policy')).toHaveValue('workspace');
-  await page.getByLabel('Session name').fill('Full worker');
+  await expect(page.getByLabel('Permission policy')).toHaveValue('native');
+  await page.getByLabel('Session name').fill('Bypass worker');
   await page.getByLabel('Project directory').fill('/Users/dev/code/worker');
   await page.getByLabel('First task').fill('Work on the project');
-  await page.getByLabel('Permission policy').selectOption('full');
+  await page.getByLabel('Permission policy').selectOption('bypass');
   await expect(page.locator('#new-policy-hint')).toContainText('outside the project without permission prompts');
   await page.getByRole('button', { name: 'Start session', exact: true }).click();
   expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
-  await page.locator('#confirm-full').check();
+  await page.locator('#confirm-bypass').check();
   await page.getByRole('button', { name: 'Start session', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Full worker', exact: true })).toBeVisible();
-  expect(state.calls.find((c) => c.path === '/api/sessions' && c.body)?.body.permission_mode).toBe('full');
-  await expect(page.locator('#conversation-subtitle')).toContainText('⚠ Full');
+  await expect(page.getByRole('heading', { name: 'Bypass worker', exact: true })).toBeVisible();
+  expect(state.calls.find((c) => c.path === '/api/sessions' && c.body)?.body.permission_mode).toBe('bypass');
+  await expect(page.locator('#conversation-subtitle')).toContainText('⚠ Bypass');
   await page.getByRole('button', { name: 'New session', exact: true }).click();
-  await expect(page.getByLabel('Permission policy')).toHaveValue('workspace');
-  await page.getByLabel('Permission policy').selectOption('full');
-  await expect(page.locator('#confirm-full')).not.toBeChecked();
+  await expect(page.getByLabel('Permission policy')).toHaveValue('native');
+  await page.getByLabel('Permission policy').selectOption('bypass');
+  await expect(page.locator('#confirm-bypass')).not.toBeChecked();
 });
 
 test('local token unlock stays usable after an invalid token without Google sign-in', async ({page}) => {

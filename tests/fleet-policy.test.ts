@@ -22,10 +22,10 @@ test('spawn_session accepts each managed preset and omission without native flag
 test('PM may propose elevated settings but cannot approve its own elevated spawn', async () => {
   const pm = new ProjectManager({} as any, undefined, '/tmp/nonexistent-foreman-policy-settings.json');
   const guard = (pm as any).canUseTool;
-  for (const permission_mode of ['trusted', 'full']) {
+  for (const permission_mode of ['bypass', 'bypassPermissions']) {
     assert.equal((await guard('mcp__fleet__spawn_session', { permission_mode })).behavior, 'deny');
     const hook = await (pm as any).enforceToolBoundary({ hook_event_name: 'PreToolUse', tool_name: 'mcp__fleet__spawn_session', tool_input: { permission_mode } });
     assert.equal(hook.hookSpecificOutput.permissionDecision, 'deny');
   }
-  assert.equal((await guard('mcp__fleet__spawn_session', { permission_mode: 'workspace' })).behavior, 'allow');
+  assert.equal((await guard('mcp__fleet__spawn_session', { permission_mode: 'native' })).behavior, 'allow');
 });

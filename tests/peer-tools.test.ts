@@ -134,10 +134,10 @@ test('peer receipts survive service restart without replay or changed sender ide
 
 test('peer summaries distinguish managed presets from observed provider modes', async () => {
   const {service}=fixture();
-  (service.list()[0] as any).permission_mode='full';
+  (service.list()[0] as any).permission_mode='bypass';
   (service.list()[3] as any).permission_mode='bypassPermissions';
   const result=await bindPeerTools(service,'a').call('list_sessions',{});
-  assert.equal(result.sessions[0].permission_mode,'full');
+  assert.equal(result.sessions[0].permission_mode,'bypass');
   assert.equal(result.sessions[3].permission_mode,undefined);
   assert.equal(result.sessions[3].provider_permission_mode,'bypassPermissions');
 });

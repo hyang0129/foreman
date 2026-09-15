@@ -177,13 +177,11 @@
         ><label>Model<select id="new-model" name="model"><option value="">Provider default</option></select></label>
         <p id="new-model-hint" class="field-hint" role="status">Uses your provider settings unless you choose a model.</p>
         <label>Permission policy<select id="new-policy" name="permission_mode" aria-describedby="new-policy-hint">
-          <option value="read-only">Read-only</option>
-          <option value="workspace" selected>Workspace (default)</option>
-          <option value="trusted">⚠ Trusted</option>
-          <option value="full">⚠ Full — no permission prompts</option>
+          <option value="native" selected>Native (default)</option>
+          <option value="bypass">⚠ Bypass — no permission prompts</option>
         </select></label>
-        <p id="new-policy-hint" class="field-hint" role="status">Write in the project; ask for network or access outside it. Secrets remain denied. Fixed for this session.</p>
-        <label id="full-confirmation" hidden><input id="confirm-full" type="checkbox">I allow Full: commands, external network, and files outside the project without permission prompts. Secrets and protected paths remain denied.</label>
+        <p id="new-policy-hint" class="field-hint" role="status">Use the provider’s normal permissions and approval prompts. Foreman adds no credential deny list.</p>
+        <label id="bypass-confirmation" hidden><input id="confirm-bypass" type="checkbox">I allow Bypass: commands, network, credentials, and files outside the project without permission prompts. Foreman adds no sandbox or credential protection.</label>
         <label
           >Session name<input
             id="new-name"

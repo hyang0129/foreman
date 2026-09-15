@@ -32,7 +32,7 @@ Restart interrupts managed sessions and active PM work. The LaunchAgent restarts
 
 ## Developer workflow
 
-1. Open Foreman and choose **New session**. Pick Claude or Codex, a model (or provider default), a name, an existing absolute project directory, a permission policy (Workspace by default), and the first task. Trusted and Full are visibly marked; Full requires confirmation. See [Session permissions](docs/SESSION_PERMISSIONS.md) for the fixed launch grants and provider mapping.
+1. Open Foreman and choose **New session**. Pick Claude or Codex, a model (or provider default), a name, an existing absolute project directory, a permission mode (Native by default), and the first task. Bypass is visibly marked and requires confirmation. See [Session permissions](docs/SESSION_PERMISSIONS.md) for the native provider mappings and their limits.
 2. Open the session conversation. Follow-up messages queue while it works; saved receipts distinguish queued, running, completed, failed, and uncertain delivery.
 3. Answer inline tool approvals or supported questions. Permission responses apply once. **Interrupt** also cancels queued follow-ups.
 4. Ask a managed session to use Foreman peer tools: `list_sessions`, `session_state`, `session_tail`, `send_message`, `request_update`, and `message_status`. Sender identity is supplied by Foreman. An update is recorded in the target conversation; read it after completion.

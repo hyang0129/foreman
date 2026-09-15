@@ -12,12 +12,10 @@ import { runClaude } from "./tools.ts";
 import { PORT, REPO_ROOT, ensureDirs, MEMORY_DIR, HOST, FOREMAN_HOME } from "./paths.ts";
 import { writeFileSync } from "node:fs";
 
-import { sweepPolicySnapshots } from './policy-snapshots.ts';
 import { localAuth } from './local-auth.ts';
 
 ensureDirs();
 const auth = localAuth(FOREMAN_HOME);
-sweepPolicySnapshots();
 for (const [f, seed] of [["PROJECTS.md", "# Projects\n\n(none yet)\n"], ["LOG.md", "# Log\n"]] as const) {
   const p = join(MEMORY_DIR, f); if (!existsSync(p)) writeFileSync(p, seed);
 }

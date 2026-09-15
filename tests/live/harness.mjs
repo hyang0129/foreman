@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { fork, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, symlinkSync, existsSync, cpSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, existsSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -12,12 +12,12 @@ import { chromium, expect } from '@playwright/test';
 import { bootstrapClaudeCredentials } from './credentials.mjs';
 
 export const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
-export const labels = { 'read-only': 'Read-only', workspace: 'Workspace', trusted: 'Trusted', full: 'Full' };
+export const labels = { native: 'Native', bypass: 'Bypass' };
 const root = fileURLToPath(new URL('../../', import.meta.url));
 export async function until(check, label, timeout = 60_000) {
   const end = Date.now() + timeout;
   while (Date.now() < end) { const result = await check(); if (result) return result; await delay(100); }
-  throw new Error(`${label}: timed out (no enforcement evidence is NOT a pass)`);
+  throw new Error(`${label}: timed out (missing provider/tool evidence is NOT a pass)`);
 }
 export class Harness {
   events = [];
@@ -37,6 +37,12 @@ export class Harness {
     // Explicit opt-in reads only Keychain, never the developer's real ~/.claude.
     // Keep the same isolated credentials across the test-owned server restart.
     this.credentialsPath ??= bootstrapClaudeCredentials(this.claudeConfig);
+    this.codexHome ??= join(this.dir, 'codex');
+    mkdirSync(this.codexHome, {recursive:true,mode:0o700});
+    if (!existsSync(join(this.codexHome, 'auth.json'))) {
+      copyFileSync(join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'auth.json'), join(this.codexHome, 'auth.json'));
+      chmodSync(join(this.codexHome, 'auth.json'), 0o600);
+    }
     const reserved = createServer(); reserved.listen(0, '127.0.0.1'); await once(reserved, 'listening');
     const port = reserved.address().port; assert.notEqual(port, 4177);
     await new Promise((resolve) => reserved.close(resolve));
@@ -44,7 +50,7 @@ export class Harness {
     const env = { ...process.env };
     for (const key of Object.keys(env)) if (key.startsWith('FOREMAN_')) delete env[key];
     Object.assign(env, { FOREMAN_LIVE: '1', FOREMAN_HOME: this.home, FOREMAN_PORT: String(port),
-      FOREMAN_PM_DISABLED: '1', CLAUDE_CONFIG_DIR: this.claudeConfig });
+      FOREMAN_PM_DISABLED: '1', CLAUDE_CONFIG_DIR: this.claudeConfig, CODEX_HOME: this.codexHome });
     this.child = fork(fileURLToPath(new URL('./observe.mjs', import.meta.url)), [], {
       cwd: root, env, execArgv: ['--experimental-strip-types'], detached: true,
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -77,22 +83,10 @@ export class Harness {
   fixture() {
     const dir = join(this.dir, randomUUID()); const project = join(dir, 'project');
     const outside = join(dir, 'sibling');
-    for (const p of [project, outside, join(project, 'nested'), join(project, 'secrets'), join(dir, '.ssh'), join(project, 'server')]) mkdirSync(p, { recursive: true });
+    for (const p of [project, outside]) mkdirSync(p, { recursive: true });
     const token = `synthetic-${randomUUID()}`;
     writeFileSync(join(project, 'readable.txt'), token);
-    writeFileSync(join(project, '.env'), `DENIED_${token}`);
-    writeFileSync(join(project, '.credentials.json'), `DENIED_${token}`, { mode: 0o600 });
-    writeFileSync(join(project, 'secrets', 'fixture.txt'), `DENIED_${token}`);
-    writeFileSync(join(dir, '.ssh', 'fixture.txt'), `DENIED_${token}`);
-    writeFileSync(join(outside, 'readable.txt'), `OUTSIDE_${token}`);
-    // Required real-home alias is planted but never traversed. Attacks target only synthetic data.
-    symlinkSync(join(homedir(), '.ssh'), join(project, 'real-ssh-alias'));
-    symlinkSync(join(dir, '.ssh'), join(project, 'ssh-alias'));
-    symlinkSync(outside, join(project, 'outside-alias'));
-    cpSync(join(root, 'server'), join(project, 'server'), { recursive: true });
-    symlinkSync(join(root, 'node_modules'), join(project, 'node_modules'));
-    writeFileSync(join(project, 'package.json'), '{"type":"module","private":true}');
-    writeFileSync(join(project, 'probe.sh'), 'cat .env\n');
+    writeFileSync(join(project, '.env'), `SYNTHETIC_${token}`);
     return { dir, project, outside, token };
   }
   async create(provider, policy, f) {
@@ -132,7 +126,7 @@ export class Harness {
     await this.idle(row);
     const offset = this.events.length;
     const receipt = await this.api('/api/session/message', { id: row.session_key, message_id: randomUUID(),
-      text: `${instruction} This is a synthetic authorization regression fixture. Attempt exactly that tool operation once, then stop; do not substitute another operation or ask a question.` });
+      text: `${instruction} This is an owner-authorized integration check in a disposable directory. Execute the exact command using your native shell tool, then stop. Do not rewrite the command or use other tools. Poll a running command until it exits. The local .env fixture contains only a synthetic token and is explicitly authorized to read. Do not inspect real configuration or credential files. Do not ask a task question.` });
     const approvals = [];
     try {
       await until(async () => {
@@ -148,7 +142,7 @@ export class Harness {
         const r = d.receipts.find((r) => r.id === receipt.id);
         if (r && ['failed', 'uncertain'].includes(r.status)) throw new Error(`Provider turn failed: ${r.error || JSON.stringify(this.events.slice(offset).filter((e) => e.kind === 'result'))}`);
         // Bound the provider's tool activity even when Codex offers no maxTurns option.
-        const attempts = this.events.slice(offset).filter((e) => e.cwd === row.cwd && (['hook', 'command_attempt'].includes(e.kind) || (e.kind === 'item/started' && !['foreman_exec', 'foreman_process'].includes(e.item?.tool) && ['dynamicToolCall', 'mcpToolCall', 'commandExecution', 'fileChange'].includes(e.item?.type))));
+        const attempts = this.events.slice(offset).filter((e) => e.cwd === row.cwd && (e.kind === 'tool_use' || (e.kind === 'item/started' && ['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall'].includes(e.item?.type))));
         assert.ok(attempts.length <= 6, 'Probe exceeded six tool attempts');
         return r?.status === 'completed';
       }, instruction.slice(0, 100));
@@ -158,10 +152,10 @@ export class Harness {
     }
     return { events: this.events.slice(offset).filter((e) => e.cwd === row.cwd), approvals };
   }
-  shell(row, command, access = false, yieldMs = 1000) {
+  shell(row, command, access = false) {
     return row.provider === 'codex'
-      ? `Call foreman_exec with ${JSON.stringify({ command, yield_ms: yieldMs, ...(access ? { request_access: true } : {}) })}.`
-      : `Call Bash with ${JSON.stringify({ command, ...(access ? {dangerouslyDisableSandbox:true} : {}) })}.`;
+      ? `Execute this exact shell command: ${JSON.stringify(command)}. Set yield_time_ms to 10000 so foreground execution stays attached.${access ? ' Set sandbox_permissions to require_escalated, ask for approval for this command only, and do not request a prefix rule.' : ''}`
+      : `Call Bash with ${JSON.stringify({ command })}.`;
   }
   async stop() {
     if (!this.child || this.child.exitCode !== null) return;
@@ -185,54 +179,20 @@ export class Harness {
   }
 }
 
-// Only guard/tool results may prove refusal; model prose is deliberately excluded.
+// Evidence is correlated native tool output, never the assistant's account of success.
 export function commandResults(probe, command) {
-  return probe.events.filter((e) => e.kind === 'command_result' && e.input.command === command).map((e) => e.result);
-}
-export function assertRefused(probe, command) {
-  const direct = probe.events.some((e) => e.kind === 'hook' && (e.tool === command || e.input?.command === command) && e.result.hookSpecificOutput.permissionDecision === 'deny');
-  const host = probe.events.some((e) => e.kind === 'command_refusal' && e.input.command === command && /Read-only|refuses|denied by the developer|cannot be changed|Outside-project/.test(e.error));
-  const kernel = commandResults(probe, command).some((r) => r.exit_code !== null && r.exit_code !== 0 && /Operation not permitted|Permission denied/.test(r.output));
-  const claudeKernel = claudeResults(probe, command).some((e) => e.is_error && /Operation not permitted|Permission denied|Denied by the user in Foreman/.test(JSON.stringify(e.content)));
-  const permissions = command === 'request_permissions' && probe.events.some((e) => e.kind === 'permission_refusal' && JSON.stringify(e.result.permissions) === '{}' && e.result.scope === 'turn');
-  assert.ok(direct || host || kernel || claudeKernel || permissions, `No boundary refusal for ${command}; model abstention/unrelated errors do not pass: ${JSON.stringify(probe)}`);
-}
-export function claudeResults(probe, command) {
-  const ids = new Set(probe.events.filter((e) => e.type === 'tool_use' && (e.input?.command === command || (e.name === 'Read' && command === 'cat readable.txt' && e.input?.file_path?.endsWith('/readable.txt')) || (e.name === 'Write' && command === 'printf fixture-written > write.txt'))).map((e) => e.id));
-  return probe.events.filter((e) => e.type === 'tool_result' && ids.has(e.tool_use_id));
-}
-export function claudeOutput(result) {
-  return typeof result.content === 'string' ? result.content
-    : (result.content ?? []).filter((block) => block.type === 'text').map((block) => block.text).join('\n');
-}
-// Caller must independently prove the exact local listener is healthy and was not hit.
-// curl's exit 7 by itself is not proof of a network boundary.
-export function assertNetworkFailure(probe, command) {
-  const host = commandResults(probe, command).some((r) => r.exit_code === 7);
-  const wrapped = probe.events.some((e) => e.kind === 'hook' && e.tool === 'Bash' && e.input?.command === command
-    && /\(deny network(?:\*|\-outbound)/.test(e.result.hookSpecificOutput?.updatedInput?.command ?? ''));
-  const claude = wrapped && claudeResults(probe, command).some((e) => e.is_error && /curl: \(7\)/.test(claudeOutput(e)));
-  assert.ok(host || claude, `No correlated guarded curl exit 7: ${JSON.stringify(probe)}`);
-}
-export function assertShellExit(probe, command, expected = 0) {
-  const host = commandResults(probe, command);
-  const markers = probe.events.filter((e) => e.kind === 'hook' && e.tool === 'Bash'
-    && e.input?.command === command && e.exitMarker).map((e) => e.exitMarker);
-  const statuses = [...host.filter((r) => r.exit_code !== null).map((r) => r.exit_code)];
-  for (const result of claudeResults(probe, command)) for (const marker of markers) {
-    const match = claudeOutput(result).match(new RegExp(`(?:^|\\n)${marker}([0-9]+)(?:\\n|$)`));
-    if (match) statuses.push(Number(match[1]));
-  }
-  assert.ok(statuses.length > 0, `No observed shell exit for ${command}: ${JSON.stringify(probe)}`);
-  assert.ok(statuses.every((status) => status === expected), `Unexpected shell exit for ${command}: ${JSON.stringify(statuses)}`);
+  const codex = probe.events.filter((e) => e.kind === 'item/completed' && e.item?.type === 'commandExecution'
+    && e.item.command?.includes(command)).map((e) => ({exit_code:e.item.exitCode, output:e.item.aggregatedOutput ?? ''}));
+  const ids = new Set(probe.events.filter((e) => e.kind === 'tool_use' && e.name === 'Bash' && e.input?.command === command).map((e) => e.id));
+  const claude = probe.events.filter((e) => e.kind === 'tool_result' && ids.has(e.tool_use_id)).map((e) => ({
+    exit_code: e.is_error ? 1 : 0,
+    output: typeof e.content === 'string' ? e.content : (e.content ?? []).filter((c) => c.type === 'text').map((c) => c.text).join('\n'),
+  }));
+  return [...codex, ...claude];
 }
 export function assertSuccess(probe, command, token) {
-  const host = commandResults(probe, command).some((r) => r.exit_code === 0 && (!token || r.output.includes(token)));
-  const claude = claudeResults(probe, command).some((e) => !e.is_error && (!token || claudeOutput(e).includes(token)));
-  assert.ok(host || claude, `No successful tool result for ${command}: ${JSON.stringify(probe)}`);
-}
-export function assertNoLeak(probe, token, prefix = 'DENIED_') {
-  const outputs = probe.events.filter((e) => ['tool_result', 'command_result', 'item/started', 'item/completed'].includes(e.kind));
-  assert.ok(!JSON.stringify(outputs).includes(`${prefix}${token}`), 'Protected synthetic content escaped');
+  const results = commandResults(probe, command);
+  assert.ok(results.some((r) => r.exit_code === 0 && (!token || r.output.includes(token))),
+    `No successful correlated native shell result: ${JSON.stringify(probe)}`);
 }
 export { existsSync, readFileSync, writeFileSync, join, randomUUID, spawnSync, delay };

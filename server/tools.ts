@@ -62,14 +62,14 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
       prompt: z.string().min(20).describe("The full brief for the worker"),
       mode: z.enum(["managed", "bg", "tab"]).optional().describe("managed (default), bg, or tab"),
       provider: z.enum(["claude", "codex"]).optional().describe("Managed provider (default claude)"),
-      permission_mode: z.enum([...PERMISSION_MODES, "default", "acceptEdits", "bypassPermissions"]).optional().describe("Managed launch preset: read-only, workspace (default), trusted, full. The PM cannot launch Trusted or Full; the developer must choose them in New session. Legacy modes accept only default, acceptEdits, bypassPermissions."),
+      permission_mode: z.enum([...PERMISSION_MODES, "default", "acceptEdits", "bypassPermissions"]).optional().describe("Managed mode: native (default) or bypass. The PM cannot launch Bypass; the developer must choose it in New session. Legacy modes accept only default, acceptEdits, bypassPermissions."),
       model: z.string().optional().describe("Optional model identifier from list_models for the selected provider; omit to use provider settings"),
     },
     async ({ name, cwd, prompt, mode, provider, permission_mode, model }) => {
       if (!existsSync(cwd)) return err(`cwd does not exist: ${cwd}`);
       if (mode === 'managed' || (!mode && sessions)) {
         if (!sessions) return err('Managed session service is unavailable');
-        if (permission_mode && !PERMISSION_MODES.includes(permission_mode as PermissionMode)) return err('Managed permission_mode must be read-only, workspace, trusted, or full');
+        if (permission_mode && !PERMISSION_MODES.includes(permission_mode as PermissionMode)) return err('Managed permission_mode must be native or bypass');
         try { return fmt(await sessions.create({ id: randomUUID(), provider: provider ?? 'claude', name, cwd, text: prompt, model, permission_mode: permission_mode as PermissionMode | undefined })); }
         catch (error) { return err(error instanceof Error ? error.message : String(error)); }
       }

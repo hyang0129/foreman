@@ -1,4 +1,4 @@
-import { permissionMode, toolDecision, type PermissionMode } from "./permission-policy.ts";
+import { permissionMode, claudePolicy, type PermissionMode } from "./permission-policy.ts";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { query, type Options, type Query, type SDKUserMessage, type PermissionResult, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
@@ -41,13 +41,11 @@ export class ClaudeControl extends EventEmitter {
   readonly finished: Promise<void>;
   private readonly policy: PermissionMode;
   get permission_mode() { return this.policy; }
-  private cwd: string;
 
   constructor(options: Pick<Options, "cwd" | "resume" | "model" | "maxBudgetUsd" | "maxTurns" | "tools" | "settingSources" | "settings" | "systemPrompt" | "persistSession" | "pathToClaudeCodeExecutable" | "mcpServers" | "allowedTools"> & { permission_mode?: PermissionMode },
     factory: QueryFactory = query) {
     super();
     this.policy = permissionMode(options.permission_mode);
-    this.cwd = options.cwd ?? process.cwd();
     const { permission_mode: _policy, ...providerOptions } = options;
     // Defer startup so callers can subscribe before any process or error event.
     this.finished = Promise.resolve().then(async () => {
@@ -55,37 +53,16 @@ export class ClaudeControl extends EventEmitter {
       try {
         this.stream = factory({ prompt: this.input.stream(), options: {
           ...providerOptions,
-          permissionMode: this.permission_mode === 'full' ? 'bypassPermissions' : this.permission_mode === 'workspace' ? 'default' : 'dontAsk',
-          allowDangerouslySkipPermissions: this.permission_mode === 'full',
+          permissionMode: claudePolicy(this.policy),
+          allowDangerouslySkipPermissions: this.policy === 'bypass',
+          // Bypass explicitly disables the provider sandbox; Native inherits provider settings.
+          ...(this.policy === 'bypass' ? { sandbox: { enabled: false } } : {}),
           includePartialMessages: true,
-          sandbox: { enabled: false }, // Foreman supplies the mandatory inherited command sandbox.
-          disallowedTools: ['Agent', 'ExitPlanMode', 'EnterWorktree'],
-          hooks: { PreToolUse: [{ hooks: [async (event) => {
-            if (event.hook_event_name !== 'PreToolUse') return {};
-            const decision = toolDecision(this.permission_mode, this.cwd, event.tool_name, event.tool_input as Record<string, any>);
-            return { hookSpecificOutput: { hookEventName: 'PreToolUse',
-              permissionDecision: decision.behavior,
-              permissionDecisionReason: decision.message,
-              ...(decision.behavior === 'allow' ? { updatedInput: decision.input } : {}),
-            } };
-          }] }] },
-          canUseTool: (tool, input, context) => {
-            if (this.state === 'closed' || this.state === 'failed' || context.signal.aborted) return Promise.resolve({ behavior: 'deny', message: 'Session is unavailable' });
-            const decision = toolDecision(this.permission_mode, this.cwd, tool, input);
-            if (decision.behavior === 'deny') return Promise.resolve({ behavior: 'deny', message: decision.message });
-            if (decision.behavior === 'allow') return Promise.resolve({ behavior: 'allow', updatedInput: decision.input });
-            const pending = this.requestApproval(tool, input, { ...context, decisionReason: decision.message || context.decisionReason }, decision.input);
-            if (tool !== 'Bash' || input.dangerouslyDisableSandbox !== true) return pending;
-            return pending.then((result) => {
-              if (result.behavior !== 'allow') return result;
-              const approved = toolDecision(this.permission_mode, this.cwd, tool, input, process.platform, true);
-              return approved.behavior === 'deny' ? { behavior: 'deny', message: approved.message } : { behavior: 'allow', updatedInput: approved.input };
-            });
-          },
+          canUseTool: (tool, input, context) => this.requestApproval(tool, input, context),
         } });
         for await (const message of this.stream) {
           if (message.type === "system" && message.subtype === "init") {
-            const expected = this.permission_mode === 'full' ? 'bypassPermissions' : this.permission_mode === 'workspace' ? 'default' : 'dontAsk';
+            const expected = claudePolicy(this.policy);
             if (message.permissionMode !== expected) throw new Error('Claude did not apply the requested launch policy');
             this.sessionId = message.session_id;
           }
@@ -96,6 +73,8 @@ export class ClaudeControl extends EventEmitter {
             // acknowledge another send when the producer supplies correlation.
             if (echoed.length && !echoed.includes(this.active.uuid)) continue;
             if (!echoed.length && message.origin && message.origin.kind !== "human") continue;
+            for (const approval of [...this.approvals.values()])
+              approval.resolve({ behavior: 'deny', message: 'Provider turn completed' });
             const receipt = this.active.receipt;
             receipt.status = message.is_error ? "failed" : "completed";
             receipt.result = message;
@@ -143,7 +122,7 @@ export class ClaudeControl extends EventEmitter {
       parent_tool_use_id: null, message: { role: "user", content: this.active.text } } as SDKUserMessage);
   }
 
-  pendingApprovals(): ClaudeApproval[] { return [...this.approvals.values()].map(({ request }) => request); }
+  pendingApprovals(): ClaudeApproval[] { return [...this.approvals.values()].map(({ request }) => structuredClone(request)); }
 
   /** Answer one concrete request only. No permanent permissions are written. */
   respondApproval(id: string, decision: "allow" | "deny", updatedInput?: Record<string, unknown>): boolean {
@@ -156,12 +135,17 @@ export class ClaudeControl extends EventEmitter {
     return true;
   }
 
-  private requestApproval(tool: string, input: Record<string, unknown>, context: PermissionContext, approvedInput: Record<string, unknown>): Promise<PermissionResult> {
+  private requestApproval(tool: string, input: Record<string, unknown>, context: PermissionContext): Promise<PermissionResult> {
     if (this.state === "closed" || this.state === "failed" || context.signal.aborted)
       return Promise.resolve({ behavior: "deny", message: "Session is unavailable" });
     const id = context.requestId || context.toolUseID;
     const existing = this.approvals.get(id);
-    if (existing) return existing.promise;
+    if (existing) {
+      if (existing.request.tool !== tool || JSON.stringify(existing.approvedInput) !== JSON.stringify(input))
+        return Promise.resolve({ behavior: 'deny', message: 'Approval id reused for different input' });
+      return existing.promise;
+    }
+    const approvedInput = structuredClone(input);
     let resolve!: (result: PermissionResult) => void;
     const promise = new Promise<PermissionResult>((settle) => { resolve = settle; });
     const abort = () => finish({ behavior: "deny", message: "Permission request cancelled" });
@@ -172,15 +156,18 @@ export class ClaudeControl extends EventEmitter {
       resolve(result);
     };
     const { signal, ...displayContext } = context;
-    const request = { id, tool, input: tool === 'Bash' ? { ...input, ...(input.dangerouslyDisableSandbox === true ? { requested_access: 'Outside-project read/write and external network for this command only; credentials and loopback remain denied.' } : { guarded_command: approvedInput.command }) } : input, reason: context.decisionReason, context: displayContext };
+    const request = { id, tool, input: structuredClone(input), reason: context.decisionReason, context: displayContext };
     this.approvals.set(id, { request, approvedInput, resolve: finish, promise });
     context.signal.addEventListener("abort", abort, { once: true });
     this.setState("input-needed");
-    this.emit("approval", request);
+    this.emit("approval", structuredClone(request));
     return promise;
   }
 
-  async interrupt() { return this.stream?.interrupt(); }
+  async interrupt() {
+    for (const approval of [...this.approvals.values()]) approval.resolve({ behavior: 'deny', message: 'Interrupted by user' });
+    return this.stream?.interrupt();
+  }
   private isClosed(): boolean { return this.state === "closed"; }
   close() { this.stop("closed", "Claude controller closed"); }
 
