@@ -4,7 +4,8 @@ Foreman selects native provider permissions. It adds no execution sandbox,
 credential deny list, command parser, or approval classifier.
 
 `POST /api/sessions`, `SessionService.create`, and managed `spawn_session` accept
-`permission_mode: "native" | "bypass"`. Omission and JSON null mean `native`.
+`permission_mode: "native" | "bypass"`. Omission means `native`; JSON null in
+the HTTP API also selects `native`.
 
 | Mode | Claude | Codex |
 | --- | --- | --- |
@@ -59,7 +60,13 @@ or command-prefix amendments. Claude command input is snapshotted and cannot be
 replaced by an approval response. Cancellation, interruption, completed turns,
 and disconnection invalidate pending approvals as supported by each adapter.
 Codex's separate `request_permissions` requests receive an empty turn grant;
-command/file approval requests still go to the user. Unknown provider dialogs
+command/file approval requests still go to the user. Stop uses the providers'
+native turn interruption and cancels pending Foreman approvals and queued messages.
+**On Codex CLI 0.149.0, a native shell command can keep running after the turn is
+interrupted.** The live suite retains a failing regression for this behavior.
+Codex's native terminal-cleanup endpoint did not resolve the foreground case and
+is not used as a workaround. Claude's tested foreground command stopped.
+Interruption does not undo effects already performed. Unknown provider dialogs
 remain unsupported and require interruption or the original client.
 
 Approval authorizes the native operation, including any subprocesses or
