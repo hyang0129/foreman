@@ -21,7 +21,7 @@ export interface ProviderSetup {
   codexTools?: { dynamicTools: any[]; developerInstructions?: string; call: (name: string, args: any) => Promise<any> };
   cleanup?: () => void;
 }
-interface Runtime { claude?: ClaudeControl; codex?: CodexControl; ready: boolean; stopped?: boolean; active?: string; turn?: string; dispatching: boolean; setup?: ProviderSetup }
+interface Runtime { claude?: ClaudeControl; codex?: CodexControl; ready: boolean; stopped?: boolean; active?: string; turn?: string; dispatching: boolean; interrupting?: boolean; setup?: ProviderSetup }
 interface Options { home?: string; fleet?: Fleet; claudeFactory?: (options: ConstructorParameters<typeof ClaudeControl>[0]) => ClaudeControl; codexFactory?: (options: ConstructorParameters<typeof CodexControl>[0]) => CodexControl; prepare?: (session: SessionRow) => ProviderSetup | Promise<ProviderSetup> }
 const now = () => new Date().toISOString();
 const clone = <T>(value: T): T => structuredClone(value);
@@ -139,6 +139,7 @@ export class SessionService extends EventEmitter {
     if (existing) { if (existing.text !== text || JSON.stringify(existing.source) !== JSON.stringify(source)) throw new Error('Message id was already used for different input'); return clone(existing); }
     const runtime = this.runtime.get(id);
     if (!runtime?.ready || this.closed) throw new Error(data.session.control_reason ?? 'Session is not ready');
+    if (runtime.interrupting) throw new Error('Session interruption is still cleaning up');
     if (data.receipts.filter((r) => ['queued', 'running'].includes(r.status)).length >= 100 || data.receipts.length >= 10000) throw new Error('Session queue or receipt limit reached');
     const receipt: Receipt = { id: messageId, status: 'queued', text, at: now(), source: clone(source) };
     data.receipts.push(receipt); data.history.push({ id: messageId, role: 'user', text, at: receipt.at, source: clone(source) });
@@ -234,7 +235,7 @@ export class SessionService extends EventEmitter {
     if (event.method === 'turn/completed' && runtime.turn === p.turn?.id) {
       this.complete(data, runtime, p.turn.status === 'completed' ? 'completed' : 'failed', p.turn.error?.message ?? (p.turn.status === 'interrupted' ? 'Interrupted by user' : undefined));
     }
-    if (event.method === 'thread/closed') this.unavailable(data, runtime, 'Codex thread closed');
+    if (['thread/closed', 'thread/archived'].includes(event.method) || (event.method === 'thread/status/changed' && p.status?.type === 'notLoaded')) this.unavailable(data, runtime, 'Codex thread closed');
     this.changed(data);
   }
   private unavailable(data: RecordData, runtime: Runtime, reason: string, definite = false) {
@@ -271,19 +272,29 @@ export class SessionService extends EventEmitter {
   }
   async interrupt(id: string) {
     const runtime = this.runtime.get(id); if (!runtime?.ready || !runtime.active) throw new Error('No active managed turn');
+    if (runtime.interrupting) throw new Error('Session interruption is still cleaning up');
+    runtime.interrupting = true;
     const data = this.records.get(id)!;
     // Explicit stop cancels follow-ups too; never start queued work immediately after stop.
     for (const receipt of data.receipts) if (receipt.status === 'queued') { receipt.status = 'failed'; receipt.error = 'Cancelled by user interruption'; }
     this.changed(data);
-    if (runtime.claude) await runtime.claude.interrupt(); else await runtime.codex!.interrupt(data.session.session_id);
+    try {
+      if (runtime.claude) await runtime.claude.interrupt(); else await runtime.codex!.interrupt(data.session.session_id);
+    } finally { runtime.interrupting = false; }
   }
+  private finished = Promise.resolve();
   close() {
-    if (this.closed) return;
+    if (this.closed) return this.finished;
     this.closed = true;
+    const closing: Promise<unknown>[] = [];
     for (const [id, runtime] of this.runtime) {
       this.unavailable(this.records.get(id)!, runtime, 'Foreman stopped; pending delivery is uncertain');
-      runtime.claude?.close(); runtime.codex?.close(); runtime.setup?.cleanup?.();
+      runtime.claude?.close();
+      if (runtime.codex) closing.push(Promise.resolve(runtime.codex.close()));
+      runtime.setup?.cleanup?.();
     }
     this.releaseLock();
+    this.finished = Promise.all(closing).then(() => {});
+    return this.finished;
   }
 }

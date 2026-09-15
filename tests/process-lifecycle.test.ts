@@ -1,0 +1,70 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { spawn } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
+import { spawnOwnedProcess } from '../server/owned-process.ts';
+import { ProcessTree, processTable, type ProcessEntry } from '../server/process-tree.ts';
+
+const fixture = fileURLToPath(new URL('./fixtures/process-provider.mjs', import.meta.url));
+async function until<T>(check: () => T | false) {
+  for (let i = 0; i < 100; i++) { const value = check(); if (value) return value; await delay(50); }
+  throw new Error('process-table condition timed out');
+}
+function row(pid: number, ppid: number, pgid: number, started = 'one'): ProcessEntry { return {pid,ppid,pgid,started,stat:'S'}; }
+test('ownership follows detached descendants and retains groups after leaders exit, but rejects reused PIDs', () => {
+  const tree = new ProcessTree(100);
+  assert.deepEqual(tree.sample([row(100,1,100),row(101,100,101),row(102,101,101),row(200,1,200)]).map((r) => r.pid), [100,101,102]);
+  assert.deepEqual(tree.sample([row(102,1,101),row(103,1,101),row(200,1,200)]).map((r) => r.pid), [102,103]);
+  assert.deepEqual(tree.sample([row(102,1,102,'reused'),row(200,1,200)]), []);
+});
+for (const action of ['close', 'provider-crash', 'provider-kill', 'owner-kill'] as const) {
+  test(`owned process ${action} removes the detached shell and its child from ps`, {timeout:15000}, async () => {
+    // Keep an unrelated sentinel alive to catch overbroad process-group kills.
+    const sentinel = spawn('sleep', ['120'], {detached:true,stdio:'ignore'});
+    let child: ReturnType<typeof spawnOwnedProcess> | ReturnType<typeof spawn>;
+    if (action === 'owner-kill') {
+      child = spawn(process.execPath, ['--experimental-strip-types','--input-type=module','-e',
+        `import {spawnOwnedProcess} from ${JSON.stringify(new URL('../server/owned-process.ts',import.meta.url).href)};
+         const child = spawnOwnedProcess(process.execPath, [${JSON.stringify(fixture)}]); child.stdout.pipe(process.stdout); child.stderr.pipe(process.stderr);`],
+        {detached:true,stdio:['pipe','pipe','pipe']});
+    } else child = spawnOwnedProcess(process.execPath, [fixture]);
+    let output = ''; child.stdout!.on('data',(chunk) => { output += chunk; });
+    child.stderr!.resume();
+    const exited = once(child,'exit');
+    let pids: {provider:number;shell:number;sleep:number} | undefined;
+    try {
+      pids = await until(() => output.includes('\n') && JSON.parse(output.trim()));
+      const started = processTable().filter((r) => Object.values(pids!).includes(r.pid));
+      assert.equal(started.length,3); assert.equal(started.find((r) => r.pid === pids!.shell)?.pgid,pids!.shell);
+      // Exercise already-running commands; the live suite covers actual Codex startup timing.
+      await delay(150);
+      if (action === 'provider-crash') child.stdin!.write('crash\n');
+      else if (action === 'provider-kill') process.kill(pids!.provider,'SIGKILL');
+      else child.kill(action === 'owner-kill' ? 'SIGKILL' : 'SIGTERM');
+      await exited;
+      await until(() => !processTable().some((r) => Object.values(pids!).includes(r.pid)));
+      assert.ok(processTable().some((r) => r.pid === sentinel.pid));
+    } finally {
+      child.kill('SIGTERM'); sentinel.kill('SIGKILL');
+      if (pids) for (const pid of [pids.provider,pids.shell]) { try { process.kill(-pid,'SIGKILL'); } catch {} }
+    }
+  });
+}
+
+test('macOS immediate provider death cannot hide a newly detached child between samples', {skip:process.platform !== 'darwin',timeout:15000}, async () => {
+  // No readiness delay: the provider dies synchronously after spawn. This leaked
+  // in every trial with ps-only ancestry; the original parent identity is needed.
+  for (let attempt=0;attempt<5;attempt++) {
+    const child = spawnOwnedProcess(process.execPath,['-e', `
+      const worker = require('child_process').spawn('/bin/sleep',['120'],{detached:true,stdio:'ignore'});
+      require('fs').writeSync(1,String(worker.pid)+'\\n');
+      process.kill(process.pid,'SIGKILL');`]);
+    let output = ''; child.stdout.on('data',(chunk) => { output += chunk; }); child.stderr.resume();
+    await once(child,'exit');
+    const pid = Number(output.trim()); assert.ok(pid > 1);
+    try { await until(() => !processTable().some((row) => row.pid === pid)); }
+    finally { try { process.kill(-pid,'SIGKILL'); } catch {} }
+  }
+});

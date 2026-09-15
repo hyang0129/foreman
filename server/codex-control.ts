@@ -2,10 +2,11 @@
 // Never resumes an arbitrary disk transcript implicitly or changes a session's permissions.
 import { permissionMode, codexPolicy, type PermissionMode } from './permission-policy.ts';
 import { EventEmitter } from 'node:events';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import WebSocket from 'ws';
+import { spawnOwnedProcess } from './owned-process.ts';
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
 export type CodexStatus = { type: 'idle' | 'notLoaded' | 'systemError' | 'active'; activeFlags?: string[] };
@@ -30,6 +31,9 @@ export class CodexControl extends EventEmitter {
   private attached = new Set<string>();
   private turns = new Map<string, string>();
   private options: Options;
+  private closing?: Promise<void>;
+  private interrupted = new Set<string>();
+  private interrupting = new Map<string, Promise<unknown>>();
   constructor(options: Options = {}) { super(); this.options = options; }
 
   async connect() {
@@ -47,8 +51,8 @@ export class CodexControl extends EventEmitter {
       await new Promise<void>((resolve, reject) => { this.socket!.once('open', resolve); this.socket!.once('error', reject); });
     } else {
     const args = ['app-server', '--stdio'];
-    this.child = spawn(this.options.bin ?? process.env.FOREMAN_CODEX_BIN ?? 'codex', [...args, ...(this.options.args ?? [])], {
-      cwd: this.options.cwd, env: this.options.env ?? process.env, stdio: 'pipe',
+    this.child = spawnOwnedProcess(this.options.bin ?? process.env.FOREMAN_CODEX_BIN ?? 'codex', [...args, ...(this.options.args ?? [])], {
+      cwd: this.options.cwd, env: this.options.env ?? process.env,
     });
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', (chunk: string) => this.receive(chunk));
@@ -66,6 +70,9 @@ export class CodexControl extends EventEmitter {
     return this;
   }
 
+  private setActive(active: boolean) {
+    if (this.child?.connected) this.child.send!({ type: 'active', active }, () => {});
+  }
   private write(message: Json) {
     if (this.socket) {
       if (this.socket.readyState !== WebSocket.OPEN) throw new Error('Codex is disconnected');
@@ -116,22 +123,34 @@ export class CodexControl extends EventEmitter {
           this.requests.set(message.id, message);
           this.emit('request', message);
         } else {
+          // Codex can announce a native command AFTER turn/completed(interrupted).
+          // Terminate that exact execution, never sweep a newer turn's terminals.
+          if (message.method === 'item/started' && p.item?.type === 'commandExecution' &&
+              this.interrupted.has(p.turnId)) {
+            if (!p.item.processId) { void this.close(); continue; }
+            void this.request('thread/backgroundTerminals/terminate', { threadId: p.threadId, processId: p.item.processId })
+              .catch(() => { void this.close(); });
+          }
+          const threadEnded = ['thread/closed', 'thread/archived'].includes(message.method) ||
+            (message.method === 'thread/status/changed' && p.status?.type === 'notLoaded');
           const completedActiveTurn = message.method === 'turn/completed' && this.turns.get(p.threadId) === p.turn?.id;
           if (message.method === 'turn/started' && p.threadId && p.turn?.id) this.turns.set(p.threadId, p.turn.id);
           if (completedActiveTurn) this.turns.delete(p.threadId);
           if (message.method === 'serverRequest/resolved') this.requests.delete(p.requestId);
-          if (message.method === 'thread/closed') { this.attached.delete(p.threadId); this.turns.delete(p.threadId); }
-          if (message.method === 'turn/completed' || message.method === 'thread/closed') {
+          if (threadEnded) { this.attached.delete(p.threadId); this.turns.delete(p.threadId); }
+          if (message.method === 'turn/completed' || threadEnded) {
             for (const [id, req] of this.requests) {
               if (req.params.threadId !== p.threadId) continue;
               // A delayed completion must not discard a newer turn's approval.
-              if (message.method === 'thread/closed' ||
+              if (threadEnded ||
                 (req.params.turnId ? req.params.turnId === p.turn?.id : completedActiveTurn)) {
                 this.requests.delete(id);
               }
             }
           }
+          if (message.method === 'turn/started' || completedActiveTurn || threadEnded) this.setActive(this.turns.size > 0);
           this.emit('notification', message);
+          if (threadEnded && this.child && !this.attached.size) void this.close();
         }
       }
     }
@@ -142,12 +161,22 @@ export class CodexControl extends EventEmitter {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error); }
     this.pending.clear(); this.requests.clear(); this.attached.clear(); this.turns.clear();
     if (wasConnected) this.emit('disconnect', error);
+    if (this.child) void this.close();
   }
-  close() {
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
+    this.closing = this.child && this.child.exitCode === null && this.child.signalCode === null
+      ? new Promise<void>((resolve, reject) => { this.child!.once('exit', (code) => code === 1
+        ? reject(new Error('Codex process cleanup failed; inspect diagnostics')) : resolve()); })
+      : this.child?.exitCode === 1 ? Promise.reject(new Error('Codex process cleanup failed; inspect diagnostics')) : Promise.resolve();
+    // Event-driven disconnects also initiate cleanup; explicit callers still
+    // receive rejection, without an unhandled promise when no caller awaits it.
+    void this.closing.catch(() => {});
     this.disconnected(new Error('Codex client closed'));
     this.child?.stdin.end(); this.child?.kill('SIGTERM');
     this.socket?.terminate();
-    // Closing a socket disconnects this client, not the shared app-server.
+    // Socket attachment does not own the external app-server or its processes.
+    return this.closing;
   }
   list(cursor?: string) {
     return this.request<{ data: CodexThread[]; nextCursor: string | null }>('thread/list', { limit: 100, sortKey: 'updated_at', ...(cursor ? { cursor } : {}) });
@@ -172,6 +201,7 @@ export class CodexControl extends EventEmitter {
       throw new Error('Codex did not apply the requested native mode; session was not activated');
     }
     this.attached.add(result.thread.id);
+    this.setActive(this.turns.size > 0);
     return result.thread;
   }
   async attach(threadId: string) {
@@ -190,6 +220,7 @@ export class CodexControl extends EventEmitter {
   }
   async send(threadId: string, text: string, mode: 'turn' | 'steer' = 'turn') {
     this.requireAttached(threadId);
+    if (this.interrupting.has(threadId)) throw new Error('Session interruption is still cleaning up');
     if (!text.trim() || text.length > 100_000) throw new Error('Message must contain 1–100000 characters');
     const turnId = this.turns.get(threadId);
     if (mode === 'steer') {
@@ -201,15 +232,27 @@ export class CodexControl extends EventEmitter {
   }
   queue(threadId: string, text: string, messageId: string = randomUUID()) {
     this.requireAttached(threadId);
+    if (this.interrupting.has(threadId)) throw new Error('Session interruption is still cleaning up');
     if (!text.trim() || text.length > 100_000) throw new Error('Message must contain 1–100000 characters');
     return this.request('thread/queue/add', { threadId, input: [{ type: 'text', text }], clientUserMessageId: messageId });
   }
   interrupt(threadId: string) {
     this.requireAttached(threadId);
+    const prior = this.interrupting.get(threadId); if (prior) return prior;
     const turnId = this.turns.get(threadId);
     if (!turnId) throw new Error('No known active turn');
+    this.interrupted.add(turnId);
     for (const [id, request] of this.requests) if (request.params.threadId === threadId) this.requests.delete(id);
-    return this.request('turn/interrupt', { threadId, turnId });
+    const operation = (async () => {
+      try {
+        const result = await this.request('turn/interrupt', { threadId, turnId });
+        await this.request('thread/backgroundTerminals/clean', { threadId });
+        return result;
+      } catch (error) { await this.close(); throw error; }
+      finally { this.interrupting.delete(threadId); }
+    })();
+    this.interrupting.set(threadId, operation);
+    return operation;
   }
   pendingRequests() { return [...this.requests.values()]; }
   respondTool(id: string | number, result: Record<string, Json>) {

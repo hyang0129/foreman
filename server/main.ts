@@ -127,14 +127,17 @@ server.listen(PORT, "127.0.0.1", () => {
   if (process.env.FOREMAN_PM_DISABLED !== "1") pm.start().catch((e: unknown) => console.error("pm:", e));
 });
 let stopping = false;
-function shutdown() {
+async function shutdown() {
   if (stopping) return;
   stopping = true;
-  fleet.stop(); pm.close(); bridge?.close(); sessions.close();
+  fleet.stop(); pm.close(); bridge?.close();
+  const providersClosed = sessions.close();
   for (const client of clients) client.end();
   clients.clear();
-  server.close(() => process.exit(0));
+  const httpClosed = new Promise<void>((resolve) => server.close(() => resolve()));
   setTimeout(() => process.exit(1), 5000).unref();
+  try { await Promise.all([httpClosed, providersClosed]); process.exit(0); }
+  catch (error) { console.error('Foreman shutdown cleanup failed:', error); process.exit(1); }
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

@@ -212,3 +212,16 @@ test('legacy presets remain historical and cannot be relaunched or silently wide
   await assert.rejects(loaded.create(input), /different input/);
   await assert.rejects(loaded.create({...input, permission_mode:'trusted' as any}), /permission_mode/);
 });
+
+test('a message arriving during Stop cannot race terminal cleanup or make the session unavailable', async (t) => {
+  const {service,codex,input} = fixture(t);
+  const row = await service.create({...input,provider:'codex'}); await tick();
+  let release!: () => void;
+  const native = codex.interrupt.bind(codex);
+  codex.interrupt = async () => { await native(); await new Promise<void>((resolve) => { release = resolve; }); };
+  const stopping = service.interrupt(row.session_key); await tick();
+  assert.throws(() => service.send(row.session_key,'next','next'),/still cleaning up/);
+  release(); await stopping;
+  service.send(row.session_key,'next','next'); await tick();
+  assert.equal(codex.sent.length,2); assert.equal(codex.closed,false);
+});

@@ -176,3 +176,38 @@ test('native approval forwards only the decision and interruption invalidates pe
   assert.equal(client.pendingRequests().length, 0);
   assert.throws(() => client.respond('approval-1', {decision:'accept'}), /no longer pending/);
 });
+
+test('a command announced after interrupted completion is terminated by its exact process id', async (t) => {
+  const {client,sent} = await fixture(t);
+  await client.start('/tmp'); await client.send('live','first');
+  await client.interrupt('live');
+  await client.request('fixture/complete',{turnId:'turn-1'});
+  await client.request('fixture/newer-approval');
+  (client as any).receive(JSON.stringify({method:'item/started',params:{threadId:'live',turnId:'turn-1',item:{type:'commandExecution',processId:'late-old-command'}}})+'\n');
+  await client.request('fixture/approval');
+  assert.deepEqual(sent.filter((m) => m.method === 'thread/backgroundTerminals/terminate').map((m) => m.params),
+    [{threadId:'live',processId:'late-old-command'}]);
+  assert.equal(sent.filter((m) => m.method === 'thread/backgroundTerminals/clean').length,1);
+  assert.ok(client.pendingRequests().some((request) => request.id === 'approval-2'));
+});
+
+for (const event of [
+  {method:'thread/archived',params:{threadId:'live'}},
+  {method:'thread/status/changed',params:{threadId:'live',status:{type:'notLoaded'}}},
+]) test(`${event.method} detaches a terminal thread and invalidates pending approvals`, async (t) => {
+  const {client} = await fixture(t);
+  await client.start('/tmp'); await client.send('live','work');
+  await client.request('fixture/approval');
+  (client as any).receive(JSON.stringify(event)+'\n');
+  assert.equal(client.pendingRequests().length,0);
+  await assert.rejects(client.send('live','after unload'),/Attach/);
+  // A socket client has no authority to kill the shared external server.
+  await client.request('fixture/approval');
+});
+
+test('an interrupted late command without a native process handle retires the controller', async (t) => {
+  const {client} = await fixture(t);
+  await client.start('/tmp'); await client.send('live','work'); await client.interrupt('live');
+  (client as any).receive(JSON.stringify({method:'item/started',params:{threadId:'live',turnId:'turn-1',item:{type:'commandExecution',processId:null}}})+'\n');
+  await assert.rejects(client.read('live'),/not initialized/);
+});
