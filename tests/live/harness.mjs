@@ -69,7 +69,7 @@ export class Harness {
   async api(path, body, expected) {
     assert.notEqual(new URL(this.url).port, '4177');
     const response = await fetch(this.url + path, { method: body === undefined ? 'GET' : 'POST',
-      headers: { 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      headers: { 'content-type': 'application/json', ...(existsSync(join(this.home, 'local-api-token')) ? {authorization:`Bearer ${readFileSync(join(this.home, 'local-api-token'),'utf8').trim()}`} : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(12_000), redirect: 'error' });
     if (expected) { assert.equal(response.status, expected); return; }
     const result = await response.json(); assert.ok(response.ok, JSON.stringify(result)); return result;
@@ -100,23 +100,24 @@ export class Harness {
       cwd: f.project, name: `${provider}-${policy}-${this.rows.length}`, model: provider === 'claude'
         ? (process.env.FOREMAN_LIVE_CLAUDE_MODEL || 'haiku') : (process.env.FOREMAN_LIVE_CODEX_MODEL || 'gpt-5.6-luna'),
       text: 'Do not use tools. Wait for the next fixture instruction.' });
-    this.rows.push({ ...row, requested: policy });
+    row.requested = policy;
+    this.rows.push(row);
     return row;
   }
   async reported(row) {
     const detail = await this.api(`/api/session?id=${encodeURIComponent(row.session_key)}`);
-    assert.equal(detail.session.permission_mode, row.permission_mode);
+    assert.equal(detail.session.permission_mode, row.requested);
     const seq = ++this.sequence;
     const peer = await Promise.race([new Promise((resolve, reject) => {
       this.responses.set(seq, (m) => m.error ? reject(new Error(m.error)) : resolve(m.result));
       this.child.send({ type: 'peer', seq, id: row.session_key });
     }), delay(5000).then(() => { throw new Error('Peer projection timeout'); })]);
-    assert.equal(peer.session.permission_mode, row.permission_mode);
-    const page = await this.browser.newPage();
+    assert.equal(peer.session.permission_mode, row.requested);
+    const page = await this.browser.newPage({extraHTTPHeaders:{authorization:`Bearer ${readFileSync(join(this.home, 'local-api-token'),'utf8').trim()}`}});
     try {
       await page.goto(this.url);
       await page.locator('#session-list').getByText(row.name, { exact: true }).click();
-      await expect(page.locator('#conversation-subtitle')).toContainText(labels[row.permission_mode]);
+      await expect(page.locator('#conversation-subtitle')).toContainText(labels[row.requested]);
     } finally { await page.close(); }
   }
   async idle(row) {
@@ -160,7 +161,7 @@ export class Harness {
   shell(row, command, access = false, yieldMs = 1000) {
     return row.provider === 'codex'
       ? `Call foreman_exec with ${JSON.stringify({ command, yield_ms: yieldMs, ...(access ? { request_access: true } : {}) })}.`
-      : `Call Bash with ${JSON.stringify({ command })}.`;
+      : `Call Bash with ${JSON.stringify({ command, ...(access ? {dangerouslyDisableSandbox:true} : {}) })}.`;
   }
   async stop() {
     if (!this.child || this.child.exitCode !== null) return;
@@ -209,7 +210,7 @@ export function claudeOutput(result) {
 export function assertNetworkFailure(probe, command) {
   const host = commandResults(probe, command).some((r) => r.exit_code === 7);
   const wrapped = probe.events.some((e) => e.kind === 'hook' && e.tool === 'Bash' && e.input?.command === command
-    && e.result.hookSpecificOutput?.updatedInput?.command?.includes('(deny network*)'));
+    && /\(deny network(?:\*|\-outbound)/.test(e.result.hookSpecificOutput?.updatedInput?.command ?? ''));
   const claude = wrapped && claudeResults(probe, command).some((e) => e.is_error && /curl: \(7\)/.test(claudeOutput(e)));
   assert.ok(host || claude, `No correlated guarded curl exit 7: ${JSON.stringify(probe)}`);
 }
@@ -230,8 +231,8 @@ export function assertSuccess(probe, command, token) {
   const claude = claudeResults(probe, command).some((e) => !e.is_error && (!token || claudeOutput(e).includes(token)));
   assert.ok(host || claude, `No successful tool result for ${command}: ${JSON.stringify(probe)}`);
 }
-export function assertNoLeak(probe, token) {
-  const outputs = probe.events.filter((e) => ['tool_result', 'command_result'].includes(e.kind));
-  assert.ok(!JSON.stringify(outputs).includes(`DENIED_${token}`), 'Protected synthetic content escaped');
+export function assertNoLeak(probe, token, prefix = 'DENIED_') {
+  const outputs = probe.events.filter((e) => ['tool_result', 'command_result', 'item/started', 'item/completed'].includes(e.kind));
+  assert.ok(!JSON.stringify(outputs).includes(`${prefix}${token}`), 'Protected synthetic content escaped');
 }
 export { existsSync, readFileSync, writeFileSync, join, randomUUID, spawnSync, delay };

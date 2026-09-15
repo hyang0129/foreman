@@ -35,7 +35,7 @@ if (process.env.FOREMAN_LIVE !== '1') {
       await t.test('git fetch exits zero and writes FETCH_HEAD', async () => {
         await probe('git fetch --depth=1 https://github.com/hyang0129/foreman.git main');
         assert.match(readFileSync(join(f.project, '.git/FETCH_HEAD'), 'utf8'), /^[a-f0-9]{40}\s/);
-        assert.ok(existsSync(join(f.project, '.foreman-tmp/xcrun_db')), 'xcrun must create its cache inside the project');
+        assert.equal(existsSync(join(f.project, '.foreman-tmp')), false, 'command caches must be cleaned after fetch');
       });
       await t.test('git pull exits zero over TLS', async () => {
         await probe('git pull --ff-only https://github.com/hyang0129/foreman.git main');

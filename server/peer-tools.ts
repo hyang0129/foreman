@@ -39,6 +39,9 @@ function publicSession(row: any) {
   for (const key of ['session_key', 'session_id', 'provider', 'model', 'permission_mode', 'name', 'cwd', 'state', 'reason', 'managed', 'capabilities', 'control_reason', 'updated_at', 'last_error']) {
     if (row[key] !== undefined) result[key] = typeof row[key] === 'string' ? row[key].slice(0, 2000) : row[key];
   }
+  if (!row.managed && row.permission_mode !== undefined) {
+    result.provider_permission_mode = result.permission_mode; delete result.permission_mode;
+  }
   if (row.last_message) result.last_message = String(row.last_message).slice(0, 400);
   return result;
 }

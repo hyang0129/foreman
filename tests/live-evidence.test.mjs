@@ -58,3 +58,26 @@ test('TLS success requires the actual correlated shell exit, including Claude', 
     [{ ...host, input: { command: 'git status' } }],
   ]) assert.throws(() => assertShellExit({ events }, command), /shell exit/);
 });
+
+test('native Codex file results cannot hide disclosed content', async () => {
+  const {assertNoLeak} = await import('./live/harness.mjs');
+  for (const kind of ['tool_result','command_result','item/started','item/completed']) {
+    assert.throws(() => assertNoLeak({events:[{kind,item:{type:'imageView',content:'DENIED_fixture'}}]}, 'fixture'), /escaped/);
+    assert.throws(() => assertNoLeak({events:[{kind,item:{type:'fileRead',content:'OUTSIDE_fixture'}}]}, 'fixture', 'OUTSIDE_'), /escaped/);
+  }
+});
+test('reported policy is compared to the requested preset before peer or UI work', async () => {
+  const {Harness} = await import('./live/harness.mjs');
+  const h = new Harness(); h.api = async () => ({session:{permission_mode:'full'}});
+  await assert.rejects(h.reported({permission_mode:'full',requested:'workspace'}), /full.*workspace/s);
+});
+
+test('live observer records native Codex read notifications for leak checking', async () => {
+  const {EventEmitter} = await import('node:events');
+  const {observeCodex} = await import('./live/observe-codex.mjs');
+  const {assertNoLeak} = await import('./live/harness.mjs');
+  const control = new EventEmitter(); control.write = () => {};
+  const events = []; observeCodex(control, '/project', (event) => events.push(event));
+  for (const method of ['item/started','item/completed']) control.emit('notification', {method,params:{item:{type:'imageView',content:'DENIED_fixture'}}});
+  assert.equal(events.length, 2); assert.throws(() => assertNoLeak({events},'fixture'), /escaped/);
+});

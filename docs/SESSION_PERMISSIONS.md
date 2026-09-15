@@ -1,12 +1,14 @@
 # Session launch permissions
 
 `POST /api/sessions`, `SessionService.create`, and managed `spawn_session` accept
-`permission_mode`: `read-only`, `workspace`, `trusted`, or `full`. Omission is
+`permission_mode`: `read-only`, `workspace`, `trusted`, or `full`. Omission and JSON null are
 normalized to `workspace` before validation, idempotency comparison, persistence,
 and provider launch. Native Claude flags are not managed presets. Existing legacy
 `bg`/`tab` launches retain their separate native flag validation.
 
-The session row and peer session summaries report the normalized preset. Old
+Managed session rows and peer summaries report the normalized preset. Observed
+external sessions instead expose `provider_permission_mode` to peers; a native
+Claude mode is not a Foreman preset. Old
 managed rows recorded as `default` display Workspace; stopped sessions are never
 resumed or silently upgraded. Duplicate creation IDs cannot select another policy.
 There is no update-policy endpoint. Peer tools cannot launch sessions or approve
@@ -43,8 +45,12 @@ controller fails instead of running with a mislabeled policy.
 Claude's `PreToolUse` hook checks canonical file paths before provider auto-allow
 rules or Full bypass take effect. Permitted file operations proceed immediately.
 Shell operations receive an inherited macOS Seatbelt boundary; Workspace shell
-approvals still go through `canUseTool`, displaying the original command while
-executing its guarded form. `allowedTools` retains the existing peer-tool list;
+approvals still go through `canUseTool`, displaying the original command, guarded
+command, and grant description. Ordinary approval retains project confinement and
+no network. Only an explicit `dangerouslyDisableSandbox:true` request followed by
+developer approval enables one-time outside access; the mandatory deny list and
+local-control-plane network denial remain active. Background Bash is refused with
+an explanation because native Monitor/TaskStop are not in the launch grant. `allowedTools` retains the existing peer-tool list;
 it is not expanded into a blanket allow rule. `disallowedTools` additionally blocks
 Agent, ExitPlanMode, and EnterWorktree. Provider-native shell sandboxing is disabled
 because Foreman supplies the mandatory shell sandbox; nesting the two does not
@@ -57,7 +63,8 @@ are disabled and the hook refuses any native shell fallback. Instead, the host
 provides `foreman_exec` and `foreman_process` as thread-bound dynamic tools. This
 is necessary because Codex's sandbox rejects applying a second Seatbelt policy.
 The host runs each command under the same mandatory boundary used for Claude,
-retains it for stdin and child processes, bounds output and active processes, and
+retains it for child processes, rejects stdin on processes with a one-time escape,
+bounds output and active processes, reaps completed entries at spawn, and
 terminates owned commands on interrupt/disconnect. The command tools accept no
 policy, caller identity, or provider flag override.
 
@@ -65,7 +72,8 @@ Workspace commands start inside the project grant with networking disabled.
 `foreman_exec(request_access:true)` asks through the existing approval UI for the
 **exact command and directory, once**. Approval permits that command's outside
 access while preserving the deny list. It never persists a broader grant for a
-later command. Codex `request_permissions` receives an empty grant; session-wide
+later command. Interactive stdin on an approved interpreter is refused: submit a
+new exact command for new input. Codex `request_permissions` receives an empty turn-scoped grant; session-wide
 approval decisions are rejected. Read-only and Trusted refuse access requests.
 
 ## Command grants and protected paths
@@ -80,7 +88,8 @@ permits outside paths but never protected targets.
 
 Protected families are `.env`/`.env.*`/`*.env`, `secret(s)` and `credential(s)`
 files/directories (including extensions), private-key files (`pem`, `key`, `p12`,
-`pfx`), `.ssh`, `.aws`, `.gnupg`, `.claude`, relay credential/token filenames,
+`pfx`), `.ssh`, `.aws`, `.gnupg`, `.claude`, `.codex`, `.git-credentials`, `.npmrc`,
+`.netrc`, home `~/.docker/config.json` and `~/.kube/config`, relay credential/token filenames,
 `cloud.json`, and Wrangler JSON/JSONC. Foreman's state directory (including
 `~/.foreman/cloud.json` or configured `FOREMAN_HOME`) and private policy snapshots
 are protected as well. They cannot be read or written through either file tools
@@ -99,14 +108,28 @@ protected; a path merely ending in `etc/ssl/cert.pem` acquires no exception.
 
 System runtime directories remain readable so binaries and libraries can run;
 these are not writable project roots. A simple Git command can consume Git
-configuration. Agreed Git/GitHub CLI operations can consume GitHub CLI configuration
-and macOS Keychain preferences for existing authentication. GitHub authentication
-environment variables are retained only for those CLI operations. Direct reads of GitHub CLI credential files and Keychain data are refused; credential files also cannot be supplied as explicit CLI input data. Other sensitive
-environment variables, especially Foreman/relay variables, are removed from tool
-commands. This distinction preserves credential **use by authenticated tools**;
-it is not a grant to inspect credentials as task data. As with the issue's
-existing-host threat model, this is not isolation against a compromised provider
-binary or arbitrary secrets hidden under unrecognized filenames.
+configuration, including repository configuration. Git/gh children get **no
+credential-read exception**: GitHub configuration and macOS Keychains are denied,
+and GitHub tokens are scrubbed along with other sensitive environment variables.
+Repository-controlled `core.sshCommand`, credential helpers, URL rewrites, and
+replacement executables therefore do not gain the host's credentials.
+
+This deliberately removes authenticated `gh` and private Git compatibility with
+the host's login. Public HTTPS Git still has a network grant. Foreman does not
+implement an authentication proxy in this pass. Pinning a few Git flags would not
+safely cover all child execution or agent-controlled executables, so the former
+credential relaxation was removed entirely. No successful authenticated operation
+is promised until a separately reviewed credential broker exists.
+
+Every guarded shell command, including Full and approved Workspace escapes,
+denies outbound loopback connections. The local HTTP API independently requires
+a bearer token or an HttpOnly SameSite=Strict cookie. A new server process creates
+an owned mode-0600 `local-api-token` in its configured Foreman state directory and
+reuses it on subsequent starts. The browser accepts that token through its local
+unlock form; the host bridge adds it to forwarded requests. `/api/config`,
+`/api/health`, and the token exchange are public and grant no session authority.
+Existing running services require a future owner-managed restart to apply this
+code; this pass does not restart or deploy them.
 
 Trusted's agreed network operations are:
 
@@ -116,12 +139,17 @@ Trusted's agreed network operations are:
   `gh workflow` list/view/run/enable/disable; and
   `gh release` list/view/create/edit/delete/upload/download.
 - `git push`, `git fetch`, and `git pull` (without executable override flags).
-- `npm`, `pnpm`, or `yarn` install/ci/add. Package scripts inherit the same project
-  and deny boundaries. Temporary files and package caches use `.foreman-tmp/`
-  inside the project rather than gaining an outside write grant. Trusted also sets
-  `xcrun_db` to `.foreman-tmp/xcrun_db`: Apple's Git shim ignores the redirected
-  `TMPDIR` for this cache on the verified host. The per-user OS temporary directory
-  retains its existing restrictions.
+
+Package install/ci/add commands have **no automatic network grant**. Their
+lifecycle scripts are arbitrary project-controlled programs. Offline/cached
+installs can work within the project; networked installs require a Workspace
+one-time request or Full, with the credential and loopback denials still active.
+
+Trusted commands allocate a unique cache below `.foreman-tmp/`, redirect TMPDIR,
+package caches, and Apple's `xcrun_db`, and remove that command's directory on
+normal shell exit. Each cache contains a self-ignoring `.gitignore`, so even a
+hard-killed command's residual cache cannot pollute `git add -A` in other projects.
+The per-user OS temp directory acquires no additional write grant.
 
 The parser accepts a single command with quoted arguments. Shell composition,
 substitution, environment assignments, aliases, `gh auth`, `gh api`, extensions,
@@ -132,8 +160,44 @@ Unknown tools and delegation/worktree/policy-changing tools are refused rather
 than given an implicit grant outside the reviewed tool boundary.
 
 The command boundary targets Foreman's macOS execution host. On other operating
-systems it fails closed. This does not install hooks, alter user configuration,
+systems it fails closed, and `npm test` explicitly fails for missing mandatory
+macOS enforcement coverage instead of reporting a green enforcement suite. This does not install hooks, alter user configuration,
 restart Foreman, or deploy anything.
+
+## Default behavior change requiring owner review
+
+Omitted `permission_mode` now means Workspace, but that is **not behaviorally
+equivalent to the old omitted native mode**. Native Glob/Grep are denied at every
+preset, so Claude falls back to Bash and requires one human approval per search at
+Workspace. In-project native Write/Edit now auto-allow where they previously
+prompted. Unknown tools fail closed. Codex's confined `foreman_exec` does not
+prompt until `request_access:true`; Claude Workspace Bash still prompts for each
+command. The grants now match, but these prompt counts differ.
+
+These changes trade search convenience and per-edit review for uniform path
+checks and fail-closed tool coverage. This pass documents that tradeoff for the
+owner; it does not redesign the default or the search/edit experience.
+
+## Codex activation compatibility and lifecycle
+
+Foreman verifies the provider's `config/read` response for hooks, disabled native
+shell/unified execution, and web-search mode, and requires `hooks/list` to report
+the exact private PreToolUse command as enabled, synchronous, and trusted or
+managed. Missing or untrusted configuration refuses activation before a user turn.
+The current Foreman integration with **Codex CLI 0.149.0 does not satisfy this check**: thread start
+does not attest the configuration, and diagnostic hooks were listed as untrusted
+and did not execute. Codex managed launches currently fail closed. This is an
+explicit compatibility limitation, not a successful live enforcement result.
+A working, supported hook trust/registration integration remains to be implemented;
+we do not bypass trust for arbitrary user/project hooks.
+
+The out-of-process guard receives the absolute configured Foreman root as a quoted argv
+argument, independent of environment filtering. Snapshot directories record their
+owning PID. Startup and snapshot creation sweep marked, owned directories whose
+owners no longer exist, preserving live owners, unknown legacy directories, and
+symlinks. PID reuse conservatively retains a directory. Old unmarked snapshots
+remain a manual cleanup limitation. Failed host-tool result delivery emits a
+diagnostic and disconnects the controller rather than disappearing into a catch.
 
 ## Verification
 
@@ -240,7 +304,7 @@ FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 node --experimental-strip-types --
 This uses the same isolated harness for Claude Trusted and Codex Trusted, without
 restarting any service. It checks real HTTPS `git fetch`, `git pull --ff-only`, and
 `gh issue view`, with no approvals. Fetch must return exit 0, populate `FETCH_HEAD`,
-and create the project-local xcrun cache. Pull uses a disposable sparse checkout
+and clean the project-local xcrun cache. Pull uses a disposable sparse checkout
 to avoid replacing the harness fixtures. A test-only Claude observer reports the
 actual guarded shell exit and returns the same status to the SDK; Codex supplies
 its command exit directly. Missing exits, unrelated successes, and model abstention

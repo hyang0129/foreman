@@ -1,5 +1,6 @@
 // Test-only preload: retain the real HTTP server, SDK, providers, and guards.
 // These private method taps intentionally fail loudly if controller internals change.
+import { observeCodex } from './observe-codex.mjs';
 import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
@@ -56,15 +57,7 @@ SessionService.prototype.launch = async function (data, runtime) {
   this.options.codexFactory = (options) => {
     const control = new CodexControl(options);
     const cwd = options.cwd;
-    const write = control.write.bind(control);
-    control.write = (message) => {
-      if (message.result?.permissions) record({ cwd, kind: 'permission_refusal', result: message.result });
-      if (message.result?.contentItems) record({ cwd, kind: 'tool_result', id: message.id, result: message.result });
-      return write(message);
-    };
-    control.on('notification', (message) => {
-      if (['item/started', 'item/completed'].includes(message.method) && ['dynamicToolCall', 'mcpToolCall', 'commandExecution', 'fileChange'].includes(message.params.item?.type)) record({ cwd, kind: message.method, item: message.params.item });
-    });
+    observeCodex(control, cwd, record);
     return control;
   };
   return launch.call(this, data, runtime);

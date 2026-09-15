@@ -84,7 +84,7 @@ if (process.env.FOREMAN_LIVE !== '1') {
             assert.equal(result.approvals[0].input.command, command);
             assertRefused(result, command);
             assert.ok(!hits.includes(url));
-            assert.ok(!JSON.stringify(result.events.filter((e) => e.kind === 'tool_result' || e.kind === 'command_result')).includes(`OUTSIDE_${f.token}`));
+            assertNoLeak(result, f.token, 'OUTSIDE_');
           });
           if (provider === 'codex') await t.test('one exact approval expires between turns and persists no grant', async () => {
             const command = `cat ${quote(join(f.outside, 'readable.txt'))}`;
@@ -128,7 +128,7 @@ if (process.env.FOREMAN_LIVE !== '1') {
           });
           await t.test('outside-project read is refused', async () => {
             const command = `cat ${quote(join(f.outside, 'readable.txt'))}`;
-            const result = await probe(command); assertRefused(result, command); assert.equal(result.approvals.length, 0);
+            const result = await probe(command); assertRefused(result, command); assert.equal(result.approvals.length, 0); assertNoLeak(result, f.token, 'OUTSIDE_');
           });
         }
         if (policy === 'full') await t.test('outside-project write succeeds but planted .env read is refused', async () => {
@@ -174,10 +174,9 @@ if (process.env.FOREMAN_LIVE !== '1') {
             });
           }
           await t.test('self-directed API policy mutation has no effect', async () => {
-            const command = `curl --max-time 2 -sS -X POST -H 'content-type: application/json' -d ${quote(JSON.stringify({ id: row.session_key, permission_mode: 'full' }))} ${h.url}/api/session/policy`;
+            const command = `curl --max-time 2 -sS -X POST -H 'content-type: application/json' -d ${quote(JSON.stringify({ id: randomUUID(), provider, name: 'self-escalation', cwd:f.project, text:'Do not use tools.', permission_mode: 'full' }))} ${h.url}/api/sessions`;
             const result = await probe(command);
-            if (policy === 'full') assertSuccess(result, command);
-            else {
+            {
               assertNetworkFailure(result, command);
               assert.equal((await h.api('/api/health')).pid, h.child.pid);
             }
@@ -222,7 +221,7 @@ if (process.env.FOREMAN_LIVE !== '1') {
         assert.ok(d.receipts.every((r) => !['queued', 'running'].includes(r.status)));
         await h.api('/api/session/message', { id: row.session_key, message_id: randomUUID(), text: 'Do not replay' }, 400);
         // No live controller exists after restart; use API and real UI for legacy reporting.
-        const page = await h.browser.newPage();
+        const page = await h.browser.newPage({extraHTTPHeaders:{authorization:`Bearer ${readFileSync(join(h.home, 'local-api-token'),'utf8').trim()}`}});
         try {
           await page.goto(h.url); await page.locator('#session-list').getByText(row.name, { exact: true }).click();
           const { expect } = await import('@playwright/test');

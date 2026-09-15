@@ -62,7 +62,7 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
       prompt: z.string().min(20).describe("The full brief for the worker"),
       mode: z.enum(["managed", "bg", "tab"]).optional().describe("managed (default), bg, or tab"),
       provider: z.enum(["claude", "codex"]).optional().describe("Managed provider (default claude)"),
-      permission_mode: z.enum([...PERMISSION_MODES, "default", "acceptEdits", "bypassPermissions"]).optional().describe("Managed launch preset: read-only, workspace (default), trusted, full. Above Workspace requires developer approval of this exact spawn call. Legacy modes accept only default, acceptEdits, bypassPermissions."),
+      permission_mode: z.enum([...PERMISSION_MODES, "default", "acceptEdits", "bypassPermissions"]).optional().describe("Managed launch preset: read-only, workspace (default), trusted, full. The PM cannot launch Trusted or Full; the developer must choose them in New session. Legacy modes accept only default, acceptEdits, bypassPermissions."),
       model: z.string().optional().describe("Optional model identifier from list_models for the selected provider; omit to use provider settings"),
     },
     async ({ name, cwd, prompt, mode, provider, permission_mode, model }) => {
