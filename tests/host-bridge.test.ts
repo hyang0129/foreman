@@ -22,13 +22,13 @@ class FakeSocket extends EventEmitter {
   terminate() { this.terminated = true; this.close(); }
 }
 
-function bridge(t: test.TestContext, port = 4177) {
+function bridge(t: test.TestContext, port = 4177, localToken?: string) {
   t.mock.method(console, 'log', () => {});
   const sockets: FakeSocket[] = [];
   const options: any[] = [];
   const urls: URL[] = [];
   const instance = new HostBridge(port, { url: 'https://foreman.example', token: TOKEN }, {
-    socketFactory: (url, opts) => { const socket = new FakeSocket(); urls.push(url); options.push(opts); sockets.push(socket); return socket as any; },
+    localToken, socketFactory: (url, opts) => { const socket = new FakeSocket(); urls.push(url); options.push(opts); sockets.push(socket); return socket as any; },
   });
   t.after(() => instance.close());
   instance.start();
@@ -211,4 +211,16 @@ test('disk pairing requires an owned private regular file and malformed content 
   writeFileSync(target, JSON.stringify({ url: 'https://foreman.test', token: TOKEN }), { mode: 0o600 });
   symlinkSync(target, path); assert.match(read(), /regular file/);
   assert.match(read({ FOREMAN_RELAY_URL: 'https://foreman.test' }), /together|both|partial/i);
+});
+
+
+test('bridge authenticates to the local API with a separate local token', async (t) => {
+  let authorization: string | undefined;
+  const port=await local(t,(req,res)=>{authorization=req.headers.authorization;res.end('{}');});
+  const f=bridge(t,port,'synthetic-local-token'),socket=f.sockets[0];socket.open();
+  const replied=response(socket,'local-auth');
+  socket.receive({type:'request',id:'local-auth',method:'GET',path:'/api/sessions'});
+  assert.equal((await replied).status,200);
+  assert.equal(authorization,'Bearer synthetic-local-token');
+  assert.equal(f.options[0].headers.authorization,`Bearer ${TOKEN}`);
 });

@@ -29,9 +29,10 @@ export class HostBridge {
   private inFlight = 0;
   private port: number;
   private config: BridgeConfig;
+  private localToken?: string;
   private socketFactory: (url: URL, options: WebSocket.ClientOptions) => WebSocket;
-  constructor(port: number, config: BridgeConfig, options: { socketFactory?: (url: URL, options: WebSocket.ClientOptions) => WebSocket } = {}) {
-    this.port = port; this.config = config;
+  constructor(port: number, config: BridgeConfig, options: { localToken?: string; socketFactory?: (url: URL, options: WebSocket.ClientOptions) => WebSocket } = {}) {
+    this.port = port; this.config = config; this.localToken = options.localToken;
     this.socketFactory = options.socketFactory ?? ((url, options) => new WebSocket(url, options));
     const url = new URL(config.url);
     if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error('Relay URL must be an HTTPS origin');
@@ -80,7 +81,7 @@ export class HostBridge {
       const origin = `http://127.0.0.1:${this.port}`;
       const response = await fetch(origin + message.path, {
         method: message.method,
-        headers: { 'content-type': 'application/json', origin },
+        headers: { 'content-type': 'application/json', origin, ...(this.localToken ? { authorization: `Bearer ${this.localToken}` } : {}) },
         ...(message.method === 'POST' ? { body: message.body || '{}' } : {}),
         redirect: 'error', signal: AbortSignal.timeout(40_000),
       });
@@ -98,7 +99,7 @@ export class HostBridge {
   close() { this.stopped = true; clearTimeout(this.reconnect); clearInterval(this.heartbeat); this.socket?.close(1000, 'Host stopping'); }
 }
 
-export function startHostBridge(port: number): { close(): void } {
-  try { const config = readBridgeConfig(); return config ? new HostBridge(port, config).start() : { close() {} }; }
+export function startHostBridge(port: number, localToken?: string): { close(): void } {
+  try { const config = readBridgeConfig(); return config ? new HostBridge(port, config, { localToken }).start() : { close() {} }; }
   catch (error) { console.error('foreman: cloud bridge configuration error:', (error as Error).message); return { close() {} }; }
 }

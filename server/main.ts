@@ -9,10 +9,15 @@ import { SessionService } from "./session-service.ts";
 import { preparePeerTools } from "./peer-tools.ts";
 import { startHostBridge } from "./host-bridge.ts";
 import { runClaude } from "./tools.ts";
-import { PORT, REPO_ROOT, ensureDirs, MEMORY_DIR, HOST } from "./paths.ts";
+import { PORT, REPO_ROOT, ensureDirs, MEMORY_DIR, HOST, FOREMAN_HOME } from "./paths.ts";
 import { writeFileSync } from "node:fs";
 
+import { sweepPolicySnapshots } from './policy-snapshots.ts';
+import { localAuth } from './local-auth.ts';
+
 ensureDirs();
+const auth = localAuth(FOREMAN_HOME);
+sweepPolicySnapshots();
 for (const [f, seed] of [["PROJECTS.md", "# Projects\n\n(none yet)\n"], ["LOG.md", "# Log\n"]] as const) {
   const p = join(MEMORY_DIR, f); if (!existsSync(p)) writeFileSync(p, seed);
 }
@@ -53,7 +58,14 @@ const server = createServer(async (req, res) => {
     const allowedHosts = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
     if (!allowedHosts.has(req.headers.host ?? '')) return json(res, 403, { error: 'Use the Foreman loopback address' });
     if (req.headers.origin && ![...allowedHosts].some((host) => req.headers.origin === `http://${host}`)) return json(res, 403, { error: 'Cross-origin requests are not allowed' });
-    if (url.pathname === '/api/config' && req.method === 'GET') return json(res, 200, { auth: { required: false } });
+    if (url.pathname === '/api/config' && req.method === 'GET') return json(res, 200, { auth: { required: true, kind: 'local' } });
+    if (url.pathname === '/api/auth/local' && req.method === 'POST') {
+      const { token } = await body(req);
+      if (!auth.valid(token)) return json(res, 401, { error: 'Invalid local API token' });
+      res.setHeader('Set-Cookie', `foreman_local=${token}; HttpOnly; SameSite=Strict; Path=/`);
+      return json(res, 200, { ok: true });
+    }
+    if (url.pathname.startsWith('/api/') && url.pathname !== '/api/health' && !auth.accepts(req)) return json(res, 401, { error: 'Local API token required' });
     if (url.pathname === '/api/host' && req.method === 'GET') return json(res, 200, { online: true, host: HOST });
     if (url.pathname === "/api/health" && req.method === "GET") return json(res, 200, { ok: true, pid: process.pid, uptime: process.uptime(), pm_enabled: process.env.FOREMAN_PM_DISABLED !== "1" });
     if (url.pathname === "/api/events") {
@@ -111,8 +123,9 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`foreman: http://localhost:${PORT}`);
+  console.log(`foreman: local API token file: ${auth.path}`);
   fleet.start();
-  bridge = startHostBridge(PORT);
+  bridge = startHostBridge(PORT, auth.token);
   if (process.env.FOREMAN_PM_DISABLED !== "1") pm.start().catch((e: unknown) => console.error("pm:", e));
 });
 let stopping = false;

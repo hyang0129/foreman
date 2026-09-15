@@ -62,6 +62,7 @@ let sessions = [],
   host = { online: false },
   authorized = false,
   authRequired = false,
+  localAuthMode = false,
   firebaseAuth,
   authSDK;
 let pollTimer,
@@ -125,7 +126,7 @@ async function api(path, options = {}, retry = true) {
   const epoch = authEpoch;
   const headers = { ...options.headers };
   if (options.body) headers["content-type"] = "application/json";
-  if (authRequired) {
+  if (authRequired && !localAuthMode) {
     if (!firebaseAuth?.currentUser) throw new Error("Sign in to continue.");
     headers.Authorization = `Bearer ${await firebaseAuth.currentUser.getIdToken()}`;
   }
@@ -986,7 +987,7 @@ function enterApp(user) {
   authorized = true;
   ui.authScreen.hidden = true;
   ui.app.hidden = false;
-  ui.signOut.hidden = !authRequired;
+  ui.signOut.hidden = !authRequired || localAuthMode;
   $("#account").textContent = user?.email || "Local connection";
   clearError();
   renderHost();
@@ -1009,6 +1010,22 @@ async function boot() {
     authRequired = config.auth?.required !== false;
     if (!authRequired) {
       enterApp(null);
+      return;
+    }
+    if (config.auth?.kind === "local") {
+      localAuthMode = true;
+      try { await api('/api/host'); enterApp(null); return; } catch {}
+      ui.authStatus.textContent = 'Enter the local API token from the file shown in the Foreman server log.';
+      const form = document.createElement('form');
+      const input = document.createElement('input'); input.type = 'password'; input.placeholder = 'Local API token'; input.autocomplete = 'off'; input.required = true;
+      const button = document.createElement('button'); button.textContent = 'Unlock Foreman';
+      form.append(input, button); ui.authScreen.append(form);
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        try { await api('/api/auth/local', {method:'POST',body:JSON.stringify({token:input.value})}); input.value = ''; form.remove(); enterApp(null); }
+        catch (error) { ui.authStatus.textContent = errorMessage(error); }
+      });
+      $('#sign-in').hidden = true;
       return;
     }
     if (!config.auth?.firebase?.apiKey)
