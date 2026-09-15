@@ -147,7 +147,7 @@ test('Claude Workspace escape is explicit, described, and effective only after e
   const pending=h.options().canUseTool('Bash',{command:`touch '${target}'`,dangerouslyDisableSandbox:true},{signal:new AbortController().signal,toolUseID:'escape'});
   assert.equal(existsSync(target),false);
   const request=h.control.pendingApprovals()[0];assert.match(request.reason!,/outside-project read\/write/);
-  assert.match(String(request.input.guarded_command),/sandbox-exec/);
+  assert.match(String(request.input.requested_access),/Outside-project/);
   h.control.respondApproval('escape','allow');
   const granted=await pending;
   assert.equal(spawnSync('/bin/sh',['-c',granted.updatedInput.command]).status,0);

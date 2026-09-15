@@ -2,8 +2,8 @@ const POLICY_LABEL = { 'read-only': 'Read-only', workspace: 'Workspace', trusted
 const POLICY_DESCRIPTION = {
   'read-only': 'Inspect the project. No file changes, network, or commands with side effects. Secrets remain denied. Fixed for this session.',
   workspace: 'Write in the project; ask for network or access outside it. Secrets remain denied. Fixed for this session.',
-  trusted: '⚠ Write in the project and run gh, git push/fetch/pull, and package installs without prompting. Other network operations and outside paths are refused. Secrets remain denied. Fixed for this session.',
-  full: '⚠ Commands, network, and files outside the project without permission prompts. Secrets and protected paths remain denied. Fixed for this session.',
+  trusted: '⚠ Write in the project and use public Git networking without prompts. Package installs get no network grant. Host credentials and outside paths stay protected. Fixed for this session.',
+  full: '⚠ Commands, external network, and files outside the project without permission prompts. Secrets and protected paths remain denied. Fixed for this session.',
 };
 const policyLabel = (session) => POLICY_LABEL[session.permission_mode] || (session.permission_mode === 'default' ? 'Workspace' : 'Policy unknown');
 // Authoritative JSON polling keeps authentication tokens out of URLs and reconnects simple.
@@ -157,7 +157,7 @@ async function api(path, options = {}, retry = true) {
   }
   if (!response.ok) {
     if (authRequired && (response.status === 401 || response.status === 403)) {
-      const reason =
+      const reason = localAuthMode ? "Enter your local API token to unlock Foreman." :
         response.status === 403
           ? "This Google account does not have access to Foreman. Sign in with the authorized account."
           : "Your sign-in expired. Sign in again to continue.";
@@ -198,8 +198,10 @@ function revokeAccess(message) {
   ui.app.hidden = true;
   ui.authScreen.hidden = false;
   ui.authStatus.textContent = message;
-  ui.signIn.hidden = false;
+  ui.signIn.hidden = localAuthMode;
   ui.signIn.disabled = false;
+  const localForm = $("#local-auth-form");
+  if (localForm) localForm.hidden = false;
 }
 function setNav(open) {
   ui.app.classList.toggle("nav-open", open);
@@ -1016,13 +1018,13 @@ async function boot() {
       localAuthMode = true;
       try { await api('/api/host'); enterApp(null); return; } catch {}
       ui.authStatus.textContent = 'Enter the local API token from the file shown in the Foreman server log.';
-      const form = document.createElement('form');
+      const form = document.createElement('form'); form.id = 'local-auth-form';
       const input = document.createElement('input'); input.type = 'password'; input.placeholder = 'Local API token'; input.autocomplete = 'off'; input.required = true;
       const button = document.createElement('button'); button.textContent = 'Unlock Foreman';
       form.append(input, button); ui.authScreen.append(form);
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
-        try { await api('/api/auth/local', {method:'POST',body:JSON.stringify({token:input.value})}); input.value = ''; form.remove(); enterApp(null); }
+        try { await api('/api/auth/local', {method:'POST',body:JSON.stringify({token:input.value})}); input.value = ''; form.hidden = true; enterApp(null); }
         catch (error) { ui.authStatus.textContent = errorMessage(error); }
       });
       $('#sign-in').hidden = true;

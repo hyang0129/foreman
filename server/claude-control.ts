@@ -77,7 +77,7 @@ export class ClaudeControl extends EventEmitter {
             const pending = this.requestApproval(tool, input, { ...context, decisionReason: decision.message || context.decisionReason }, decision.input);
             if (tool !== 'Bash' || input.dangerouslyDisableSandbox !== true) return pending;
             return pending.then((result) => {
-              if (result.behavior !== 'allow' || tool !== 'Bash' || input.dangerouslyDisableSandbox !== true) return result;
+              if (result.behavior !== 'allow') return result;
               const approved = toolDecision(this.permission_mode, this.cwd, tool, input, process.platform, true);
               return approved.behavior === 'deny' ? { behavior: 'deny', message: approved.message } : { behavior: 'allow', updatedInput: approved.input };
             });
@@ -172,7 +172,7 @@ export class ClaudeControl extends EventEmitter {
       resolve(result);
     };
     const { signal, ...displayContext } = context;
-    const request = { id, tool, input: tool === 'Bash' ? { ...input, guarded_command: approvedInput.command } : input, reason: context.decisionReason, context: displayContext };
+    const request = { id, tool, input: tool === 'Bash' ? { ...input, ...(input.dangerouslyDisableSandbox === true ? { requested_access: 'Outside-project read/write and external network for this command only; credentials and loopback remain denied.' } : { guarded_command: approvedInput.command }) } : input, reason: context.decisionReason, context: displayContext };
     this.approvals.set(id, { request, approvedInput, resolve: finish, promise });
     context.signal.addEventListener("abort", abort, { once: true });
     this.setState("input-needed");

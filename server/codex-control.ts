@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import WebSocket from 'ws';
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json | undefined };
@@ -190,7 +190,7 @@ export class CodexControl extends EventEmitter {
     this.policySnapshots.push(directory);
     for (const name of ['permission-policy.ts', 'permission-hook.ts']) copyFileSync(fileURLToPath(new URL(name, import.meta.url)), join(directory, name));
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
-    const command = [process.execPath, '--experimental-strip-types', join(directory, 'permission-hook.ts'), mode, cwd, process.env.FOREMAN_HOME ?? join(homedir(), '.foreman')].map(quote).join(' ');
+    const command = [process.execPath, '--experimental-strip-types', join(directory, 'permission-hook.ts'), mode, cwd, resolve(process.env.FOREMAN_HOME ?? join(homedir(), '.foreman'))].map(quote).join(' ');
     const result = await this.request<{ thread: CodexThread; approvalPolicy: string; sandbox: { type: string; networkAccess?: boolean } }>('thread/start', {
       ...extra, cwd, ...codexPolicy(mode), approvalsReviewer: 'user',
       dynamicTools: [...(Array.isArray(extra.dynamicTools) ? extra.dynamicTools : []), ...POLICY_COMMAND_TOOLS] as Json,

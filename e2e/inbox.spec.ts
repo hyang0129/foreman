@@ -548,3 +548,22 @@ test('launch policy defaults to Workspace, Full requires confirmation, and runni
   await page.getByLabel('Permission policy').selectOption('full');
   await expect(page.locator('#confirm-full')).not.toBeChecked();
 });
+
+test('local token unlock stays usable after an invalid token without Google sign-in', async ({page}) => {
+  await fixture(page, {auth:{required:true,kind:'local'}});
+  let unlocked=false;
+  await page.route('**/api/host', async (route) => route.fulfill({status:unlocked?200:401,json:unlocked?{online:true,host:'Local'}:{error:'Local API token required'}}));
+  await page.route('**/api/auth/local', async (route) => {
+    unlocked=route.request().postDataJSON().token==='fixture-local-token';
+    await route.fulfill({status:unlocked?200:401,json:unlocked?{ok:true}:{error:'Invalid local API token'}});
+  });
+  await page.goto('/');
+  await page.getByPlaceholder('Local API token').fill('wrong');
+  await page.getByRole('button',{name:'Unlock Foreman'}).click();
+  await expect(page.locator('#auth-status')).toContainText('Invalid local API token');
+  await expect(page.locator('#sign-in')).toBeHidden();
+  await page.getByPlaceholder('Local API token').fill('fixture-local-token');
+  await page.getByRole('button',{name:'Unlock Foreman'}).click();
+  await expect(page.locator('#app')).toBeVisible();
+  await expect(page.locator('#auth-screen')).toBeHidden();
+});
