@@ -16,7 +16,7 @@ async function fixture(t: test.TestContext, options = {}) {
   const sent: any[] = [];
   ws.on('connection', (peer, request) => {
     assert.equal(request.headers['sec-websocket-extensions'], undefined);
-    let initialized = false, toolSeq = 0;
+    let initialized = false, toolSeq = 0; let launchConfig: any;
     peer.on('message', (raw) => {
       const msg = JSON.parse(raw.toString()); sent.push(msg);
       if (!msg.method) return;
@@ -26,6 +26,9 @@ async function fixture(t: test.TestContext, options = {}) {
       if (msg.method === 'initialized' || msg.method === 'fixture/hang') return;
       const thread = { id: msg.params.threadId ?? 'live', cwd:dir, createdAt:1, updatedAt:1,
         status:{ type:msg.params.threadId === 'stored' ? 'notLoaded' : 'idle' }, canAcceptDirectInput:true, turns:[] };
+      if (msg.method === 'thread/start') launchConfig = msg.params.config;
+      if (msg.method === 'config/read') { reply({config:{features:{hooks:launchConfig['features.hooks'],shell_tool:launchConfig['features.shell_tool'],unified_exec:launchConfig['features.unified_exec']},web_search:launchConfig.web_search}});return;}
+      if (msg.method === 'hooks/list') {reply({data:[{cwd:msg.params.cwds[0],errors:[],hooks:[{eventName:'preToolUse',command:launchConfig['hooks.PreToolUse'][0].hooks[0].command,enabled:true,async:false,trustStatus:'trusted'}]}]});return;}
       if (msg.method === 'thread/start') reply({ thread, approvalPolicy: msg.params.approvalPolicy, sandbox: {
         type: msg.params.sandbox === 'read-only' ? 'readOnly' : msg.params.sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'workspaceWrite',
         networkAccess: msg.params.config?.['sandbox_workspace_write.network_access'] ?? false,
@@ -202,4 +205,77 @@ test('native recursive searches and unified execution are refused by the executa
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, 'deny', tool_name);
   }
+});
+
+
+test('Workspace executable hook asks for outside native reads and web access', async (t) => {
+  const {client, sent, dir} = await fixture(t); await client.start(dir, {}, 'workspace');
+  const command = sent.find((m) => m.method === 'thread/start').params.config['hooks.PreToolUse'][0].hooks[0].command;
+  const {spawnSync} = await import('node:child_process');
+  for (const tool_name of ['Read', 'view_image', 'WebFetch']) {
+    const result = spawnSync('/bin/sh', ['-c', command], {input:JSON.stringify({tool_name,tool_input:{file_path:'/tmp/outside.txt',path:'/tmp/outside.png',url:'https://example.com'}}),encoding:'utf8'});
+    assert.equal(result.status, 0); assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, 'ask');
+  }
+});
+test('native request_permissions always returns an empty turn grant', async (t) => {
+  const {client, sent} = await fixture(t);
+  for (const policy of ['read-only','workspace','trusted','full'] as const) {
+    await client.start('/tmp', {}, policy);
+    (client as any).receive(JSON.stringify({id:`permissions-${policy}`,method:'item/permissions/requestApproval',params:{threadId:'live',permissions:{network:true},scope:'session'}})+'\n');
+    for (let i=0;i<50 && !sent.some((m) => m.id === `permissions-${policy}`);i++) await new Promise((r) => setTimeout(r,10));
+    assert.deepEqual(sent.find((m) => m.id === `permissions-${policy}`).result, {permissions:{},scope:'turn'});
+    assert.equal(client.pendingRequests().length, 0);
+  }
+});
+test('snapshot is private, byte-identical, independent of source edits, and removed on close', async (t) => {
+  const {client,sent,dir} = await fixture(t); await client.start(dir, {}, 'trusted');
+  const {shellWords,under,canonical} = await import('../server/permission-policy.ts');
+  const {readFileSync,statSync,existsSync} = await import('node:fs');
+  const {dirname,resolve} = await import('node:path');
+  const hook = shellWords(sent.find((m) => m.method === 'thread/start').params.config['hooks.PreToolUse'][0].hooks[0].command)![2];
+  assert.equal(under(canonical(hook), canonical(resolve('.'))), false);
+  assert.equal(statSync(dirname(hook)).mode & 0o077, 0);
+  assert.equal(readFileSync(join(dirname(hook),'permission-policy.ts'),'utf8'), readFileSync('server/permission-policy.ts','utf8'));
+  client.close(); assert.equal(existsSync(dirname(hook)), false);
+});
+
+test('late host result delivery is surfaced instead of swallowed', async (t) => {
+  const {client} = await fixture(t); await client.start('/tmp',{},'workspace');
+  const notices: string[] = []; client.on('diagnostic', (message) => notices.push(message));
+  let finish!: (result: any) => void;
+  (client as any).commands.set('live', {call:() => new Promise((r) => {finish=r;}),close(){}});
+  (client as any).receive(JSON.stringify({id:'late',method:'item/tool/call',params:{threadId:'live',tool:'foreman_exec',arguments:{command:'pwd'}}})+'\n');
+  (client as any).receive(JSON.stringify({method:'thread/closed',params:{threadId:'live'}})+'\n');
+  finish({output:'done',exit_code:0}); await new Promise((r) => setTimeout(r,20));
+  assert.ok(notices.some((m) => /result delivery failed/i.test(m)));
+});
+
+for (const mismatch of ['hooks','shell_tool','unified_exec','web_search','registration','trust']) test(`Codex refuses unattested guard configuration: ${mismatch}`, async (t) => {
+  const {client,sent} = await fixture(t); const request=client.request.bind(client);
+  client.request=(async (method:string,params:any)=>{
+    const result:any=await request(method,params);
+    if(method==='config/read') {
+      if(mismatch==='web_search') result.config.web_search='live';
+      else if(['hooks','shell_tool','unified_exec'].includes(mismatch)) delete result.config.features[mismatch];
+    }
+    if(method==='hooks/list') {
+      if(mismatch==='registration') result.data[0].hooks=[];
+      if(mismatch==='trust') result.data[0].hooks[0].trustStatus='untrusted';
+    }
+    return result;
+  }) as typeof client.request;
+  await assert.rejects(client.start('/tmp',{},'trusted'), /cannot attest/);
+  await assert.rejects(client.send('live','must not run'), /Attach/);
+  assert.equal(sent.some((m)=>m.method==='turn/start'),false);
+});
+
+test('hook receives the configured Foreman root explicitly with a scrubbed environment', async (t) => {
+  const {client,sent,dir}=await fixture(t);const original=process.env.FOREMAN_HOME;
+  process.env.FOREMAN_HOME=dir;
+  try {await client.start('/tmp',{},'full');} finally {if(original===undefined) delete process.env.FOREMAN_HOME;else process.env.FOREMAN_HOME=original;}
+  const command=sent.find((m)=>m.method==='thread/start').params.config['hooks.PreToolUse'][0].hooks[0].command;
+  const {spawnSync}=await import('node:child_process');
+  const env={...process.env};delete env.FOREMAN_HOME;
+  const result=spawnSync('/bin/sh',['-c',command],{env,input:JSON.stringify({tool_name:'Read',tool_input:{file_path:join(dir,'ordinary.txt')}}),encoding:'utf8'});
+  assert.equal(result.status,0);assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision,'deny');
 });

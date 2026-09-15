@@ -54,7 +54,7 @@ test('command network access and long-running process ownership remain bounded',
   const trusted = new PolicyCommands('trusted', cwd, async () => { throw new Error('No prompt at Trusted'); });
   t.after(() => { full.close(); trusted.close(); server.close(); rmSync(cwd, {recursive:true,force:true}); });
   const command = `curl --max-time 2 http://127.0.0.1:${port}`;
-  assert.match((await full.call('foreman_exec', {command,yield_ms:5000})).output, /fixture-response/);
+  assert.doesNotMatch((await full.call('foreman_exec', {command,yield_ms:5000})).output, /fixture-response/);
   assert.doesNotMatch((await trusted.call('foreman_exec', {command,yield_ms:5000})).output, /fixture-response/);
   const long = await full.call('foreman_exec', {command:'sleep 30',yield_ms:0});
   assert.ok(long.process_id);
@@ -84,10 +84,10 @@ test('Trusted xcrun writes its project cache while outside temp writes remain de
   const cwd = join(dir, 'project'); mkdirSync(cwd);
   const runner = new PolicyCommands('trusted', cwd, async () => { throw new Error('Must not prompt'); });
   t.after(() => { runner.close(); rmSync(dir, { recursive: true, force: true }); });
-  const result = await runner.call('foreman_exec', { command: '/usr/bin/xcrun --find git', yield_ms: 10000 });
+  const result = await runner.call('foreman_exec', { command: '/usr/bin/xcrun --find git; test -s "$xcrun_db"', yield_ms: 10000 });
   assert.equal(result.exit_code, 0, result.output);
   assert.match(result.output, /^\/.*\/git\n$/);
-  assert.ok(readFileSync(join(cwd, '.foreman-tmp/xcrun_db')).length > 0);
+  assert.equal((await import('node:fs')).existsSync(join(cwd, '.foreman-tmp')), false);
   const denied = await runner.call('foreman_exec', { command: `printf outside > ${join(dir, 'outside-cache')}`, yield_ms: 5000 });
   assert.notEqual(denied.exit_code, 0);
   assert.match(denied.output, /Operation not permitted|Permission denied/);

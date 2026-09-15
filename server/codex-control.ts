@@ -2,9 +2,10 @@ import { PolicyCommands, POLICY_COMMAND_TOOLS, POLICY_COMMAND_INSTRUCTIONS } fro
 // Small app-server client. stdio owns a server; socket attaches to an existing one.
 // Never resumes an arbitrary disk transcript implicitly or changes a session's permissions.
 import { permissionMode, codexPolicy, type PermissionMode } from './permission-policy.ts';
-import { mkdtempSync, copyFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { policySnapshot } from './policy-snapshots.ts';
+import { copyFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -127,7 +128,11 @@ export class CodexControl extends EventEmitter {
             void commands.call(p.tool, p.arguments).then(
               (result) => this.respondTool(message.id, { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(result) }] }),
               (error) => this.respondTool(message.id, { success: false, contentItems: [{ type: 'inputText', text: String(error) }] }),
-            ).catch(() => {});
+            ).catch((error) => {
+              this.emit('diagnostic', `Foreman command result delivery failed for request ${message.id}: ${String(error)}`);
+              this.disconnected(new Error('Foreman command result delivery failed; session stopped'));
+              this.close();
+            });
           } else this.emit('request', message);
         } else {
           const completedActiveTurn = message.method === 'turn/completed' && this.turns.get(p.threadId) === p.turn?.id;
@@ -181,11 +186,11 @@ export class CodexControl extends EventEmitter {
     for (const key of ['sandbox', 'approvalPolicy', 'permissions', 'config', 'approvalsReviewer']) {
       if (key in extra) throw new Error('Provider permission overrides are forbidden; choose a launch preset');
     }
-    const directory = mkdtempSync(join(tmpdir(), 'foreman-policy-'));
+    const directory = policySnapshot();
     this.policySnapshots.push(directory);
     for (const name of ['permission-policy.ts', 'permission-hook.ts']) copyFileSync(fileURLToPath(new URL(name, import.meta.url)), join(directory, name));
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
-    const command = [process.execPath, '--experimental-strip-types', join(directory, 'permission-hook.ts'), mode, cwd].map(quote).join(' ');
+    const command = [process.execPath, '--experimental-strip-types', join(directory, 'permission-hook.ts'), mode, cwd, process.env.FOREMAN_HOME ?? join(homedir(), '.foreman')].map(quote).join(' ');
     const result = await this.request<{ thread: CodexThread; approvalPolicy: string; sandbox: { type: string; networkAccess?: boolean } }>('thread/start', {
       ...extra, cwd, ...codexPolicy(mode), approvalsReviewer: 'user',
       dynamicTools: [...(Array.isArray(extra.dynamicTools) ? extra.dynamicTools : []), ...POLICY_COMMAND_TOOLS] as Json,
@@ -204,6 +209,20 @@ export class CodexControl extends EventEmitter {
     if (result.approvalPolicy !== codexPolicy(mode).approvalPolicy || result.sandbox?.type !== expectedSandbox ||
       (mode !== 'full' && !!result.sandbox.networkAccess !== (mode === 'trusted'))) {
       throw new Error('Codex did not apply the requested launch policy; session was not activated');
+    }
+    // thread/start does not attest these security-critical keys. Ask the
+    // provider for its effective config and registered, trusted executable hook.
+    // Unsupported/ignored session overrides must fail before any user turn.
+    const effective = await this.request<{config: any}>('config/read', {cwd});
+    const registered = await this.request<{data: {cwd: string; hooks: any[]; errors: any[]}[]}>('hooks/list', {cwds:[cwd]});
+    const config = effective.config;
+    const hook = registered.data?.find((entry) => entry.cwd === cwd && !entry.errors?.length)?.hooks.find((hook) =>
+      hook.eventName === 'preToolUse' && hook.command === command && hook.enabled && !hook.async &&
+      (hook.isManaged || hook.trustStatus === 'trusted'));
+    const web = mode === 'read-only' || mode === 'trusted' ? 'disabled' : mode === 'full' ? 'live' : 'cached';
+    if (config?.features?.hooks !== true || config.features.shell_tool !== false || config.features.unified_exec !== false ||
+        config.web_search !== web || !hook) {
+      throw new Error('Codex cannot attest the active Foreman guard configuration and trusted hook; session was not activated');
     }
     this.commands.set(result.thread.id, new PolicyCommands(mode, cwd, (command, workdir) => {
       const id = `foreman-command:${randomUUID()}`;

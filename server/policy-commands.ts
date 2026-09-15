@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { canonical, protectedPath, shellSandbox, toolDecision, trustedNetworkCommand, under, type PermissionMode } from './permission-policy.ts';
 
-type Process = { child: ChildProcessWithoutNullStreams; output: string; code: number | null; done: boolean; wake: Set<() => void> };
+type Process = { oneTimeAccess: boolean; child: ChildProcessWithoutNullStreams; output: string; code: number | null; done: boolean; wake: Set<() => void> };
 export const POLICY_COMMAND_TOOLS = [
   { type: 'function', name: 'foreman_exec', description: 'Run a shell command under this session’s fixed launch policy. Returns output and, for ongoing commands, a process_id. In Workspace only, request_access asks the developer to approve this exact command once when network or outside-project access is needed. It never changes the session policy.', inputSchema: { type: 'object', additionalProperties: false, required: ['command'], properties: {
     command: { type: 'string' }, cwd: { type: 'string' }, request_access: { type: 'boolean' }, yield_ms: { type: 'integer', minimum: 0, maximum: 30000 },
@@ -47,12 +47,13 @@ export class PolicyCommands {
       }
       if (this.closed) throw new Error('Command controller is closed');
       if ([...this.processes.values()].filter((p) => !p.done).length >= 16) throw new Error('Too many active commands');
+      for (const [id, process] of this.processes) if (process.done) this.processes.delete(id);
       if (this.processes.size >= 100) throw new Error('Collect completed command output before starting more commands');
       const network = this.mode === 'full' || oneTimeAccess || (this.mode === 'trusted' && trustedNetworkCommand(input.command));
       const command = shellSandbox(input.command, this.cwd, this.mode, network, undefined, undefined, oneTimeAccess);
       const child = spawn('/bin/sh', ['-c', command], { cwd, stdio: 'pipe', detached: true });
       const id = randomUUID();
-      const process: Process = { child, output: '', code: null, done: false, wake: new Set() };
+      const process: Process = { oneTimeAccess, child, output: '', code: null, done: false, wake: new Set() };
       this.processes.set(id, process);
       const append = (data: Buffer) => { process.output = (process.output + data.toString()).slice(-1_000_000); };
       child.stdout.on('data', append); child.stderr.on('data', append);
@@ -64,6 +65,7 @@ export class PolicyCommands {
     const process = this.processes.get(input.process_id);
     if (!process) throw new Error('No such process in this session');
     if (input.chars !== undefined) {
+      if (process.oneTimeAccess) throw new Error('stdin cannot extend a one-time command approval; submit a new exact command');
       if (typeof input.chars !== 'string' || Buffer.byteLength(input.chars) > 65536) throw new Error('stdin exceeds 65536 bytes');
       if (process.done) throw new Error('Process has ended');
       process.child.stdin.write(input.chars);

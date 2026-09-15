@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 export const PERMISSION_MODES = ['read-only', 'workspace', 'trusted', 'full'] as const;
 export type PermissionMode = typeof PERMISSION_MODES[number];
 export function permissionMode(value: unknown): PermissionMode {
-  if (value === undefined) return 'workspace';
+  if (value == null) return 'workspace';
   if (!PERMISSION_MODES.includes(value as PermissionMode)) throw new Error('permission_mode must be read-only, workspace, trusted, or full');
   return value as PermissionMode;
 }
@@ -23,7 +23,7 @@ export function canonical(path: string): string {
 }
 // PEM is still a private-key family everywhere except these OS trust anchors.
 // Keep other credential names (even secrets.pem) protected inside the CA tree.
-const SECRET_NON_PEM_COMPONENT = /^(?:foreman-policy-[^/]+|\.claude|\.ssh|\.aws|\.gnupg|\.env(?:\..*)?|.*\.env|secrets?(?:\..*)?|\.?credentials?(?:\..*)?|.*\.(?:key|p12|pfx)|(?:.*[-_])?relay[-_](?:credentials?|tokens?)(?:\..*)?|wrangler\.jsonc?|cloud\.json)$/i;
+const SECRET_NON_PEM_COMPONENT = /^(?:foreman-policy-[^/]+|\.claude|\.codex|\.git-credentials|\.npmrc|\.netrc|\.ssh|\.aws|\.gnupg|\.env(?:\..*)?|.*\.env|secrets?(?:\..*)?|\.?credentials?(?:\..*)?|.*\.(?:key|p12|pfx)|(?:.*[-_])?relay[-_](?:credentials?|tokens?)(?:\..*)?|wrangler\.jsonc?|cloud\.json)$/i;
 export const SECRET_COMPONENT = new RegExp(`(?:${SECRET_NON_PEM_COMPONENT.source}|^.*\\.pem$)`, 'i');
 const SYSTEM_CA_FILES = ['/etc/ssl/cert.pem', '/private/etc/ssl/cert.pem'];
 const SYSTEM_CA_DIRS = ['/etc/ssl/certs', '/private/etc/ssl/certs'];
@@ -32,7 +32,7 @@ function systemTrustAnchor(path: string) {
 }
 export function protectedPath(path: string, home = homedir(), foreman = process.env.FOREMAN_HOME ?? join(home, '.foreman')) {
   const component = systemTrustAnchor(path) ? SECRET_NON_PEM_COMPONENT : SECRET_COMPONENT;
-  return path.split(sep).some((part) => component.test(part)) || under(path, foreman) || under(path, join(home, '.config/gh')) || under(path, join(home, 'Library/Keychains'));
+  return [join(home, '.docker/config.json'), join(home, '.kube/config')].some((root) => under(path, root)) || path.split(sep).some((part) => component.test(part)) || under(path, foreman) || under(path, join(home, '.config/gh')) || under(path, join(home, 'Library/Keychains'));
 }
 export const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 const sb = (value: string) => JSON.stringify(value);
@@ -42,9 +42,8 @@ const sb = (value: string) => JSON.stringify(value);
 // Tool execution is supported on the product's macOS execution host. Other OSes
 // fail closed rather than pretending a regex is a sandbox.
 export function shellSandbox(command: string, cwd: string, mode: PermissionMode, network: boolean, home = homedir(), foreman = process.env.FOREMAN_HOME ?? join(home, '.foreman'), oneTimeAccess = false): string {
-  const authenticatedVcs = ['gh', 'git'].includes(shellWords(command)?.[0] ?? '') && trustedNetworkCommand(command);
   const insensitive = (pattern: string) => pattern.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
-  const secretRegex = insensitive('(^|/)(foreman-policy-[^/]+|[.]claude|[.]ssh|[.]aws|[.]gnupg|[.]env([.][^/]*)?|[^/]*[.]env|secrets?([.][^/]*)?|[.]?credentials?([.][^/]*)?|[^/]*[.](key|p12|pfx)|([^/]*[-_])?relay[-_](credentials?|tokens?)([.][^/]*)?|wrangler[.]jsonc?|cloud[.]json)(/|$)');
+  const secretRegex = insensitive('(^|/)(foreman-policy-[^/]+|[.]claude|[.]codex|[.]git-credentials|[.]npmrc|[.]netrc|[.]ssh|[.]aws|[.]gnupg|[.]env([.][^/]*)?|[^/]*[.]env|secrets?([.][^/]*)?|[.]?credentials?([.][^/]*)?|[^/]*[.](key|p12|pfx)|([^/]*[-_])?relay[-_](credentials?|tokens?)([.][^/]*)?|wrangler[.]jsonc?|cloud[.]json)(/|$)');
   const pemRegex = insensitive('(^|/)[^/]*[.]pem(/|$)');
   const trustPaths = [...SYSTEM_CA_FILES.map((p) => `(literal ${sb(p)})`), ...SYSTEM_CA_DIRS.map((p) => `(subpath ${sb(p)})`)];
   const rules = ['(version 1)', '(allow default)',
@@ -53,7 +52,10 @@ export function shellSandbox(command: string, cwd: string, mode: PermissionMode,
     `(deny file-read* (require-all (regex #${sb(pemRegex)}) (require-not (require-any ${trustPaths.join(' ')}))))`,
     `(deny file-write* (regex #${sb(pemRegex)}) ${trustPaths.join(' ')})`,
   ];
-  if (!authenticatedVcs) rules.push(`(deny file-read* file-write* (subpath ${sb(join(home, '.config/gh'))}) (subpath ${sb(join(home, 'Library/Keychains'))}))`);
+  rules.push(`(deny file-read* file-write* (subpath ${sb(join(home, '.config/gh'))}) (subpath ${sb(join(home, 'Library/Keychains'))}))`);
+  rules.push(`(deny file-read* file-write* (subpath ${sb(join(home, '.docker/config.json'))}) (subpath ${sb(join(home, '.kube/config'))}))`);
+  // Never let a guarded child reach local control planes, including Foreman.
+  rules.push('(deny network-outbound (remote ip "localhost:*"))');
   if (!network) rules.push('(deny network*)');
   if (mode === 'read-only') rules.push('(deny file-write*)');
   if ((mode === 'trusted' || mode === 'workspace') && !oneTimeAccess) rules.push(`(deny file-write* (require-not (subpath ${sb(cwd)})))`);
@@ -64,13 +66,12 @@ export function shellSandbox(command: string, cwd: string, mode: PermissionMode,
     const readable = [cwd, '/System', '/Library', '/usr', '/bin', '/sbin', '/opt', '/dev', '/private/var/db', '/private/var/run', '/private/etc', '/private/preboot'];
     const words = shellWords(command);
     if (words?.[0] === 'git') readable.push(join(home, '.gitconfig'), join(home, '.config/git'));
-    if (['gh', 'git'].includes(words?.[0] ?? '') && trustedNetworkCommand(command)) readable.push(join(home, '.config/gh'), join(home, 'Library/Keychains'), join(home, 'Library/Preferences'));
     rules.push(`(deny file-read-data (require-all (require-not (literal "/")) ${readable.map((p) => `(require-not (subpath ${sb(p)}))`).join(' ')}))`);
   }
   if (mode === 'trusted') {
     // Apple's xcrun uses its own cache override and ignores TMPDIR on this host.
     const temp = join(cwd, '.foreman-tmp');
-    command = `mkdir -p ${quote(temp)} && export TMPDIR=${quote(temp + '/')} xcrun_db=${quote(join(temp, 'xcrun_db'))} npm_config_cache=${quote(join(temp, 'npm-cache'))} YARN_CACHE_FOLDER=${quote(join(temp, 'yarn-cache'))}; ${command}`;
+    command = `mkdir -p ${quote(temp)} && foreman_command_tmp=$(/usr/bin/mktemp -d ${quote(join(temp, 'run-XXXXXX'))}) || exit 1; /usr/bin/printf '*\\n' > "$foreman_command_tmp/.gitignore"; foreman_command_root=${quote(temp)}; trap '/bin/rm -rf "$foreman_command_tmp"; /bin/rmdir "$foreman_command_root" 2>/dev/null || true' EXIT; export TMPDIR="$foreman_command_tmp/" xcrun_db="$foreman_command_tmp/xcrun_db" npm_config_cache="$foreman_command_tmp/npm-cache" YARN_CACHE_FOLDER="$foreman_command_tmp/yarn-cache"; ${command}`;
   }
   if (mode === 'read-only') {
     const words = shellWords(command);
@@ -82,11 +83,11 @@ export function shellSandbox(command: string, cwd: string, mode: PermissionMode,
       command = [binaries[words[0]], ...words.slice(1)].map(quote).join(' ');
     }
   }
-  const scrub = ['BASH_ENV', 'ENV', ...Object.keys(process.env).filter((name) => /FOREMAN_|SECRET|TOKEN|PASSWORD|CREDENTIAL|API_KEY/i.test(name) && !(authenticatedVcs && /^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN)$/.test(name)))].flatMap((name) => ['-u', name]).map(quote).join(' ');
+  const scrub = ['BASH_ENV', 'ENV', ...Object.keys(process.env).filter((name) => /FOREMAN_|SECRET|TOKEN|PASSWORD|CREDENTIAL|API_KEY/i.test(name))].flatMap((name) => ['-u', name]).map(quote).join(' ');
   return `/usr/bin/env ${scrub} /usr/bin/sandbox-exec -p ${quote(rules.join('\n'))} /bin/sh -c ${quote(command)}`;
 }
 export type Decision = { behavior: 'allow' | 'deny' | 'ask'; message: string; input: Record<string, any> };
-const READ_TOOLS = ['Read', 'Glob', 'Grep', 'view_image'];
+const READ_TOOLS = ['Read', 'view_image'];
 const WRITE_TOOLS = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'apply_patch'];
 const LOCAL_TOOLS = ['TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'update_plan'];
 const PEER_READ = ['list_sessions', 'session_state', 'session_tail', 'message_status'];
@@ -141,10 +142,10 @@ export function trustedNetworkCommand(command: string) {
     return !!verbs[rest[0]]?.includes(rest[1]) && !rest.some((w) => w === '--web' || w === '-w' || w.startsWith('--browser'));
   }
   if (words[0] === 'git') return ['push', 'fetch', 'pull'].includes(words[1]) && !words.some((w) => /^(--exec|--upload-pack|--receive-pack|--config-env)/.test(w));
-  return ['npm', 'pnpm', 'yarn'].includes(words[0]) && ['install', 'ci', 'add'].includes(words[1]);
+  return false; // Package lifecycle scripts are arbitrary code; no automatic egress.
 }
 
-export function toolDecision(mode: PermissionMode, cwd: string, tool: string, original: Record<string, any>, platform = process.platform): Decision {
+export function toolDecision(mode: PermissionMode, cwd: string, tool: string, original: Record<string, any>, platform = process.platform, approvedAccess = false): Decision {
   const input = { ...original };
   const result = (behavior: Decision['behavior'], message = ''): Decision => ({ behavior, message, input });
   const deny = (message: string) => result('deny', message);
@@ -167,13 +168,14 @@ export function toolDecision(mode: PermissionMode, cwd: string, tool: string, or
     if (LOCAL_TOOLS.includes(tool)) return result('allow');
     const peer = tool.replace(/^mcp__peers__/, '');
     if (PEER_READ.includes(peer) || PEER_WRITE.includes(peer)) return result('allow');
+    if (['Glob', 'Grep'].includes(tool)) return deny('Use a sandboxed shell search so denied descendants remain protected.');
     if (READ_TOOLS.includes(tool) || WRITE_TOOLS.includes(tool)) {
       if (mode === 'read-only' && WRITE_TOOLS.includes(tool)) return deny('Read-only sessions cannot write files.');
       let paths: string[];
       if (tool === 'apply_patch') {
         paths = [...String(input.command ?? input.patch ?? '').matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/gm)].map((m) => m[1]);
         if (!paths.length) return deny('Patch paths could not be verified.');
-      } else paths = [input.file_path ?? input.notebook_path ?? input.path ?? (['Glob', 'Grep'].includes(tool) ? root : '')];
+      } else paths = [input.file_path ?? input.notebook_path ?? input.path ?? ''];
       let ask = false;
       for (const path of paths) {
         if (typeof path !== 'string' || !path) return deny('An explicit file path is required.');
@@ -181,12 +183,10 @@ export function toolDecision(mode: PermissionMode, cwd: string, tool: string, or
         if (decision === 'deny') return deny('Path is outside the launch grant or on the deny list.');
         ask ||= decision === 'ask';
       }
-      // Recursive native searches can read denied descendants. Route inspection
-      // through sandboxed shell searches instead of trusting glob exclusion flags.
-      if (['Glob', 'Grep'].includes(tool)) return deny('Use a sandboxed shell search so denied descendants remain protected.');
       return result(ask ? 'ask' : 'allow');
     }
     if (tool === 'Bash' || tool === 'exec_command' || tool === 'shell_command') {
+      if (input.run_in_background) return deny('Background Bash is unsupported; use a foreground command and interrupt to stop it.');
       const command = input.command ?? input.cmd;
       if (typeof command !== 'string' || !command.trim()) return deny('A shell command is required.');
       if (platform !== 'darwin') return deny('The mandatory Foreman command sandbox requires macOS.');
@@ -203,10 +203,10 @@ export function toolDecision(mode: PermissionMode, cwd: string, tool: string, or
       }
       // The provider may approve an outer sandbox escape, but this inner
       // inherited boundary remains part of the exact command being approved.
-      const wrapped = shellSandbox(command, root, mode, mode === 'full' || mode === 'workspace' || (mode === 'trusted' && trustedNetworkCommand(command)), undefined, undefined, mode === 'workspace');
+      const wrapped = shellSandbox(command, root, mode, mode === 'full' || approvedAccess || (mode === 'trusted' && trustedNetworkCommand(command)), undefined, undefined, approvedAccess);
       input.command = wrapped;
       if ('cmd' in input) input.cmd = wrapped;
-      return result(mode === 'workspace' ? 'ask' : 'allow');
+      return result(mode === 'workspace' ? 'ask' : 'allow', mode === 'workspace' ? (original.dangerouslyDisableSandbox === true ? 'One-time outside-project read/write and external network access for this exact command. Credential and local API denials remain enforced. No interactive stdin grant.' : 'Run this exact guarded command with project-only data access and writes, and no network. To request outside access, explicitly set dangerouslyDisableSandbox:true.') : '');
     }
     if (tool === 'WebFetch' || tool === 'WebSearch') return mode === 'full' ? result('allow') : mode === 'workspace' ? result('ask') : deny('Network tool is outside the launch grant.');
     return deny(`Tool ${tool} is outside the launch grant.`);

@@ -22,7 +22,7 @@ function fixture(t: test.TestContext) {
 }
 test('only named presets are accepted, omission is Workspace', () => {
   assert.equal(permissionMode(undefined), 'workspace');
-  for (const value of [null, '', 'default', 'bypassPermissions', {}, 'FULL']) assert.throws(() => permissionMode(value), /permission_mode/);
+  for (const value of ['', 'default', 'bypassPermissions', {}, 'FULL']) assert.throws(() => permissionMode(value), /permission_mode/);
 });
 for (const mode of PERMISSION_MODES) {
   test(`${mode}: direct file operations, denied paths, symlinks, and escalation`, (t) => {
@@ -64,8 +64,8 @@ for (const mode of PERMISSION_MODES) {
   });
 }
 test('network grants do not mistake compound commands or execution flags for agreed operations', () => {
-  for (const command of ['gh -R hyang0129/foreman issue view 2', 'git push origin main', 'npm install', 'pnpm add zod', "gh issue comment 2 --body 'A message with spaces'"]) assert.equal(trustedNetworkCommand(command), true, command);
-  for (const command of ['gh auth token', 'gh alias set x !sh', 'gh issue list; curl x', 'git -c alias.x=push x', 'git push --receive-pack=sh', 'npm exec sh', 'npm install && curl x', 'curl https://example.com']) assert.equal(trustedNetworkCommand(command), false, command);
+  for (const command of ['gh -R hyang0129/foreman issue view 2', 'git push origin main', "gh issue comment 2 --body 'A message with spaces'"]) assert.equal(trustedNetworkCommand(command), true, command);
+  for (const command of ['npm install', 'pnpm add zod', 'gh auth token', 'gh alias set x !sh', 'gh issue list; curl x', 'git -c alias.x=push x', 'git push --receive-pack=sh', 'npm exec sh', 'npm install && curl x', 'curl https://example.com']) assert.equal(trustedNetworkCommand(command), false, command);
 });
 test('Read-only refuses side-effectful shell syntax and unsupported hosts fail closed', (t) => {
   const { project } = fixture(t);

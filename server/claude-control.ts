@@ -64,7 +64,7 @@ export class ClaudeControl extends EventEmitter {
             if (event.hook_event_name !== 'PreToolUse') return {};
             const decision = toolDecision(this.permission_mode, this.cwd, event.tool_name, event.tool_input as Record<string, any>);
             return { hookSpecificOutput: { hookEventName: 'PreToolUse',
-              permissionDecision: decision.behavior === 'ask' ? 'ask' : decision.behavior,
+              permissionDecision: decision.behavior,
               permissionDecisionReason: decision.message,
               ...(decision.behavior === 'allow' ? { updatedInput: decision.input } : {}),
             } };
@@ -74,7 +74,13 @@ export class ClaudeControl extends EventEmitter {
             const decision = toolDecision(this.permission_mode, this.cwd, tool, input);
             if (decision.behavior === 'deny') return Promise.resolve({ behavior: 'deny', message: decision.message });
             if (decision.behavior === 'allow') return Promise.resolve({ behavior: 'allow', updatedInput: decision.input });
-            return this.requestApproval(tool, input, context, decision.input);
+            const pending = this.requestApproval(tool, input, { ...context, decisionReason: decision.message || context.decisionReason }, decision.input);
+            if (tool !== 'Bash' || input.dangerouslyDisableSandbox !== true) return pending;
+            return pending.then((result) => {
+              if (result.behavior !== 'allow' || tool !== 'Bash' || input.dangerouslyDisableSandbox !== true) return result;
+              const approved = toolDecision(this.permission_mode, this.cwd, tool, input, process.platform, true);
+              return approved.behavior === 'deny' ? { behavior: 'deny', message: approved.message } : { behavior: 'allow', updatedInput: approved.input };
+            });
           },
         } });
         for await (const message of this.stream) {
@@ -150,7 +156,7 @@ export class ClaudeControl extends EventEmitter {
     return true;
   }
 
-  private requestApproval(tool: string, input: Record<string, unknown>, context: PermissionContext, approvedInput = input): Promise<PermissionResult> {
+  private requestApproval(tool: string, input: Record<string, unknown>, context: PermissionContext, approvedInput: Record<string, unknown>): Promise<PermissionResult> {
     if (this.state === "closed" || this.state === "failed" || context.signal.aborted)
       return Promise.resolve({ behavior: "deny", message: "Session is unavailable" });
     const id = context.requestId || context.toolUseID;
@@ -166,7 +172,7 @@ export class ClaudeControl extends EventEmitter {
       resolve(result);
     };
     const { signal, ...displayContext } = context;
-    const request = { id, tool, input, reason: context.decisionReason, context: displayContext };
+    const request = { id, tool, input: tool === 'Bash' ? { ...input, guarded_command: approvedInput.command } : input, reason: context.decisionReason, context: displayContext };
     this.approvals.set(id, { request, approvedInput, resolve: finish, promise });
     context.signal.addEventListener("abort", abort, { once: true });
     this.setState("input-needed");

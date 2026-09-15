@@ -119,9 +119,37 @@ for (const policy of ['read-only', 'workspace', 'trusted', 'full'] as const) {
   });
 }
 
-test('Claude refuses an effective provider mode different from its launch policy', async () => {
+test('Claude refuses an effective provider mode different from its launch policy', {timeout:1000}, async (t) => {
   const h = harness('workspace'); await tick();
+  t.after(() => h.control.close());
   h.emit({type:'system',subtype:'init',session_id:'test',permissionMode:'bypassPermissions'});
   await h.control.finished;
   assert.equal(h.control.state, 'failed');
+});
+
+test('approval responses cannot swap guarded Bash input for raw commands', async (t) => {
+  const h = harness(); t.after(() => h.control.close()); await tick();
+  const pending = h.options().canUseTool('Bash', {command:'pwd'}, {signal:new AbortController().signal,toolUseID:'immutable'});
+  assert.throws(() => h.control.respondApproval('immutable','allow',{command:'touch /tmp/swapped'}), /cannot change/);
+  assert.equal(h.control.pendingApprovals().length, 1);
+  h.control.respondApproval('immutable','allow');
+  assert.match((await pending).updatedInput.command, /sandbox-exec/);
+});
+
+test('Claude Workspace escape is explicit, described, and effective only after exact approval', {timeout:5000}, async (t) => {
+  const {mkdtempSync,mkdirSync,existsSync,rmSync} = await import('node:fs');
+  const {tmpdir} = await import('node:os'); const {join} = await import('node:path');
+  const {spawnSync} = await import('node:child_process');
+  const dir=mkdtempSync(join(tmpdir(),'foreman-claude-grant-')), project=join(dir,'project');mkdirSync(project);
+  const h=harness('workspace'); (h.control as any).cwd=project;
+  t.after(()=>{h.control.close();rmSync(dir,{recursive:true,force:true});});await tick();
+  const target=join(dir,'outside');
+  const pending=h.options().canUseTool('Bash',{command:`touch '${target}'`,dangerouslyDisableSandbox:true},{signal:new AbortController().signal,toolUseID:'escape'});
+  assert.equal(existsSync(target),false);
+  const request=h.control.pendingApprovals()[0];assert.match(request.reason!,/outside-project read\/write/);
+  assert.match(String(request.input.guarded_command),/sandbox-exec/);
+  h.control.respondApproval('escape','allow');
+  const granted=await pending;
+  assert.equal(spawnSync('/bin/sh',['-c',granted.updatedInput.command]).status,0);
+  assert.equal(existsSync(target),true);
 });
