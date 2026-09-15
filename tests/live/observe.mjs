@@ -10,6 +10,7 @@ assert.notEqual(process.env.FOREMAN_PORT, '4177');
 assert.ok(process.env.FOREMAN_HOME?.includes('foreman-conformance-'));
 const record = (event) => { if (process.connected) process.send({ event }); };
 let service;
+const controls = new Map();
 const launch = SessionService.prototype.launch;
 SessionService.prototype.launch = async function (data, runtime) {
   service = this;
@@ -29,7 +30,9 @@ SessionService.prototype.launch = async function (data, runtime) {
   };
   this.options.codexFactory = (options) => {
     const control = new CodexControl(options);
+    controls.set(options.cwd, control);
     control.on('notification', (message) => {
+      if (message.method.startsWith('thread/')) record({cwd:options.cwd,kind:message.method,params:message.params});
       if (['item/started', 'item/completed'].includes(message.method)) record({cwd:options.cwd,kind:message.method,item:message.params.item});
     });
     return control;
@@ -37,6 +40,23 @@ SessionService.prototype.launch = async function (data, runtime) {
   return launch.call(this, data, runtime);
 };
 process.on('message', async (message) => {
+  if (message.type === 'lifecycle') {
+    try {
+      const control = controls.get(message.cwd);
+      assert.ok(control, 'Live Codex controller must exist');
+      let result;
+      if (message.action === 'info') result = {watchdog:control.child.pid};
+      else if (message.action === 'close') await control.close();
+      else if (message.action === 'archive') {
+        // Real provider unload, in the disposable CODEX_HOME only. Closure can
+        // disconnect the RPC before its response arrives.
+        try { await control.request('thread/archive', {threadId:message.threadId}); }
+        catch (error) { result = {rpcError:String(error)}; }
+      } else throw new Error('Unknown lifecycle test action');
+      process.send({reply:message.seq,result});
+    } catch (error) { process.send({reply:message.seq,error:String(error)}); }
+    return;
+  }
   if (message.type !== 'peer') return;
   try {
     const result = await bindPeerTools(service, message.id).call('session_state', { session: message.id });

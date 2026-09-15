@@ -61,11 +61,31 @@ isolated Foreman HTTP server. It requires successful provider turns, verifies
 Native approvals, and checks Bypass authenticated gh/private Git execution on
 both providers. Tool-result correlation and independent file artifacts replace
 model prose as evidence. [Actual results and limitations](LIVE_POLICY_RESULTS.md)
-record the runs, including failed attempts. The remaining live failure is Codex
-CLI 0.149.0 foreground command cancellation: the turn stops but the command can
-continue. Calling native terminal cleanup before or after cancellation did not
-resolve it, so that attempted workaround was removed. The failing live regression
-is retained; this release does not claim complete native process termination.
+record the runs, including failed attempts. The formerly failing Codex CLI 0.149.0
+foreground-interruption regression now passes, with its completion-marker assertion
+unchanged and additional process-table checks.
+
+## Follow-up: session lifecycle, not permission enforcement
+
+The failure was a race: Codex could report the turn interrupted before registering
+and announcing its already-running shell. A one-off terminal cleanup missed that
+shell. Foreman now remembers interrupted turns, cleans registered native terminals,
+and terminates late announcements by their exact execution IDs. New sends cannot
+race Stop cleanup, and a live follow-up command verifies the session stays usable.
+
+Owned app-servers now run under a small process watchdog. It handles controller
+close, thread unload/archive/close, broken transport, provider kill/crash, and
+normal or abrupt Foreman shutdown. Native shell groups are separate from the
+app-server group; signaling only the app-server PID or PGID was insufficient.
+Shutdown now waits for cleanup. Shared external socket servers remain unowned.
+
+Ordinary PID polling also failed five immediate-spawn/crash trials. The retained
+macOS implementation uses kernel birth/original-parent identities and gates provider
+startup until ownership is recorded; the same five trials now pass without a
+readiness delay. This adds a small C helper and an explicit Command Line Tools
+prerequisite. It does not reintroduce Seatbelt, shell rewriting, policy snapshots,
+credential rules, hook attestation, or replacement execution tools. See the precise
+platform and ownership limits in [session modes](SESSION_PERMISSIONS.md).
 
 No deployment, installed-service restart, package manifest/lockfile changes, or
 changes to the real `~/.foreman` or `.claude` directories are part of this work.

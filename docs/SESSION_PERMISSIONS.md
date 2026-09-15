@@ -62,10 +62,9 @@ and disconnection invalidate pending approvals as supported by each adapter.
 Codex's separate `request_permissions` requests receive an empty turn grant;
 command/file approval requests still go to the user. Stop uses the providers'
 native turn interruption and cancels pending Foreman approvals and queued messages.
-**On Codex CLI 0.149.0, a native shell command can keep running after the turn is
-interrupted.** The live suite retains a failing regression for this behavior.
-Codex's native terminal-cleanup endpoint did not resolve the foreground case and
-is not used as a workaround. Claude's tested foreground command stopped.
+For Codex, Foreman also cleans native terminals and terminates commands announced
+late for the interrupted turn, using their exact native execution IDs. A new send
+is rejected while Stop is cleaning up. The tested session remains usable afterward.
 Interruption does not undo effects already performed. Unknown provider dialogs
 remain unsupported and require interruption or the original client.
 
@@ -88,6 +87,45 @@ On recovery they remain unavailable, with history retained and uncertain work
 never replayed. Old creation IDs cannot silently acquire the new semantics; use a
 new session. Existing legacy `bg`/`tab` provider flags remain separate.
 
+## Managed Codex process lifetime
+
+Foreman owns the app-server it launches over stdio. A separate watchdog tracks
+its process family and detached process groups, sends TERM on teardown, escalates
+to KILL, and waits for the processes to exit. It survives loss of Foreman's IPC
+connection, including Foreman being killed. Provider exit/crash also starts cleanup.
+Controller close, thread `closed`/`archived`/`notLoaded`, transport disconnect, and
+daemon shutdown all retire the owned runtime. Graceful daemon shutdown waits for
+cleanup before reporting successful exit; cleanup failure produces a nonzero exit.
+
+On macOS, a small C helper reads kernel process birth identities and original
+parent identities using the [Apple process-identity ABI](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h). Those identities survive reparenting and prevent PID reuse
+from assigning unrelated processes to a session. The provider starts behind a
+one-byte readiness gate until its identity is recorded. This fixes the race where
+an app-server dies immediately after creating a detached shell, before an ordinary
+`ps` ancestry poll sees it. No shell commands or native provider tools are replaced.
+
+**macOS now requires Xcode Command Line Tools (`/usr/bin/cc`) and the process
+identity API.** Each watchdog builds and validates the 49-line helper in its own
+temporary directory before launching the provider, then removes that directory
+on exit. It writes no helper or configuration to `~/.foreman` or `.claude`.
+The helper only reads process metadata and gates startup; it is not a sandbox,
+a credential filter, a TCC change, or a permissions attestation.
+
+The live evidence covers managed Codex on macOS. Linux uses PID/start-time/group
+observation and has not received equivalent live certification; it lacks the
+macOS original-parent recovery for a detached child whose parent dies before a
+sample. Socket attachment to an existing external app-server does not transfer
+ownership to Foreman: disconnecting that client must not kill a shared server.
+Claude continues to use SDK lifecycle handling; its foreground interruption is
+checked in the native-mode matrix, not the Codex crash matrix.
+
+Lifecycle cleanup is not containment of hostile code. Work deliberately delegated
+to another service (for example launchd), elevated processes, killing the watchdog
+itself, or multiple unseen intermediate processes that detach and disappear cannot
+be given a universal cleanup guarantee by this adapter. These are not restored
+Trusted guarantees. Normal command groups, background children, immediate provider
+death, and graceful/abrupt daemon shutdown are exercised by the lifecycle tests.
+
 ## Verification
 
 Run:
@@ -101,6 +139,8 @@ npm run test:ui
 FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 \
   FOREMAN_LIVE_PRIVATE_REPO=owner/private-repository \
   npm --prefix tests/live run test:policy
+FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 \
+  node --experimental-strip-types --test --test-concurrency=1 tests/live/lifecycle.live.mjs
 ```
 
 The live suite starts a separate Foreman server on an assigned loopback port with
@@ -115,7 +155,7 @@ The suite requires successful real provider turns before asserting reporting. It
 checks API/peer/browser mode reporting, native shell execution, Native one-time
 approvals, and Bypass access to a synthetic `.env`, outside writes, authenticated
 private-repository `gh`, private Git fetch, and native command interruption.
-Only tool results and independent filesystem artifacts establish execution;
+Tool results, independent filesystem artifacts, and process-table observations establish execution;
 assistant prose and missing provider calls cannot pass. Git fetch downloads into
 a disposable repository without checking out or executing private code. Existing
 host Git/gh authentication is used without a special credential exception.

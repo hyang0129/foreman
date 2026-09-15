@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 if (process.env.FOREMAN_LIVE !== '1') {
   test('live native modes (set FOREMAN_LIVE=1)', {skip:'spends real provider turns; opt in explicitly'}, () => {});
 } else {
-  const { Harness, until, quote, assertSuccess, commandResults, existsSync, readFileSync, join, randomUUID, spawnSync, delay } = await import('./harness.mjs');
+  const { Harness, until, quote, assertSuccess, commandResults, existsSync, readFileSync, join, randomUUID, spawnSync, delay, commandProcesses, assertProcessesGone } = await import('./harness.mjs');
   const repo = process.env.FOREMAN_LIVE_PRIVATE_REPO;
   assert.match(repo ?? '', /^[\w.-]+\/[\w.-]+$/, 'Set FOREMAN_LIVE_PRIVATE_REPO to an accessible private repository');
   const metadata = spawnSync('gh', ['api', `repos/${repo}`, '--jq', '.private'], {encoding:'utf8',timeout:20000});
@@ -76,12 +76,17 @@ if (process.env.FOREMAN_LIVE !== '1') {
             const offset = h.events.length;
             const receipt = await h.api('/api/session/message', {id:row.session_key,message_id:randomUUID(),text:h.shell(row,command) + ' Run exactly this command once and wait for it. This is an interruption test.'});
             await until(() => existsSync(marker), 'native command started', 60000);
+            const before = commandProcesses(marker);
+            t.diagnostic(`Before interrupt: ${JSON.stringify(before.map(({pid,ppid,pgid,stat}) => ({pid,ppid,pgid,stat})))}`);
             await h.api('/api/session/interrupt',{id:row.session_key});
+            await assertProcessesGone(before, `${provider} interrupted command group must disappear from ps`);
+            t.diagnostic('After interrupt: no command group members remain in ps');
             await until(async () => {
               const detail = await h.api(`/api/session?id=${encodeURIComponent(row.session_key)}`);
               return detail.receipts.some((r) => r.id === receipt.id && ['failed','completed'].includes(r.status));
             }, 'interrupted turn settled');
             await delay(13000);
+            await assertProcessesGone(before, 'Command group must stay gone after its original completion time');
             assert.equal(existsSync(finished),false,`Interrupted foreground command continued: ${JSON.stringify(h.events.slice(offset))}`);
             assert.ok(h.events.slice(offset).some((e) => e.cwd === row.cwd &&
               ((e.kind === 'tool_use' && e.input?.command === command) || (e.kind === 'item/started' && e.item?.command?.includes(command)))));

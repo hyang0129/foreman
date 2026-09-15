@@ -158,7 +158,7 @@ export class Harness {
       : `Call Bash with ${JSON.stringify({ command })}.`;
   }
   async stop() {
-    if (!this.child || this.child.exitCode !== null) return;
+    if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null) return;
     const child = this.child;
     child.kill('SIGTERM');
     await Promise.race([once(child, 'exit'), delay(7000)]);
@@ -196,3 +196,26 @@ export function assertSuccess(probe, command, token) {
     `No successful correlated native shell result: ${JSON.stringify(probe)}`);
 }
 export { existsSync, readFileSync, writeFileSync, join, randomUUID, spawnSync, delay };
+
+// Inspect OS identities and complete groups, including children reparented after
+// the shell exits. Never treat a completed turn as proof of process termination.
+export function processRows() {
+  const result = spawnSync('ps', ['-axo', 'pid=,ppid=,pgid=,stat=,command='], {encoding:'utf8'});
+  assert.equal(result.status, 0, 'ps must succeed');
+  return result.stdout.trim().split('\n').map((line) => {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    assert.ok(match, 'ps row must parse');
+    return {pid:Number(match[1]),ppid:Number(match[2]),pgid:Number(match[3]),stat:match[4],command:match[5]};
+  });
+}
+export function commandProcesses(command) {
+  const rows = processRows();
+  const groups = new Set(rows.filter((r) => r.command.includes(command)).map((r) => r.pgid));
+  assert.ok(groups.size, 'Exact long-running command must appear in ps before cancellation');
+  return rows.filter((r) => groups.has(r.pgid));
+}
+export async function assertProcessesGone(before, label) {
+  const groups = new Set(before.map((r) => r.pgid));
+  await until(() => !processRows().some((r) => groups.has(r.pgid)), label, 5000);
+  assert.deepEqual(processRows().filter((r) => groups.has(r.pgid)), [], label);
+}
