@@ -2,9 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#142b24" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="theme-color" content="#f8faf8" />
     <title>Foreman · Session inbox</title>
+    <script src="/appearance.js"></script>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
@@ -19,6 +20,9 @@
         </p>
         <p id="auth-status" role="status">Connecting to Foreman…</p>
         <button id="sign-in" class="btn" hidden>Continue with Google</button>
+        <label class="appearance-control">Appearance
+          <select data-appearance><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>
+        </label>
       </div>
     </section>
     <div class="app" id="app" hidden>
@@ -55,6 +59,9 @@
         /></label>
         <nav class="session-list" id="session-list" aria-label="Sessions"></nav>
         <footer class="rail-footer">
+          <label class="appearance-control">Appearance
+            <select data-appearance><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>
+          </label>
           <div class="host-line">
             <span id="host-dot" class="dot"></span
             ><span id="host-status" role="status">Checking host…</span>
@@ -87,14 +94,19 @@
               <h1 id="conversation-title">Your session inbox</h1>
               <span id="provider" class="badge" hidden></span>
             </div>
-            <p id="conversation-subtitle">
-              Choose a session or start something new.
-            </p>
+            <div id="activity-status" class="activity-status" role="status" aria-live="polite" aria-atomic="true" hidden>
+              <span class="activity-symbol" aria-hidden="true"></span><span id="activity-label"></span>
+            </div>
+            <details id="heading-details">
+              <summary>Session details</summary>
+              <p id="conversation-subtitle">Choose a session or start something new.</p>
+            </details>
           </div>
-          <button id="interrupt" class="btn ghost small" disabled>
+          <button id="interrupt" class="btn ghost small" aria-describedby="interrupt-feedback" disabled>
             Interrupt
           </button>
         </header>
+        <p id="interrupt-feedback" class="action-feedback" role="status" hidden></p>
         <div
           id="connection-banner"
           class="banner warning"
@@ -126,14 +138,16 @@
         </div>
         <div id="pm-model-control" class="model-control" hidden>
           <label for="pm-model">Project manager model · Claude</label>
-          <select id="pm-model" disabled><option value="">Provider default</option></select>
+          <select id="pm-model" aria-describedby="pm-model-hint" disabled><option value="">Provider default</option></select>
           <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn.</span>
         </div>
         <div id="control-note" class="control-note" role="status"></div>
         <form id="composer" class="composer">
+          <p id="send-feedback" class="action-feedback" role="status" hidden></p>
           <label class="sr-only" for="message-input">Message this session</label
           ><textarea
             id="message-input"
+            aria-describedby="send-feedback"
             rows="2"
             placeholder="Choose a session to start a conversation"
             maxlength="60000"

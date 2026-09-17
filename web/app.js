@@ -77,6 +77,44 @@ let pmModel = "", pmModelSaving = false, pmModelLoading = false, pmModelReady = 
   pmModelLoaded = false, modelRevision = 0, newModelRequest = 0;
 const drafts = new Map(),
   sendAttempts = new Map();
+const actionFeedback = new Map(), approvalFeedback = new Map();
+let conversationLoading = false;
+
+function setActionFeedback(key, action, text, error = false) {
+  const feedback = actionFeedback.get(key) || {};
+  feedback[action] = { text, error };
+  actionFeedback.set(key, feedback);
+  if (key === selected) renderActionFeedback();
+}
+function renderActionFeedback() {
+  for (const action of ["send", "interrupt"]) {
+    const target = $(`#${action}-feedback`);
+    const feedback = actionFeedback.get(selected)?.[action];
+    const text = feedback?.text || "";
+    if (target.textContent !== text) target.textContent = text;
+    target.classList.toggle("error", !!feedback?.error);
+    target.hidden = !text;
+  }
+}
+function showConversationLoading(message = "Opening conversation…", failed = false) {
+  conversationLoading = true;
+  let loading = $("#conversation-loading");
+  if (!loading) {
+    loading = node("div", "loading-state");
+    loading.id = "conversation-loading";
+    loading.setAttribute("role", "status");
+    ui.messages.replaceChildren(loading);
+  }
+  if (loading.dataset.message === message) return;
+  loading.dataset.message = message;
+  const symbol = node("span", failed ? "" : "activity-symbol", failed ? "!" : "");
+  symbol.setAttribute("aria-hidden", "true");
+  loading.replaceChildren(symbol, node("span", "", message));
+}
+function showRefreshError(error) {
+  if (conversationLoading) showConversationLoading(`Could not open conversation. ${errorMessage(error)} Retrying automatically.`, true);
+  else showError(error);
+}
 
 function node(tag, className, text) {
   const el = document.createElement(tag);
@@ -177,6 +215,11 @@ function revokeAccess(message) {
   authEpoch++;
   authorized = false;
   pmModel = ""; pmModelLoaded = false; pmModelReady = false;
+  sending = false; creating = false; pmModelSaving = false; pmModelLoading = false;
+  newModelRequest++;
+  ui.interrupt.dataset.busy = "false";
+  $("#create-session").textContent = "Start session";
+  $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved on your Mac.";
   modelOptions($("#pm-model"), []);
   clearTimeout(pollTimer);
   sessions = [];
@@ -184,6 +227,10 @@ function revokeAccess(message) {
   host = { online: false };
   drafts.clear();
   sendAttempts.clear();
+  actionFeedback.clear();
+  approvalFeedback.clear();
+  conversationLoading = false;
+  renderActionFeedback();
   messageSignature = "";
   approvalSignature = "";
   ui.messages.replaceChildren();
@@ -200,6 +247,7 @@ function revokeAccess(message) {
   ui.signIn.disabled = false;
   const localForm = $("#local-auth-form");
   if (localForm) localForm.hidden = false;
+  updateControls();
 }
 function setNav(open) {
   ui.app.classList.toggle("nav-open", open);
@@ -317,6 +365,8 @@ function updateControls() {
     !host.online ||
     (isPm ? !pmBusy : !session?.capabilities?.interrupt) ||
     ui.interrupt.dataset.busy === "true";
+  ui.interrupt.textContent = ui.interrupt.dataset.busy === "true" ? "Interrupting…" : "Interrupt";
+  renderActionFeedback();
   ui.input.placeholder = !selected
     ? "Choose a session to start a conversation"
     : !host.online
@@ -351,18 +401,33 @@ function renderHeading() {
     ui.subtitle.textContent = pmBusy
       ? "Working · Planning and delegating"
       : "Ready · Your view across the fleet";
+    if (!host.online) ui.subtitle.textContent += " · Last known";
   } else if (detail?.session) {
     const s = detail.session;
     ui.title.textContent = s.name || "Session";
     ui.provider.hidden = false;
     ui.provider.textContent = s.provider === "codex" ? "Codex" : "Claude";
-    ui.subtitle.textContent = `${LABEL[s.state] || s.state || "Unknown"}${!host.online ? " · Last known" : ""} · ${shortPath(s.cwd)}${s.managed ? ` · ${s.model || "Provider default"} · ${policyLabel(s)}` : " · Monitoring only"}`;
+    ui.subtitle.textContent = `${LABEL[s.state] || s.state || "Unknown"}${!host.online ? " · Last known" : ""} · ${s.cwd || "Project unavailable"}${s.managed ? ` · ${s.model || "Provider default"} · ${policyLabel(s)}` : " · Monitoring only"}`;
   } else {
     ui.title.textContent = selected ? "Loading session…" : "Your session inbox";
     ui.provider.hidden = true;
     ui.subtitle.textContent = "Choose a session or start something new.";
   }
+  renderActivity();
   updateControls();
+}
+function renderActivity() {
+  const status = $("#activity-status"), label = $("#activity-label");
+  const state = selected === "pm" ? (pmModelReady ? (pmBusy ? "working" : "turn_finished") : null) : detail?.session?.state;
+  const working = state === "working";
+  const tool = working && selected !== "pm" ? detail?.session?.current_tool : null;
+  const text = state ? `${host.online ? "" : "Last known · "}${working ? "Working…" : LABEL[state] || state}${tool ? ` · ${tool}` : ""}` : "";
+  status.hidden = !text;
+  // Keep the live region and symbol mounted; only announce actual transitions.
+  if (label.textContent !== text) label.textContent = text;
+  status.classList.toggle("is-active", working && host.online);
+  status.classList.toggle("is-stale", !!state && !host.online);
+  status.dataset.state = state || "";
 }
 function emptyState(title, text, allowCreate = false) {
   const empty = node("div", "empty-state");
@@ -515,11 +580,17 @@ function renderApprovals(approvals = []) {
       input.value,
     ]),
   );
+  const focused = ui.approvals.contains(document.activeElement) ? document.activeElement : null;
+  const focusKey = focused?.dataset.focusKey;
+  const selectionStart = focused?.selectionStart, selectionEnd = focused?.selectionEnd;
+  const expanded = new Set([...ui.approvals.querySelectorAll("details[open]")].map((el) => el.dataset.focusKey));
   approvalSignature = signature;
   ui.approvals.replaceChildren();
   for (const approval of approvals) {
     const sessionKey = selected;
+    const feedbackKey = JSON.stringify([sessionKey, approval.id]);
     const form = node("form", "approval");
+    form.dataset.approvalKey = feedbackKey;
     form.append(
       node(
         "h3",
@@ -534,10 +605,13 @@ function renderApprovals(approvals = []) {
     if (approval.reason) form.append(node("p", "", approval.reason));
     if (approval.input && Object.keys(approval.input).length) {
       const details = node("details");
+      details.dataset.focusKey = `${feedbackKey}:details`;
+      details.open = expanded.has(details.dataset.focusKey);
       details.append(
         node("summary", "", "Review request details"),
         node("pre", "", JSON.stringify(approval.input, null, 2)),
       );
+      details.querySelector("summary").dataset.focusKey = `${feedbackKey}:summary`;
       form.append(details);
     }
     if (approval.kind === "unsupported") {
@@ -567,6 +641,7 @@ function renderApprovals(approvals = []) {
         }
       }
       input.dataset.questionKey = `${approval.id}:${question.id}`;
+      input.dataset.focusKey = `${feedbackKey}:question:${question.id}`;
       input.value = oldAnswers.get(input.dataset.questionKey) || "";
       label.append(input);
       form.append(label);
@@ -579,18 +654,44 @@ function renderApprovals(approvals = []) {
       approval.kind === "question" ? "Send answer" : "Allow once",
     );
     allow.type = "submit";
+    allow.dataset.focusKey = `${feedbackKey}:allow`;
     const deny = node(
       "button",
       "btn ghost",
       approval.kind === "question" ? "Decline" : "Deny",
     );
     deny.type = "button";
+    deny.dataset.focusKey = `${feedbackKey}:deny`;
     actions.append(allow, deny);
     form.append(actions);
-    const respond = async (decision) => {
-      form.dataset.busy = "true";
+    const feedback = node("p", "form-error");
+    feedback.setAttribute("role", "alert");
+    form.append(feedback);
+    const syncFeedback = () => {
+      const state = approvalFeedback.get(feedbackKey);
+      form.dataset.busy = String(!!state?.pending);
+      allow.textContent = state?.pending === "allow"
+        ? (approval.kind === "question" ? "Sending answer…" : "Allowing…")
+        : (approval.kind === "question" ? "Send answer" : "Allow once");
+      deny.textContent = state?.pending === "deny"
+        ? (approval.kind === "question" ? "Declining…" : "Denying…")
+        : (approval.kind === "question" ? "Decline" : "Deny");
+      feedback.textContent = state?.error || "";
+      feedback.hidden = !state?.error;
+    };
+    form.syncFeedback = syncFeedback;
+    syncFeedback();
+    const syncCurrentFeedback = () => {
+      [...ui.approvals.querySelectorAll("form")].find((current) => current.dataset.approvalKey === feedbackKey)?.syncFeedback?.();
       updateControls();
+    };
+    const respond = async (decision) => {
+      if (approvalFeedback.get(feedbackKey)?.pending || !host.online) return;
+      const epoch = authEpoch;
+      approvalFeedback.set(feedbackKey, { pending: decision });
+      syncCurrentFeedback();
       clearError();
+      let accepted = false;
       try {
         const answers = Object.fromEntries(
           answerInputs.map(([id, input]) => [id, input.value]),
@@ -603,16 +704,29 @@ function renderApprovals(approvals = []) {
             ? { answers }
             : {}),
         });
-        form.remove();
+        if (epoch !== authEpoch || !authorized) return;
+        accepted = true;
+        [...ui.approvals.querySelectorAll("form")].find((current) => current.dataset.approvalKey === feedbackKey)?.remove();
+        approvalFeedback.delete(feedbackKey);
         approvalSignature = "";
         await refreshSelected();
       } catch (error) {
-        showError(error);
-        approvalSignature = "";
-        await refreshSelected().catch(() => {});
+        if (epoch !== authEpoch || !authorized) return;
+        if (accepted) showError(`Your response was accepted, but the conversation could not refresh. ${errorMessage(error)}`);
+        else {
+          approvalFeedback.set(feedbackKey, { error: errorMessage(error) });
+          syncCurrentFeedback();
+          approvalSignature = "";
+          await refreshSelected().catch(() => {});
+        }
       } finally {
-        form.dataset.busy = "false";
-        updateControls();
+        if (epoch === authEpoch && authorized) {
+          syncCurrentFeedback();
+          if (selected === sessionKey && document.activeElement === document.body && !ui.dialog.open && !ui.app.classList.contains("nav-open")) {
+            const focusTarget = accepted ? ui.input : [...ui.approvals.querySelectorAll("[data-focus-key]")].find((el) => el.dataset.focusKey === `${feedbackKey}:${decision}`);
+            if (focusTarget && !focusTarget.disabled) focusTarget.focus({ preventScroll: true });
+          }
+        }
       }
     };
     form.addEventListener("submit", (event) => {
@@ -623,6 +737,11 @@ function renderApprovals(approvals = []) {
     ui.approvals.append(form);
   }
   updateControls();
+  if (focusKey) {
+    const next = [...ui.approvals.querySelectorAll("[data-focus-key]")].find((el) => el.dataset.focusKey === focusKey);
+    next?.focus({ preventScroll: true });
+    if (next?.setSelectionRange && selectionStart != null) next.setSelectionRange(selectionStart, selectionEnd);
+  }
   if (approvals.length && wasNearBottom)
     ui.timeline.scrollTop = ui.timeline.scrollHeight;
 }
@@ -630,6 +749,7 @@ async function selectSession(key) {
   if (selected) drafts.set(selected, ui.input.value);
   selected = key;
   selectionEpoch++;
+  const epoch = selectionEpoch;
   detail = null;
   pmBusy = false;
   pmModelReady = false;
@@ -643,17 +763,21 @@ async function selectSession(key) {
   ui.input.value = drafts.get(key) || "";
   autosize();
   clearError();
-  ui.messages.replaceChildren(
-    emptyState("Opening conversation…", "Getting the latest messages."),
-  );
+  showConversationLoading();
   ui.approvals.replaceChildren();
   renderRail();
   renderHeading();
+  const returnFocus = ui.app.classList.contains("nav-open") && window.matchMedia("(max-width: 760px)").matches;
   setNav(false);
+  if (returnFocus) {
+    ui.title.tabIndex = -1;
+    ui.title.focus({ preventScroll: true });
+  }
+  if (!host.online) showConversationLoading("Conversation unavailable while your Mac is offline. It will open when your Mac reconnects.", true);
   try {
     await refreshSelected();
   } catch (error) {
-    showError(error);
+    if (epoch === selectionEpoch) showRefreshError(error);
   }
 }
 async function refreshSelected() {
@@ -673,6 +797,7 @@ async function refreshSelected() {
     !authorized
   )
     return;
+  conversationLoading = false;
   if (key === "pm") {
     pmBusy = !!result.busy;
     pmModelReady = true;
@@ -705,12 +830,13 @@ async function poll() {
       if (!authorized || epoch !== authEpoch) return;
       sessions = Array.isArray(rows) ? rows : [];
       renderRail();
-      await refreshSelected().catch(showError);
+      await refreshSelected().catch(showRefreshError);
       if (!selected) {
         renderMessages();
         renderHeading();
       }
     } else {
+      if (conversationLoading) showConversationLoading("Conversation unavailable while your Mac is offline. It will open when your Mac reconnects.", true);
       renderRail();
       renderHeading();
     }
@@ -721,6 +847,7 @@ async function poll() {
       renderHeading();
       $("#connection-banner").textContent =
         `Cannot reach the execution host. ${errorMessage(error)} Retrying automatically.`;
+      if (conversationLoading) showConversationLoading("Conversation unavailable while your Mac is offline. Retrying automatically.", true);
     }
   } finally {
     polling = false;
@@ -734,6 +861,10 @@ function autosize() {
 }
 ui.input.addEventListener("input", () => {
   if (selected) drafts.set(selected, ui.input.value);
+  for (const action of ["send", "interrupt"]) {
+    const feedback = actionFeedback.get(selected)?.[action];
+    if (feedback?.text && !feedback.error) setActionFeedback(selected, action, "");
+  }
   autosize();
   updateControls();
 });
@@ -753,6 +884,8 @@ $("#composer").addEventListener("submit", async (event) => {
     previous?.text === text ? previous : { id: crypto.randomUUID(), text };
   sendAttempts.set(key, attempt);
   sending = true;
+  const epoch = authEpoch;
+  setActionFeedback(key, "send", "");
   updateControls();
   clearError();
   let accepted = false;
@@ -771,36 +904,49 @@ $("#composer").addEventListener("submit", async (event) => {
       ui.input.value = "";
       autosize();
     }
+    if (epoch === authEpoch && authorized) setActionFeedback(key, "send", "Message accepted.");
     await refreshSelected();
   } catch (error) {
-    showError(
+    if (epoch === authEpoch && authorized) setActionFeedback(key, "send",
       accepted
         ? `Your message was accepted, but the conversation could not refresh. ${errorMessage(error)}`
         : `${errorMessage(error)} Your message is still in the composer.${key === "pm" ? " Check the conversation before sending again." : " Retry the same message to check delivery without creating a duplicate."}`,
+      true,
     );
   } finally {
-    sending = false;
-    updateControls();
-    if (selected === key && !ui.input.disabled) ui.input.focus();
+    if (epoch === authEpoch) {
+      sending = false;
+      updateControls();
+      if (selected === key && !ui.input.disabled) ui.input.focus();
+    }
   }
 });
 ui.interrupt.addEventListener("click", async () => {
   if (ui.interrupt.disabled) return;
   const key = selected;
+  const epoch = authEpoch;
   ui.interrupt.dataset.busy = "true";
+  setActionFeedback(key, "interrupt", "");
   updateControls();
   clearError();
+  let accepted = false;
   try {
     await post(
       key === "pm" ? "/api/pm/interrupt" : "/api/session/interrupt",
       key === "pm" ? {} : { id: key },
     );
+    accepted = true;
+    if (epoch === authEpoch && authorized) setActionFeedback(key, "interrupt", "Interrupt request accepted.");
     await refreshSelected();
   } catch (error) {
-    showError(error);
+    if (epoch === authEpoch && authorized) setActionFeedback(key, "interrupt", accepted
+      ? `Interrupt request accepted, but the conversation could not refresh. ${errorMessage(error)}`
+      : errorMessage(error), true);
   } finally {
-    ui.interrupt.dataset.busy = "false";
-    updateControls();
+    if (epoch === authEpoch) {
+      ui.interrupt.dataset.busy = "false";
+      updateControls();
+    }
   }
 });
 function retainModel(select, value) {
@@ -847,12 +993,13 @@ async function loadPmModels() {
   } catch (error) {
     if (epoch !== authEpoch || !authorized) return;
     $("#pm-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen the project manager to retry.`;
-  } finally { pmModelLoading = false; updateControls(); }
+  } finally { if (epoch === authEpoch) { pmModelLoading = false; updateControls(); } }
 }
 $("#pm-model").addEventListener("change", async () => {
   const value = $("#pm-model").value;
   if (pmModelSaving || pmBusy || !host.online) { retainModel($("#pm-model"), pmModel); return; }
   pmModelSaving = true;
+  $("#pm-model-hint").textContent = "Saving…";
   modelRevision++;
   const epoch = authEpoch;
   updateControls();
@@ -861,12 +1008,14 @@ $("#pm-model").addEventListener("change", async () => {
     if (epoch !== authEpoch || !authorized) return;
     pmModel = result.model || "";
     $("#pm-model-hint").textContent = "Saved. Applies to the next turn.";
-  } catch (error) { if (epoch === authEpoch && authorized) showError(error); }
+  } catch (error) { if (epoch === authEpoch && authorized) $("#pm-model-hint").textContent = `Could not save model. ${errorMessage(error)}`; }
   finally {
-    pmModelSaving = false;
-    retainModel($("#pm-model"), pmModel);
-    updateControls();
-    if (epoch === authEpoch && authorized) await refreshSelected().catch(showError);
+    if (epoch === authEpoch) {
+      pmModelSaving = false;
+      retainModel($("#pm-model"), pmModel);
+      updateControls();
+      if (authorized) await refreshSelected().catch(showError);
+    }
   }
 });
 $("#new-provider").addEventListener("change", loadNewModels);
@@ -878,8 +1027,10 @@ function updateNewPolicy() {
   $("#confirm-bypass").checked = false;
 }
 $("#new-policy").addEventListener("change", updateNewPolicy);
-function openNew() {
+let dialogOpener;
+function openNew(event) {
   if (!authorized || !host.online) return;
+  dialogOpener = event?.currentTarget || document.activeElement;
   if (!$("#new-cwd").value && detail?.session?.cwd)
     $("#new-cwd").value = detail.session.cwd;
   $("#new-error").hidden = true;
@@ -890,6 +1041,10 @@ function openNew() {
   $("#new-name").focus();
 }
 ui.newButton.addEventListener("click", openNew);
+ui.dialog.addEventListener("close", () => {
+  if (!authorized || creating) return;
+  if (dialogOpener?.isConnected && !dialogOpener.closest("[inert]")) dialogOpener.focus({ preventScroll: true });
+});
 for (const selector of ["#close-dialog", "#cancel-new"])
   $(selector).addEventListener("click", () => ui.dialog.close());
 ui.newForm.addEventListener("submit", async (event) => {
@@ -908,6 +1063,7 @@ ui.newForm.addEventListener("submit", async (event) => {
   if (creationAttempt?.signature !== signature)
     creationAttempt = { signature, id: crypto.randomUUID() };
   creating = true;
+  const epoch = authEpoch;
   updateControls();
   $("#new-error").hidden = true;
   $("#create-session").textContent = "Starting…";
@@ -926,13 +1082,16 @@ ui.newForm.addEventListener("submit", async (event) => {
     $("#new-prompt").value = "";
     await selectSession(session.session_key);
   } catch (error) {
+    if (epoch !== authEpoch || !authorized) return;
     $("#new-error").textContent =
       `${errorMessage(error)} You can retry with the same details.`;
     $("#new-error").hidden = false;
   } finally {
-    creating = false;
-    $("#create-session").textContent = "Start session";
-    updateControls();
+    if (epoch === authEpoch) {
+      creating = false;
+      $("#create-session").textContent = "Start session";
+      updateControls();
+    }
   }
 });
 $("#select-pm").addEventListener("click", () => { if (!pmModelLoading) pmModelLoaded = false; return selectSession("pm"); });
@@ -945,7 +1104,7 @@ for (const selector of ["#close-nav", "#nav-backdrop"])
     $("#open-nav").focus();
   });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && ui.app.classList.contains("nav-open")) {
+  if (event.key === "Escape" && !ui.dialog.open && ui.app.classList.contains("nav-open")) {
     setNav(false);
     $("#open-nav").focus();
   }
@@ -993,7 +1152,8 @@ function enterApp(user) {
   renderHost();
   renderRail();
   renderHeading();
-  renderMessages();
+  if (selected) showConversationLoading();
+  else renderMessages();
   poll();
 }
 async function boot() {
@@ -1054,5 +1214,14 @@ async function boot() {
 window
   .matchMedia("(max-width: 760px)")
   .addEventListener("change", () => setNav(false));
+// Android keyboards can resize only the visual viewport. Keep the composer and
+// dialog scroll area inside it without changing browser pinch-zoom behavior.
+function fitViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport || viewport.scale !== 1) return;
+  document.documentElement.style.setProperty("--viewport-height", `${viewport.height}px`);
+}
+window.visualViewport?.addEventListener("resize", fitViewport);
+fitViewport();
 setNav(false);
 boot();
