@@ -1,0 +1,13 @@
+#!/bin/sh
+# Reject direct pushes to main. Work goes through a branch and a pull request.
+# See AGENTS.md. The developer can bypass deliberately with `git push --no-verify`.
+protected='refs/heads/main'
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  if [ "$remote_ref" = "$protected" ]; then
+    echo "pre-push: direct pushes to main are blocked (see AGENTS.md)." >&2
+    echo "  Move your commits to a branch and open a PR:" >&2
+    echo "    git switch -c <type>/<name> && git push -u origin HEAD && gh pr create --fill" >&2
+    exit 1
+  fi
+done
+exit 0
