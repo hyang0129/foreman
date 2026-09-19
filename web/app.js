@@ -563,6 +563,22 @@ function appendContent(container, text, entryKey) {
     } else container.append(node("div", "message-body", part));
   });
 }
+function entryDate(entry) {
+  const timestamp = entry.at || entry.ts;
+  if (typeof timestamp !== "string" || !timestamp.trim()) return null;
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+function localDay(date) {
+  return date ? `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}` : "unknown";
+}
+function dayLabel(date, now) {
+  if (!date) return "Date unavailable";
+  if (localDay(date) === localDay(now)) return "Today";
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  return localDay(date) === localDay(yesterday) ? "Yesterday" : date.toLocaleDateString([], { dateStyle: "medium" });
+}
 function messageNode(entry, receipt, entryKey) {
   const role = ["user", "assistant", "tool", "system"].includes(entry.role)
     ? entry.role
@@ -586,18 +602,15 @@ function messageNode(entry, receipt, entryKey) {
             ? "Activity"
             : "Session",
   );
-  if (entry.at && !Number.isNaN(Date.parse(entry.at))) {
-    const time = node(
-      "time",
-      "",
-      new Date(entry.at).toLocaleTimeString([], {
-        hour: "numeric",
-        minute: "2-digit",
-      }),
-    );
-    time.dateTime = entry.at;
+  const date = entryDate(entry);
+  if (date) {
+    const time = node("time", "", date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
+    time.dateTime = date.toISOString();
+    const description = date.toLocaleString([], { dateStyle: "full", timeStyle: "long" });
+    time.setAttribute("aria-description", description);
+    time.title = description;
     label.append(time);
-  }
+  } else label.append(node("span", "timestamp-unavailable", "Time unavailable"));
   article.append(label);
   appendContent(article, entry.text || entry.summary || "", entryKey);
   article.append(copyControl(String(entry.text || entry.summary || ""), "Copy message", "message", entryKey));
@@ -625,7 +638,8 @@ function renderMessageReceipt(article, receipt) {
   }
 }
 function renderMessages(history = [], receipts = []) {
-  const signature = JSON.stringify([selected, history, receipts]);
+  const now = new Date();
+  const signature = JSON.stringify([selected, history, receipts, localDay(now)]);
   if (signature === messageSignature) return;
   const wasNearBottom = nearLatest();
   const firstRender = !messageSignature;
@@ -660,6 +674,7 @@ function renderMessages(history = [], receipts = []) {
       : !identityOf(old) && sameMetadata(old.entry, item.entry) && textOf(old.entry) === textOf(item.entry));
     if (previous) { item.previous = previous; unmatched.delete(previous); }
   }
+  let previousDay;
   for (const item of entries) {
     if (!item.previous && !identityOf(item)) {
       const previous = [...unmatched].find((old) => !identityOf(old) && sameMetadata(old.entry, item.entry)
@@ -676,6 +691,14 @@ function renderMessages(history = [], receipts = []) {
     item.contentSignature = contentSignature;
     item.receiptSignature = receiptSignature;
     item.element.dataset.entryKey = String(item.key);
+    const date = entryDate(item.entry), day = localDay(date);
+    if (day !== previousDay) {
+      item.separator = previous?.separator || node("p", "date-separator");
+      const label = dayLabel(date, now);
+      if (item.separator.textContent !== label) item.separator.textContent = label;
+      fragment.append(item.separator);
+    }
+    previousDay = day;
     delete item.previous;
     fragment.append(item.element);
   }
