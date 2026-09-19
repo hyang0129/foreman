@@ -63,6 +63,9 @@ async function fixture(
     failMessages: 0,
     failCreates: 0,
     deny: false,
+    launchStatus: "ready",
+    launchError: "Launcher unavailable",
+    launchProposal: { project: "app", cwd: "/Users/dev/code/app", provider: "codex", model: "gpt-6-astra", name: "fix-sign-in", text: "Repair sign-in and verify with tests", reason: "Codex suits this implementation task." },
   };
   await page.route("**/api/**", async (route) => {
     const request = route.request(),
@@ -115,6 +118,9 @@ async function fixture(
         state.sessions.push(session);
         result = session;
       }
+    } else if (path === "/api/launch/propose" || path === "/api/launch") {
+      result = { id: body?.id || url.searchParams.get("id"), status: state.launchStatus, model: body?.model || "claude-sonnet-5", proposal: state.launchProposal, error: state.launchError };
+    } else if (path === "/api/launch/cancel") { result = { status: "cancelled" };
     } else if (path === "/api/session") {
       const session = state.sessions.find(
         (s) => s.session_key === url.searchParams.get("id"),
@@ -243,6 +249,7 @@ test("new Codex session retries creation with stable ID and opens chat", async (
   state.failCreates = 1;
   await page.goto("/");
   await page.getByRole("button", { name: "New session", exact: true }).click();
+  await page.locator("#start-manually").click();
   await page
     .getByRole("combobox", { name: "Agent", exact: true })
     .selectOption("codex");
@@ -530,6 +537,7 @@ test("model selections follow the provider and reach session creation", async ({
   const state = await fixture(page);
   await page.goto("/");
   await page.locator("#new-session").click();
+  await page.locator("#start-manually").click();
   await expect(page.locator("#new-model option[value=haiku]")).toHaveCount(1);
   await page.locator("#new-model").selectOption("haiku");
   await page.locator("#new-provider").selectOption("codex");
@@ -565,6 +573,7 @@ test('launch policy defaults to Native, Bypass requires confirmation, and runnin
   const state = await fixture(page);
   await page.goto('/');
   await page.getByRole('button', { name: 'New session', exact: true }).click();
+  await page.locator("#start-manually").click();
   await expect(page.getByLabel('Permission policy')).toHaveValue('native');
   await page.getByLabel('Session name').fill('Bypass worker');
   await page.getByLabel('Project directory').fill('/Users/dev/code/worker');
@@ -579,6 +588,7 @@ test('launch policy defaults to Native, Bypass requires confirmation, and runnin
   expect(state.calls.find((c) => c.path === '/api/sessions' && c.body)?.body.permission_mode).toBe('bypass');
   await expect(page.locator('#conversation-subtitle')).toContainText('⚠ Bypass');
   await page.getByRole('button', { name: 'New session', exact: true }).click();
+  await page.locator("#start-manually").click();
   await expect(page.getByLabel('Permission policy')).toHaveValue('native');
   await page.getByLabel('Permission policy').selectOption('bypass');
   await expect(page.locator('#confirm-bypass')).not.toBeChecked();
@@ -814,6 +824,7 @@ test("session creation and model save wait for confirmation before reporting suc
   release();
   await expect(page.locator("#pm-model-hint")).toContainText("Saved");
   await page.getByRole("button", { name: "New session", exact: true }).click();
+  await page.locator("#start-manually").click();
   await page.getByLabel("Session name").fill("Pending launch");
   await page.getByLabel("Project directory").fill("/Users/dev/code/app");
   await page.getByLabel("First task").fill("Inspect the project");
@@ -895,10 +906,11 @@ test.describe("mobile polish", () => {
     await page.keyboard.press("Enter");
     await page.locator("#new-session").focus();
     await page.keyboard.press("Enter");
-    await expect(page.getByLabel("Session name")).toBeFocused();
+    await expect(page.locator("#launch-brief")).toBeFocused();
     await page.keyboard.press("Escape");
     await expect(page.locator("#new-session")).toBeFocused();
     await page.keyboard.press("Enter");
+    await page.locator("#start-manually").click();
     await page.setViewportSize({ width: 740, height: 360 });
     await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
     await page.getByLabel("Session name").fill("Landscape test");
@@ -977,6 +989,7 @@ test("project picker resolves names, asks for ambiguity and missing references, 
   const state = await fixture(page);
   state.projects.push({ id: "second", name: "work app", path: "/Users/dev/work/app", aliases: ["personal repo"], lastUsed: null });
   await page.goto("/"); await page.getByRole("button", { name: "New session", exact: true }).click();
+  await page.locator("#start-manually").click();
   await expect(page.getByRole("button", { name: "app /Users/dev/code/app", exact: true })).toBeVisible();
   await page.getByLabel("Project directory").fill("personal repo");
   await expect(page.locator("#project-status")).toContainText("Which project");
@@ -1003,6 +1016,7 @@ test("a developer remembers, renames, removes projects on the host and can read 
   await expect(details).toContainText("personal");
   await page.getByRole("button", { name: "Open session navigation" }).click();
   await page.getByRole("button", { name: "New session", exact: true }).click();
+  await page.locator("#start-manually").click();
   await page.getByLabel("Project directory").fill("/Users/dev/code/new-project");
   await expect(page.locator("#project-status")).toContainText("Unregistered directory");
   await page.getByText("Remember or manage a project", { exact: true }).click();
@@ -1024,6 +1038,7 @@ test("a developer remembers, renames, removes projects on the host and can read 
 test("a stale project resolution cannot enable launch for a newer unknown reference", async ({ page }) => {
   const state = await fixture(page); state.projectDelay = 500;
   await page.goto("/"); await page.getByRole("button", { name: "New session", exact: true }).click();
+  await page.locator("#start-manually").click();
   await page.getByLabel("Project directory").fill("app");
   await expect.poll(() => state.calls.some((c) => c.path === "/api/projects/resolve" && c.body.reference === "app")).toBe(true);
   state.projectDelay = 0; await page.getByLabel("Project directory").fill("unknown");
@@ -1039,6 +1054,7 @@ for (const problem of ["Project directory is missing or unreadable", "Project di
   test(`an unavailable registered project remains manageable: ${problem}`, async ({ page }) => {
     const state = await fixture(page); state.projectErrors["/Users/dev/code/app"] = `${problem}: /Users/dev/code/app`;
     await page.goto("/"); await page.getByRole("button", { name: "New session", exact: true }).click();
+  await page.locator("#start-manually").click();
     await page.getByRole("button", { name: "app /Users/dev/code/app", exact: true }).click();
     await expect(page.locator("#project-status")).toContainText(problem);
     await expect(page.getByRole("button", { name: "Start session", exact: true })).toBeDisabled();
@@ -1057,3 +1073,99 @@ for (const problem of ["Project directory is missing or unreadable", "Project di
     expect(state.calls.filter((c) => c.path === "/api/sessions" && c.body)).toHaveLength(0);
   });
 }
+
+test('launcher brief is default, has an independent model, and manual spends no launcher turn', async ({ page }) => {
+  const state = await fixture(page); await page.goto('/'); await page.locator('#new-session').click();
+  await expect(page.locator('#launch-brief')).toBeFocused();
+  await expect(page.locator('#launcher-model')).toHaveValue('claude-sonnet-5');
+  await page.locator('#launch-brief').fill('Fix sign-in in app');
+  await expect(page.locator('#propose-session')).toBeEnabled();
+  expect(state.calls.filter((c) => c.path === '/api/launch/propose' || c.path === '/api/sessions' && c.body)).toHaveLength(0);
+  await page.locator('#start-manually').click();
+  await expect(page.locator('#new-prompt')).toHaveValue('Fix sign-in in app');
+  await expect(page.locator('#new-name')).toBeFocused();
+  expect(state.calls.filter((c) => c.path === '/api/launch/propose')).toHaveLength(0);
+});
+
+test('proposal requires confirmation, every field is editable, and confirmation retains creation retry ID', async ({ page }) => {
+  const state = await fixture(page); state.failCreates = 1;
+  await page.goto('/'); await page.locator('#new-session').click();
+  await page.locator('#launch-brief').fill('Fix sign-in in app');
+  await page.locator('#launcher-model').selectOption('haiku');
+  const release = state.defer('/api/launch/propose');
+  await page.locator('#propose-session').click();
+  await expect(page.locator('#launch-status')).toContainText('Working…');
+  await expect(page.locator('#propose-session')).toBeDisabled();
+  expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
+  release();
+  await expect(page.locator('#launch-status')).toContainText('Proposal ready');
+  await expect(page.locator('#new-model')).toHaveValue('gpt-6-astra');
+  expect(state.calls.find((c) => c.path === '/api/launch/propose')?.body.model).toBe('haiku');
+  await expect(page.locator('#launch-reason')).toContainText('Codex suits');
+  await page.locator('#new-name').fill('edited-session');
+  await page.locator('#new-cwd').fill('/Users/dev/code/other');
+  await page.locator('#new-provider').selectOption('claude');
+  await expect(page.locator('#new-model')).toBeEnabled(); await page.locator('#new-model').selectOption('sonnet');
+  await page.locator('#new-prompt').fill('The complete edited first task\nKeep every line.');
+  expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
+  await page.getByRole('button', { name: 'Confirm and start', exact: true }).click();
+  await expect(page.locator('#new-error')).toContainText('Temporary relay failure');
+  await page.getByRole('button', { name: 'Confirm and start', exact: true }).click();
+  await expect(page.locator('#new-dialog')).not.toBeVisible();
+  const creates = state.calls.filter((c) => c.path === '/api/sessions' && c.body);
+  expect(creates).toHaveLength(2); expect(creates[0].body.id).toBe(creates[1].body.id);
+  expect(creates[1].body).toMatchObject({ name: 'edited-session', cwd: '/Users/dev/code/other', provider: 'claude', model: 'sonnet', text: 'The complete edited first task\nKeep every line.', permission_mode: 'native' });
+});
+
+for (const reason of ['Launcher claude-sonnet-5 is unavailable', 'Launcher took too long', 'Which project do you mean?', 'Launcher returned an unusable proposal']) {
+  test(`launcher manual fallback preserves brief: ${reason}`, async ({ page }) => {
+    const state = await fixture(page); state.launchStatus = 'failed'; state.launchError = reason;
+    await page.goto('/'); await page.locator('#new-session').click(); await page.locator('#launch-brief').fill('Preserve the complete brief');
+    await page.locator('#propose-session').click();
+    await expect(page.locator('#launch-status')).toContainText(reason);
+    await expect(page.locator('#new-prompt')).toHaveValue('Preserve the complete brief');
+    await expect(page.locator('#new-name')).toBeFocused();
+    expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
+    expect(state.calls.find((c) => c.path === '/api/launch/propose')?.body.model).toBe('claude-sonnet-5');
+    await page.locator('#edit-brief').click(); await expect(page.locator('#launch-brief')).toHaveValue('Preserve the complete brief');
+  });
+}
+
+test('cancel/manual discard delayed proposals, preserve edits, and never create sessions', async ({ page }) => {
+  const state = await fixture(page); await page.goto('/'); await page.locator('#new-session').click();
+  await page.locator('#launch-brief').fill('First brief'); let release = state.defer('/api/launch/propose');
+  await page.locator('#propose-session').click(); await expect(page.locator('#launch-status')).toContainText('Working');
+  await page.locator('#start-manually').click(); await page.locator('#new-name').fill('manual-edit');
+  release(); await expect.poll(() => state.calls.filter((c) => c.path === '/api/launch/cancel').length).toBe(1);
+  await expect(page.locator('#new-name')).toHaveValue('manual-edit'); await expect(page.locator('#new-prompt')).toHaveValue('First brief');
+  await page.locator('#edit-brief').click(); await page.locator('#launch-brief').fill('Second brief');
+  release = state.defer('/api/launch/propose'); await page.locator('#propose-session').click();
+  await expect(page.locator('#launch-status')).toContainText('Working'); await page.keyboard.press('Escape'); release();
+  await expect(page.locator('#new-dialog')).not.toBeVisible();
+  await expect.poll(() => state.calls.filter((c) => c.path === '/api/launch/cancel').length).toBe(2);
+  expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
+});
+
+test('manual after proposal retains edits and first-task text without another launcher turn', async ({ page }) => {
+  const state = await fixture(page); await page.goto('/'); await page.locator('#new-session').click();
+  await page.locator('#launch-brief').fill('Original brief'); await page.locator('#propose-session').click();
+  await expect(page.locator('#launch-status')).toContainText('Proposal ready');
+  await page.locator('#new-name').fill('my-edited-name'); await page.locator('#new-prompt').fill('My edited complete task');
+  await page.locator('#start-manually').click();
+  await expect(page.locator('#new-name')).toHaveValue('my-edited-name'); await expect(page.locator('#new-prompt')).toHaveValue('My edited complete task');
+  expect(state.calls.filter((c) => c.path === '/api/launch/propose')).toHaveLength(1);
+  expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
+});
+
+test('launcher keyboard review remains usable at 360px and short landscape with enlarged text', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 740 }); await fixture(page); await page.goto('/');
+  await page.locator('#open-nav').click(); await page.locator('#new-session').focus(); await page.keyboard.press('Enter');
+  await expect(page.locator('#launch-brief')).toBeFocused(); await page.locator('#launch-brief').fill('Fix sign-in in app');
+  await page.locator('#propose-session').focus(); await page.keyboard.press('Enter');
+  await expect(page.locator('#new-name')).toBeFocused(); await expectNoPageOverflow(page);
+  await page.setViewportSize({ width: 740, height: 360 }); await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+  await page.locator('#new-prompt').fill('Edited task on a small screen');
+  await page.locator('#create-session').scrollIntoViewIfNeeded(); await expect(page.locator('#create-session')).toBeInViewport();
+  await expectActionTextFits(page, '.dialog-actions button'); await expectNoPageOverflow(page);
+  await page.keyboard.press('Escape'); await expect(page.locator('#new-session')).toBeFocused();
+});

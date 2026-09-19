@@ -1008,3 +1008,13 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 #project-management { margin-block: 10px; }
 #project-management summary { min-height: 44px; padding-block: 12px; cursor: pointer; }
 #project-status, #project-feedback { overflow-wrap: anywhere; }
+
+/* Launcher reuses the shared activity, form, and scrollable dialog patterns. */
+#session-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+#session-fields legend { font-weight: 600; margin-bottom: 12px; }
+#launch-brief-panel { display: grid; gap: 12px; }
+#launch-brief-panel[hidden] { display: none; }
+.launch-mode-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+#launch-status { min-height: 0; }
+#launch-status:has(#launch-status-label:empty) { display: none; }
+#launch-reason { overflow-wrap: anywhere; }

@@ -32,7 +32,9 @@ export class Launcher {
   private catalog: NonNullable<Dependencies['catalog']>;
   private timeoutMs: number;
   private closed = false;
-  constructor(private projects: ProjectRegistry, deps: Dependencies = {}) {
+  private projects: ProjectRegistry;
+  constructor(projects: ProjectRegistry, deps: Dependencies = {}) {
+    this.projects = projects;
     this.runQuery = deps.query ?? query; this.catalog = deps.catalog ?? modelCatalog; this.timeoutMs = deps.timeoutMs ?? 60_000;
   }
   private id(value: unknown): string {
