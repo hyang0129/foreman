@@ -1558,3 +1558,70 @@ test("approval details retain full safe input, focus and answers across polls wi
   expect(state.calls.find((call) => call.path === "/api/session/approval")?.body).toEqual({ id: "managed:alpha", approval_id: "other", decision: "deny" });
   await expect(answer).toHaveValue("Only source files");
 });
+
+test("local day separators retain history and receipt order with neutral unknown timestamps", async ({ browser }) => {
+  const context = await browser.newContext({ locale: "en-US", timezoneId: "America/Los_Angeles" });
+  const page = await context.newPage();
+  await page.clock.setFixedTime(new Date("2026-09-19T19:00:00Z"));
+  const state = await fixture(page, { history: [
+    { id: "old", role: "assistant", text: "Older answer", at: "2026-09-15T19:00:00Z" },
+    { id: "yesterday", role: "assistant", text: "Yesterday locally", at: "2026-09-19T00:30:00Z" },
+    { id: "today", role: "assistant", text: "Today locally", at: "2026-09-19T18:00:00Z" },
+    { id: "invalid", role: "assistant", text: "Invalid timestamp", at: "not-a-date" },
+    { id: "missing", role: "assistant", text: "Missing timestamp" },
+  ] });
+  state.receipts.push({ id: "receipt", text: "Receipt from yesterday", status: "uncertain", at: "2026-09-19T02:00:00Z" });
+  await openManaged(page);
+  await expect(page.locator(".date-separator")).toHaveText(["Sep 15, 2026", "Yesterday", "Today", "Date unavailable", "Yesterday"]);
+  await expect(page.locator(".message-body")).toHaveText(["Older answer", "Yesterday locally", "Today locally", "Invalid timestamp", "Missing timestamp", "Receipt from yesterday"]);
+  await expect(page.locator(".timestamp-unavailable")).toHaveCount(2);
+  const time = page.locator(".message").filter({ hasText: "Yesterday locally" }).locator("time");
+  await expect(time).toHaveAccessibleDescription(/Friday, September 18, 2026.*5:30:00 PM/);
+  await expect(time).toHaveAttribute("datetime", "2026-09-19T00:30:00.000Z");
+  await expect(page.locator(".receipt-label")).toContainText("Delivery uncertain");
+  await context.close();
+});
+
+test("PM dates use ts and midnight relabeling preserves copy focus without a new-message marker", async ({ page }) => {
+  const now = new Date("2026-09-19T12:00:00Z");
+  await page.clock.setFixedTime(now);
+  const state = await fixture(page);
+  state.pmHistory = Array.from({ length: 30 }, (_, i) => ({ role: "assistant", text: `Answer ${i} ${"detail ".repeat(30)}`, ts: now.toISOString() }));
+  await page.goto("/");
+  await page.getByRole("button", { name: /Project manager Plan and delegate/ }).click();
+  await expect(page.locator(".date-separator")).toHaveText(["Today"]);
+  await expect(page.locator("time")).toHaveCount(30);
+  const copy = page.getByRole("button", { name: "Copy message", exact: true }).nth(10);
+  await copy.focus();
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  const before = await copy.evaluate((el) => el.getBoundingClientRect().top);
+  await page.evaluate(() => { (window as any).dateSeparatorBefore = document.querySelector(".date-separator"); });
+  await page.clock.setFixedTime(new Date("2026-09-20T12:00:00Z"));
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.locator(".date-separator")).toHaveText(["Yesterday"]);
+  await expect(copy).toBeFocused();
+  expect(Math.abs(await copy.evaluate((el) => el.getBoundingClientRect().top) - before)).toBeLessThan(2);
+  await expect(page.getByRole("button", { name: "New messages ↓", exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).dateSeparatorBefore === document.querySelector(".date-separator"))).toBe(true);
+  await expect(page.locator(".date-separator[aria-live], .date-separator[role=status]")).toHaveCount(0);
+});
+
+
+test("impossible calendar dates stay neutral while valid offsets and leap days keep their local dates", async ({ browser }) => {
+  const context = await browser.newContext({ locale: "en-US", timezoneId: "America/Los_Angeles" });
+  const page = await context.newPage();
+  await page.clock.setFixedTime(new Date("2026-09-19T19:00:00Z"));
+  await fixture(page, { history: [
+    { id: "feb", role: "assistant", text: "Impossible February day", at: "2026-02-30T12:00:00Z" },
+    { id: "apr", role: "assistant", text: "Impossible April day", at: "2026-04-31T12:00:00Z" },
+    { id: "nonleap", role: "assistant", text: "Not a leap year", at: "2025-02-29T12:00:00Z" },
+    { id: "leap", role: "assistant", text: "Valid leap day", at: "2024-02-29T12:00:00-08:00" },
+    { id: "offset", role: "assistant", text: "Offset crosses local midnight", at: "2026-09-19T02:30:00+02:00" },
+  ] });
+  await openManaged(page);
+  await expect(page.locator(".timestamp-unavailable")).toHaveCount(3);
+  await expect(page.locator(".date-separator")).toHaveText(["Date unavailable", "Feb 29, 2024", "Yesterday"]);
+  await expect(page.locator("time")).toHaveCount(2);
+  await expect(page.locator(".message").filter({ hasText: "Offset crosses local midnight" }).locator("time")).toHaveAccessibleDescription(/Friday, September 18, 2026.*5:30:00 PM/);
+  await context.close();
+});

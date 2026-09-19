@@ -1049,3 +1049,8 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 .approval-reason { font-weight: 600; }
 .approval-context { white-space: pre-wrap; overflow-wrap: anywhere; font-family: ui-monospace, monospace; }
 .approval-actions { padding-top: 8px; border-top: 1px solid var(--line); }
+
+.date-separator { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: .75rem; margin: 0; }
+.date-separator::before, .date-separator::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.timestamp-unavailable { font-weight: 400; }
+.message-label { flex-wrap: wrap; }
