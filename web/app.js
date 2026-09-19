@@ -485,6 +485,37 @@ function emptyState(title, text, allowCreate = false) {
   }
   return empty;
 }
+function copyControl(text, label, key) {
+  const group = node("div", "copy-control");
+  const button = node("button", "btn ghost copy-button", label);
+  button.type = "button";
+  button.dataset.copyKey = key;
+  const feedback = node("span", "copy-feedback");
+  feedback.setAttribute("role", "status");
+  let pending = false, timer;
+  button.addEventListener("click", async () => {
+    if (pending) return;
+    pending = true;
+    clearTimeout(timer);
+    feedback.textContent = "";
+    feedback.classList.remove("error");
+    button.setAttribute("aria-busy", "true");
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      feedback.textContent = "Copied";
+      timer = setTimeout(() => { feedback.textContent = ""; }, 2500);
+    } catch {
+      feedback.classList.add("error");
+      feedback.textContent = "Could not copy. Allow clipboard access or select and copy the text manually.";
+    } finally {
+      pending = false;
+      button.removeAttribute("aria-busy");
+    }
+  });
+  group.append(button, feedback);
+  return group;
+}
 function appendContent(container, text) {
   // Render plain text and fenced code with DOM nodes. Provider output never enters HTML.
   const parts = String(text || "").split(/```[^\n]*\n([\s\S]*?)(?:```|$)/g);
@@ -493,7 +524,9 @@ function appendContent(container, text) {
     if (index % 2) {
       const pre = node("pre");
       pre.append(node("code", "", part));
-      container.append(pre);
+      const block = node("div", "code-block");
+      block.append(copyControl(part, "Copy code", `code-${index}`), pre);
+      container.append(block);
     } else container.append(node("div", "message-body", part));
   });
 }
@@ -534,6 +567,12 @@ function messageNode(entry, receipt) {
   }
   article.append(label);
   appendContent(article, entry.text || entry.summary || "");
+  article.append(copyControl(String(entry.text || entry.summary || ""), "Copy message", "message"));
+  renderMessageReceipt(article, receipt);
+  return article;
+}
+function renderMessageReceipt(article, receipt) {
+  article.querySelector(".receipt")?.remove();
   if (receipt) {
     const status =
       {
@@ -552,7 +591,6 @@ function messageNode(entry, receipt) {
       ),
     );
   }
-  return article;
 }
 function renderMessages(history = [], receipts = []) {
   const signature = JSON.stringify([selected, history, receipts]);
@@ -560,6 +598,9 @@ function renderMessages(history = [], receipts = []) {
   const wasNearBottom = nearLatest();
   const firstRender = !messageSignature;
   const oldTop = ui.timeline.scrollTop;
+  const focusedCopy = ui.messages.contains(document.activeElement) ? document.activeElement : null;
+  const focusEntry = focusedCopy?.closest("[data-entry-key]")?.dataset.entryKey;
+  const focusCopy = focusedCopy?.dataset.copyKey;
   const viewportTop = ui.timeline.getBoundingClientRect().top;
   const anchors = timelineEntries.map((item) => ({ key: item.key, top: item.element.getBoundingClientRect().top - viewportTop, bottom: item.element.getBoundingClientRect().bottom - viewportTop }))
     .filter((item) => item.bottom > 0);
@@ -596,9 +637,12 @@ function renderMessages(history = [], receipts = []) {
     const previous = item.previous;
     if (!firstRender && !wasNearBottom && (!previous || textOf(previous.entry) !== textOf(item.entry))) newMessages = true;
     item.key = previous?.key || ++nextEntryKey;
-    const contentSignature = JSON.stringify([item.entry, item.receipt]);
+    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source]);
+    const receiptSignature = JSON.stringify(item.receipt);
     item.element = previous?.contentSignature === contentSignature ? previous.element : messageNode(item.entry, item.receipt);
+    if (item.element === previous?.element && previous.receiptSignature !== receiptSignature) renderMessageReceipt(item.element, item.receipt);
     item.contentSignature = contentSignature;
+    item.receiptSignature = receiptSignature;
     item.element.dataset.entryKey = String(item.key);
     delete item.previous;
     fragment.append(item.element);
@@ -624,6 +668,10 @@ function renderMessages(history = [], receipts = []) {
           ),
     );
   ui.messages.replaceChildren(fragment);
+  if (focusEntry && focusCopy) {
+    const article = entries.find((item) => String(item.key) === focusEntry)?.element;
+    [...(article?.querySelectorAll("[data-copy-key]") || [])].find((button) => button.dataset.copyKey === focusCopy)?.focus({ preventScroll: true });
+  }
   if (wasNearBottom || firstRender) ui.timeline.scrollTop = ui.timeline.scrollHeight;
   else {
     const anchor = anchors.find((old) => entries.some((item) => item.key === old.key));

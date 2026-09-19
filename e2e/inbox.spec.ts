@@ -1347,3 +1347,66 @@ test("jump and composer remain reachable when a viewport resize notification is 
   await expect(jump).toBeHidden();
   await context.close();
 });
+
+test("copy controls write original message and fenced code bytes without sending work", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const code = "printf '<unsafe> & text'\n  indented\n";
+  const original = `A useful answer\n\n\`\`\`sh\n${code}\`\`\`\nKeep the final newline.\n`;
+  const state = await fixture(page, { history: [{ id: "copy", role: "assistant", text: original, at: new Date().toISOString() }] });
+  await openManaged(page);
+  const codeCopy = page.getByRole("button", { name: "Copy code", exact: true });
+  await codeCopy.focus();
+  await page.keyboard.press("Enter");
+  await expect(codeCopy.locator("..").getByRole("status")).toHaveText("Copied");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(code);
+  await expect(codeCopy).toBeFocused();
+  const messageCopy = page.getByRole("button", { name: "Copy message", exact: true });
+  await messageCopy.click();
+  await expect(messageCopy.locator("..").getByRole("status")).toHaveText("Copied");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(original);
+  expect(state.calls.filter((call) => call.body && /message|sessions|approval/.test(call.path))).toHaveLength(0);
+  await expect(page.locator("#messages unsafe")).toHaveCount(0);
+});
+
+test("copy feedback waits for clipboard success and preserves focus through denial and receipt polling", async ({ page }) => {
+  const state = await fixture(page, { history: [{ id: "copy", role: "user", text: "Original task" }] });
+  state.receipts.push({ id: "copy", text: "Original task", status: "queued" });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { value: { writeText: () => new Promise<void>((resolve, reject) => { (window as any).finishCopy = { resolve, reject }; }) } });
+  });
+  await openManaged(page);
+  const copy = page.getByRole("button", { name: "Copy message", exact: true });
+  await copy.focus();
+  await page.keyboard.press("Enter");
+  await expect(copy).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByText("Copied", { exact: true })).toHaveCount(0);
+  state.receipts[0].status = "running";
+  await refreshTimeline(page);
+  await expect(copy).toBeFocused();
+  await page.evaluate(() => (window as any).finishCopy.reject(new DOMException("Denied", "NotAllowedError")));
+  await expect(page.getByRole("status").filter({ hasText: "Could not copy." })).toBeVisible();
+  await expect(copy).toBeFocused();
+  await expect(page.locator(".message-body")).toHaveText("Original task");
+  await page.keyboard.press("Enter");
+  await page.evaluate(() => (window as any).finishCopy.resolve());
+  await expect(page.getByText("Copied", { exact: true })).toBeVisible();
+  await expect(copy).toBeFocused();
+});
+
+test("copy controls stay discoverable and tappable on touch at enlarged text", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 360, height: 640 }, hasTouch: true, permissions: ["clipboard-read", "clipboard-write"] });
+  const page = await context.newPage();
+  await fixture(page, { history: [{ id: "copy", role: "assistant", text: "```sh\necho touch\n```" }] });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  await page.getByRole("button", { name: /Fix sign-in/ }).tap();
+  await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+  const copy = page.getByRole("button", { name: "Copy code", exact: true });
+  await expect(copy).toBeVisible();
+  await copy.tap();
+  await expect(copy.locator("..").getByRole("status")).toHaveText("Copied");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("echo touch\n");
+  expect((await copy.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  await expectNoPageOverflow(page);
+  await context.close();
+});
