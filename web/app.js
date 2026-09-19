@@ -434,27 +434,46 @@ function updateControls() {
     });
 }
 function renderHeading() {
-  const headingSummary = $("#heading-details summary");
-  const headingName = detail?.session && selected !== "pm" ? projectName(detail.session) : "";
-  if (headingSummary.dataset.project !== headingName) { headingSummary.replaceChildren(node("span", "", "Session details"), ...(headingName ? [node("span", "", ` · ${headingName}`)] : [])); headingSummary.dataset.project = headingName; }
-  if (selected === "pm") {
-    ui.title.textContent = "Project manager";
-    ui.provider.hidden = false;
-    ui.provider.textContent = "PINNED";
-    ui.subtitle.textContent = pmBusy
-      ? "Working · Planning and delegating"
-      : "Ready · Your view across the fleet";
-    if (!host.online) ui.subtitle.textContent += " · Last known";
+  const headingSummary = $("#heading-details summary"), model = $("#header-model");
+  const isPm = selected === "pm";
+  const headingName = detail?.session && !isPm ? projectName(detail.session) : "";
+  const summaryLabel = isPm ? "Model details" : "Session details";
+  const summarySignature = JSON.stringify([summaryLabel, headingName]);
+  if (headingSummary.dataset.signature !== summarySignature) {
+    headingSummary.replaceChildren(node("span", "", summaryLabel), ...(headingName ? [node("span", "", ` · ${headingName}`)] : []));
+    headingSummary.dataset.signature = summarySignature;
+  }
+  const fields = [];
+  let selectedModel = "";
+  if (isPm) {
+    ui.title.textContent = "Claude · Project manager";
+    ui.provider.hidden = true;
+    selectedModel = pmModel || "Provider default";
+    fields.push(["Selected model", selectedModel]);
+    if (!pmModel) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
+    fields.push(["Applies to", "The PM’s replies and planning. Newly launched agents have their own model selection."]);
   } else if (detail?.session) {
     const s = detail.session;
     ui.title.textContent = s.name || "Session";
     ui.provider.hidden = false;
     ui.provider.textContent = s.provider === "codex" ? "Codex" : "Claude";
-    ui.subtitle.textContent = `${LABEL[s.state] || s.state || "Unknown"}${!host.online ? " · Last known" : ""} · ${s.cwd || "Project unavailable"}${s.managed ? ` · ${s.model || "Provider default"} · ${policyLabel(s)}` : " · Monitoring only"}`;
+    selectedModel = s.model || (s.managed ? "Provider default" : "Model not reported");
+    fields.push([s.managed ? "Selected model" : "Reported model", selectedModel]);
+    if (!s.model && s.managed) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
+    fields.push(["Project", projectName(s)], ["Directory", s.cwd || "Project unavailable"], ["Permissions", s.managed ? policyLabel(s) : "Monitoring only"]);
   } else {
     ui.title.textContent = selected ? "Loading session…" : "Your session inbox";
     ui.provider.hidden = true;
-    ui.subtitle.textContent = "Choose a session or start something new.";
+  }
+  model.hidden = !selectedModel;
+  model.textContent = selectedModel ? `Model · ${selectedModel}` : "";
+  model.title = selectedModel;
+  const detailSignature = JSON.stringify(fields);
+  if (ui.subtitle.dataset.signature !== detailSignature) {
+    ui.subtitle.dataset.signature = detailSignature;
+    const metadata = node("dl", "header-metadata");
+    for (const [label, value] of fields) metadata.append(node("dt", "", label), node("dd", "", value));
+    ui.subtitle.replaceChildren(fields.length ? metadata : node("p", "", "Choose a session or start something new."));
   }
   renderActivity();
   updateControls();

@@ -1440,3 +1440,66 @@ for (const kind of ["message", "code"]) test(`pending ${kind} clipboard results 
   await expect(copy).toBeFocused();
   await expect(page.locator(kind === "code" ? "code" : ".message-body")).toHaveText(copied("First chunk and more output again"));
 });
+
+test("header identifies the PM and honestly explains its selected model and independent agent choices", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: /Project manager Plan and delegate/ }).click();
+  await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
+  await expect(page.locator("#header-model")).toHaveText("Model · Provider default");
+  await page.getByText("Model details", { exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#conversation-subtitle")).toContainText("Provider settings determine the model");
+  await expect(page.locator(".pm-model-help")).toContainText("replies and planning");
+  await expect(page.locator(".pm-model-help")).toContainText("agents have their own model selection");
+  await expect(page.locator("#pm-model option[value=haiku]")).toHaveCount(1);
+  await page.locator("#pm-model").selectOption("haiku");
+  await expect(page.locator("#header-model")).toHaveText("Model · haiku");
+  await expect(page.locator("#pm-model-hint")).toContainText("next turn");
+  state.pmBusy = true;
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.locator("#pm-model")).toBeDisabled();
+  await expect(page.locator("#header-model")).toHaveText("Model · haiku");
+});
+
+test("worker header separates identity state project and full model details without inferring defaults", async ({ page }) => {
+  const state = await fixture(page);
+  Object.assign(state.sessions[0], { permission_mode: "native", project_name: "app", model: "provider-model-with-a-very-long-identifier-".repeat(5) });
+  await openManaged(page);
+  await expect(page.locator("#provider")).toHaveText("Claude");
+  await expect(page.locator("#activity-label")).toContainText("Working");
+  await expect(page.locator("#header-model")).toContainText((state.sessions[0] as any).model);
+  const details = page.locator("#heading-details summary");
+  await details.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#conversation-subtitle dd").filter({ hasText: (state.sessions[0] as any).model })).toBeVisible();
+  await expect(page.locator("#conversation-subtitle")).toContainText(managed.cwd);
+  await expect(page.locator("#conversation-subtitle")).toContainText("Native");
+  (state.sessions[0] as any).model = null;
+  await refreshTimeline(page);
+  await expect(page.locator("#header-model")).toHaveText("Model · Provider default");
+  await expect(page.locator("#conversation-subtitle")).toContainText("Provider settings determine the model");
+  await expect(details).toBeFocused();
+});
+
+test("phone header keeps history space and exposes long model and project values by touch", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 360, height: 740 }, hasTouch: true });
+  const page = await context.newPage();
+  const state = await fixture(page);
+  const longModel = "model-".repeat(45), longPath = "/Users/dev/" + "long-project/".repeat(20);
+  Object.assign(state.sessions[0], { model: longModel, cwd: longPath, project_name: "Personal project" });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  await page.getByRole("button", { name: /Fix sign-in/ }).tap();
+  await expect(page.locator("#header-model")).toContainText(longModel);
+  const header = await page.locator(".conversation-head").boundingBox();
+  const history = await page.locator("#timeline").boundingBox();
+  expect(header!.height).toBeLessThan(history!.height);
+  await page.locator("#heading-details summary").tap();
+  await expect(page.locator("#conversation-subtitle")).toContainText(longModel);
+  await expect(page.locator("#conversation-subtitle")).toContainText(longPath);
+  await page.locator("#conversation-subtitle dd").filter({ hasText: longPath }).scrollIntoViewIfNeeded();
+  await expect(page.locator("#conversation-subtitle dd").filter({ hasText: longPath })).toBeInViewport();
+  await expectNoPageOverflow(page);
+  await context.close();
+});
