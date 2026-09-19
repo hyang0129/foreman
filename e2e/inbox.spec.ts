@@ -57,6 +57,7 @@ async function fixture(
     calls: [] as { path: string; body: any; headers: any }[],
     projects: [{ id: "project-app", name: "app", path: "/Users/dev/code/app", canonicalPath: "/Users/dev/code/app", aliases: ["personal repo"], lastUsed: "2026-09-10" }] as any[],
     projectDelay: 0,
+    projectErrors: {} as Record<string, string>,
     pmModel: null as string | null,
     pmBusy: false,
     failMessages: 0,
@@ -89,12 +90,13 @@ async function fixture(
       const exact = state.projects.filter((p) => [p.name, p.path, ...p.aliases].some((v) => v.toLowerCase() === reference));
       const matches = exact.length ? exact : state.projects.filter((p) => [p.name, p.path, ...p.aliases].some((v) => v.toLowerCase().includes(reference)));
       result = reference.startsWith("/") ? { status: "resolved", path: body.reference, project: exact[0] } : matches.length === 1 ? { status: "resolved", path: matches[0].path, project: matches[0] } : { status: matches.length ? "ambiguous" : "not_found", candidates: matches };
+      if (state.projectErrors[body.reference]) { status = 400; result = { error: state.projectErrors[body.reference] }; }
       if (state.projectDelay) await new Promise((resolve) => setTimeout(resolve, state.projectDelay));
     } else if (path === "/api/projects/register") {
       result = { id: `project-${state.projects.length}`, name: body.name, path: body.path, canonicalPath: body.path, aliases: body.aliases || [], lastUsed: null }; state.projects.push(result);
     } else if (path === "/api/projects/update") {
       result = state.projects.find((p) => p.id === body.id); Object.assign(result, { name: body.name, aliases: body.aliases });
-    } else if (path === "/api/projects/remove") { state.projects = state.projects.filter((p) => p.id !== body.id); result = { ok: true }; }
+    } else if (path === "/api/projects/remove") { const removed = state.projects.find((p) => p.id === body.id); if (removed) delete state.projectErrors[removed.path]; state.projects = state.projects.filter((p) => p.id !== body.id); result = { ok: true }; }
     else if (path === "/api/sessions" && request.method() === "GET")
       result = state.sessions;
     else if (path === "/api/sessions") {
@@ -1031,3 +1033,27 @@ test("a stale project resolution cannot enable launch for a newer unknown refere
   await expect(page.getByRole("button", { name: "Start session", exact: true })).toBeDisabled();
   expect(state.calls.filter((c) => c.path === "/api/sessions" && c.body)).toHaveLength(0);
 });
+
+
+for (const problem of ["Project directory is missing or unreadable", "Project directory changed its symlink target"]) {
+  test(`an unavailable registered project remains manageable: ${problem}`, async ({ page }) => {
+    const state = await fixture(page); state.projectErrors["/Users/dev/code/app"] = `${problem}: /Users/dev/code/app`;
+    await page.goto("/"); await page.getByRole("button", { name: "New session", exact: true }).click();
+    await page.getByRole("button", { name: "app /Users/dev/code/app", exact: true }).click();
+    await expect(page.locator("#project-status")).toContainText(problem);
+    await expect(page.getByRole("button", { name: "Start session", exact: true })).toBeDisabled();
+    await page.getByText("Remember or manage a project", { exact: true }).click();
+    await page.getByLabel("Short project name").fill("stale project"); await page.getByRole("button", { name: "Save project name" }).click();
+    await expect(page.locator("#project-feedback")).toContainText("Project saved");
+    await expect(page.getByRole("button", { name: "Start session", exact: true })).toBeDisabled();
+    await page.getByRole("button", { name: "Remove project" }).click();
+    await expect(page.locator("#project-feedback")).toContainText("Project removed");
+    expect(state.projects).toHaveLength(0);
+    // Restoring a directory or removing its obsolete pin makes explicit registration possible.
+    await page.getByLabel("Project directory").fill("/Users/dev/code/app");
+    await expect(page.locator("#project-status")).toContainText("Unregistered directory");
+    await page.getByLabel("Short project name").fill("restored project"); await page.getByRole("button", { name: "Remember project", exact: true }).click();
+    await expect(page.locator("#project-status")).toContainText("restored project");
+    expect(state.calls.filter((c) => c.path === "/api/sessions" && c.body)).toHaveLength(0);
+  });
+}

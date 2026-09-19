@@ -75,7 +75,7 @@ let messageSignature = "",
   pmBusy = false;
 let pmModel = "", pmModelSaving = false, pmModelLoading = false, pmModelReady = false,
   pmModelLoaded = false, modelRevision = 0, newModelRequest = 0;
-let projectRows = [], projectResolution = null, projectRevision = 0, projectPending = false;
+let projectRows = [], projectResolution = null, projectSelection = null, projectRevision = 0, projectPending = false;
 const projectName = (s) => s.project_name || (s.cwd || "").split("/").filter(Boolean).at(-1) || "Project unavailable";
 const drafts = new Map(),
   sendAttempts = new Map();
@@ -219,7 +219,7 @@ function revokeAccess(message) {
   pmModel = ""; pmModelLoaded = false; pmModelReady = false;
   sending = false; creating = false; pmModelSaving = false; pmModelLoading = false;
   newModelRequest++;
-  projectRevision++; projectRows = []; projectResolution = null; projectPending = false;
+  projectRevision++; projectRows = []; projectResolution = null; projectSelection = null; projectPending = false;
   $("#project-choices").replaceChildren(); $("#project-status").textContent = ""; $("#project-feedback").textContent = "";
   ui.interrupt.dataset.busy = "false";
   $("#create-session").textContent = "Start session";
@@ -1041,7 +1041,7 @@ function projectChoices(rows) {
   for (const project of rows) {
     const button = node("button", "project-choice"); button.type = "button";
     button.append(node("strong", "", project.name), node("span", "", project.path));
-    button.addEventListener("click", () => { $("#new-cwd").value = project.path; void resolveNewProject(); });
+    button.addEventListener("click", () => { $("#new-cwd").value = project.path; void resolveNewProject(project); });
     choices.append(button);
   }
 }
@@ -1054,11 +1054,13 @@ async function loadProjects() {
     if (!$("#new-cwd").value.trim()) projectChoices(projectRows);
   } catch (error) { if (epoch === authEpoch) $("#project-status").textContent = `Projects unavailable: ${errorMessage(error)} Enter an absolute directory to try resolving it.`; }
 }
-async function resolveNewProject() {
+async function resolveNewProject(selectedProject) {
   const revision = ++projectRevision, epoch = authEpoch, reference = $("#new-cwd").value.trim();
   projectResolution = null; projectPending = !!reference;
-  $("#rename-project").hidden = true; $("#remove-project").hidden = true; $("#remember-project").hidden = false;
-  $("#project-name").value = ""; $("#project-aliases").value = ""; $("#project-feedback").textContent = "";
+  const matches = projectRows.filter((p) => [p.path, p.canonicalPath, p.name, ...(p.aliases || [])].some((v) => v?.toLowerCase() === reference.toLowerCase()));
+  projectSelection = selectedProject || (matches.length === 1 ? matches[0] : null);
+  $("#rename-project").hidden = !projectSelection; $("#remove-project").hidden = !projectSelection; $("#remember-project").hidden = !!projectSelection;
+  $("#project-name").value = projectSelection?.name || ""; $("#project-aliases").value = (projectSelection?.aliases || []).join(", "); $("#project-feedback").textContent = "";
   $("#project-status").textContent = reference ? "Resolving project…" : "Choose a recent project or search by name, alias, or absolute path.";
   projectChoices(reference ? projectRows.filter((p) => `${p.name} ${p.path} ${(p.aliases || []).join(" ")}`.toLowerCase().includes(reference.toLowerCase())) : projectRows);
   updateControls();
@@ -1067,7 +1069,7 @@ async function resolveNewProject() {
     const result = await post("/api/projects/resolve", { reference });
     if (revision !== projectRevision || epoch !== authEpoch || !ui.dialog.open) return;
     if (result.status === "resolved") {
-      projectResolution = { ...result, reference };
+      projectResolution = { ...result, reference }; projectSelection = result.project || null;
       $("#project-status").textContent = `Project: ${result.project?.name || "Unregistered directory"} · ${result.path}`;
       projectChoices([]);
       $("#project-name").value = result.project?.name || result.path.split("/").filter(Boolean).at(-1) || "";
@@ -1080,10 +1082,10 @@ async function resolveNewProject() {
   } catch (error) { if (revision === projectRevision && epoch === authEpoch) $("#project-status").textContent = errorMessage(error); }
   finally { if (revision === projectRevision && epoch === authEpoch) { projectPending = false; updateControls(); } }
 }
-$("#new-cwd").addEventListener("input", resolveNewProject);
+$("#new-cwd").addEventListener("input", () => resolveNewProject());
 async function changeProject(action) {
-  if (!projectResolution || projectPending || !authorized || !host.online) return;
-  const selection = projectResolution, epoch = authEpoch, revision = projectRevision;
+  if (projectPending || !authorized || !host.online || (action === "register" ? !projectResolution : !projectSelection)) return;
+  const selection = projectResolution || { project: projectSelection }, epoch = authEpoch, revision = projectRevision;
   const button = $(action === "register" ? "#remember-project" : action === "update" ? "#rename-project" : "#remove-project");
   button.disabled = true; $("#project-feedback").textContent = "Saving…";
   try {
@@ -1116,7 +1118,7 @@ function openNew(event) {
 }
 ui.newButton.addEventListener("click", openNew);
 ui.dialog.addEventListener("close", () => {
-  projectRevision++; projectPending = false; projectResolution = null;
+  projectRevision++; projectPending = false; projectResolution = null; projectSelection = null;
   if (!authorized || creating) return;
   if (dialogOpener?.isConnected && !dialogOpener.closest("[inert]")) dialogOpener.focus({ preventScroll: true });
 });

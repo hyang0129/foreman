@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, symlinkSync, rmSync, mkdtempSync, realpathSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
+import { bootstrapClaudeCredentials } from './credentials.mjs';
 import { Harness, assertSuccess, join, randomUUID, delay } from './harness.mjs';
 
 test('live registered project launch uses its pinned symlink-parent cwd and rejects retargeting after restart', { skip: process.env.FOREMAN_LIVE !== '1', timeout: 240_000 }, async () => {
@@ -12,6 +13,8 @@ test('live registered project launch uses its pinned symlink-parent cwd and reje
     // Its Foreman/Claude/Codex state and provider commands stay in disposable roots.
     process.env.CODEX_HOME ||= join(homedir(), '.codex');
     h.dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-conformance-')));
+    h.claudeConfig = join(h.dir, 'claude-config'); mkdirSync(h.claudeConfig, { mode: 0o700 });
+    h.credentialsPath = bootstrapClaudeCredentials(h.claudeConfig);
     process.env.HOME = join(h.dir, 'home'); mkdirSync(process.env.HOME);
     await h.start();
     const f = h.fixture(), parent = join(h.dir, 'code');
