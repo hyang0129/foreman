@@ -7,6 +7,7 @@ const managed = {
   name: "Fix sign-in",
   cwd: "/Users/dev/code/app",
   state: "working",
+  current_tool: "Read",
   managed: true,
   capabilities: { message: true, interrupt: true, approvals: true },
   updated_at: new Date().toISOString(),
@@ -32,7 +33,15 @@ async function fixture(
     auth?: any;
   } = {},
 ) {
+  const deferred = new Map<string, Promise<void>>();
   const state = {
+    defer(path: string) {
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => { release = resolve; });
+      deferred.set(path, pending);
+      return () => { deferred.delete(path); release(); };
+    },
+    failures: new Map<string, string>(),
     online: options.online ?? true,
     sessions: [structuredClone(managed), structuredClone(observed)],
     approvals: options.approvals ?? [],
@@ -58,6 +67,11 @@ async function fixture(
       path = url.pathname;
     const body = request.method() === "POST" ? request.postDataJSON() : null;
     state.calls.push({ path, body, headers: request.headers() });
+    await deferred.get(path);
+    if (state.failures.has(path)) {
+      await route.fulfill({ status: 502, json: { error: state.failures.get(path) } });
+      return;
+    }
     let result: any = {},
       status = 200;
     if (path === "/api/config")
@@ -167,6 +181,9 @@ test("managed follow-up is queued, approval resolves, history survives refresh",
     .fill("Please add a regression test.");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect(page.getByText("Queued", { exact: true })).toBeVisible();
+  await expect(page.locator("#send-feedback")).toHaveText("Message accepted.");
+  await page.getByLabel("Message this session").fill("A new unsent draft");
+  await expect(page.locator("#send-feedback")).toBeHidden();
   expect(
     state.calls.find((c) => c.path === "/api/session/message")?.body.id,
   ).toBe(managed.session_key);
@@ -192,7 +209,7 @@ test("message retry retains its ID and composer text", async ({ page }) => {
   await openManaged(page);
   await page.getByLabel("Message this session").fill("Check the tests");
   await page.getByRole("button", { name: "Send", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("Retry the same message");
+  await expect(page.locator("#send-feedback")).toContainText("Retry the same message");
   await expect(page.getByLabel("Message this session")).toHaveValue(
     "Check the tests",
   );
@@ -268,6 +285,8 @@ test("host disconnection disables mutations and preserves last conversation", as
     page.getByText("Execution host offline", { exact: true }),
   ).toBeVisible();
   await expect(page.getByLabel("Message this session")).toBeDisabled();
+  await expect(page.locator("#activity-status")).toContainText("Last known · Working…");
+  expect(await page.locator("#activity-status").evaluate((el) => el.getAnimations({ subtree: true }).some((animation) => animation.playState === "running"))).toBe(false);
   await expect(
     page.getByRole("button", { name: "New session", exact: true }),
   ).toBeDisabled();
@@ -566,4 +585,373 @@ test('local token unlock stays usable after an invalid token without Google sign
   await page.getByRole('button',{name:'Unlock Foreman'}).click();
   await expect(page.locator('#app')).toBeVisible();
   await expect(page.locator('#auth-screen')).toBeHidden();
+});
+
+async function refreshFixture(page: Page, state: Awaited<ReturnType<typeof fixture>>) {
+  const before = state.calls.filter((call) => call.path === "/api/host").length;
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect.poll(() => state.calls.filter((call) => call.path === "/api/host").length).toBeGreaterThan(before);
+}
+
+async function expectNoPageOverflow(page: Page) {
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+}
+
+async function expectActionTextFits(page: Page, selector: string) {
+  const clippedLabels = await page.locator(selector).evaluateAll((buttons) => buttons.flatMap((button) => {
+    const bounds = button.getBoundingClientRect();
+    const walker = document.createTreeWalker(button, NodeFilter.SHOW_TEXT);
+    let text;
+    while ((text = walker.nextNode())) {
+      if (!text.textContent?.trim()) continue;
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      if (Array.from(range.getClientRects()).some((rect) => rect.left < bounds.left - 1 || rect.right > bounds.right + 1 || rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1))
+        return [button.textContent];
+    }
+    return [];
+  }));
+  expect(clippedLabels).toEqual([]);
+}
+
+test("activity transitions are stable across polls and queued messages are not running turns", async ({ page }) => {
+  const state = await fixture(page);
+  await openManaged(page);
+  const status = page.locator("#activity-status");
+  await expect(status).toHaveAttribute("role", "status");
+  await expect(status).toContainText("Working…");
+  await expect(status).toContainText("Read");
+  await page.evaluate(() => {
+    (window as any).statusMutations = 0;
+    new MutationObserver((records) => { (window as any).statusMutations += records.length; })
+      .observe(document.querySelector("#activity-status")!, { childList: true, subtree: true, characterData: true });
+  });
+  const before = state.calls.filter((call) => call.path === "/api/session").length;
+  await refreshFixture(page, state);
+  await expect.poll(() => state.calls.filter((call) => call.path === "/api/session").length).toBeGreaterThan(before);
+  // Wait for the response to be rendered, not merely for its request to arrive.
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  expect(await page.evaluate(() => (window as any).statusMutations)).toBe(0);
+  for (const [reported, label] of [["needs_input", "Needs you"], ["turn_finished", "Ready"], ["failed", "Failed"]]) {
+    state.sessions[0].state = reported;
+    await refreshFixture(page, state);
+    await expect(status).toHaveText(label);
+  }
+  state.sessions[0].state = "turn_finished";
+  await refreshFixture(page, state);
+  await expect(status).toHaveText("Ready");
+  await page.getByLabel("Message this session").fill("A queued follow-up");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText("Queued", { exact: true })).toBeVisible();
+  await expect(status).toHaveText("Ready");
+});
+
+test("PM busy and offline last-known activity use the same status without live offline animation", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmBusy = true;
+  await page.goto("/");
+  await page.locator("#select-pm").click();
+  const status = page.locator("#activity-status");
+  await expect(status).toHaveText("Working…");
+  await expect.poll(() => status.evaluate((el) => el.getAnimations({ subtree: true }).filter((animation) => animation.playState === "running").length)).toBeGreaterThan(0);
+  state.online = false;
+  await refreshFixture(page, state);
+  await expect(status).toContainText("Last known");
+  await expect(status).toContainText("Working…");
+  expect(await status.evaluate((el) => el.getAnimations({ subtree: true }).filter((animation) => animation.playState === "running").length)).toBe(0);
+  state.online = true;
+  state.pmBusy = false;
+  await refreshFixture(page, state);
+  await expect(status).toHaveText("Ready");
+});
+
+test("reduced motion keeps the working label and static activity symbol", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await fixture(page);
+  await openManaged(page);
+  const status = page.locator("#activity-status");
+  await expect(status).toContainText("Working…");
+  expect(await status.evaluate((el) => el.getAnimations({ subtree: true }).some((animation) => animation.playState === "running"))).toBe(false);
+});
+
+test("appearance follows the OS until overridden and persists only its preference locally", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await fixture(page);
+  await page.goto("/");
+  const appearance = page.getByRole("combobox", { name: "Appearance", exact: true });
+  await expect(appearance).toHaveValue("system");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  const darkThemeColor = await page.locator('meta[name="theme-color"]').getAttribute("content");
+  await page.emulateMedia({ colorScheme: "light" });
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  expect(await page.locator('meta[name="theme-color"]').getAttribute("content")).not.toBe(darkThemeColor);
+  await appearance.focus();
+  await expect(appearance).toBeFocused();
+  await page.keyboard.press("d");
+  await page.keyboard.press("Enter");
+  await expect(appearance).toHaveValue("dark");
+  await page.reload();
+  await expect(appearance).toHaveValue("dark");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  expect(await page.evaluate(() => ({ ...localStorage }))).toEqual({ "foreman:appearance": "dark" });
+  await appearance.selectOption("light");
+  await page.emulateMedia({ colorScheme: "dark" });
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await appearance.selectOption("system");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+});
+
+test("stored appearance reaches sign-in before app code loads", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(() => localStorage.setItem("foreman:appearance", "dark"));
+  await fixture(page, { auth: { required: true } });
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/app.js", async (route) => { await pending; await route.continue(); });
+  await page.goto("/", { waitUntil: "commit" });
+  await expect(page.locator("#auth-title")).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  release();
+  await expect(page.locator("#auth-status")).toContainText("has not been configured");
+  const appearance = page.getByRole("combobox", { name: "Appearance", exact: true });
+  await expect(appearance).toHaveValue("dark");
+  await appearance.selectOption("light");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+});
+
+test("unavailable browser storage leaves appearance and inbox usable", async ({ page }) => {
+  await page.addInitScript(() => {
+    for (const method of ["getItem", "setItem"] as const)
+      Storage.prototype[method] = () => { throw new DOMException("Storage blocked", "SecurityError"); };
+  });
+  await page.emulateMedia({ colorScheme: "light" });
+  await fixture(page);
+  await openManaged(page);
+  const appearance = page.getByRole("combobox", { name: "Appearance", exact: true });
+  await expect(appearance).toHaveValue("system");
+  await appearance.selectOption("dark");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(page.getByLabel("Message this session")).toBeEnabled();
+  await page.reload();
+  await expect(appearance).toHaveValue("system");
+});
+
+test("initial conversation loading becomes a true empty state and background refresh retains history", async ({ page }) => {
+  const state = await fixture(page, { history: [] });
+  let release = state.defer("/api/session");
+  await page.goto("/");
+  await page.getByRole("button", { name: /Fix sign-in/ }).click();
+  const loading = page.locator("#conversation-loading");
+  await expect(loading).toHaveAttribute("role", "status");
+  await expect(loading).toContainText("Opening conversation…");
+  release();
+  await expect(loading).toBeHidden();
+  await expect(page.getByText("Send a task or a follow-up to begin the conversation.", { exact: true })).toBeVisible();
+  await expect(page.locator(".message")).toHaveCount(0);
+  state.history.push({ id: "loaded", role: "assistant", text: "History remains readable", at: new Date().toISOString() });
+  await refreshFixture(page, state);
+  await expect(page.getByText("History remains readable", { exact: true })).toBeVisible();
+  release = state.defer("/api/session");
+  const before = state.calls.filter((call) => call.path === "/api/session").length;
+  await refreshFixture(page, state);
+  await expect.poll(() => state.calls.filter((call) => call.path === "/api/session").length).toBeGreaterThan(before);
+  await expect(page.getByText("History remains readable", { exact: true })).toBeVisible();
+  await expect(loading).toBeHidden();
+  release();
+});
+
+test("send and interrupt show pending once and retain local recoverable failures", async ({ page }) => {
+  const state = await fixture(page);
+  await openManaged(page);
+  let release = state.defer("/api/session/message");
+  await page.getByLabel("Message this session").fill("Preserve my draft");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Sending…", exact: true })).toBeDisabled();
+  expect(state.calls.filter((call) => call.path === "/api/session/message")).toHaveLength(1);
+  await expect(page.getByText("Queued", { exact: true })).toHaveCount(0);
+  state.failures.set("/api/session/message", "Relay unavailable: " + "unbroken-error-detail".repeat(20));
+  release();
+  await expect(page.locator("#send-feedback")).toContainText("Relay unavailable");
+  await expect(page.getByLabel("Message this session")).toHaveValue("Preserve my draft");
+  await expectNoPageOverflow(page);
+  release = state.defer("/api/session/interrupt");
+  await page.getByRole("button", { name: "Interrupt", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Interrupting…", exact: true })).toBeDisabled();
+  expect(state.calls.filter((call) => call.path === "/api/session/interrupt")).toHaveLength(1);
+  state.failures.set("/api/session/interrupt", "Interrupt was not accepted");
+  release();
+  await expect(page.locator("#interrupt-feedback")).toContainText("Interrupt was not accepted");
+  await expect(page.getByRole("button", { name: "Interrupt", exact: true })).toBeEnabled();
+});
+
+test("session creation and model save wait for confirmation before reporting success", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  await page.locator("#select-pm").click();
+  await expect(page.locator("#pm-model")).toBeEnabled();
+  let release = state.defer("/api/pm/model");
+  await page.locator("#pm-model").selectOption("haiku");
+  await expect(page.locator("#pm-model-hint")).toHaveText("Saving…");
+  await expect(page.locator("#pm-model")).toBeDisabled();
+  expect(state.calls.filter((call) => call.path === "/api/pm/model")).toHaveLength(1);
+  expect(state.pmModel).toBeNull();
+  release();
+  await expect(page.locator("#pm-model-hint")).toContainText("Saved");
+  await page.getByRole("button", { name: "New session", exact: true }).click();
+  await page.getByLabel("Session name").fill("Pending launch");
+  await page.getByLabel("Project directory").fill("/Users/dev/code/app");
+  await page.getByLabel("First task").fill("Inspect the project");
+  release = state.defer("/api/sessions");
+  await page.getByRole("button", { name: "Start session", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Starting…", exact: true })).toBeDisabled();
+  expect(state.calls.filter((call) => call.path === "/api/sessions" && call.body)).toHaveLength(1);
+  expect(state.sessions).toHaveLength(2);
+  release();
+  await expect(page.getByRole("heading", { name: "Pending launch", exact: true })).toBeVisible();
+});
+
+for (const [kind, decision, action, pending] of [
+  ["permission", "allow", "Allow once", "Allowing…"],
+  ["permission", "deny", "Deny", "Denying…"],
+  ["question", "allow", "Send answer", "Sending answer…"],
+  ["question", "deny", "Decline", "Declining…"],
+]) {
+  test(`${action} stays pending across polls and failure preserves the request`, async ({ page }) => {
+    const state = await fixture(page, { approvals: [{
+      id: "pending-approval", kind, tool: "Read", input: { path: "src/index.ts" },
+      ...(kind === "question" ? { questions: [{ id: "scope", question: "Which scope?", options: ["Unit", "All"] }] } : {}),
+    }] });
+    await openManaged(page);
+    if (kind === "question") await page.getByLabel("Which scope?").selectOption("Unit");
+    const release = state.defer("/api/session/approval");
+    await page.getByRole("button", { name: action, exact: true }).click();
+    await expect(page.getByRole("button", { name: pending, exact: true })).toBeDisabled();
+    state.approvals.push({ id: "arrived-during-response", kind: "permission", tool: "Write", input: {} });
+    await refreshFixture(page, state);
+    await expect(page.getByText("Permission requested · Write", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: pending, exact: true })).toBeDisabled();
+    const calls = state.calls.filter((call) => call.path === "/api/session/approval");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body.decision).toBe(decision);
+    state.failures.set("/api/session/approval", "Approval response was not accepted");
+    release();
+    await expect(page.locator("#approvals").getByRole("alert")).toContainText("Approval response was not accepted");
+    await expect(page.locator("#approvals form").first().getByRole("button", { name: action, exact: true })).toBeEnabled();
+    if (kind === "question") await expect(page.getByLabel("Which scope?")).toHaveValue("Unit");
+  });
+}
+
+test.describe("mobile polish", () => {
+  test.use({ hasTouch: true, isMobile: true, viewport: { width: 360, height: 740 } });
+
+  test("touch navigation, full session details, and dismiss controls remain reachable", async ({ page }) => {
+    const state = await fixture(page);
+    const longPath = "/Users/dev/code/" + "a-long-project-directory-".repeat(8);
+    state.sessions[0].cwd = longPath;
+    await page.goto("/");
+    await page.getByRole("button", { name: "Open session navigation" }).tap();
+    await page.getByRole("button", { name: /Fix sign-in/ }).tap();
+    await page.getByText("Session details", { exact: true }).tap();
+    await expect(page.getByText(longPath, { exact: false })).toBeVisible();
+    await expectNoPageOverflow(page);
+    await page.getByText("Session details", { exact: true }).tap();
+    await page.getByRole("button", { name: "Open session navigation" }).tap();
+    const appearance = page.getByRole("combobox", { name: "Appearance", exact: true });
+    await appearance.selectOption("dark");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await page.locator("#close-nav").tap();
+    await expect(page.locator("#open-nav")).toBeFocused();
+    for (const selector of ["#open-nav", "#interrupt", "#send"]) {
+      const box = await page.locator(selector).boundingBox();
+      expect(box?.width).toBeGreaterThanOrEqual(44);
+      expect(box?.height).toBeGreaterThanOrEqual(44);
+    }
+  });
+
+  test("keyboard dismiss returns focus and the short landscape dialog can scroll to its actions", async ({ page }) => {
+    await fixture(page);
+    await page.goto("/");
+    await page.locator("#open-nav").focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator("#close-nav")).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#open-nav")).toBeFocused();
+    await page.keyboard.press("Enter");
+    await page.locator("#new-session").focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByLabel("Session name")).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#new-session")).toBeFocused();
+    await page.keyboard.press("Enter");
+    await page.setViewportSize({ width: 740, height: 360 });
+    await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+    await page.getByLabel("Session name").fill("Landscape test");
+    await page.getByLabel("Project directory").fill("/Users/dev/code/app");
+    await page.getByLabel("First task").fill("Keep the form usable");
+    await page.getByRole("button", { name: "Start session", exact: true }).scrollIntoViewIfNeeded();
+    await expect(page.getByRole("button", { name: "Start session", exact: true })).toBeInViewport();
+    await expectActionTextFits(page, ".dialog-actions button");
+    await expectNoPageOverflow(page);
+    await page.getByRole("button", { name: "Cancel", exact: true }).tap();
+    await expect(page.locator("#new-session")).toBeFocused();
+  });
+
+  test("short landscape rail retains scrollable sessions and reachable appearance at 200 percent text", async ({ page }) => {
+    await page.setViewportSize({ width: 740, height: 360 });
+    const state = await fixture(page);
+    state.sessions.push(...Array.from({ length: 30 }, (_, index) => ({
+      ...observed, session_key: `codex:landscape-${index}`, session_id: `landscape-${index}`, name: `Landscape worker ${index + 1}`,
+    })));
+    await page.goto("/");
+    await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+    await page.getByRole("button", { name: "Open session navigation" }).tap();
+    await page.getByRole("button", { name: /Landscape worker 30/ }).scrollIntoViewIfNeeded();
+    await expect(page.getByRole("button", { name: /Landscape worker 30/ })).toBeInViewport();
+    const dimensions = await page.locator("#session-list").evaluate((el) => ({ height: el.clientHeight, scrolls: el.scrollHeight > el.clientHeight }));
+    expect(dimensions.height).toBeGreaterThan(44);
+    expect(dimensions.scrolls).toBe(true);
+    await page.getByRole("button", { name: /Landscape worker 30/ }).tap();
+    await expect(page.getByRole("heading", { name: "Landscape worker 30", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Open session navigation" }).tap();
+    const appearance = page.getByRole("combobox", { name: "Appearance", exact: true });
+    await appearance.scrollIntoViewIfNeeded();
+    await expect(appearance).toBeInViewport();
+    await appearance.selectOption("dark");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await page.locator("#close-nav").scrollIntoViewIfNeeded();
+    await page.locator("#close-nav").tap();
+    await expect(page.locator("#open-nav")).toBeFocused();
+    await expectNoPageOverflow(page);
+  });
+
+  test("200 percent text and a reduced visual viewport preserve composer and approval actions", async ({ page }) => {
+    await fixture(page, { approvals: [{
+      id: "mobile-question", kind: "question", tool: "requestUserInput", input: {},
+      questions: [{ id: "scope", question: "Which scope should this long-running session inspect?", options: ["Unit tests", "All tests"] }],
+    }], history: Array.from({ length: 25 }, (_, index) => ({
+      id: `mobile-${index}`, role: "assistant", text: `Update ${index}: ${"A readable history entry. ".repeat(10)}`,
+      at: new Date().toISOString(),
+    })) });
+    await page.goto("/");
+    await page.getByRole("button", { name: "Open session navigation" }).tap();
+    await page.getByRole("button", { name: /Fix sign-in/ }).tap();
+    await expect(page.locator(".message")).toHaveCount(25);
+    // Root text sizing persists when polling replaces message or approval elements.
+    await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+    await expectNoPageOverflow(page);
+    await expectActionTextFits(page, "#send, #interrupt, #approvals button");
+    const answer = page.getByLabel("Which scope should this long-running session inspect?");
+    await answer.selectOption("All tests");
+    await page.getByRole("button", { name: "Send answer", exact: true }).scrollIntoViewIfNeeded();
+    await expect(page.getByRole("button", { name: "Send answer", exact: true })).toBeInViewport();
+    await page.getByRole("button", { name: "Send answer", exact: true }).tap();
+    await expect(answer).toHaveCount(0);
+    await page.getByLabel("Message this session").fill("A mobile draft");
+    // Reduced viewport exercises layout constraints, not actual Android keyboard behavior.
+    await page.setViewportSize({ width: 360, height: 420 });
+    await expectNoPageOverflow(page);
+    await expect(page.getByRole("button", { name: "Send", exact: true })).toBeInViewport();
+    await page.getByRole("button", { name: "Send", exact: true }).tap();
+    await expect(page.getByText("Queued", { exact: true })).toBeVisible();
+  });
 });
