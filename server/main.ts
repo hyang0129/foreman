@@ -5,6 +5,7 @@ import { join, extname } from "node:path";
 import { Fleet, transcriptTail } from "./fleet.ts";
 import { modelCatalog } from "./models.ts";
 import { ProjectManager } from "./pm.ts";
+import { ProjectRegistry } from "./projects.ts";
 import { SessionService } from "./session-service.ts";
 import { preparePeerTools } from "./peer-tools.ts";
 import { startHostBridge } from "./host-bridge.ts";
@@ -21,9 +22,11 @@ for (const [f, seed] of [["PROJECTS.md", "# Projects\n\n(none yet)\n"], ["LOG.md
 }
 
 const fleet = new Fleet();
-const sessions = new SessionService({ fleet });
+const projects = new ProjectRegistry();
+const sessions = new SessionService({ fleet, projects });
+projects.seed(sessions.list());
 sessions.setPrepare((session) => preparePeerTools(sessions, session));
-const pm = new ProjectManager(fleet, sessions);
+const pm = new ProjectManager(fleet, sessions, undefined, projects);
 let bridge: { close(): void } | undefined;
 const clients = new Set<ServerResponse>();
 
@@ -32,7 +35,7 @@ function sse(res: ServerResponse, event: string, data: unknown) {
 }
 function broadcast(event: string, data: unknown) { for (const c of clients) sse(c, event, data); }
 
-fleet.on("change", () => broadcast("fleet", sessions.list()));
+fleet.on("change", () => { projects.seed(sessions.list()); broadcast("fleet", sessions.list()); });
 sessions.on("change", (list) => broadcast("fleet", list));
 sessions.on("session", (event) => broadcast("session", event));
 pm.on("event", (ev) => broadcast("pm", ev));
@@ -77,6 +80,11 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (url.pathname === "/api/sessions" && req.method === 'GET') { await fleet.refresh(); return json(res, 200, sessions.list()); }
+    if (url.pathname === '/api/projects' && req.method === 'GET') { await fleet.refresh(); projects.seed(sessions.list()); return json(res, 200, { projects: projects.list() }); }
+    if (url.pathname === '/api/projects/resolve' && req.method === 'POST') { const { reference } = await body(req); return json(res, 200, projects.resolve(reference)); }
+    if (url.pathname === '/api/projects/register' && req.method === 'POST') return json(res, 200, projects.register(await body(req)));
+    if (url.pathname === '/api/projects/update' && req.method === 'POST') { const { id, name, aliases } = await body(req); return json(res, 200, projects.update(id, name, aliases)); }
+    if (url.pathname === '/api/projects/remove' && req.method === 'POST') { const { id } = await body(req); projects.remove(id); return json(res, 200, { ok: true }); }
     if (url.pathname === '/api/sessions' && req.method === 'POST') return json(res, 202, await sessions.create(await body(req)));
     if (url.pathname === '/api/session' && req.method === 'GET') return json(res, 200, sessions.detail(url.searchParams.get('id') ?? ''));
     if (url.pathname === '/api/session/message' && req.method === 'POST') {

@@ -205,17 +205,28 @@
             placeholder="e.g. Fix the sign-in flow"
             autocomplete="off" /></label
         ><label
-          >Project directory<input
+          >Project directory or name<input
             id="new-cwd"
             name="cwd"
             required
-            placeholder="/Users/you/code/project"
+            placeholder="Search projects or paste an absolute path"
+            aria-describedby="project-status"
             autocomplete="off"
             spellcheck="false"
         /></label>
-        <p class="field-hint">
-          Use the full path to an existing directory on your Mac.
-        </p>
+        <p id="project-status" class="field-hint" role="status">Choose a recent project or search by name, alias, or absolute path.</p>
+        <div id="project-choices" class="project-choices" aria-label="Matching projects"></div>
+        <details id="project-management">
+          <summary>Remember or manage a project</summary>
+          <label>Short project name<input id="project-name" maxlength="200" autocomplete="off"></label>
+          <label>Aliases (comma separated)<input id="project-aliases" maxlength="1000" autocomplete="off"></label>
+          <div class="project-actions">
+            <button type="button" class="btn ghost" id="remember-project">Remember project</button>
+            <button type="button" class="btn ghost" id="rename-project" hidden>Save project name</button>
+            <button type="button" class="btn ghost" id="remove-project" hidden>Remove project</button>
+          </div>
+          <p id="project-feedback" class="field-hint" role="status"></p>
+        </details>
         <label
           >First task<textarea
             id="new-prompt"

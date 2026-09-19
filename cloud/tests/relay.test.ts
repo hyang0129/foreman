@@ -118,3 +118,16 @@ it('the shared route contract refuses arbitrary paths and unsupported methods', 
     expect(allowedRequest(method!, path!)).toBe(false);
   }
 });
+
+describe('project registry relay contract', () => {
+  it('requires identity on every project route and allowlists only explicit methods', async () => {
+    const routes = [['GET', '/api/projects'], ...['resolve', 'register', 'update', 'remove'].map((action) => ['POST', `/api/projects/${action}`])];
+    for (const [method, path] of routes) {
+      expect(allowedRequest(method, path)).toBe(true);
+      expect((await exports.default.fetch(`https://foreman.test${path}`, { method, ...(method === 'POST' ? { body: '{}' } : {}) })).status).toBe(401);
+    }
+    expect(allowedRequest('GET', '/api/projects/register')).toBe(false);
+    expect(allowedRequest('POST', '/api/projects')).toBe(false);
+    expect(allowedRequest('GET', '/api/projects/list-directory')).toBe(false);
+  });
+});
