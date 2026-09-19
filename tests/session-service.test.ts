@@ -225,3 +225,49 @@ test('a message arriving during Stop cannot race terminal cleanup or make the se
   service.send(row.session_key,'next','next'); await tick();
   assert.equal(codex.sent.length,2); assert.equal(codex.closed,false);
 });
+
+test('named project starts in pinned canonical cwd and retries survive rename/removal without relaunch', async (t) => {
+  const { ProjectRegistry } = await import('../server/projects.ts');
+  const { mkdirSync, realpathSync, symlinkSync } = await import('node:fs');
+  const f = fixture(t), parent = join(f.home, 'real'); mkdirSync(parent);
+  const project = join(parent, 'project'); mkdirSync(project);
+  const linkedParent = join(f.home, 'code'); symlinkSync(parent, linkedParent);
+  const registry = new ProjectRegistry(f.home); const entry = registry.register({ name: 'personal', path: join(linkedParent, 'project') });
+  (f.service as any).options.projects = registry;
+  let launches = 0, launchCwd = '';
+  (f.service as any).options.claudeFactory = (options: any) => { launches++; launchCwd = options.cwd; return f.claude; };
+  const input = { ...f.input, cwd: 'personal' };
+  const row = await f.service.create(input); await tick();
+  assert.equal(launchCwd, realpathSync(project)); assert.equal(row.project_name, 'personal');
+  registry.update(entry.id, 'renamed'); assert.equal((await f.service.create(input)).session_key, row.session_key);
+  registry.remove(entry.id); assert.equal((await f.service.create(input)).session_key, row.session_key);
+  assert.equal(launches, 1); assert.equal(f.claude.sent.length, 1);
+});
+test('retargeted project parent or final symlink rejects named and absolute launches before provider factory', async (t) => {
+  const { ProjectRegistry } = await import('../server/projects.ts');
+  const { mkdirSync, symlinkSync } = await import('node:fs');
+  const f = fixture(t), one = join(f.home, 'one'), two = join(f.home, 'two');
+  mkdirSync(join(one, 'repo'), { recursive: true }); mkdirSync(join(two, 'repo'), { recursive: true });
+  const parent = join(f.home, 'code'), final = join(f.home, 'final'); symlinkSync(one, parent); symlinkSync(join(one, 'repo'), final);
+  const registry = new ProjectRegistry(f.home);
+  registry.register({ name: 'parent', path: join(parent, 'repo') }); registry.register({ name: 'final', path: final });
+  (f.service as any).options.projects = registry;
+  let launches = 0; (f.service as any).options.claudeFactory = () => { launches++; return f.claude; };
+  rmSync(parent); symlinkSync(two, parent); rmSync(final); symlinkSync(join(two, 'repo'), final);
+  for (const cwd of ['parent', 'final', join(parent, 'repo'), final, join(one, 'repo')]) await assert.rejects(f.service.create({ ...f.input, cwd }), /changed its symlink target/);
+  assert.equal(launches, 0); assert.equal(f.service.list().length, 0); assert.equal(f.claude.sent.length, 0);
+});
+
+
+test('a retargeted canonical-equivalent seeded session path cannot launch a provider', async (t) => {
+  const { ProjectRegistry } = await import('../server/projects.ts');
+  const { mkdirSync, realpathSync, symlinkSync } = await import('node:fs');
+  const f = fixture(t), one = join(f.home, 'one'), two = join(f.home, 'two'), link = join(f.home, 'recent-link');
+  mkdirSync(one); mkdirSync(two); symlinkSync(one, link);
+  const registry = new ProjectRegistry(f.home); registry.seed([{ cwd: realpathSync(one) }, { cwd: link }]);
+  rmSync(link); symlinkSync(two, link);
+  const restored = new ProjectRegistry(f.home); restored.seed([{ cwd: link }]); (f.service as any).options.projects = restored;
+  let launches = 0; (f.service as any).options.claudeFactory = () => { launches++; return f.claude; };
+  for (const cwd of [link, 'recent-link', one]) await assert.rejects(f.service.create({ ...f.input, cwd }), /changed its symlink target/);
+  assert.equal(launches, 0); assert.equal(f.service.list().length, 0); assert.equal(restored.list().length, 1);
+});

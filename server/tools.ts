@@ -1,3 +1,4 @@
+import { ProjectRegistry } from "./projects.ts";
 import { PERMISSION_MODES, type PermissionMode } from './permission-policy.ts';
 // In-process MCP tools the PM uses to see and steer the fleet.
 import { tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
@@ -27,7 +28,7 @@ export function runClaude(args: string[], cwd?: string): Promise<{ code: number;
   });
 }
 
-export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
+export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService, projects?: ProjectRegistry) {
   const peers = sessions ? bindPeerTools(sessions, 'foreman-pm') : undefined;
   const list_sessions = tool(
     "list_sessions",
@@ -53,12 +54,19 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
       try { return fmt({ provider, models: await modelCatalog.list(provider) }); }
       catch (error) { return err(error instanceof Error ? error.message : String(error)); }
     });
+  const list_projects = tool('list_projects', 'List registered project names, aliases, absolute directories and recent use. Never invent a directory.', {}, async () => fmt(projects?.list() ?? []), { annotations: { readOnlyHint: true } });
+  const resolve_project = tool('resolve_project', 'Resolve a project reference. Ask the developer to choose when ambiguous or missing; never guess a path.', { reference: z.string() }, async ({ reference }) => {
+    try { if (!projects) throw new Error('Project registry unavailable'); return fmt(projects.resolve(reference)); } catch (error) { return err(String(error)); }
+  }, { annotations: { readOnlyHint: true } });
+  const register_project = tool('register_project', 'Remember an existing absolute directory by name and optional aliases. For an already registered directory, adds the name/aliases without changing its pinned target. When the developer names their current project, register that alias using its known resolved directory.', { name: z.string(), path: z.string(), aliases: z.array(z.string()).optional() }, async (input) => {
+    try { if (!projects) throw new Error('Project registry unavailable'); return fmt(projects.register(input)); } catch (error) { return err(String(error)); }
+  });
   const spawn_session = tool(
     "spawn_session",
     "Start a tracked session agent. Default mode 'managed' creates a Claude or Codex conversation in Foreman's durable service, controllable in the webapp and through peer tools. Legacy mode 'bg' uses the Claude supervisor; 'tab' opens Warp. State the goal, definition of done, and constraints in the prompt. Read managed outcomes with peers.session_tail and request_update; managed sessions do not support native SendMessage subscriptions.",
     {
       name: z.string().regex(/^[a-z0-9][a-z0-9-]{1,40}$/).describe("Short kebab-case task name, e.g. auth-refactor"),
-      cwd: z.string().describe("Absolute path of the project directory"),
+      cwd: z.string().describe("Registered project name or alias, or absolute project directory. Resolve and clarify ambiguous references before spawning"),
       prompt: z.string().min(20).describe("The full brief for the worker"),
       mode: z.enum(["managed", "bg", "tab"]).optional().describe("managed (default), bg, or tab"),
       provider: z.enum(["claude", "codex"]).optional().describe("Managed provider (default claude)"),
@@ -66,7 +74,8 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
       model: z.string().optional().describe("Optional model identifier from list_models for the selected provider; omit to use provider settings"),
     },
     async ({ name, cwd, prompt, mode, provider, permission_mode, model }) => {
-      if (!existsSync(cwd)) return err(`cwd does not exist: ${cwd}`);
+      try { if (projects) cwd = projects.require(cwd).path; else if (!existsSync(cwd)) return err(`cwd does not exist: ${cwd}`); }
+      catch (error) { return err(String(error)); }
       if (mode === 'managed' || (!mode && sessions)) {
         if (!sessions) return err('Managed session service is unavailable');
         if (permission_mode && !PERMISSION_MODES.includes(permission_mode as PermissionMode)) return err('Managed permission_mode must be native or bypass');
@@ -137,5 +146,5 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService) {
     },
   );
 
-  return createSdkMcpServer({ name: "fleet", version: "0.1.0", tools: [list_sessions, list_models, spawn_session, session_tail, stop_session, log_note] });
+  return createSdkMcpServer({ name: "fleet", version: "0.1.0", tools: [list_sessions, list_models, list_projects, resolve_project, register_project, spawn_session, session_tail, stop_session, log_note] });
 }

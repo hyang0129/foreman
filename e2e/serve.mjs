@@ -7,6 +7,7 @@ const allowed = new Map([
   ["/", "index.html"],
   ["/index.html", "index.html"],
   ["/app.js", "app.js"],
+  ["/appearance.js", "appearance.js"],
   ["/style.css", "style.css"],
 ]);
 const mime = {

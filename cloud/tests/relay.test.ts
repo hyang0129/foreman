@@ -118,3 +118,26 @@ it('the shared route contract refuses arbitrary paths and unsupported methods', 
     expect(allowedRequest(method!, path!)).toBe(false);
   }
 });
+
+describe('project registry relay contract', () => {
+  it('requires identity on every project route and allowlists only explicit methods', async () => {
+    const routes = [['GET', '/api/projects'], ...['resolve', 'register', 'update', 'remove'].map((action) => ['POST', `/api/projects/${action}`])];
+    for (const [method, path] of routes) {
+      expect(allowedRequest(method, path)).toBe(true);
+      expect((await exports.default.fetch(`https://foreman.test${path}`, { method, ...(method === 'POST' ? { body: '{}' } : {}) })).status).toBe(401);
+    }
+    expect(allowedRequest('GET', '/api/projects/register')).toBe(false);
+    expect(allowedRequest('POST', '/api/projects')).toBe(false);
+    expect(allowedRequest('GET', '/api/projects/list-directory')).toBe(false);
+  });
+});
+
+// The launcher adds only these authenticated, narrowly allowlisted routes.
+it('permits launcher proposal/status/cancel but no arbitrary launch endpoints', () => {
+  expect(allowedRequest('GET', '/api/launch?id=123')).toBe(true);
+  expect(allowedRequest('POST', '/api/launch/propose')).toBe(true);
+  expect(allowedRequest('POST', '/api/launch/cancel')).toBe(true);
+  expect(allowedRequest('POST', '/api/launch')).toBe(false);
+  expect(allowedRequest('GET', '/api/launch/propose')).toBe(false);
+  expect(allowedRequest('POST', '/api/launch/execute')).toBe(false);
+});
