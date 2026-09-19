@@ -577,7 +577,7 @@ function renderMessages(history = [], receipts = []) {
   const unmatched = new Set(timelineEntries);
   const textOf = (entry) => String(entry.text || entry.summary || "");
   const identityOf = ({ entry, receipt }) => entry.id || receipt?.id;
-  const sameMetadata = (a, b) => a.role === b.role && a.at === b.at && a.source === b.source;
+  const sameMetadata = (a, b) => a.role === b.role && (a.at || a.ts) === (b.at || b.ts) && JSON.stringify(a.source) === JSON.stringify(b.source);
   // IDs are authoritative when present. Provider history can omit IDs; match its
   // unchanged entries before matching a growing final entry, independent of indices.
   for (const item of entries) {

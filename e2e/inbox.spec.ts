@@ -58,6 +58,7 @@ async function fixture(
     projects: [{ id: "project-app", name: "app", path: "/Users/dev/code/app", canonicalPath: "/Users/dev/code/app", aliases: ["personal repo"], lastUsed: "2026-09-10" }] as any[],
     projectDelay: 0,
     projectErrors: {} as Record<string, string>,
+    pmHistory: [{ role: "assistant", text: "How can I help the fleet?" }] as any[],
     pmModel: null as string | null,
     pmBusy: false,
     failMessages: 0,
@@ -158,7 +159,7 @@ async function fixture(
     else if (path === "/api/pm/model") { state.pmModel = body.model; result = { model: state.pmModel }; }
     else if (path === "/api/pm/history")
       result = {
-        history: [{ role: "assistant", text: "How can I help the fleet?" }],
+        history: state.pmHistory,
         busy: state.pmBusy,
         model: state.pmModel,
       };
@@ -1300,5 +1301,49 @@ test("mobile touch jump stays separate from composer and approval actions", asyn
   await button.tap();
   await expect(button).toBeHidden();
   await expect(page.getByRole("button", { name: "Allow once" })).toBeInViewport();
+  await context.close();
+});
+
+
+test("PM timestamp identity notices a repeated answer after capped history shifts", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmHistory = Array.from({ length: 40 }, (_, i) => ({ role: "assistant", text: i === 0 ? "Done" : `Answer ${i} ${"detail ".repeat(40)}`, ts: new Date(2026, 8, 1, 0, i).toISOString() }));
+  await page.goto("/");
+  await page.getByRole("button", { name: /Project manager Plan and delegate/ }).click();
+  await expect(page.locator(".message")).toHaveCount(40);
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 1000; });
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  state.pmHistory = state.pmHistory.slice(1);
+  state.pmHistory.push({ role: "assistant", text: "Done", ts: new Date(2026, 8, 1, 1, 0).toISOString() });
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.getByRole("button", { name: "New messages ↓", exact: true })).toBeVisible();
+});
+
+
+test("jump and composer remain reachable when a viewport resize notification is missed", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 360, height: 740 }, hasTouch: true, reducedMotion: "reduce" });
+  const page = await context.newPage();
+  // Model a delayed visualViewport resize event, while keeping the real viewport.
+  await page.addInitScript(() => {
+    const viewport = window.visualViewport!;
+    const listen = viewport.addEventListener.bind(viewport);
+    viewport.addEventListener = ((type: string, ...args: any[]) => {
+      if (type !== "resize") (listen as any)(type, ...args);
+    }) as typeof viewport.addEventListener;
+  });
+  await fixture(page, { history: Array.from({ length: 30 }, (_, i) => ({ id: String(i), role: "assistant", text: `Answer ${i} ${"detail ".repeat(30)}` })) });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  await page.getByRole("button", { name: /Fix sign-in/ }).tap();
+  await expect(page.locator(".message")).toHaveCount(30);
+  await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+  await page.setViewportSize({ width: 360, height: 420 });
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 100; });
+  const jump = page.getByRole("button", { name: "Jump to latest", exact: true });
+  await expect(jump).toBeInViewport();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeInViewport();
+  await expectNoPageOverflow(page);
+  await jump.tap();
+  await expect(jump).toBeHidden();
   await context.close();
 });
