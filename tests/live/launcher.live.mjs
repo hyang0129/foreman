@@ -164,6 +164,12 @@ test('live launcher requests the exact default, proposes with an explicit availa
     assert.equal((await h.api('/api/launch/propose', { id: tombstoneId, brief, model: launcherModel })).status, 'cancelled');
     await delay(200);
     assert.equal(h.events.some((e) => e.kind === 'launcher:query' && e.id === tombstoneId), false);
+    await assertNoUnconfirmedSession(h, baseline, f.project);
+    // Preserve all owned host/provider state across restart; do not remove registry
+    // records to hide stale internal launcher entries. The reviewed proposal is
+    // ordinary client data and remains available for an explicit confirmation.
+    await h.stop(); await h.start();
+    await assertNoUnconfirmedSession(h, baseline, f.project);
 
     // Explicit confirmation edits the proposal to one known cheap worker/model and
     // a precise first task. The unknown fixture token proves native work ran.
