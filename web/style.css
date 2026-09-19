@@ -1026,3 +1026,11 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 .timeline { overflow-anchor: none; }
 /* Let the already-scrollable header yield space to the jump row at text zoom. */
 .conversation:has(#jump-latest:not([hidden])) .conversation-head { flex-shrink: 1; min-height: 44px; }
+
+.code-block { min-width: 0; margin-block: 12px; }
+.code-block pre { margin-top: 4px; }
+.copy-control { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 4px; }
+.copy-button { min-height: 44px; font-size: .75rem; padding: 6px 10px; color: var(--secondary); }
+.copy-feedback { font-size: .75rem; overflow-wrap: anywhere; }
+.copy-feedback.error { color: var(--error); }
+.message:hover .copy-button, .message:focus-within .copy-button { border-color: var(--accent); }
