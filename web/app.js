@@ -20,6 +20,7 @@ const ui = {
   provider: $("#provider"),
   timeline: $("#timeline"),
   messages: $("#messages"),
+  latest: $("#jump-latest"),
   approvals: $("#approvals"),
   input: $("#message-input"),
   send: $("#send"),
@@ -82,6 +83,29 @@ const drafts = new Map(),
   sendAttempts = new Map();
 const actionFeedback = new Map(), approvalFeedback = new Map();
 let conversationLoading = false;
+let timelineEntries = [], nextEntryKey = 0, newMessages = false;
+function nearLatest() {
+  return ui.timeline.scrollHeight - ui.timeline.scrollTop - ui.timeline.clientHeight < 100;
+}
+function updateLatest() {
+  if (nearLatest()) newMessages = false;
+  ui.latest.hidden = !selected || conversationLoading || nearLatest();
+  const label = newMessages ? "New messages ↓" : "Jump to latest";
+  if (ui.latest.textContent !== label) ui.latest.textContent = label;
+}
+function resetLatest() {
+  timelineEntries = [];
+  newMessages = false;
+  ui.latest.hidden = true;
+}
+ui.timeline.addEventListener("scroll", updateLatest, { passive: true });
+ui.latest.addEventListener("click", () => {
+  newMessages = false;
+  // Keep keyboard focus in the history when the button disappears at the bottom.
+  ui.timeline.focus({ preventScroll: true });
+  ui.timeline.scrollTo({ top: ui.timeline.scrollHeight, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
+  updateLatest();
+});
 
 function setActionFeedback(key, action, text, error = false) {
   const feedback = actionFeedback.get(key) || {};
@@ -238,6 +262,7 @@ function revokeAccess(message) {
   conversationLoading = false;
   renderActionFeedback();
   messageSignature = "";
+  resetLatest();
   approvalSignature = "";
   ui.messages.replaceChildren();
   ui.approvals.replaceChildren();
@@ -532,30 +557,53 @@ function messageNode(entry, receipt) {
 function renderMessages(history = [], receipts = []) {
   const signature = JSON.stringify([selected, history, receipts]);
   if (signature === messageSignature) return;
-  const wasNearBottom =
-    ui.timeline.scrollHeight -
-      ui.timeline.scrollTop -
-      ui.timeline.clientHeight <
-    100;
+  const wasNearBottom = nearLatest();
   const firstRender = !messageSignature;
+  const oldTop = ui.timeline.scrollTop;
+  const viewportTop = ui.timeline.getBoundingClientRect().top;
+  const anchors = timelineEntries.map((item) => ({ key: item.key, top: item.element.getBoundingClientRect().top - viewportTop, bottom: item.element.getBoundingClientRect().bottom - viewportTop }))
+    .filter((item) => item.bottom > 0);
   messageSignature = signature;
-  const fragment = document.createDocumentFragment(),
-    used = new Set();
+  const fragment = document.createDocumentFragment(), used = new Set(), entries = [];
   for (const entry of history) {
-    const receipt =
-      entry.role === "user"
-        ? receipts.find(
-            (r) =>
-              !used.has(r.id) && (r.id === entry.id || r.text === entry.text),
-          )
-        : null;
+    const receipt = entry.role === "user"
+      ? receipts.find((r) => !used.has(r.id) && (r.id === entry.id || r.text === entry.text)) : null;
     if (receipt) used.add(receipt.id);
-    fragment.append(messageNode(entry, receipt));
+    entries.push({ entry, receipt });
   }
   for (const receipt of receipts) {
-    if (!used.has(receipt.id))
-      fragment.append(messageNode({ ...receipt, role: "user" }, receipt));
+    if (!used.has(receipt.id)) entries.push({ entry: { ...receipt, role: "user" }, receipt });
   }
+  const unmatched = new Set(timelineEntries);
+  const textOf = (entry) => String(entry.text || entry.summary || "");
+  const identityOf = ({ entry, receipt }) => entry.id || receipt?.id;
+  const sameMetadata = (a, b) => a.role === b.role && (a.at || a.ts) === (b.at || b.ts) && JSON.stringify(a.source) === JSON.stringify(b.source);
+  // IDs are authoritative when present. Provider history can omit IDs; match its
+  // unchanged entries before matching a growing final entry, independent of indices.
+  for (const item of entries) {
+    const id = identityOf(item);
+    const previous = [...unmatched].find((old) => id
+      ? identityOf(old) === id
+      : !identityOf(old) && sameMetadata(old.entry, item.entry) && textOf(old.entry) === textOf(item.entry));
+    if (previous) { item.previous = previous; unmatched.delete(previous); }
+  }
+  for (const item of entries) {
+    if (!item.previous && !identityOf(item)) {
+      const previous = [...unmatched].find((old) => !identityOf(old) && sameMetadata(old.entry, item.entry)
+        && textOf(item.entry).startsWith(textOf(old.entry)) && textOf(old.entry));
+      if (previous) { item.previous = previous; unmatched.delete(previous); }
+    }
+    const previous = item.previous;
+    if (!firstRender && !wasNearBottom && (!previous || textOf(previous.entry) !== textOf(item.entry))) newMessages = true;
+    item.key = previous?.key || ++nextEntryKey;
+    const contentSignature = JSON.stringify([item.entry, item.receipt]);
+    item.element = previous?.contentSignature === contentSignature ? previous.element : messageNode(item.entry, item.receipt);
+    item.contentSignature = contentSignature;
+    item.element.dataset.entryKey = String(item.key);
+    delete item.previous;
+    fragment.append(item.element);
+  }
+  timelineEntries = entries;
   if (!history.length && !receipts.length)
     fragment.append(
       selected
@@ -576,8 +624,13 @@ function renderMessages(history = [], receipts = []) {
           ),
     );
   ui.messages.replaceChildren(fragment);
-  if (wasNearBottom || firstRender)
-    ui.timeline.scrollTop = ui.timeline.scrollHeight;
+  if (wasNearBottom || firstRender) ui.timeline.scrollTop = ui.timeline.scrollHeight;
+  else {
+    const anchor = anchors.find((old) => entries.some((item) => item.key === old.key));
+    const element = anchor && entries.find((item) => item.key === anchor.key).element;
+    ui.timeline.scrollTop = element ? ui.timeline.scrollTop + element.getBoundingClientRect().top - viewportTop - anchor.top : oldTop;
+  }
+  updateLatest();
 }
 function renderApprovals(approvals = []) {
   const signature = JSON.stringify([selected, approvals]);
@@ -759,6 +812,7 @@ function renderApprovals(approvals = []) {
   }
   if (approvals.length && wasNearBottom)
     ui.timeline.scrollTop = ui.timeline.scrollHeight;
+  updateLatest();
 }
 async function selectSession(key) {
   if (selected) drafts.set(selected, ui.input.value);
@@ -769,6 +823,7 @@ async function selectSession(key) {
   pmBusy = false;
   pmModelReady = false;
   messageSignature = "";
+  resetLatest();
   approvalSignature = "";
   try {
     sessionStorage.setItem("foreman:selected", key);

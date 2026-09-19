@@ -153,7 +153,7 @@ select:focus-visible,
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   height: 100dvh;
-  height: var(--viewport-height, 100dvh);
+  height: min(var(--viewport-height, 100dvh), 100dvh);
   max-width: 2000px;
   margin: auto;
 }
@@ -789,7 +789,7 @@ label textarea {
     position: fixed;
     z-index: 30;
     inset: 0 auto auto 0;
-    height: var(--viewport-height, 100dvh);
+    height: min(var(--viewport-height, 100dvh), 100dvh);
     width: min(320px, 88vw);
     transform: translateX(-100%);
     transition: transform 0.18s ease;
@@ -1018,3 +1018,11 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 #launch-status { min-height: 0; }
 #launch-status:has(#launch-status-label:empty) { display: none; }
 #launch-reason { overflow-wrap: anywhere; }
+
+/* A separate row reserves space for navigation without obscuring requests. */
+.latest-control { flex-shrink: 0; text-align: center; }
+.latest-control:has(button[hidden]) { display: none; }
+.latest-control button { min-height: 44px; margin: 2px 8px; }
+.timeline { overflow-anchor: none; }
+/* Let the already-scrollable header yield space to the jump row at text zoom. */
+.conversation:has(#jump-latest:not([hidden])) .conversation-head { flex-shrink: 1; min-height: 44px; }

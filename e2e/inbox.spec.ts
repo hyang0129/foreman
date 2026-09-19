@@ -58,6 +58,7 @@ async function fixture(
     projects: [{ id: "project-app", name: "app", path: "/Users/dev/code/app", canonicalPath: "/Users/dev/code/app", aliases: ["personal repo"], lastUsed: "2026-09-10" }] as any[],
     projectDelay: 0,
     projectErrors: {} as Record<string, string>,
+    pmHistory: [{ role: "assistant", text: "How can I help the fleet?" }] as any[],
     pmModel: null as string | null,
     pmBusy: false,
     failMessages: 0,
@@ -158,7 +159,7 @@ async function fixture(
     else if (path === "/api/pm/model") { state.pmModel = body.model; result = { model: state.pmModel }; }
     else if (path === "/api/pm/history")
       result = {
-        history: [{ role: "assistant", text: "How can I help the fleet?" }],
+        history: state.pmHistory,
         busy: state.pmBusy,
         model: state.pmModel,
       };
@@ -1215,4 +1216,134 @@ test('sign-out cancels the launcher and erases its brief while a delayed respons
   await expect(page.locator('#launch-brief')).toHaveValue('');
   await expect.poll(() => state.calls.filter((c) => c.path === '/api/launch/cancel').length).toBe(1);
   expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
+});
+
+async function refreshTimeline(page: Page) {
+  const response = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/session");
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await response;
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+}
+
+test("new output preserves the reading anchor across polls, streaming and history truncation", async ({ page }) => {
+  const state = await fixture(page, {
+    history: Array.from({ length: 60 }, (_, index) => ({ role: "assistant", text: `Answer ${index}\n${"Read this detail. ".repeat(20)}`, at: new Date(2026, 8, 1, 0, index).toISOString() })),
+  });
+  await openManaged(page);
+  const timeline = page.locator("#timeline");
+  await expect(page.locator("#jump-latest")).toBeHidden();
+  await timeline.evaluate((el) => { el.scrollTop = 1800; });
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  const anchor = await page.locator(".message").evaluateAll((els) => {
+    const top = document.querySelector("#timeline")!.getBoundingClientRect().top;
+    const el = els.find((el) => el.getBoundingClientRect().bottom > top)!;
+    return { text: el.querySelector(".message-body")!.textContent!, top: el.getBoundingClientRect().top };
+  });
+  await refreshTimeline(page);
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  state.history = state.history.slice(3);
+  state.history[0].text += "\nStreaming growth above the visible answer. ".repeat(10);
+  state.history.push({ role: "assistant", text: "A new answer arrived", at: new Date().toISOString() });
+  await refreshTimeline(page);
+  await expect(page.getByRole("button", { name: "New messages ↓", exact: true })).toBeVisible();
+  const position = await page.locator(".message").filter({ has: page.locator(".message-body", { hasText: anchor.text }) }).evaluate((el) => el.getBoundingClientRect().top);
+  expect(Math.abs(position - anchor.top)).toBeLessThan(2);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.getByRole("button", { name: "New messages ↓", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(timeline).toBeFocused();
+  await expect(page.locator("#jump-latest")).toBeHidden();
+  expect(await timeline.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(2);
+  state.history.push({ role: "assistant", text: "Automatically follow this new answer", at: new Date().toISOString() });
+  await refreshTimeline(page);
+  expect(await timeline.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(2);
+});
+
+test("receipt updates do not announce new history and switching conversations clears the marker", async ({ page }) => {
+  const state = await fixture(page, { history: Array.from({ length: 40 }, (_, i) => ({ id: `entry-${i}`, role: "assistant", text: `Message ${i} ${"detail ".repeat(40)}` })) });
+  state.receipts.push({ id: "receipt", text: "queued task", status: "queued" });
+  await openManaged(page);
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 200; });
+  state.receipts[0].status = "running";
+  await refreshTimeline(page);
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New messages ↓", exact: true })).toBeHidden();
+  state.history.at(-1)!.text += " streamed output";
+  await refreshTimeline(page);
+  await expect(page.getByRole("button", { name: "New messages ↓", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /Terminal research/ }).click();
+  await expect(page.locator(".message")).toHaveCount(41);
+  await expect(page.locator("#jump-latest")).toBeHidden();
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 200; });
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(page.locator("#jump-latest")).toBeHidden();
+});
+
+test("mobile touch jump stays separate from composer and approval actions", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 360, height: 640 }, hasTouch: true, reducedMotion: "reduce" });
+  const page = await context.newPage();
+  const state = await fixture(page, { history: Array.from({ length: 30 }, (_, i) => ({ id: String(i), role: "assistant", text: `Answer ${i} ${"detail ".repeat(30)}` })), approvals: [{ id: "allow", kind: "permission", tool: "Read", reason: "Read the project file" }] });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  await page.getByRole("button", { name: /Fix sign-in/ }).tap();
+  await expect(page.locator(".message")).toHaveCount(30);
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 100; });
+  state.history.push({ id: "new", role: "assistant", text: "New answer" });
+  await refreshTimeline(page);
+  const button = page.getByRole("button", { name: "New messages ↓", exact: true });
+  const bounds = await button.boundingBox();
+  const composer = await page.locator("#composer").boundingBox();
+  const history = await page.locator("#timeline").boundingBox();
+  expect(bounds!.height).toBeGreaterThanOrEqual(44);
+  expect(bounds!.y).toBeGreaterThanOrEqual(history!.y + history!.height);
+  expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(composer!.y);
+  await button.tap();
+  await expect(button).toBeHidden();
+  await expect(page.getByRole("button", { name: "Allow once" })).toBeInViewport();
+  await context.close();
+});
+
+
+test("PM timestamp identity notices a repeated answer after capped history shifts", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmHistory = Array.from({ length: 40 }, (_, i) => ({ role: "assistant", text: i === 0 ? "Done" : `Answer ${i} ${"detail ".repeat(40)}`, ts: new Date(2026, 8, 1, 0, i).toISOString() }));
+  await page.goto("/");
+  await page.getByRole("button", { name: /Project manager Plan and delegate/ }).click();
+  await expect(page.locator(".message")).toHaveCount(40);
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 1000; });
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  state.pmHistory = state.pmHistory.slice(1);
+  state.pmHistory.push({ role: "assistant", text: "Done", ts: new Date(2026, 8, 1, 1, 0).toISOString() });
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.getByRole("button", { name: "New messages ↓", exact: true })).toBeVisible();
+});
+
+
+test("jump and composer remain reachable when a viewport resize notification is missed", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 360, height: 740 }, hasTouch: true, reducedMotion: "reduce" });
+  const page = await context.newPage();
+  // Model a delayed visualViewport resize event, while keeping the real viewport.
+  await page.addInitScript(() => {
+    const viewport = window.visualViewport!;
+    const listen = viewport.addEventListener.bind(viewport);
+    viewport.addEventListener = ((type: string, ...args: any[]) => {
+      if (type !== "resize") (listen as any)(type, ...args);
+    }) as typeof viewport.addEventListener;
+  });
+  await fixture(page, { history: Array.from({ length: 30 }, (_, i) => ({ id: String(i), role: "assistant", text: `Answer ${i} ${"detail ".repeat(30)}` })) });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  await page.getByRole("button", { name: /Fix sign-in/ }).tap();
+  await expect(page.locator(".message")).toHaveCount(30);
+  await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+  await page.setViewportSize({ width: 360, height: 420 });
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 100; });
+  const jump = page.getByRole("button", { name: "Jump to latest", exact: true });
+  await expect(jump).toBeInViewport();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeInViewport();
+  await expectNoPageOverflow(page);
+  await jump.tap();
+  await expect(jump).toBeHidden();
+  await context.close();
 });
