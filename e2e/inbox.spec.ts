@@ -1410,3 +1410,33 @@ test("copy controls stay discoverable and tappable on touch at enlarged text", a
   await expectNoPageOverflow(page);
   await context.close();
 });
+
+
+for (const kind of ["message", "code"]) test(`pending ${kind} clipboard results follow streaming while copying the clicked text`, async ({ page }) => {
+  const content = (text: string) => kind === "code" ? `\`\`\`sh\n${text}\n\`\`\`` : text;
+  const copied = (text: string) => kind === "code" ? `${text}\n` : text;
+  const state = await fixture(page, { history: [{ id: "stream", role: "assistant", text: content("First chunk") }] });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { value: { writeText: (text: string) => new Promise<void>((resolve, reject) => { (window as any).finishCopy = { text, resolve, reject }; }) } });
+  });
+  await openManaged(page);
+  const copy = page.getByRole("button", { name: kind === "code" ? "Copy code" : "Copy message", exact: true });
+  await copy.focus();
+  await page.keyboard.press("Enter");
+  state.history[0].text = content("First chunk and more output");
+  await refreshTimeline(page);
+  await expect(copy).toBeFocused();
+  await expect(copy).toHaveAttribute("aria-busy", "true");
+  expect(await page.evaluate(() => (window as any).finishCopy.text)).toBe(copied("First chunk"));
+  await page.evaluate(() => (window as any).finishCopy.reject(new DOMException("Denied", "NotAllowedError")));
+  await expect(copy.locator("..").getByRole("status")).toContainText("Could not copy");
+  await expect(copy).toBeFocused();
+  await page.keyboard.press("Enter");
+  state.history[0].text = content("First chunk and more output again");
+  await refreshTimeline(page);
+  expect(await page.evaluate(() => (window as any).finishCopy.text)).toBe(copied("First chunk and more output"));
+  await page.evaluate(() => (window as any).finishCopy.resolve());
+  await expect(copy.locator("..").getByRole("status")).toHaveText("Copied");
+  await expect(copy).toBeFocused();
+  await expect(page.locator(kind === "code" ? "code" : ".message-body")).toHaveText(copied("First chunk and more output again"));
+});
