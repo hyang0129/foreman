@@ -1516,3 +1516,45 @@ test("PM header does not claim a default while its selected model is loading", a
   release();
   await expect(page.locator("#header-model")).toHaveText("Model · sonnet");
 });
+
+test("receipt labels distinguish every authoritative status including uncertainty without color", async ({ page }) => {
+  const state = await fixture(page, { history: [] });
+  state.receipts = ["queued", "running", "completed", "failed", "uncertain"].map((status) => ({ id: status, text: `Task ${status}`, status }));
+  await openManaged(page);
+  await expect(page.locator(".receipt-label")).toHaveText(["Queued", "Running", "Completed", "Failed", "Delivery uncertain · Check the session before sending again"]);
+  const symbols = await page.locator(".receipt-symbol").allTextContents();
+  expect(new Set(symbols).size).toBe(5);
+  await expect(page.locator(".receipt-symbol[aria-hidden=true]")).toHaveCount(5);
+  await expect(page.locator(".message").filter({ hasText: "Task uncertain" })).not.toContainText("Failed");
+  expect(state.calls.filter((call) => call.body)).toHaveLength(0);
+});
+
+test("approval details retain full safe input, focus and answers across polls without choosing a decision", async ({ page }) => {
+  const command = `cat ${"very-long-file-name/".repeat(30)}<untrusted>`;
+  const state = await fixture(page, { approvals: [{ id: "request", kind: "question", tool: "Read", reason: "Choose which files to inspect", input: { command, nested: { complete: "Preserve all input" } }, questions: [{ id: "scope", question: "Which files?" }] }] });
+  await openManaged(page);
+  await expect(page.getByRole("heading", { name: "The agent has a question" })).toBeVisible();
+  await expect(page.locator(".approval-reason")).toHaveText("Choose which files to inspect");
+  await expect(page.locator(".approval-context")).toContainText("cat very-long-file-name/");
+  const answer = page.getByLabel("Which files?");
+  await expect(answer).toHaveValue("");
+  const summary = page.locator(".approval summary");
+  await summary.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".approval pre")).toHaveText(JSON.stringify(state.approvals[0].input, null, 2));
+  await expect(page.locator(".approval untrusted")).toHaveCount(0);
+  await answer.fill("Only source files");
+  state.approvals.push({ id: "other", kind: "permission", tool: "Write", input: {} });
+  await refreshTimeline(page);
+  await expect(answer).toBeFocused();
+  await expect(answer).toHaveValue("Only source files");
+  await expect(page.locator(".approval details")).toHaveAttribute("open", "");
+  await summary.focus();
+  state.approvals[1].reason = "Write the requested change";
+  await refreshTimeline(page);
+  await expect(summary).toBeFocused();
+  expect(state.calls.filter((call) => call.path === "/api/session/approval")).toHaveLength(0);
+  await page.getByRole("button", { name: "Deny", exact: true }).click();
+  expect(state.calls.find((call) => call.path === "/api/session/approval")?.body).toEqual({ id: "managed:alpha", approval_id: "other", decision: "deny" });
+  await expect(answer).toHaveValue("Only source files");
+});

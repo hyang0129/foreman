@@ -616,13 +616,12 @@ function renderMessageReceipt(article, receipt) {
         uncertain:
           "Delivery uncertain · Check the session before sending again",
       }[receipt.status] || receipt.status;
-    article.append(
-      node(
-        "div",
-        `receipt ${["failed", "uncertain"].includes(receipt.status) ? receipt.status : ""}`,
-        `${status}${receipt.error ? ` · ${receipt.error}` : ""}`,
-      ),
-    );
+    const chip = node("div", `receipt receipt-chip ${["failed", "uncertain"].includes(receipt.status) ? receipt.status : ""}`);
+    const symbol = node("span", "receipt-symbol", { queued: "◷", running: "↻", completed: "✓", failed: "!", uncertain: "?" }[receipt.status] || "·");
+    symbol.setAttribute("aria-hidden", "true");
+    chip.append(symbol, node("span", "receipt-label", status));
+    if (receipt.error) chip.append(node("span", "receipt-error", ` · ${receipt.error}`));
+    article.append(chip);
   }
 }
 function renderMessages(history = [], receipts = []) {
@@ -751,13 +750,18 @@ function renderApprovals(approvals = []) {
             : `Permission requested · ${approval.tool || "Tool"}`,
       ),
     );
-    if (approval.reason) form.append(node("p", "", approval.reason));
+    form.append(node("p", "approval-reason", approval.reason || (approval.kind === "question"
+      ? "Your answer is needed before the agent can continue."
+      : approval.kind === "unsupported" ? "This interaction cannot be answered here."
+      : `The agent is requesting permission to use ${approval.tool || "this tool"}.`)));
+    const context = approval.input?.command || approval.input?.file_path || approval.input?.path;
+    if (typeof context === "string" && context) form.append(node("p", "approval-context", context.length > 180 ? `${context.slice(0, 180)}…` : context));
     if (approval.input && Object.keys(approval.input).length) {
       const details = node("details");
       details.dataset.focusKey = `${feedbackKey}:details`;
       details.open = expanded.has(details.dataset.focusKey);
       details.append(
-        node("summary", "", "Review request details"),
+        node("summary", "", "Show details"),
         node("pre", "", JSON.stringify(approval.input, null, 2)),
       );
       details.querySelector("summary").dataset.focusKey = `${feedbackKey}:summary`;
