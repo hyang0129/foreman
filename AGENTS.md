@@ -1,17 +1,50 @@
 # Working in this repo
 
-## Branch and PR workflow
+## Sprint and task workflow
 
-**Do not commit or push to `main`.** Every change — including a one-line fix, a docs edit, or a revert — goes on a branch and lands through a pull request.
+Work here is either a **sprint** or a **single task**, and they land differently.
 
-1. Branch from up-to-date `main`: `git fetch origin && git switch -c <type>/<short-name> origin/main`, where `<type>` is `feat`, `fix`, `test`, `docs`, `chore`, or `refactor`.
-2. Commit in reviewable increments. One concern per commit; a commit that mixes a behavior change with a large mechanical rename is hard to review and should be split.
-3. Push the branch and open a PR: `gh pr create --fill` (add `--draft` while still working).
-4. In the PR body, state what changed, what you verified with real results including failures, and what you could not close. If the change touches an authorization or permission boundary, say so explicitly in the first line so it gets the review it needs.
-5. Link the issue the work belongs to. Do not close an issue from a commit message; let the merge do it.
-6. Leave the merge decision to the developer unless they told you to merge. If you are told to merge, use `gh pr merge --squash --delete-branch` and confirm `main` is green afterwards.
+A **sprint** is a bounded, human-approved outcome made of several related stories — a tracked epic issue such as the UX polish epic. A **single task** is a genuinely isolated, low-risk change: one fix, one doc edit, one mechanical refactor.
 
-A pre-push hook rejects direct pushes to `main`. If it fires, you are on the wrong branch — move your commits rather than bypassing it. `--no-verify` exists for the developer, not for agents.
+**Never commit or push to `main` directly.** A pre-push hook rejects it.
+
+### Sprint topology
+
+```
+main
+ └── epic/<epic-issue>-<slug>        long-lived integration branch
+      ├── agent/<leaf-issue>-<slug>  one story, one PR into the epic branch
+      ├── agent/<leaf-issue>-<slug>
+      └── ...
+```
+
+- Story branches target the **epic branch**, never `main`. Each story gets its own PR there.
+- **Only the integrated epic PR targets `main`.** That PR is the unit of human review: the developer reviews the sprint whole, once, and does not review individual story PRs.
+- Story PRs are reviewed by an agent that is **not their author**, before merging into the epic branch.
+- The integrator resolves conflicts and changes integration-owned files only. A behavioral defect goes back to the story that owns it; do not fix it in the integration commit.
+- After a story has merged, further repairs to it are new PRs into the epic branch. Never merge a broken epic PR and fix it on `main`.
+
+### Decomposition
+
+Split a sprint by **ownership seam, not by feature slice**: each story owns explicit files or directories, and two concurrent stories must not edit the same implementation file. Where stories share a contract — a schema, an API shape, shared CSS tokens — land the contract story on the epic branch *first*, before dependent stories begin.
+
+Use a separate git worktree per concurrent agent. Never run two write-capable agents in one worktree.
+
+### Issues are the source of truth
+
+Every sprint and every story has its own issue before implementation starts. Do not replace an issue with a committed plan document, a PR description, or an agent conversation, and do not create `docs/` files as temporary plans, handoffs, or review ledgers.
+
+A sprint issue states the outcome and why it matters, the scope and explicit non-goals, invariants and material decisions, shared contracts, acceptance criteria, the planned stories with their dependencies and integration order, risks and cut order, and a human QA checklist.
+
+A story issue states one independently deliverable concern, the files it may write and what it only reads, the contracts it consumes and produces, behavior that must not change, and the condition for returning the work to the sprint.
+
+### Single tasks
+
+A single task goes straight to `main` as one `<type>/<short-name>` branch and PR — `feat`, `fix`, `test`, `docs`, `chore`, or `refactor`. Use `gh pr create --fill`, link the issue, and let the merge close it rather than closing it from a commit message. If you chose the single-task path for something that could have been a sprint, say why orchestration was unnecessary.
+
+### Merging
+
+Leave the merge decision to the developer unless they tell you otherwise. When told to merge: story PRs merge into the epic branch preserving their merge commits; the epic PR squash-merges into `main` with `gh pr merge --squash --delete-branch`.
 
 ## Verification before you claim anything
 
@@ -29,9 +62,23 @@ The live suites (`FOREMAN_LIVE=1`) spend real model turns and real network calls
 
 Never describe a test as passing unless you watched it pass. A test that cannot distinguish "the mechanism worked" from "the operation never ran" is not evidence — this repo has been burned by exactly that.
 
+## Definition of done
+
+A **story** is done when its scoped behavior works, its focused tests pass, an independent non-author review has passed each applicable concern, and it changed no contract it did not own. A concern that genuinely does not apply may be marked not-applicable with a concrete reason.
+
+A **sprint** is done when every acceptance criterion maps to a test or a review artifact, all five checks pass on the pushed epic commit, evidence identifies the exact commit it came from, known limitations and scope cuts are explicit, and `main` remains working after the merge.
+
+The epic PR body carries the evidence the developer needs and nothing they should have to dig for: the exact head SHA, real verification numbers, what changed and what did not, known limitations, and a short human QA checklist — at most a dozen items, each with setup, action, and expected result. Do not ask the developer to inspect source, story PRs, logs, or raw artifacts to answer a checklist item.
+
+## Feedback that is not blocking
+
+Blocking means it fails an approved acceptance criterion. Everything else — a good idea, a nit, an adjacent bug — becomes its own issue rather than growing the current sprint. Before proposing the next sprint, review those issues and record a disposition for each: included, deferred, duplicate, or declined.
+
 ## Things not to do
 
 - Do not deploy to Cloudflare (`npm run cloud:deploy`) or restart the Foreman service. The developer does both. A daemon usually runs from this same source tree; restarting it can kill the session doing the work.
 - Do not modify `package.json` or `package-lock.json` unless the task is specifically about dependencies.
 - Do not touch `~/.foreman`, `wrangler.jsonc` credentials, or the `.claude` directory.
-- Do not weaken a failing assertion to make a suite green. Fix the behavior, or report that you could not.
+- Do not weaken a failing assertion to make a suite green. Fix the behavior, or report that you could not. The same applies to skipping a test, raising a tolerance, updating a golden, or relaxing a budget — unless the sprint explicitly changed that expectation.
+- Do not treat a passing retry as proof a flaky test is fine. Flakiness is itself a failure.
+- Do not report a check as passing if it was skipped, run against a dirty tree, or run against a different commit than the one you pushed.
