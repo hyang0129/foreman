@@ -130,3 +130,22 @@ test('single observed JSON fence is accepted but prose, multiple fences and fenc
     assert.equal(result.status, expected); launcher.close();
   }
 });
+
+test('host-generated native IDs are reserved before query and remain excluded after completion, cancellation and restart', async (t) => {
+  const f = setup(t), identityFile = join(f.home, 'launcher-sessions.json'); let nativeId = '', launcher: Launcher;
+  const id = randomUUID();
+  launcher = new Launcher(f.projects, { identityFile, catalog: f.catalog, query: ({ options }) => {
+    nativeId = options.sessionId!; assert.ok(nativeId); assert.notEqual(nativeId, id);
+    assert.equal(launcher.ownsSession({ provider: 'claude', session_id: nativeId }), true);
+    const restarted = new Launcher(f.projects, { identityFile });
+    assert.equal(restarted.ownsSession({ provider: 'claude', session_id: nativeId }), true); restarted.close();
+    return stream(f.value);
+  } });
+  assert.equal((await settled(launcher, launcher.start({ id, brief: 'fixture' }).id)).status, 'ready');
+  launcher.cancel(id); launcher.close();
+  const restarted = new Launcher(f.projects, { identityFile });
+  assert.equal(restarted.ownsSession({ provider: 'claude', session_id: nativeId }), true);
+  assert.equal(restarted.ownsSession({ provider: 'codex', session_id: nativeId }), false);
+  assert.equal(restarted.ownsSession({ provider: 'claude', session_id: id }), false);
+  restarted.close();
+});

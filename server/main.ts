@@ -22,9 +22,9 @@ for (const [f, seed] of [["PROJECTS.md", "# Projects\n\n(none yet)\n"], ["LOG.md
   const p = join(MEMORY_DIR, f); if (!existsSync(p)) writeFileSync(p, seed);
 }
 
-const fleet = new Fleet();
 const projects = new ProjectRegistry();
-const launcher = new Launcher(projects);
+const launcher = new Launcher(projects, { identityFile: join(FOREMAN_HOME, 'launcher-sessions.json') });
+const fleet = new Fleet({ excludeSession: (session) => launcher.ownsSession(session) });
 const sessions = new SessionService({ fleet, projects });
 projects.seed(sessions.list());
 sessions.setPrepare((session) => preparePeerTools(sessions, session));

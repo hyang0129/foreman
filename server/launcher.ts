@@ -1,5 +1,6 @@
 import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CLAUDE_BIN } from './paths.ts';
@@ -12,7 +13,7 @@ type Status = 'working' | 'ready' | 'failed' | 'cancelled';
 interface Job { id: string; status: Status; model: string; proposal?: Proposal; error?: string }
 interface InternalJob { result: Job; signature: string; abort: AbortController; at: number; timer?: ReturnType<typeof setTimeout> }
 type QueryLike = AsyncIterable<SDKMessage> & { close(): void };
-interface Dependencies { query?: (input: { prompt: string; options: Options }) => QueryLike; catalog?: { list(provider: string): Promise<ModelOption[]> }; timeoutMs?: number }
+interface Dependencies { query?: (input: { prompt: string; options: Options }) => QueryLike; catalog?: { list(provider: string): Promise<ModelOption[]> }; timeoutMs?: number; identityFile?: string }
 
 // This role has no tools, hooks, MCP servers, project cwd, or reference to SessionService.
 // Creation and permission selection remain exclusively in the existing confirmed form.
@@ -32,10 +33,32 @@ export class Launcher {
   private catalog: NonNullable<Dependencies['catalog']>;
   private timeoutMs: number;
   private closed = false;
+  private nativeIds = new Set<string>();
+  private identityFile?: string;
   private projects: ProjectRegistry;
   constructor(projects: ProjectRegistry, deps: Dependencies = {}) {
-    this.projects = projects;
+    this.projects = projects; this.identityFile = deps.identityFile;
+    if (this.identityFile) {
+      try {
+        const ids = JSON.parse(readFileSync(this.identityFile, 'utf8'));
+        if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string' || !/^[a-f0-9-]{36}$/i.test(id))) throw new Error('Invalid launcher session identities');
+        this.nativeIds = new Set(ids);
+      } catch (error: any) { if (error.code !== 'ENOENT') throw error; }
+    }
     this.runQuery = deps.query ?? query; this.catalog = deps.catalog ?? modelCatalog; this.timeoutMs = deps.timeoutMs ?? 60_000;
+  }
+  // Only host-generated native identities are retained, never briefs or proposals.
+  // Preserve them across restart so stale native registry/agent-view rows cannot
+  // become user sessions or seed temporary launcher directories as projects.
+  ownsSession(session: { provider: string; session_id: string }): boolean { return session.provider === 'claude' && this.nativeIds.has(session.session_id); }
+  private reserveNativeId(): string {
+    const id = randomUUID(); this.nativeIds.add(id);
+    if (this.identityFile) {
+      const temp = `${this.identityFile}.${randomUUID()}.tmp`;
+      writeFileSync(temp, JSON.stringify([...this.nativeIds]), { flag: 'wx', mode: 0o600 });
+      renameSync(temp, this.identityFile);
+    }
+    return id;
   }
   private id(value: unknown): string {
     if (typeof value !== 'string' || !/^[a-f0-9-]{36}$/i.test(value)) throw new Error('Invalid launcher request ID');
@@ -111,7 +134,8 @@ export class Launcher {
       const catalogs = Object.fromEntries(['claude', 'codex'].map((p, i) => [p, result[i].status === 'fulfilled' ? result[i].value : []]));
       if (!Object.values(catalogs).some((models) => models.length)) throw new Error('Model catalogs are unavailable. Start manually or try again.');
       cwd = mkdtempSync(join(tmpdir(), 'foreman-launcher-'));
-      stream = this.runQuery({ prompt: JSON.stringify({ brief, projects: projects.map(({ id, name, aliases, canonicalPath }) => ({ id, name, aliases, path: canonicalPath })), catalogs }), options: launcherOptions(job.result.model, cwd, job.abort) });
+      const sessionId = this.reserveNativeId();
+      stream = this.runQuery({ prompt: JSON.stringify({ brief, projects: projects.map(({ id, name, aliases, canonicalPath }) => ({ id, name, aliases, path: canonicalPath })), catalogs }), options: { ...launcherOptions(job.result.model, cwd, job.abort), sessionId } });
       let text: string | undefined;
       for await (const message of stream) {
         if (job.abort.signal.aborted) return;
