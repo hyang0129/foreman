@@ -1605,3 +1605,23 @@ test("PM dates use ts and midnight relabeling preserves copy focus without a new
   expect(await page.evaluate(() => (window as any).dateSeparatorBefore === document.querySelector(".date-separator"))).toBe(true);
   await expect(page.locator(".date-separator[aria-live], .date-separator[role=status]")).toHaveCount(0);
 });
+
+
+test("impossible calendar dates stay neutral while valid offsets and leap days keep their local dates", async ({ browser }) => {
+  const context = await browser.newContext({ locale: "en-US", timezoneId: "America/Los_Angeles" });
+  const page = await context.newPage();
+  await page.clock.setFixedTime(new Date("2026-09-19T19:00:00Z"));
+  await fixture(page, { history: [
+    { id: "feb", role: "assistant", text: "Impossible February day", at: "2026-02-30T12:00:00Z" },
+    { id: "apr", role: "assistant", text: "Impossible April day", at: "2026-04-31T12:00:00Z" },
+    { id: "nonleap", role: "assistant", text: "Not a leap year", at: "2025-02-29T12:00:00Z" },
+    { id: "leap", role: "assistant", text: "Valid leap day", at: "2024-02-29T12:00:00-08:00" },
+    { id: "offset", role: "assistant", text: "Offset crosses local midnight", at: "2026-09-19T02:30:00+02:00" },
+  ] });
+  await openManaged(page);
+  await expect(page.locator(".timestamp-unavailable")).toHaveCount(3);
+  await expect(page.locator(".date-separator")).toHaveText(["Date unavailable", "Feb 29, 2024", "Yesterday"]);
+  await expect(page.locator("time")).toHaveCount(2);
+  await expect(page.locator(".message").filter({ hasText: "Offset crosses local midnight" }).locator("time")).toHaveAccessibleDescription(/Friday, September 18, 2026.*5:30:00 PM/);
+  await context.close();
+});
