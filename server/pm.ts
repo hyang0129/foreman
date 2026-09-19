@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync, realpathSync, 
 import { join, resolve, sep, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { Fleet } from "./fleet.ts";
+import { ProjectRegistry } from "./projects.ts";
 import { makeFleetServer, type ManagedFleetService } from "./tools.ts";
 import { makePeerMcpServer, PEER_ALLOWED_TOOLS, PEER_INSTRUCTIONS } from "./peer-tools.ts";
 import { FOREMAN_HOME, MEMORY_DIR, PM_SESSION_FILE, PM_HISTORY_FILE, REPO_ROOT } from "./paths.ts";
@@ -69,8 +70,9 @@ export class ProjectManager extends EventEmitter {
 
   private fleet: Fleet;
   private sessions?: ManagedFleetService;
-  constructor(fleet: Fleet, sessions?: ManagedFleetService, settingsPath = join(FOREMAN_HOME, 'pm', 'settings.json')) {
-    super(); this.fleet = fleet; this.sessions = sessions; this.settingsPath = settingsPath;
+  private projects?: ProjectRegistry;
+  constructor(fleet: Fleet, sessions?: ManagedFleetService, settingsPath = join(FOREMAN_HOME, 'pm', 'settings.json'), projects?: ProjectRegistry) {
+    super(); this.fleet = fleet; this.sessions = sessions; this.projects = projects; this.settingsPath = settingsPath;
     this.model = normalizeModel(existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf8')).model : process.env.FOREMAN_PM_MODEL);
   }
   async setModel(value: unknown) {
@@ -167,14 +169,14 @@ export class ProjectManager extends EventEmitter {
         options: {
           cwd: FOREMAN_HOME,
           resume,
-          systemPrompt: { type: "preset", preset: "claude_code", append: base + this.memoryBlock() + (this.sessions ? '\n\n' + PEER_INSTRUCTIONS + '\nFor Foreman-managed sessions, use peer tools to request updates and read outcomes. Native SendMessage subscriptions apply only to legacy Claude background sessions. You still must not read or edit source code or bypass your PM tool restrictions.' : '') },
+          systemPrompt: { type: "preset", preset: "claude_code", append: base + '\nUse list_projects and resolve_project for project references; ask when ambiguous or missing. When the developer gives a name or alias for their current known project, register_project records it. Never invent directories.' + this.memoryBlock() + (this.sessions ? '\n\n' + PEER_INSTRUCTIONS + '\nFor Foreman-managed sessions, use peer tools to request updates and read outcomes. Native SendMessage subscriptions apply only to legacy Claude background sessions. You still must not read or edit source code or bypass your PM tool restrictions.' : '') },
           settingSources: ["user"],
           permissionMode: "default",
           canUseTool: this.canUseTool,
           hooks: { PreToolUse: [{ hooks: [this.enforceToolBoundary] }] },
           includePartialMessages: true,
-          mcpServers: { fleet: makeFleetServer(this.fleet, this.sessions), ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, 'foreman-pm') } : {}) },
-          allowedTools: ["mcp__fleet__list_sessions", "mcp__fleet__list_models", "mcp__fleet__session_tail", "mcp__fleet__log_note", "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : [])],
+          mcpServers: { fleet: makeFleetServer(this.fleet, this.sessions, this.projects), ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, 'foreman-pm') } : {}) },
+          allowedTools: ["mcp__fleet__list_projects", "mcp__fleet__resolve_project", "mcp__fleet__register_project", "mcp__fleet__list_sessions", "mcp__fleet__list_models", "mcp__fleet__session_tail", "mcp__fleet__log_note", "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : [])],
           disallowedTools: ["Agent", "Bash", "Glob", "Grep"],
           extraArgs: { name: "foreman-pm" },
           maxTurns: 60,

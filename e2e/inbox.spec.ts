@@ -55,6 +55,8 @@ async function fixture(
     ],
     receipts: [] as any[],
     calls: [] as { path: string; body: any; headers: any }[],
+    projects: [{ id: "project-app", name: "app", path: "/Users/dev/code/app", canonicalPath: "/Users/dev/code/app", aliases: ["personal repo"], lastUsed: "2026-09-10" }] as any[],
+    projectDelay: 0,
     pmModel: null as string | null,
     pmBusy: false,
     failMessages: 0,
@@ -81,6 +83,18 @@ async function fixture(
       result = { error: "Not authorized" };
     } else if (path === "/api/host")
       result = { online: state.online, host: "Dev Mac" };
+    else if (path === "/api/projects") result = { projects: state.projects };
+    else if (path === "/api/projects/resolve") {
+      const reference = body.reference.toLowerCase().replace(/^the /, "");
+      const exact = state.projects.filter((p) => [p.name, p.path, ...p.aliases].some((v) => v.toLowerCase() === reference));
+      const matches = exact.length ? exact : state.projects.filter((p) => [p.name, p.path, ...p.aliases].some((v) => v.toLowerCase().includes(reference)));
+      result = reference.startsWith("/") ? { status: "resolved", path: body.reference, project: exact[0] } : matches.length === 1 ? { status: "resolved", path: matches[0].path, project: matches[0] } : { status: matches.length ? "ambiguous" : "not_found", candidates: matches };
+      if (state.projectDelay) await new Promise((resolve) => setTimeout(resolve, state.projectDelay));
+    } else if (path === "/api/projects/register") {
+      result = { id: `project-${state.projects.length}`, name: body.name, path: body.path, canonicalPath: body.path, aliases: body.aliases || [], lastUsed: null }; state.projects.push(result);
+    } else if (path === "/api/projects/update") {
+      result = state.projects.find((p) => p.id === body.id); Object.assign(result, { name: body.name, aliases: body.aliases });
+    } else if (path === "/api/projects/remove") { state.projects = state.projects.filter((p) => p.id !== body.id); result = { ok: true }; }
     else if (path === "/api/sessions" && request.method() === "GET")
       result = state.sessions;
     else if (path === "/api/sessions") {
@@ -954,4 +968,66 @@ test.describe("mobile polish", () => {
     await page.getByRole("button", { name: "Send", exact: true }).tap();
     await expect(page.getByText("Queued", { exact: true })).toBeVisible();
   });
+});
+
+
+test("project picker resolves names, asks for ambiguity and missing references, and confirms an absolute path before launch", async ({ page }) => {
+  const state = await fixture(page);
+  state.projects.push({ id: "second", name: "work app", path: "/Users/dev/work/app", aliases: ["personal repo"], lastUsed: null });
+  await page.goto("/"); await page.getByRole("button", { name: "New session", exact: true }).click();
+  await expect(page.getByRole("button", { name: "app /Users/dev/code/app", exact: true })).toBeVisible();
+  await page.getByLabel("Project directory").fill("personal repo");
+  await expect(page.locator("#project-status")).toContainText("Which project");
+  await expect(page.getByRole("button", { name: "Start session", exact: true })).toBeDisabled();
+  await page.getByRole("button", { name: "work app /Users/dev/work/app", exact: true }).click();
+  await expect(page.locator("#project-status")).toContainText("/Users/dev/work/app");
+  await page.getByLabel("Project directory").fill("unknown repo");
+  await expect(page.locator("#project-status")).toContainText("No project matches");
+  expect(state.calls.filter((c) => c.path === "/api/sessions" && c.body)).toHaveLength(0);
+  await page.getByLabel("Project directory").fill("app");
+  await expect(page.locator("#project-status")).toContainText("Project: app · /Users/dev/code/app");
+  await page.getByLabel("Session name").fill("named-project"); await page.getByLabel("First task").fill("Inspect this project");
+  await page.getByRole("button", { name: "Start session", exact: true }).click();
+  expect(state.calls.find((c) => c.path === "/api/sessions" && c.body)?.body.cwd).toBe("/Users/dev/code/app");
+});
+
+test("a developer remembers, renames, removes projects on the host and can read full paths by keyboard on mobile", async ({ page }) => {
+  const state = await fixture(page); (state.sessions[0] as any).project_name = "personal";
+  await page.setViewportSize({ width: 360, height: 640 }); await page.goto("/");
+  await page.getByRole("button", { name: "Open session navigation" }).click();
+  await page.getByRole("button", { name: /Fix sign-in/ }).click();
+  const details = page.locator("#heading-details summary"); await details.focus(); await page.keyboard.press("Enter");
+  await expect(page.locator("#conversation-subtitle")).toContainText(managed.cwd);
+  await expect(details).toContainText("personal");
+  await page.getByRole("button", { name: "Open session navigation" }).click();
+  await page.getByRole("button", { name: "New session", exact: true }).click();
+  await page.getByLabel("Project directory").fill("/Users/dev/code/new-project");
+  await expect(page.locator("#project-status")).toContainText("Unregistered directory");
+  await page.getByText("Remember or manage a project", { exact: true }).click();
+  await page.getByLabel("Short project name").fill("new repo"); await page.getByLabel("Aliases (comma separated)").fill("my repo");
+  await page.getByRole("button", { name: "Remember project", exact: true }).click();
+  await expect(page.locator("#project-feedback")).toContainText("Project saved");
+  expect(state.projects.at(-1)).toMatchObject({ name: "new repo", aliases: ["my repo"] });
+  await page.getByLabel("Short project name").fill("renamed repo"); await page.getByRole("button", { name: "Save project name" }).click();
+  await expect(page.locator("#project-status")).toContainText("renamed repo");
+  await page.getByRole("button", { name: "Remove project" }).click();
+  await expect(page.locator("#project-feedback")).toContainText("Project removed");
+  expect(state.projects.some((p) => p.name === "renamed repo")).toBe(false);
+  await expect(page.getByLabel("Project directory")).toBeFocused();
+  await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+});
+
+test("a stale project resolution cannot enable launch for a newer unknown reference", async ({ page }) => {
+  const state = await fixture(page); state.projectDelay = 500;
+  await page.goto("/"); await page.getByRole("button", { name: "New session", exact: true }).click();
+  await page.getByLabel("Project directory").fill("app");
+  await expect.poll(() => state.calls.some((c) => c.path === "/api/projects/resolve" && c.body.reference === "app")).toBe(true);
+  state.projectDelay = 0; await page.getByLabel("Project directory").fill("unknown");
+  await expect(page.locator("#project-status")).toContainText("No project matches");
+  await page.waitForTimeout(600);
+  await expect(page.locator("#project-status")).toContainText("No project matches");
+  await expect(page.getByRole("button", { name: "Start session", exact: true })).toBeDisabled();
+  expect(state.calls.filter((c) => c.path === "/api/sessions" && c.body)).toHaveLength(0);
 });

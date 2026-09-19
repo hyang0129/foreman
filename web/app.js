@@ -75,6 +75,8 @@ let messageSignature = "",
   pmBusy = false;
 let pmModel = "", pmModelSaving = false, pmModelLoading = false, pmModelReady = false,
   pmModelLoaded = false, modelRevision = 0, newModelRequest = 0;
+let projectRows = [], projectResolution = null, projectRevision = 0, projectPending = false;
+const projectName = (s) => s.project_name || (s.cwd || "").split("/").filter(Boolean).at(-1) || "Project unavailable";
 const drafts = new Map(),
   sendAttempts = new Map();
 const actionFeedback = new Map(), approvalFeedback = new Map();
@@ -217,6 +219,8 @@ function revokeAccess(message) {
   pmModel = ""; pmModelLoaded = false; pmModelReady = false;
   sending = false; creating = false; pmModelSaving = false; pmModelLoading = false;
   newModelRequest++;
+  projectRevision++; projectRows = []; projectResolution = null; projectPending = false;
+  $("#project-choices").replaceChildren(); $("#project-status").textContent = ""; $("#project-feedback").textContent = "";
   ui.interrupt.dataset.busy = "false";
   $("#create-session").textContent = "Start session";
   $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved on your Mac.";
@@ -277,7 +281,7 @@ function renderRail() {
     (s) =>
       s.name !== "foreman-pm" &&
       (!query ||
-        `${s.name} ${s.cwd} ${s.provider}`.toLowerCase().includes(query)),
+        `${s.name} ${s.cwd} ${s.project_name || ""} ${s.provider}`.toLowerCase().includes(query)),
   );
   $("#session-count").textContent = String(
     sessions.filter((s) => s.name !== "foreman-pm").length,
@@ -300,6 +304,8 @@ function renderRail() {
         "button",
         `session-row${selected === s.session_key ? " selected" : ""}`,
       );
+      row.title = s.cwd || "";
+      row.setAttribute("aria-description", s.cwd || "");
       row.type = "button";
       row.dataset.session = s.session_key;
       row.setAttribute("aria-pressed", String(selected === s.session_key));
@@ -317,13 +323,13 @@ function renderRail() {
           ? s.reason || "Waiting for your response"
           : s.state === "working"
             ? s.current_tool || "Working on your task"
-            : s.last_message || shortPath(s.cwd);
+            : s.last_message || projectName(s);
       row.append(
         node("span", "session-sub", summary),
         node(
           "span",
           "session-meta",
-          `${s.provider === "codex" ? "Codex" : "Claude"} · ${s.managed ? `Managed · ${policyLabel(s)}` : "Monitoring"}${!host.online ? " · Last known" : ""}`,
+          `${projectName(s)} · ${s.provider === "codex" ? "Codex" : "Claude"} · ${s.managed ? `Managed · ${policyLabel(s)}` : "Monitoring"}${!host.online ? " · Last known" : ""}`,
         ),
       );
       row.addEventListener("click", () => selectSession(s.session_key));
@@ -356,7 +362,7 @@ function updateControls() {
   ui.messages.querySelectorAll("[data-new-session]").forEach((button) => {
     button.disabled = !authorized || !host.online;
   });
-  $("#create-session").disabled = !authorized || !host.online || creating;
+  $("#create-session").disabled = !authorized || !host.online || creating || projectPending || !projectResolution;
   ui.input.disabled = !canMessage || sending;
   ui.send.disabled = !canMessage || sending || !ui.input.value.trim();
   ui.send.firstChild.textContent = sending ? "Sending… " : "Send ";
@@ -394,6 +400,9 @@ function updateControls() {
     });
 }
 function renderHeading() {
+  const headingSummary = $("#heading-details summary");
+  const headingName = detail?.session && selected !== "pm" ? projectName(detail.session) : "";
+  if (headingSummary.dataset.project !== headingName) { headingSummary.replaceChildren(node("span", "", "Session details"), ...(headingName ? [node("span", "", ` · ${headingName}`)] : [])); headingSummary.dataset.project = headingName; }
   if (selected === "pm") {
     ui.title.textContent = "Project manager";
     ui.provider.hidden = false;
@@ -1027,6 +1036,70 @@ function updateNewPolicy() {
   $("#confirm-bypass").checked = false;
 }
 $("#new-policy").addEventListener("change", updateNewPolicy);
+function projectChoices(rows) {
+  const choices = $("#project-choices"); choices.replaceChildren();
+  for (const project of rows) {
+    const button = node("button", "project-choice"); button.type = "button";
+    button.append(node("strong", "", project.name), node("span", "", project.path));
+    button.addEventListener("click", () => { $("#new-cwd").value = project.path; void resolveNewProject(); });
+    choices.append(button);
+  }
+}
+async function loadProjects() {
+  const epoch = authEpoch;
+  try {
+    const result = await api("/api/projects");
+    if (epoch !== authEpoch || !ui.dialog.open) return;
+    projectRows = result.projects || [];
+    if (!$("#new-cwd").value.trim()) projectChoices(projectRows);
+  } catch (error) { if (epoch === authEpoch) $("#project-status").textContent = `Projects unavailable: ${errorMessage(error)} Enter an absolute directory to try resolving it.`; }
+}
+async function resolveNewProject() {
+  const revision = ++projectRevision, epoch = authEpoch, reference = $("#new-cwd").value.trim();
+  projectResolution = null; projectPending = !!reference;
+  $("#rename-project").hidden = true; $("#remove-project").hidden = true; $("#remember-project").hidden = false;
+  $("#project-name").value = ""; $("#project-aliases").value = ""; $("#project-feedback").textContent = "";
+  $("#project-status").textContent = reference ? "Resolving project…" : "Choose a recent project or search by name, alias, or absolute path.";
+  projectChoices(reference ? projectRows.filter((p) => `${p.name} ${p.path} ${(p.aliases || []).join(" ")}`.toLowerCase().includes(reference.toLowerCase())) : projectRows);
+  updateControls();
+  if (!reference) return;
+  try {
+    const result = await post("/api/projects/resolve", { reference });
+    if (revision !== projectRevision || epoch !== authEpoch || !ui.dialog.open) return;
+    if (result.status === "resolved") {
+      projectResolution = { ...result, reference };
+      $("#project-status").textContent = `Project: ${result.project?.name || "Unregistered directory"} · ${result.path}`;
+      projectChoices([]);
+      $("#project-name").value = result.project?.name || result.path.split("/").filter(Boolean).at(-1) || "";
+      $("#project-aliases").value = (result.project?.aliases || []).join(", ");
+      $("#rename-project").hidden = !result.project; $("#remove-project").hidden = !result.project; $("#remember-project").hidden = !!result.project;
+    } else {
+      $("#project-status").textContent = result.status === "ambiguous" ? "Several projects match. Which project do you mean?" : "No project matches. Choose a registered project or enter its full absolute directory.";
+      projectChoices(result.candidates || []);
+    }
+  } catch (error) { if (revision === projectRevision && epoch === authEpoch) $("#project-status").textContent = errorMessage(error); }
+  finally { if (revision === projectRevision && epoch === authEpoch) { projectPending = false; updateControls(); } }
+}
+$("#new-cwd").addEventListener("input", resolveNewProject);
+async function changeProject(action) {
+  if (!projectResolution || projectPending || !authorized || !host.online) return;
+  const selection = projectResolution, epoch = authEpoch, revision = projectRevision;
+  const button = $(action === "register" ? "#remember-project" : action === "update" ? "#rename-project" : "#remove-project");
+  button.disabled = true; $("#project-feedback").textContent = "Saving…";
+  try {
+    const name = $("#project-name").value.trim(), aliases = $("#project-aliases").value.split(",").map((v) => v.trim()).filter(Boolean);
+    const result = await post(`/api/projects/${action}`, action === "register" ? { name, path: selection.reference.startsWith("/") ? selection.reference : selection.path, aliases } : { id: selection.project.id, name, aliases });
+    if (epoch !== authEpoch || revision !== projectRevision || !ui.dialog.open) return;
+    if (action === "remove") { $("#new-cwd").value = ""; await loadProjects(); await resolveNewProject(); }
+    else { $("#new-cwd").value = result.path; await loadProjects(); await resolveNewProject(); }
+    $("#project-feedback").textContent = action === "remove" ? "Project removed. Existing sessions are unchanged." : "Project saved on your Mac.";
+    $("#new-cwd").focus();
+  } catch (error) { if (epoch === authEpoch && revision === projectRevision) $("#project-feedback").textContent = errorMessage(error); }
+  finally { button.disabled = false; }
+}
+$("#remember-project").addEventListener("click", () => changeProject("register"));
+$("#rename-project").addEventListener("click", () => changeProject("update"));
+$("#remove-project").addEventListener("click", () => changeProject("remove"));
 let dialogOpener;
 function openNew(event) {
   if (!authorized || !host.online) return;
@@ -1038,10 +1111,12 @@ function openNew(event) {
   updateNewPolicy();
   ui.dialog.showModal();
   void loadNewModels();
+  void loadProjects(); void resolveNewProject();
   $("#new-name").focus();
 }
 ui.newButton.addEventListener("click", openNew);
 ui.dialog.addEventListener("close", () => {
+  projectRevision++; projectPending = false; projectResolution = null;
   if (!authorized || creating) return;
   if (dialogOpener?.isConnected && !dialogOpener.closest("[inert]")) dialogOpener.focus({ preventScroll: true });
 });
@@ -1049,13 +1124,13 @@ for (const selector of ["#close-dialog", "#cancel-new"])
   $(selector).addEventListener("click", () => ui.dialog.close());
 ui.newForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (creating || !host.online || !ui.newForm.reportValidity()) return;
+  if (creating || !host.online || projectPending || !projectResolution || projectResolution.reference !== $("#new-cwd").value.trim() || !ui.newForm.reportValidity()) return;
   const values = {
     provider: $("#new-provider").value,
     permission_mode: $("#new-policy").value,
     ...($("#new-model").value ? { model: $("#new-model").value } : {}),
     name: $("#new-name").value.trim(),
-    cwd: $("#new-cwd").value.trim(),
+    cwd: projectResolution.path,
     text: $("#new-prompt").value.trim(),
   };
   if (!values.name || !values.cwd || !values.text) return;

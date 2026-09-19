@@ -999,3 +999,12 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
   .rail-footer { padding-block: 4px; }
   .appearance-control { margin-bottom: 0; }
 }
+
+/* The project picker uses ordinary buttons so touch and keyboard share a flow. */
+.project-choices { display: grid; gap: 6px; max-height: 180px; overflow-y: auto; }
+.project-choice { display: grid; gap: 4px; text-align: left; min-height: 44px; padding: 8px 12px; border: 1px solid var(--control-line); border-radius: 8px; background: var(--surface); color: var(--ink); font: inherit; cursor: pointer; overflow-wrap: anywhere; }
+.project-choice span { font-size: 12px; }
+.project-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-block: 8px; }
+#project-management { margin-block: 10px; }
+#project-management summary { min-height: 44px; padding-block: 12px; cursor: pointer; }
+#project-status, #project-feedback { overflow-wrap: anywhere; }
