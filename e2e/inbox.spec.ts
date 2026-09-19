@@ -1625,3 +1625,88 @@ test("impossible calendar dates stay neutral while valid offsets and leap days k
   await expect(page.locator(".message").filter({ hasText: "Offset crosses local midnight" }).locator("time")).toHaveAccessibleDescription(/Friday, September 18, 2026.*5:30:00 PM/);
   await context.close();
 });
+
+test("no-match search offers a keyboard clear action that preserves focus through polling", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  const search = page.getByRole("searchbox", { name: "Find a session" });
+  await search.fill("no such conversation");
+  await expect(page.getByText("No sessions match your search.", { exact: true })).toBeVisible();
+  const clear = page.getByRole("button", { name: "Clear search", exact: true });
+  await clear.focus();
+  const response = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/sessions");
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await response;
+  await expect(clear).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(search).toBeFocused();
+  await expect(search).toHaveValue("");
+  await expect(page.getByRole("button", { name: /Fix sign-in/ })).toBeVisible();
+  expect(state.calls.filter((call) => call.body)).toHaveLength(0);
+});
+
+test("loading, no sessions and offline empty states retain authoritative Start availability", async ({ page }) => {
+  const state = await fixture(page);
+  state.sessions = [];
+  const release = state.defer("/api/sessions");
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Loading sessions…", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "No sessions yet", exact: true })).toHaveCount(0);
+  release();
+  await expect(page.getByRole("heading", { name: "No sessions yet", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start a session", exact: true })).toBeEnabled();
+  expect(state.calls.filter((call) => call.body)).toHaveLength(0);
+  state.online = false;
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.getByRole("heading", { name: "Your Mac is offline", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start a session", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "New session", exact: true })).toBeDisabled();
+  state.online = true;
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.getByRole("heading", { name: "No sessions yet", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Start a session", exact: true }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  expect(state.calls.filter((call) => call.path === "/api/launch/propose" || (call.path === "/api/sessions" && call.body))).toHaveLength(0);
+});
+
+test("managed and observed empty states recognize host sentinel history without hiding real output", async ({ page }) => {
+  const state = await fixture(page, { history: [] });
+  await openManaged(page);
+  await expect(page.getByRole("heading", { name: "Ready when you are.", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /Terminal research/ }).click();
+  await expect(page.getByRole("heading", { name: "No readable history yet.", exact: true })).toBeVisible();
+  for (const text of ["(no transcript available)", "(transcript unavailable)", "(no transcript on disk)", "(no message records found)"]) {
+    state.history = [{ id: "observed-tail", role: "system", text }];
+    await refreshTimeline(page);
+    await expect(page.getByRole("heading", { name: "No readable history yet.", exact: true })).toBeVisible();
+    await expect(page.locator(".message")).toHaveCount(0);
+  }
+  state.history[0].text = "assistant: (no transcript on disk) is the error we are investigating";
+  await refreshTimeline(page);
+  await expect(page.locator(".message-body")).toHaveText(state.history[0].text);
+  state.online = false;
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.locator("#connection-banner")).toBeVisible();
+  await expect(page.locator(".message-body")).toHaveText(state.history[0].text);
+});
+
+test("touch clear search is reachable at enlarged text without launching work", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 360, height: 640 }, hasTouch: true });
+  const page = await context.newPage();
+  const state = await fixture(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+  const search = page.getByRole("searchbox", { name: "Find a session" });
+  await search.fill("missing project");
+  const clear = page.getByRole("button", { name: "Clear search", exact: true });
+  await expect(clear).toBeVisible();
+  expect((await clear.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  await clear.tap();
+  await expect(search).toBeFocused();
+  await expect(search).toHaveValue("");
+  await expect(page.getByRole("button", { name: /Fix sign-in/ })).toBeVisible();
+  await expectNoPageOverflow(page);
+  expect(state.calls.filter((call) => call.body)).toHaveLength(0);
+  await context.close();
+});

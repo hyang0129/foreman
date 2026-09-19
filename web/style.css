@@ -1054,3 +1054,6 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 .date-separator::before, .date-separator::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 .timestamp-unavailable { font-weight: 400; }
 .message-label { flex-wrap: wrap; }
+
+.rail-empty p { margin: 0 0 12px; }
+.rail-empty .btn { max-width: 100%; }
