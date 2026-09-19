@@ -1503,3 +1503,16 @@ test("phone header keeps history space and exposes long model and project values
   await expectNoPageOverflow(page);
   await context.close();
 });
+
+
+test("PM header does not claim a default while its selected model is loading", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmModel = "sonnet";
+  const release = state.defer("/api/pm/history");
+  await page.goto("/");
+  await page.getByRole("button", { name: /Project manager Plan and delegate/ }).click();
+  await expect(page.locator("#header-model")).toHaveText("Model · Loading model…");
+  await expect(page.locator("#conversation-subtitle")).not.toContainText("Provider default");
+  release();
+  await expect(page.locator("#header-model")).toHaveText("Model · sonnet");
+});

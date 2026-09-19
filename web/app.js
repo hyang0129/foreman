@@ -448,9 +448,9 @@ function renderHeading() {
   if (isPm) {
     ui.title.textContent = "Claude · Project manager";
     ui.provider.hidden = true;
-    selectedModel = pmModel || "Provider default";
+    selectedModel = pmModelReady ? pmModel || "Provider default" : "Loading model…";
     fields.push(["Selected model", selectedModel]);
-    if (!pmModel) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
+    if (pmModelReady && !pmModel) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
     fields.push(["Applies to", "The PM’s replies and planning. Newly launched agents have their own model selection."]);
   } else if (detail?.session) {
     const s = detail.session;
