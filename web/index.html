@@ -181,8 +181,24 @@
         </div>
         <p class="dialog-intro">
           Give an agent a project and a clear first task. It runs on your
-          connected Mac.
+          connected Mac. Review and confirm the setup before a session starts.
         </p>
+        <section id="launch-brief-panel" aria-label="Describe the work">
+          <label for="launch-brief">What should the agent work on?</label>
+          <textarea id="launch-brief" rows="4" maxlength="60000" placeholder="Describe the task and name your project"></textarea>
+          <label for="launcher-model">Launcher model · Claude</label>
+          <select id="launcher-model"><option value="claude-sonnet-5">claude-sonnet-5 (default)</option></select>
+          <p id="launcher-model-hint" class="field-hint">Proposes the setup only. The session has its own model selection.</p>
+          <button id="propose-session" class="btn" type="button">Propose session</button>
+        </section>
+        <div class="launch-mode-actions">
+          <button id="start-manually" class="btn ghost" type="button">Start manually</button>
+          <button id="edit-brief" class="btn ghost" type="button" hidden>Edit brief</button>
+        </div>
+        <p id="launch-status" class="activity-status" role="status"><span class="activity-symbol" aria-hidden="true" hidden></span><span id="launch-status-label"></span></p>
+        <p id="launch-reason" class="field-hint" hidden></p>
+        <fieldset id="session-fields" hidden disabled>
+        <legend>Review and edit session</legend>
         <label
           >Agent<select id="new-provider" name="provider">
             <option value="claude">Claude</option>
@@ -237,6 +253,7 @@
             placeholder="What should the agent work on?"
           ></textarea>
         </label>
+        </fieldset>
         <p id="new-error" class="form-error" role="alert" hidden></p>
         <div class="dialog-actions">
           <button type="button" class="btn ghost" id="cancel-new">Cancel</button

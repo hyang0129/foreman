@@ -5,6 +5,7 @@ import { join, extname } from "node:path";
 import { Fleet, transcriptTail } from "./fleet.ts";
 import { modelCatalog } from "./models.ts";
 import { ProjectManager } from "./pm.ts";
+import { Launcher } from "./launcher.ts";
 import { ProjectRegistry } from "./projects.ts";
 import { SessionService } from "./session-service.ts";
 import { preparePeerTools } from "./peer-tools.ts";
@@ -21,8 +22,9 @@ for (const [f, seed] of [["PROJECTS.md", "# Projects\n\n(none yet)\n"], ["LOG.md
   const p = join(MEMORY_DIR, f); if (!existsSync(p)) writeFileSync(p, seed);
 }
 
-const fleet = new Fleet();
 const projects = new ProjectRegistry();
+const launcher = new Launcher(projects, { identityFile: join(FOREMAN_HOME, 'launcher-sessions.json') });
+const fleet = new Fleet({ excludeSession: (session) => launcher.ownsSession(session) });
 const sessions = new SessionService({ fleet, projects });
 projects.seed(sessions.list());
 sessions.setPrepare((session) => preparePeerTools(sessions, session));
@@ -80,6 +82,9 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (url.pathname === "/api/sessions" && req.method === 'GET') { await fleet.refresh(); return json(res, 200, sessions.list()); }
+    if (url.pathname === '/api/launch/propose' && req.method === 'POST') return json(res, 202, launcher.start(await body(req)));
+    if (url.pathname === '/api/launch' && req.method === 'GET') return json(res, 200, launcher.get(url.searchParams.get('id') ?? ''));
+    if (url.pathname === '/api/launch/cancel' && req.method === 'POST') { const { id } = await body(req); return json(res, 200, launcher.cancel(id)); }
     if (url.pathname === '/api/projects' && req.method === 'GET') { await fleet.refresh(); projects.seed(sessions.list()); return json(res, 200, { projects: projects.list() }); }
     if (url.pathname === '/api/projects/resolve' && req.method === 'POST') { const { reference } = await body(req); return json(res, 200, projects.resolve(reference)); }
     if (url.pathname === '/api/projects/register' && req.method === 'POST') return json(res, 200, projects.register(await body(req)));
@@ -138,7 +143,7 @@ let stopping = false;
 async function shutdown() {
   if (stopping) return;
   stopping = true;
-  fleet.stop(); pm.close(); bridge?.close();
+  fleet.stop(); pm.close(); launcher.close(); bridge?.close();
   const providersClosed = sessions.close();
   for (const client of clients) client.end();
   clients.clear();

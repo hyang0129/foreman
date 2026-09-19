@@ -75,6 +75,7 @@ let messageSignature = "",
   pmBusy = false;
 let pmModel = "", pmModelSaving = false, pmModelLoading = false, pmModelReady = false,
   pmModelLoaded = false, modelRevision = 0, newModelRequest = 0;
+let launchRevision = 0, launchJob = null, launchMode = "brief", launchBusy = false, launcherModelRequest = 0;
 let projectRows = [], projectResolution = null, projectSelection = null, projectRevision = 0, projectPending = false;
 const projectName = (s) => s.project_name || (s.cwd || "").split("/").filter(Boolean).at(-1) || "Project unavailable";
 const drafts = new Map(),
@@ -214,6 +215,7 @@ function post(path, body) {
 }
 
 function revokeAccess(message) {
+  cancelLauncher(); launcherModelRequest++;
   authEpoch++;
   authorized = false;
   pmModel = ""; pmModelLoaded = false; pmModelReady = false;
@@ -362,7 +364,11 @@ function updateControls() {
   ui.messages.querySelectorAll("[data-new-session]").forEach((button) => {
     button.disabled = !authorized || !host.online;
   });
-  $("#create-session").disabled = !authorized || !host.online || creating || projectPending || !projectResolution;
+  $("#create-session").disabled = !authorized || !host.online || creating || projectPending || !projectResolution || launchMode === "brief" || launchBusy;
+  $("#propose-session").disabled = !authorized || !host.online || launchBusy || !$("#launch-brief").value.trim();
+  $("#launch-brief").disabled = launchBusy;
+  $("#launcher-model").disabled = launchBusy;
+  if (launchBusy && !host.online) manualLaunch("Host is offline. Your brief is preserved; start manually when it reconnects.");
   ui.input.disabled = !canMessage || sending;
   ui.send.disabled = !canMessage || sending || !ui.input.value.trim();
   ui.send.firstChild.textContent = sending ? "Sending… " : "Send ";
@@ -973,20 +979,21 @@ function modelOptions(select, models, value = "") {
   }
   retainModel(select, value);
 }
-async function loadNewModels() {
+async function loadNewModels(value = "") {
+  if (typeof value !== "string") value = "";
   const request = ++newModelRequest, epoch = authEpoch;
   const provider = $("#new-provider").value, select = $("#new-model");
-  modelOptions(select, []);
+  modelOptions(select, [], value);
   select.disabled = true;
   $("#new-model-hint").textContent = "Loading available models…";
   try {
     const result = await api(`/api/models?provider=${provider}`);
     if (request !== newModelRequest || epoch !== authEpoch || !authorized) return;
-    modelOptions(select, result.models || []);
+    modelOptions(select, result.models || [], value);
     $("#new-model-hint").textContent = "Uses your provider settings unless you choose a model.";
   } catch (error) {
     if (request !== newModelRequest || epoch !== authEpoch || !authorized) return;
-    $("#new-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen this dialog to retry, or use the provider default.`;
+    $("#new-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Your selected model is retained. Reopen this dialog to retry.`;
   } finally { if (request === newModelRequest) select.disabled = false; }
 }
 async function loadPmModels() {
@@ -1102,6 +1109,87 @@ async function changeProject(action) {
 $("#remember-project").addEventListener("click", () => changeProject("register"));
 $("#rename-project").addEventListener("click", () => changeProject("update"));
 $("#remove-project").addEventListener("click", () => changeProject("remove"));
+function launchStatus(text, busy = false) {
+  $("#launch-status-label").textContent = text;
+  $("#launch-status").classList.toggle("is-active", busy);
+  $("#launch-status .activity-symbol").hidden = !busy;
+}
+function cancelLauncher() {
+  launchRevision++; launchBusy = false;
+  const id = launchJob; launchJob = null;
+  if (id && authorized) void post("/api/launch/cancel", { id }).catch(() => {});
+}
+function setLaunchMode(mode) {
+  launchMode = mode;
+  $("#launch-brief-panel").hidden = mode !== "brief";
+  $("#session-fields").hidden = mode === "brief";
+  $("#session-fields").disabled = mode === "brief";
+  $("#create-session").hidden = mode === "brief";
+  $("#create-session").textContent = mode === "proposal" ? "Confirm and start" : "Start session";
+  $("#edit-brief").hidden = mode === "brief";
+  $("#start-manually").hidden = mode === "manual";
+  $("#launch-reason").hidden = mode !== "proposal";
+  updateControls();
+}
+function manualLaunch(message = "") {
+  cancelLauncher();
+  if (launchMode === "brief" || !$("#new-prompt").value.trim()) $("#new-prompt").value = $("#launch-brief").value;
+  setLaunchMode("manual"); launchStatus(message);
+  $("#new-name").focus();
+}
+async function loadLauncherModels() {
+  const request = ++launcherModelRequest, epoch = authEpoch, value = $("#launcher-model").value || "claude-sonnet-5";
+  try {
+    const result = await api("/api/models?provider=claude");
+    if (epoch !== authEpoch || request !== launcherModelRequest || !ui.dialog.open) return;
+    const select = $("#launcher-model");
+    select.replaceChildren(new Option("claude-sonnet-5 (default)", "claude-sonnet-5"));
+    for (const model of result.models || []) if (model.value !== "claude-sonnet-5") select.add(new Option(model.displayName, model.value));
+    retainModel(select, value);
+    $("#launcher-model-hint").textContent = "Proposes the setup only. The session has its own model selection.";
+  } catch (error) {
+    if (epoch === authEpoch && request === launcherModelRequest) $("#launcher-model-hint").textContent = `Launcher models unavailable: ${errorMessage(error)} You can start manually.`;
+  }
+}
+$("#launch-brief").addEventListener("input", updateControls);
+$("#start-manually").addEventListener("click", () => manualLaunch());
+$("#edit-brief").addEventListener("click", () => {
+  cancelLauncher(); setLaunchMode("brief"); launchStatus(""); $("#launch-brief").focus();
+});
+$("#propose-session").addEventListener("click", async () => {
+  if (launchBusy || !authorized || !host.online || !$("#launch-brief").value.trim()) return;
+  cancelLauncher();
+  const revision = launchRevision, epoch = authEpoch, id = crypto.randomUUID();
+  launchJob = id; launchBusy = true;
+  $("#new-error").hidden = true;
+  launchStatus("Working… Proposing your session", true); updateControls();
+  const current = () => revision === launchRevision && epoch === authEpoch && authorized && ui.dialog.open;
+  try {
+    let job = await post("/api/launch/propose", { id, brief: $("#launch-brief").value.trim(), model: $("#launcher-model").value });
+    const deadline = Date.now() + 65_000;
+    while (current() && job.status === "working") {
+      if (Date.now() > deadline) throw new Error("Launcher took too long.");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (!current()) return;
+      job = await api(`/api/launch?id=${encodeURIComponent(id)}`);
+    }
+    if (!current()) return;
+    if (job.status !== "ready" || !job.proposal) throw new Error(job.error || "Launcher was cancelled or returned no proposal.");
+    const proposal = job.proposal;
+    $("#new-name").value = proposal.name; $("#new-cwd").value = proposal.cwd;
+    $("#new-prompt").value = proposal.text; $("#new-provider").value = proposal.provider;
+    $("#launch-reason").textContent = proposal.reason;
+    await loadNewModels(proposal.model);
+    if (!current()) return;
+    await resolveNewProject();
+    if (!current()) return;
+    launchBusy = false; launchJob = null;
+    setLaunchMode("proposal"); launchStatus("Proposal ready. Edit any field, then confirm to start.");
+    $("#new-name").focus();
+  } catch (error) {
+    if (current()) manualLaunch(`${errorMessage(error)} Your brief is preserved below; review the manual form.`);
+  }
+});
 let dialogOpener;
 function openNew(event) {
   if (!authorized || !host.online) return;
@@ -1112,12 +1200,15 @@ function openNew(event) {
   $("#new-policy").value = "native";
   updateNewPolicy();
   ui.dialog.showModal();
+  setLaunchMode("brief"); launchStatus("");
+  void loadLauncherModels();
   void loadNewModels();
   void loadProjects(); void resolveNewProject();
-  $("#new-name").focus();
+  $("#launch-brief").focus();
 }
 ui.newButton.addEventListener("click", openNew);
 ui.dialog.addEventListener("close", () => {
+  cancelLauncher(); launcherModelRequest++;
   projectRevision++; projectPending = false; projectResolution = null; projectSelection = null;
   if (!authorized || creating) return;
   if (dialogOpener?.isConnected && !dialogOpener.closest("[inert]")) dialogOpener.focus({ preventScroll: true });
@@ -1126,7 +1217,7 @@ for (const selector of ["#close-dialog", "#cancel-new"])
   $(selector).addEventListener("click", () => ui.dialog.close());
 ui.newForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (creating || !host.online || projectPending || !projectResolution || projectResolution.reference !== $("#new-cwd").value.trim() || !ui.newForm.reportValidity()) return;
+  if (launchMode === "brief" || launchBusy || creating || !host.online || projectPending || !projectResolution || projectResolution.reference !== $("#new-cwd").value.trim() || !ui.newForm.reportValidity()) return;
   const values = {
     provider: $("#new-provider").value,
     permission_mode: $("#new-policy").value,
@@ -1156,7 +1247,7 @@ ui.newForm.addEventListener("submit", async (event) => {
     creationAttempt = undefined;
     ui.dialog.close();
     $("#new-name").value = "";
-    $("#new-prompt").value = "";
+    $("#new-prompt").value = ""; $("#launch-brief").value = "";
     await selectSession(session.session_key);
   } catch (error) {
     if (epoch !== authEpoch || !authorized) return;
@@ -1166,7 +1257,7 @@ ui.newForm.addEventListener("submit", async (event) => {
   } finally {
     if (epoch === authEpoch) {
       creating = false;
-      $("#create-session").textContent = "Start session";
+      $("#create-session").textContent = launchMode === "proposal" ? "Confirm and start" : "Start session";
       updateControls();
     }
   }

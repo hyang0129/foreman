@@ -131,3 +131,13 @@ describe('project registry relay contract', () => {
     expect(allowedRequest('GET', '/api/projects/list-directory')).toBe(false);
   });
 });
+
+// The launcher adds only these authenticated, narrowly allowlisted routes.
+it('permits launcher proposal/status/cancel but no arbitrary launch endpoints', () => {
+  expect(allowedRequest('GET', '/api/launch?id=123')).toBe(true);
+  expect(allowedRequest('POST', '/api/launch/propose')).toBe(true);
+  expect(allowedRequest('POST', '/api/launch/cancel')).toBe(true);
+  expect(allowedRequest('POST', '/api/launch')).toBe(false);
+  expect(allowedRequest('GET', '/api/launch/propose')).toBe(false);
+  expect(allowedRequest('POST', '/api/launch/execute')).toBe(false);
+});
