@@ -30,7 +30,7 @@ if (process.argv[1]?.endsWith('/tests/live/observe.mjs')) {
             try {
               for await (const message of stream) {
                 if (message.type === 'system' && message.subtype === 'init')
-                  record({kind:'launcher:init',id,model:message.model,tools:message.tools});
+                  record({kind:'launcher:init',id,session_id:message.session_id,model:message.model,tools:message.tools});
                 if (message.type === 'assistant') for (const block of message.message?.content || [])
                   if (block.type === 'tool_use') record({kind:'launcher:tool_use',id,name:block.name});
                 if (message.type === 'result') {
@@ -66,6 +66,12 @@ function descendants(pid) {
     }
   } while (changed);
   return found;
+}
+async function assertNoUnconfirmedSession(h, count, project) {
+  const rows = await h.api('/api/sessions');
+  assert.equal(rows.length, count, `Unconfirmed sessions: ${JSON.stringify(rows.map(({ managed, cwd, name, kind, session_key }) => ({ managed, cwd, name, kind, session_key })))}`);
+  const projects = (await h.api('/api/projects')).projects;
+  assert.deepEqual(projects.map((entry) => entry.canonicalPath), [project], 'Launcher temporary cwd must not seed a user project');
 }
 async function completedProposal(h, id) {
   return until(async () => {
@@ -118,7 +124,7 @@ test('live launcher requests the exact default, proposes with an explicit availa
     } else {
       assert.ok(defaultResult.proposal); t.diagnostic('Exact claude-sonnet-5 produced a valid proposal.');
     }
-    assert.equal((await h.api('/api/sessions')).length, baseline);
+    await assertNoUnconfirmedSession(h, baseline, f.project);
     assert.equal(existsSync(marker), false);
 
     const launcherModel = process.env.FOREMAN_LIVE_LAUNCHER_MODEL || 'haiku';
@@ -131,7 +137,7 @@ test('live launcher requests the exact default, proposes with an explicit availa
     assert.equal(available.proposal.cwd, f.project); assert.equal(available.proposal.project, 'launcher-fixture');
     assert.match(available.proposal.name, /^[a-z0-9]+(?:-[a-z0-9]+)*$/);
     assert.ok(available.proposal.text.includes('readable.txt')); assert.ok(available.proposal.reason);
-    assert.equal((await h.api('/api/sessions')).length, baseline);
+    await assertNoUnconfirmedSession(h, baseline, f.project);
     assert.equal(existsSync(marker), false, 'A completed launcher must not execute requested setup commands');
 
     // Cancel after a real provider query has a live child process, not merely before dispatch.
@@ -151,7 +157,7 @@ test('live launcher requests the exact default, proposes with an explicit availa
     await until(() => !processRows().some((row) => pids.has(row.pid)), 'cancelled launcher process exit', 10_000);
     const cancelled = await h.api(`/api/launch?id=${cancelId}`);
     assert.equal(cancelled.status, 'cancelled'); assert.equal(cancelled.proposal, undefined);
-    assert.equal((await h.api('/api/sessions')).length, baseline);
+    await assertNoUnconfirmedSession(h, baseline, f.project);
     assert.equal(existsSync(marker), false);
     const tombstoneId = randomUUID();
     await h.api('/api/launch/cancel', { id: tombstoneId });
