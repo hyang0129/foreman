@@ -21,7 +21,7 @@ if (process.argv[1]?.endsWith('/tests/live/observe.mjs')) {
       const query = this.runQuery;
       this.runQuery = (input) => {
         const id = ids.get(input.options.abortController), o = input.options;
-        record({kind:'launcher:query',id,model:o.model,cwd:o.cwd,tools:o.tools,
+        record({kind:'launcher:query',id,sessionId:o.sessionId,model:o.model,cwd:o.cwd,tools:o.tools,
           mcpServers:Object.keys(o.mcpServers || {}),strictMcpConfig:o.strictMcpConfig,
           settingSources:o.settingSources,skills:o.skills,plugins:o.plugins,persistSession:o.persistSession});
         const stream = query(input);
@@ -146,8 +146,13 @@ test('live launcher requests the exact default, proposes with an explicit availa
     await h.api('/api/launch/propose', { id: cancelId, model: launcherModel,
       brief: 'For launcher-fixture, propose a detailed plan for a comprehensive reliability review. Include a thorough first task with many concrete investigation steps, but do not start a session or run commands.' });
     const running = await until(async () => {
-      if (!h.events.some((e) => e.kind === 'launcher:query' && e.id === cancelId)) return false;
-      const rows = descendants(h.child.pid);
+      const query = h.events.find((e) => e.kind === 'launcher:query' && e.id === cancelId);
+      if (!query) return false;
+      assert.ok(query.sessionId, 'Cancellation needs the actual reserved SDK session identity');
+      // Attribute the native process to this exact SDK invocation, not an incidental
+      // concurrent fleet/model-discovery process under the same temporary host.
+      const providers = descendants(h.child.pid).filter((row) => row.command.includes(`--session-id=${query.sessionId}`));
+      const rows = providers.flatMap((row) => [row, ...descendants(row.pid)]);
       const job = await h.api(`/api/launch?id=${cancelId}`);
       assert.equal(job.status, 'working', 'Cancellation must interrupt an active launcher turn');
       return rows.length && rows;
