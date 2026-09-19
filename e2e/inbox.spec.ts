@@ -1183,3 +1183,36 @@ test('a model catalog refresh failure retains the explicitly proposed worker mod
   await expect.poll(() => state.calls.filter((c) => c.path === '/api/sessions' && c.body).length).toBe(1);
   expect(state.calls.find((c) => c.path === '/api/sessions' && c.body)?.body.model).toBe('gpt-6-astra');
 });
+
+test('an offline host cancels a pending proposal and preserves the brief in manual fallback', async ({ page }) => {
+  const state = await fixture(page); state.launchStatus = 'working';
+  await page.goto('/'); await page.locator('#new-session').click(); await page.locator('#launch-brief').fill('Keep this offline brief');
+  await page.locator('#propose-session').click(); await expect(page.locator('#launch-status')).toContainText('Working');
+  state.online = false; await page.evaluate(() => window.dispatchEvent(new Event('online')));
+  await expect(page.locator('#launch-status')).toContainText('Host is offline');
+  await expect(page.locator('#new-prompt')).toHaveValue('Keep this offline brief');
+  await expect(page.locator('#create-session')).toBeDisabled();
+  await expect.poll(() => state.calls.filter((c) => c.path === '/api/launch/cancel').length).toBe(1);
+  expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
+});
+
+test('sign-out cancels the launcher and erases its brief while a delayed response cannot restore it', async ({ page }) => {
+  await page.route('https://www.gstatic.com/firebasejs/**/firebase-app.js', (route) => route.fulfill({ contentType: 'application/javascript', body: 'export const initializeApp = value => value;' }));
+  await page.route('https://www.gstatic.com/firebasejs/**/firebase-auth.js', (route) => route.fulfill({ contentType: 'application/javascript', body: `
+    const user = {email:'owner@example.com',getIdToken:async()=> 'fixture-id-token'};
+    let callback;
+    export const getAuth = () => ({currentUser:user});
+    export const onAuthStateChanged = (auth,fn) => { callback=fn; queueMicrotask(()=>fn(user)); };
+    export const signOut = async auth => { auth.currentUser=null; callback(null); };
+  ` }));
+  const state = await fixture(page, { auth: { required: true, firebase: { apiKey: 'fixture-api-key' } } });
+  await page.goto('/'); await page.locator('#new-session').click(); await page.locator('#launch-brief').fill('Private launch draft');
+  const release = state.defer('/api/launch/propose'); await page.locator('#propose-session').click();
+  await expect(page.locator('#launch-status')).toContainText('Working');
+  // Sign-out control sits outside the modal; exercise the existing sign-out handler directly.
+  await page.locator('#sign-out').evaluate((button: HTMLButtonElement) => button.click());
+  release(); await expect(page.locator('#app')).toBeHidden(); await expect(page.locator('#new-dialog')).not.toBeVisible();
+  await expect(page.locator('#launch-brief')).toHaveValue('');
+  await expect.poll(() => state.calls.filter((c) => c.path === '/api/launch/cancel').length).toBe(1);
+  expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
+});
