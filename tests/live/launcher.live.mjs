@@ -33,7 +33,16 @@ if (process.argv[1]?.endsWith('/tests/live/observe.mjs')) {
                   record({kind:'launcher:init',id,model:message.model,tools:message.tools});
                 if (message.type === 'assistant') for (const block of message.message?.content || [])
                   if (block.type === 'tool_use') record({kind:'launcher:tool_use',id,name:block.name});
-                if (message.type === 'result') record({kind:'launcher:result',id,subtype:message.subtype,is_error:message.is_error});
+                if (message.type === 'result') {
+                  const output = String(message.result || '').trim();
+                  let plainJson = false, fencedJson = false;
+                  try { JSON.parse(output); plainJson = true; } catch {}
+                  const lines = output.split('\\n');
+                  const fenced = ['\`\`\`', '\`\`\`json'].includes(lines[0]) && lines.at(-1) === '\`\`\`';
+                  if (fenced) { try { JSON.parse(lines.slice(1, -1).join('\\n')); fencedJson = true; } catch {} }
+                  record({kind:'launcher:result',id,subtype:message.subtype,is_error:message.is_error,
+                    shape:{length:output.length,startsWithFence:output.startsWith('\`\`\`'),plainJson,fencedJson}});
+                }
                 yield message;
               }
             } finally { record({kind:'launcher:stream_end',id}); }
@@ -117,7 +126,7 @@ test('live launcher requests the exact default, proposes with an explicit availa
     await h.api('/api/launch/propose', { id: availableId, brief, model: launcherModel });
     const available = await completedProposal(h, availableId);
     assert.equal(assertProposalOnlyQuery(h, availableId, f.project).model, launcherModel);
-    assert.equal(available.status, 'ready', `Explicit available launcher model failed: ${available.error}`);
+    assert.equal(available.status, 'ready', `Explicit available launcher model failed: ${available.error}; observed result shape ${JSON.stringify(h.events.find((e) => e.kind === 'launcher:result' && e.id === availableId)?.shape)}`);
     assert.ok(h.events.some((e) => e.kind === 'launcher:result' && e.id === availableId && e.subtype === 'success' && !e.is_error));
     assert.equal(available.proposal.cwd, f.project); assert.equal(available.proposal.project, 'launcher-fixture');
     assert.match(available.proposal.name, /^[a-z0-9]+(?:-[a-z0-9]+)*$/);
