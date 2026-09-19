@@ -1216,3 +1216,89 @@ test('sign-out cancels the launcher and erases its brief while a delayed respons
   await expect.poll(() => state.calls.filter((c) => c.path === '/api/launch/cancel').length).toBe(1);
   expect(state.calls.filter((c) => c.path === '/api/sessions' && c.body)).toHaveLength(0);
 });
+
+async function refreshTimeline(page: Page) {
+  const response = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/session");
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await response;
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+}
+
+test("new output preserves the reading anchor across polls, streaming and history truncation", async ({ page }) => {
+  const state = await fixture(page, {
+    history: Array.from({ length: 60 }, (_, index) => ({ role: "assistant", text: `Answer ${index}\n${"Read this detail. ".repeat(20)}`, at: new Date(2026, 8, 1, 0, index).toISOString() })),
+  });
+  await openManaged(page);
+  const timeline = page.locator("#timeline");
+  await expect(page.locator("#jump-latest")).toBeHidden();
+  await timeline.evaluate((el) => { el.scrollTop = 1800; });
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  const anchor = await page.locator(".message").evaluateAll((els) => {
+    const top = document.querySelector("#timeline")!.getBoundingClientRect().top;
+    const el = els.find((el) => el.getBoundingClientRect().bottom > top)!;
+    return { text: el.querySelector(".message-body")!.textContent!, top: el.getBoundingClientRect().top };
+  });
+  await refreshTimeline(page);
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  state.history = state.history.slice(3);
+  state.history[0].text += "\nStreaming growth above the visible answer. ".repeat(10);
+  state.history.push({ role: "assistant", text: "A new answer arrived", at: new Date().toISOString() });
+  await refreshTimeline(page);
+  await expect(page.getByRole("button", { name: "New messages ↓", exact: true })).toBeVisible();
+  const position = await page.locator(".message").filter({ has: page.locator(".message-body", { hasText: anchor.text }) }).evaluate((el) => el.getBoundingClientRect().top);
+  expect(Math.abs(position - anchor.top)).toBeLessThan(2);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.getByRole("button", { name: "New messages ↓", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(timeline).toBeFocused();
+  await expect(page.locator("#jump-latest")).toBeHidden();
+  expect(await timeline.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(2);
+  state.history.push({ role: "assistant", text: "Automatically follow this new answer", at: new Date().toISOString() });
+  await refreshTimeline(page);
+  expect(await timeline.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(2);
+});
+
+test("receipt updates do not announce new history and switching conversations clears the marker", async ({ page }) => {
+  const state = await fixture(page, { history: Array.from({ length: 40 }, (_, i) => ({ id: `entry-${i}`, role: "assistant", text: `Message ${i} ${"detail ".repeat(40)}` })) });
+  state.receipts.push({ id: "receipt", text: "queued task", status: "queued" });
+  await openManaged(page);
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 200; });
+  state.receipts[0].status = "running";
+  await refreshTimeline(page);
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New messages ↓", exact: true })).toBeHidden();
+  state.history.at(-1)!.text += " streamed output";
+  await refreshTimeline(page);
+  await expect(page.getByRole("button", { name: "New messages ↓", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /Terminal research/ }).click();
+  await expect(page.locator(".message")).toHaveCount(41);
+  await expect(page.locator("#jump-latest")).toBeHidden();
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 200; });
+  await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(page.locator("#jump-latest")).toBeHidden();
+});
+
+test("mobile touch jump stays separate from composer and approval actions", async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 360, height: 640 }, hasTouch: true, reducedMotion: "reduce" });
+  const page = await context.newPage();
+  const state = await fixture(page, { history: Array.from({ length: 30 }, (_, i) => ({ id: String(i), role: "assistant", text: `Answer ${i} ${"detail ".repeat(30)}` })), approvals: [{ id: "allow", kind: "permission", tool: "Read", reason: "Read the project file" }] });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  await page.getByRole("button", { name: /Fix sign-in/ }).tap();
+  await expect(page.locator(".message")).toHaveCount(30);
+  await page.locator("#timeline").evaluate((el) => { el.scrollTop = 100; });
+  state.history.push({ id: "new", role: "assistant", text: "New answer" });
+  await refreshTimeline(page);
+  const button = page.getByRole("button", { name: "New messages ↓", exact: true });
+  const bounds = await button.boundingBox();
+  const composer = await page.locator("#composer").boundingBox();
+  const history = await page.locator("#timeline").boundingBox();
+  expect(bounds!.height).toBeGreaterThanOrEqual(44);
+  expect(bounds!.y).toBeGreaterThanOrEqual(history!.y + history!.height);
+  expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(composer!.y);
+  await button.tap();
+  await expect(button).toBeHidden();
+  await expect(page.getByRole("button", { name: "Allow once" })).toBeInViewport();
+  await context.close();
+});

@@ -1018,3 +1018,9 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 #launch-status { min-height: 0; }
 #launch-status:has(#launch-status-label:empty) { display: none; }
 #launch-reason { overflow-wrap: anywhere; }
+
+/* A separate row reserves space for navigation without obscuring requests. */
+.latest-control { flex-shrink: 0; text-align: center; }
+.latest-control:has(button[hidden]) { display: none; }
+.latest-control button { min-height: 44px; margin: 2px 8px; }
+.timeline { overflow-anchor: none; }
