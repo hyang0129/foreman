@@ -116,3 +116,17 @@ test('missing registry/catalog and tool-use output fail explicitly', async (t) =
   const empty = new Launcher(f.projects, { catalog: f.catalog, query: () => { calls++; return stream(f.value); } });
   result = await settled(empty, empty.start({ id: randomUUID(), brief: 'fixture' }).id); assert.match(result.error!, /No registered/); assert.equal(calls, 0); empty.close();
 });
+
+test('single observed JSON fence is accepted but prose, multiple fences and fenced policy fields still fail', async (t) => {
+  const f = setup(t);
+  for (const [text, expected] of [
+    ['```json\n' + JSON.stringify(f.value) + '\n```', 'ready'],
+    ['Before the proposal\n```json\n' + JSON.stringify(f.value) + '\n```', 'failed'],
+    ['```json\n' + JSON.stringify(f.value) + '\n```\n```json\n{}\n```', 'failed'],
+    ['```json\n' + JSON.stringify({ ...f.value, permission_mode: 'bypass' }) + '\n```', 'failed'],
+  ]) {
+    const launcher = new Launcher(f.projects, { catalog: f.catalog, query: () => stream(text) });
+    const result = await settled(launcher, launcher.start({ id: randomUUID(), brief: 'fixture' }).id);
+    assert.equal(result.status, expected); launcher.close();
+  }
+});

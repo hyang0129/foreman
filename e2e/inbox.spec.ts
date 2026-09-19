@@ -1172,7 +1172,7 @@ test('launcher keyboard review remains usable at 360px and short landscape with 
 
 test('a model catalog refresh failure retains the explicitly proposed worker model for confirmation', async ({ page }) => {
   const state = await fixture(page); await page.goto('/'); await page.locator('#new-session').click();
-  await expect(page.locator('#new-model')).toBeEnabled();
+  await expect(page.locator('#new-model option')).toHaveCount(3);
   await page.locator('#launch-brief').fill('Fix sign-in in app');
   state.failures.set('/api/models', 'Model catalog disconnected');
   await page.locator('#propose-session').click();

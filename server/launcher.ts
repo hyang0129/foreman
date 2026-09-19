@@ -78,8 +78,11 @@ export class Launcher {
   }
   private proposal(text: string, projects: Project[], catalogs: Record<string, ModelOption[]>): Proposal {
     if (text.length > 100_000) throw new Error('Launcher returned too much text. Start manually.');
+    // Some catalog models return one complete Markdown JSON fence despite the
+    // JSON-only instruction. Accept only that exact envelope, never surrounding prose.
+    const trimmed = text.trim(), fenced = /^```(?:json)?\r?\n([\s\S]*?)\r?\n```$/.exec(trimmed);
     let value: any;
-    try { value = JSON.parse(text); } catch { throw new Error('Launcher returned an unusable proposal. Start manually or try another launcher model.'); }
+    try { value = JSON.parse(fenced ? fenced[1] : trimmed); } catch { throw new Error('Launcher returned an unusable proposal. Start manually or try another launcher model.'); }
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Launcher returned an unusable proposal. Start manually.');
     if (Object.keys(value).length === 1 && typeof value.question === 'string') throw new Error(bounded(value.question, 'question', 1000));
     const fields = ['project', 'provider', 'model', 'name', 'text', 'reason'];
