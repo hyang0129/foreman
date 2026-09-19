@@ -257,3 +257,17 @@ test('retargeted project parent or final symlink rejects named and absolute laun
   for (const cwd of ['parent', 'final', join(parent, 'repo'), final, join(one, 'repo')]) await assert.rejects(f.service.create({ ...f.input, cwd }), /changed its symlink target/);
   assert.equal(launches, 0); assert.equal(f.service.list().length, 0); assert.equal(f.claude.sent.length, 0);
 });
+
+
+test('a retargeted canonical-equivalent seeded session path cannot launch a provider', async (t) => {
+  const { ProjectRegistry } = await import('../server/projects.ts');
+  const { mkdirSync, realpathSync, symlinkSync } = await import('node:fs');
+  const f = fixture(t), one = join(f.home, 'one'), two = join(f.home, 'two'), link = join(f.home, 'recent-link');
+  mkdirSync(one); mkdirSync(two); symlinkSync(one, link);
+  const registry = new ProjectRegistry(f.home); registry.seed([{ cwd: realpathSync(one) }, { cwd: link }]);
+  rmSync(link); symlinkSync(two, link);
+  const restored = new ProjectRegistry(f.home); restored.seed([{ cwd: link }]); (f.service as any).options.projects = restored;
+  let launches = 0; (f.service as any).options.claudeFactory = () => { launches++; return f.claude; };
+  for (const cwd of [link, 'recent-link', one]) await assert.rejects(f.service.create({ ...f.input, cwd }), /changed its symlink target/);
+  assert.equal(launches, 0); assert.equal(f.service.list().length, 0); assert.equal(restored.list().length, 1);
+});

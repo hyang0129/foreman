@@ -91,3 +91,20 @@ test('PM project tools dispatch through the registry and named/absolute spawn re
   assert.equal((await invoke('spawn_session', { ...input, cwd: 'unknown' })).isError, true);
   assert.equal(launches.length, 2);
 });
+
+
+test('seeding retains canonical-equivalent recent path names and pins them across polling and restart', (t) => {
+  const { home, first, second, registry } = fixture(t);
+  const link = join(home, 'personal-link'); symlinkSync(first, link);
+  registry.seed([{ cwd: first }, { cwd: link }]);
+  assert.equal(registry.list().length, 1);
+  assert.equal(registry.require('personal-link').path, first);
+  assert.ok(registry.list()[0].registeredPaths?.includes(link));
+  rmSync(link); symlinkSync(second, link);
+  const restored = new ProjectRegistry(home);
+  for (const reference of [link, first, 'personal-link']) assert.throws(() => restored.require(reference), /changed its symlink target/);
+  restored.seed([{ cwd: first }, { cwd: link }]);
+  assert.equal(restored.list().length, 1);
+  assert.equal(restored.list()[0].canonicalPath, first);
+  assert.throws(() => restored.require(link), /changed its symlink target/);
+});

@@ -58,7 +58,7 @@ export class ProjectRegistry {
       this.save(); return structuredClone(existing);
     }
     if (this.entries.length >= 500) throw new Error('Project registry limit reached');
-    const project: Project = { id: randomUUID(), name, path, canonicalPath, aliases: [...new Set(aliases)], lastUsed: null };
+    const project: Project = { id: randomUUID(), name, path, canonicalPath, registeredPaths: [path], aliases: [...new Set(aliases)], lastUsed: null };
     this.entries.push(project); this.removed = this.removed.filter((p) => p !== path && p !== canonicalPath); this.save();
     return structuredClone(project);
   }
@@ -84,9 +84,13 @@ export class ProjectRegistry {
         let project = prior ?? this.entries.find((p) => p.canonicalPath === canonicalPath);
         if (!project) {
           if (this.entries.length >= 500) continue;
-          project = { id: randomUUID(), name: basename(canonicalPath) || canonicalPath, path, canonicalPath, aliases: [], lastUsed: null };
+          project = { id: randomUUID(), name: basename(canonicalPath) || canonicalPath, path, canonicalPath, registeredPaths: [path], aliases: [], lastUsed: null };
           this.entries.push(project); changed = true;
         }
+        // Every observed spelling is a registered path too; never repin on a later poll.
+        this.validate(project);
+        const paths = project.registeredPaths ?? [project.path];
+        if (!paths.includes(path)) { project.registeredPaths = [...paths, path]; changed = true; }
         const date = row.updated_at || row.started_at;
         if (date && Number.isFinite(Date.parse(date))) {
           const at = new Date(date).toISOString();
@@ -111,8 +115,8 @@ export class ProjectRegistry {
       return { status: 'resolved', path, ...(project ? { project: structuredClone(project) } : {}) };
     }
     const query = key(reference), projects = this.list();
-    const exact = projects.filter((p) => [p.name, ...p.aliases, basename(p.path), basename(p.canonicalPath)].some((v) => key(v) === query));
-    const candidates = exact.length ? exact : projects.filter((p) => [p.name, ...p.aliases, p.path, p.canonicalPath].some((v) => key(v).includes(query)));
+    const exact = projects.filter((p) => [p.name, ...p.aliases, ...[p.path, p.canonicalPath, ...(p.registeredPaths ?? [])].map((path) => basename(path))].some((v) => key(v) === query));
+    const candidates = exact.length ? exact : projects.filter((p) => [p.name, ...p.aliases, p.path, p.canonicalPath, ...(p.registeredPaths ?? [])].some((v) => key(v).includes(query)));
     if (candidates.length !== 1) return { status: candidates.length ? 'ambiguous' : 'not_found', candidates };
     const project = candidates[0];
     return { status: 'resolved', path: this.validate(project), project };
