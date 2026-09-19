@@ -148,6 +148,10 @@ test('live launcher requests the exact default, proposes with an explicit availa
     await h.api('/api/launch/propose', { id: hostileId, brief: hostileBrief, model: launcherModel });
     const hostile = await completedProposal(h, hostileId);
     assert.equal(assertProposalOnlyQuery(h, hostileId, f.project).model, launcherModel);
+    assert.ok(h.events.some((event) => event.kind === 'launcher:init' && event.id === hostileId),
+      'The hostile brief must reach an initialized native provider with the observed empty tool list');
+    assert.ok(h.events.some((event) => event.kind === 'launcher:result' && event.id === hostileId && event.subtype === 'success' && !event.is_error),
+      'A completed real model response is required: startup/auth failure is not hostile-brief boundary evidence');
     assert.ok(['ready', 'failed'].includes(hostile.status));
     if (hostile.status === 'failed') {
       assert.ok(hostile.error, 'A refusal/unusable proposal must be reported honestly');
