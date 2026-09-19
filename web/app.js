@@ -82,7 +82,7 @@ const projectName = (s) => s.project_name || (s.cwd || "").split("/").filter(Boo
 const drafts = new Map(),
   sendAttempts = new Map();
 const actionFeedback = new Map(), approvalFeedback = new Map();
-let conversationLoading = false;
+let conversationLoading = false, hostChecked = false, sessionsLoaded = false;
 let timelineEntries = [], nextEntryKey = 0, newMessages = false;
 const copyStates = new Map();
 function nearLatest() {
@@ -256,6 +256,8 @@ function revokeAccess(message) {
   modelOptions($("#pm-model"), []);
   clearTimeout(pollTimer);
   sessions = [];
+  hostChecked = false;
+  sessionsLoaded = false;
   detail = null;
   host = { online: false };
   drafts.clear();
@@ -294,17 +296,19 @@ function setNav(open) {
 }
 function renderHost() {
   $("#host-dot").className = `dot ${host.online ? "online" : "offline"}`;
-  $("#host-status").textContent = host.online
+  $("#host-status").textContent = !hostChecked ? "Connecting to execution host…" : host.online
     ? `${host.host || "Execution host"} · online`
     : "Execution host offline";
   const banner = $("#connection-banner");
-  banner.hidden = !!host.online;
+  banner.hidden = !!host.online || !hostChecked;
   banner.textContent =
     "Your Mac is disconnected. Showing the last available state. Messages and approvals will be available when it reconnects.";
   updateControls();
+  if (ui.messages.querySelector(".empty-state") && !conversationLoading) renderMessages();
 }
 function renderRail() {
   const focusedKey = document.activeElement?.dataset?.session;
+  const focusedClear = document.activeElement?.hasAttribute("data-clear-search");
   ui.list.replaceChildren();
   const query = ui.search.value.trim().toLowerCase();
   const visible = sessions.filter(
@@ -366,16 +370,23 @@ function renderRail() {
       ui.list.append(row);
     }
   }
-  if (!visible.length)
-    ui.list.append(
-      node(
-        "p",
-        "rail-empty",
-        query
-          ? "No sessions match your search."
-          : "Your sessions will appear here. Start one above to put an agent to work.",
-      ),
-    );
+  if (!visible.length) {
+    const empty = node("div", "rail-empty");
+    const noMatches = !!query && sessionsLoaded;
+    empty.append(node("p", "", noMatches ? "No sessions match your search."
+      : !hostChecked || (host.online && !sessionsLoaded) ? "Loading sessions…"
+      : !host.online ? "Your Mac is offline. Reconnect to see sessions."
+      : "No sessions yet. Start a session above."));
+    if (noMatches) {
+      const clear = node("button", "btn ghost", "Clear search");
+      clear.type = "button";
+      clear.dataset.clearSearch = "true";
+      clear.addEventListener("click", () => { ui.search.value = ""; renderRail(); ui.search.focus(); });
+      empty.append(clear);
+    }
+    ui.list.append(empty);
+  }
+  if (focusedClear) ui.list.querySelector("[data-clear-search]")?.focus({ preventScroll: true });
   if (focusedKey)
     [...ui.list.querySelectorAll("button")]
       .find((button) => button.dataset.session === focusedKey)
@@ -646,8 +657,12 @@ function renderMessageReceipt(article, receipt) {
   }
 }
 function renderMessages(history = [], receipts = []) {
+  // The observed-session API uses these system sentinels instead of readable history.
+  // Match the exact host-owned shape so actual provider/message text is never hidden.
+  if (detail?.session?.managed === false && history.length === 1 && history[0].id === "observed-tail" && history[0].role === "system"
+    && ["(no transcript available)", "(transcript unavailable)", "(no transcript on disk)", "(no message records found)"].includes(history[0].text)) history = [];
   const now = new Date();
-  const signature = JSON.stringify([selected, history, receipts, localDay(now)]);
+  const signature = JSON.stringify([selected, history, receipts, localDay(now), hostChecked, host.online, sessionsLoaded, sessions.length, detail?.session?.capabilities?.message]);
   if (signature === messageSignature) return;
   const wasNearBottom = nearLatest();
   const firstRender = !messageSignature;
@@ -711,25 +726,19 @@ function renderMessages(history = [], receipts = []) {
     fragment.append(item.element);
   }
   timelineEntries = entries;
-  if (!history.length && !receipts.length)
-    fragment.append(
-      selected
-        ? emptyState(
-            selected === "pm"
-              ? "A little direction goes a long way."
-              : "Ready when you are.",
-            selected === "pm"
-              ? "Tell your project manager what you want to accomplish. It can check the fleet and delegate the next steps."
-              : detail?.session?.capabilities?.message
-                ? "Send a task or a follow-up to begin the conversation."
-                : "No readable conversation is available yet. Activity will appear as this session runs.",
-          )
-        : emptyState(
-            "Make room for the work.",
-            "Start a Claude or Codex session, or pick an existing conversation. Everything that needs you is one click away.",
-            true,
-          ),
-    );
+  if (!history.length && !receipts.length) {
+    const loading = !hostChecked || (host.online && !sessionsLoaded && !selected);
+    const title = loading ? "Loading sessions…" : !host.online ? "Your Mac is offline"
+      : selected === "pm" ? "A little direction goes a long way."
+      : selected ? (detail?.session?.capabilities?.message ? "Ready when you are." : "No readable history yet.")
+      : sessions.filter((s) => s.name !== "foreman-pm").length ? "Choose a conversation" : "No sessions yet";
+    const text = loading ? "Checking your execution host for sessions."
+      : !host.online ? "Reconnect your Mac to view sessions and continue work."
+      : selected === "pm" ? "Tell your project manager what you want to accomplish. It can check the fleet and delegate the next steps."
+      : selected ? (detail?.session?.capabilities?.message ? "Send a task or a follow-up to begin the conversation." : "No readable conversation is available yet. Activity will appear as this session runs.")
+      : "Choose an existing conversation or start a Claude or Codex session.";
+    fragment.append(emptyState(title, text, !selected && !loading));
+  }
   ui.messages.replaceChildren(fragment);
   if (focusEntry && focusCopy) {
     const article = entries.find((item) => String(item.key) === focusEntry)?.element;
@@ -1010,11 +1019,13 @@ async function poll() {
     const nextHost = await api("/api/host");
     if (!authorized || epoch !== authEpoch) return;
     host = nextHost;
+    hostChecked = true;
     renderHost();
     if (host.online) {
       const rows = await api("/api/sessions");
       if (!authorized || epoch !== authEpoch) return;
       sessions = Array.isArray(rows) ? rows : [];
+      sessionsLoaded = true;
       renderRail();
       await refreshSelected().catch(showRefreshError);
       if (!selected) {
@@ -1029,7 +1040,9 @@ async function poll() {
   } catch (error) {
     if (authorized && epoch === authEpoch) {
       host = { online: false };
+      hostChecked = true;
       renderHost();
+      renderRail();
       renderHeading();
       $("#connection-banner").textContent =
         `Cannot reach the execution host. ${errorMessage(error)} Retrying automatically.`;
