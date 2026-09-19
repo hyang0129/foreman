@@ -1034,3 +1034,9 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 .copy-feedback { font-size: .75rem; overflow-wrap: anywhere; }
 .copy-feedback.error { color: var(--error); }
 .message:hover .copy-button, .message:focus-within .copy-button { border-color: var(--accent); }
+
+.header-model { overflow: hidden !important; text-overflow: ellipsis; white-space: nowrap !important; }
+.header-metadata { display: grid; gap: 4px; margin: 8px 0; font-size: .75rem; overflow-wrap: anywhere; }
+.header-metadata dt { color: var(--secondary); font-weight: 650; }
+.header-metadata dd { margin: 0 0 6px; }
+.pm-model-help { flex-basis: 100%; }

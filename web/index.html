@@ -94,12 +94,13 @@
               <h1 id="conversation-title">Your session inbox</h1>
               <span id="provider" class="badge" hidden></span>
             </div>
+            <p id="header-model" class="header-model" hidden></p>
             <div id="activity-status" class="activity-status" role="status" aria-live="polite" aria-atomic="true" hidden>
               <span class="activity-symbol" aria-hidden="true"></span><span id="activity-label"></span>
             </div>
             <details id="heading-details">
               <summary>Session details</summary>
-              <p id="conversation-subtitle">Choose a session or start something new.</p>
+              <div id="conversation-subtitle">Choose a session or start something new.</div>
             </details>
           </div>
           <button id="interrupt" class="btn ghost small" aria-describedby="interrupt-feedback" disabled>
@@ -140,6 +141,7 @@
         <div id="pm-model-control" class="model-control" hidden>
           <label for="pm-model">Project manager model · Claude</label>
           <select id="pm-model" aria-describedby="pm-model-hint" disabled><option value="">Provider default</option></select>
+          <p class="field-hint pm-model-help">Controls the PM’s replies and planning. Newly launched agents have their own model selection.</p>
           <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn.</span>
         </div>
         <div id="control-note" class="control-note" role="status"></div>
