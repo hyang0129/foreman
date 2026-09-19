@@ -1169,3 +1169,17 @@ test('launcher keyboard review remains usable at 360px and short landscape with 
   await expectActionTextFits(page, '.dialog-actions button'); await expectNoPageOverflow(page);
   await page.keyboard.press('Escape'); await expect(page.locator('#new-session')).toBeFocused();
 });
+
+test('a model catalog refresh failure retains the explicitly proposed worker model for confirmation', async ({ page }) => {
+  const state = await fixture(page); await page.goto('/'); await page.locator('#new-session').click();
+  await expect(page.locator('#new-model')).toBeEnabled();
+  await page.locator('#launch-brief').fill('Fix sign-in in app');
+  state.failures.set('/api/models', 'Model catalog disconnected');
+  await page.locator('#propose-session').click();
+  await expect(page.locator('#launch-status')).toContainText('Proposal ready');
+  await expect(page.locator('#new-model-hint')).toContainText('Model catalog disconnected');
+  await expect(page.locator('#new-model')).toHaveValue('gpt-6-astra');
+  await page.locator('#create-session').click();
+  await expect.poll(() => state.calls.filter((c) => c.path === '/api/sessions' && c.body).length).toBe(1);
+  expect(state.calls.find((c) => c.path === '/api/sessions' && c.body)?.body.model).toBe('gpt-6-astra');
+});

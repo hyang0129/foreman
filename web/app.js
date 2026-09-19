@@ -983,7 +983,7 @@ async function loadNewModels(value = "") {
   if (typeof value !== "string") value = "";
   const request = ++newModelRequest, epoch = authEpoch;
   const provider = $("#new-provider").value, select = $("#new-model");
-  modelOptions(select, []);
+  modelOptions(select, [], value);
   select.disabled = true;
   $("#new-model-hint").textContent = "Loading available models…";
   try {
@@ -993,7 +993,7 @@ async function loadNewModels(value = "") {
     $("#new-model-hint").textContent = "Uses your provider settings unless you choose a model.";
   } catch (error) {
     if (request !== newModelRequest || epoch !== authEpoch || !authorized) return;
-    $("#new-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen this dialog to retry, or use the provider default.`;
+    $("#new-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Your selected model is retained. Reopen this dialog to retry.`;
   } finally { if (request === newModelRequest) select.disabled = false; }
 }
 async function loadPmModels() {
