@@ -6,7 +6,7 @@ The Cloudflare app is deployed at **https://foreman.hooong-yang.workers.dev**. I
 
 Firebase project **foreman-hong-2026** (number `1070263755050`) is active. Google sign-in is enabled, the web app is registered, and the public SDK configuration is deployed. Google Cloud billing is disabled; no paid plan was enabled.
 
-Authorized domains are `foreman-hong-2026.firebaseapp.com`, `foreman-hong-2026.web.app`, and `foreman.hooong-yang.workers.dev`. The Worker allows verified Google identity `hooong.yang@gmail.com` only.
+Authorized domains are `foreman-hong-2026.firebaseapp.com`, `foreman-hong-2026.web.app`, `foreman.hooong-yang.workers.dev`, and `foreman-dev.hooong-yang.workers.dev`. The Worker allows verified Google identity `hooong.yang@gmail.com` only.
 
 Open the hosted app and choose **Continue with Google**. The deployed browser flow was checked through the Google Accounts sign-in page with no browser errors. Completing account selection in the user's browser remains the final end-to-end identity check; unauthenticated and malformed-token API requests were verified to fail with 401/403.
 
@@ -46,3 +46,80 @@ The alternate environment configuration requires **both** `FOREMAN_RELAY_URL` (H
 `npm run cloud:test` exercises Firebase token rules and actual Durable Object WebSocket routing in the Workers test runtime. `npm test` includes the outbound bridge and local session service. `npm run test:ui` covers browser flows with mock APIs. `npm run probe:mvp -- --live` exercises both installed providers in disposable sessions and consumes provider usage.
 
 References: [Firebase activation requirements](https://firebase.google.com/docs/projects/use-firebase-with-existing-cloud-project), [Firebase token verification](https://firebase.google.com/docs/auth/admin/verify-id-tokens), [Durable Object WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
+
+## Stable development environment
+
+**https://foreman-dev.hooong-yang.workers.dev** is the reusable branch preview. Its browser tab says **[DEV]** and a **DEV · commit · :4178** badge stays visible. The hostname remains stable across deploys, including teardown/recreation. This is one shared dev environment, not one environment per branch.
+
+| | Production | Development |
+|---|---|---|
+| Worker | `foreman` | `foreman-dev` |
+| Durable Object | Production `HostRelay` namespace | Separate `HostRelay` namespace owned by `foreman-dev` |
+| Local port | 4177 | 4178 (loopback only) |
+| Local state | `~/.foreman` | `~/.foreman-dev` |
+| Pairing | `~/.foreman/cloud.json` | `~/.foreman-dev/dev-pairing.json`, independent random credential |
+| Daemon | Installed launchd service | Detached process controlled only by `dev:*` scripts |
+
+Both use Firebase project `foreman-hong-2026`, its Google provider, public web configuration, and the same single allowed identity, **hooong.yang@gmail.com**. Both run on this Mac and consume the same Cloudflare and provider accounts/quotas. Dev has separate managed sessions, receipts, PM history, memory, local API token, provider configuration/history, and (for the UX sprint) project registry. Production's launchd job, pairing and state are never read or modified by the dev commands.
+
+Dev is not a filesystem sandbox. Sessions can work in whichever project directory you select, so choose a disposable worktree for UX testing. The dev daemon uses the selected branch's application code, including its normal PM and provider behavior; Native/Bypass still mean the same thing. No production sessions or project registrations are imported. Existing terminal sessions in production's provider registry are not shown in the isolated dev registry.
+
+### Deploy a branch or worktree
+
+Run these commands from a checkout containing this workflow. Until this PR merges, use `/private/tmp/foreman-dev-environment` on `feat/dev-environment`; the UX branch itself does not need these scripts.
+
+```sh
+cd /private/tmp/foreman-dev-environment
+npm run dev:stop
+npm run dev:deploy -- --source /private/tmp/foreman-ux-integration
+npm run dev:start
+npm run dev:status
+```
+
+That deploys the committed `HEAD` of `/private/tmp/foreman-ux-integration` (`epic/1-ux-polish`) without changing its branch or working files. Alternatively choose any local branch/ref explicitly:
+
+```sh
+npm run dev:stop
+npm run dev:deploy -- --source /Users/hong/code/foreman --ref epic/1-ux-polish
+npm run dev:start
+```
+
+Without arguments, `dev:deploy` selects the workflow checkout's `HEAD`. The source must be a local Git checkout with installed `node_modules` and a `package-lock.json` identical to the selected commit. Use `npm ci` in the source checkout when needed. Tracked changes must be committed for a `HEAD` preview; untracked files are excluded. A named `--ref` intentionally previews that commit, ignoring working changes. Commits containing symlinks are refused.
+
+Deployment creates a source snapshot beneath `~/.foreman-dev/release-*`, links the source checkout's installed dependencies, adds the DEV badge to the snapshot only, and uploads its Worker and web assets using a generated dev-only config. Starting the daemon uses that exact snapshot. Keep the source checkout and its dependencies available while the dev daemon runs; changing installed dependencies requires a new preview. No package install scripts run during deploy. The config supports the current `HostRelay`/`RELAY`/`ASSETS` contract; a future branch that changes bindings or migrations needs an explicit update to the dev workflow.
+
+Only `foreman-dev`, its fixed Cloudflare account, hostname, home and port are accepted. Dev scripts refuse `FOREMAN_*`, account/environment/config overrides, extra target flags, unsafe state files, a busy port, or an unrelated process in the saved PID. A running dev daemon must be stopped before redeploy. Start also refuses a mismatched Worker commit or an already-connected dev host. Concurrent commands are locked; after a crashed command, check that no dev operation remains before removing only `~/.foreman-dev/operation.lock`.
+
+`cloud:deploy`, `cloud:dev` (Wrangler's local emulator), and `service:*` retain their existing production behavior. Do not use them for this preview. The dev scripts do not call them.
+
+### Start, use, and stop
+
+`dev:start` passes `FOREMAN_HOME=~/.foreman-dev`, `FOREMAN_PORT=4178`, `FOREMAN_RELAY_URL=https://foreman-dev.hooong-yang.workers.dev`, and the dev `FOREMAN_HOST_TOKEN` to a detached daemon. The token stays out of command arguments and logs. Pairing and credential files have mode 0600 inside a mode-0700 directory. The daemon remains running after the shell exits; it does not automatically start after logout/reboot or restart after a crash.
+
+On first start, it copies only Codex `auth.json` from the current Codex home and retrieves Claude OAuth credentials from the macOS **Claude Code-credentials** Keychain entry into private dev configuration directories. It never reads or writes `~/.claude`. An existing `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` can supply Claude authentication instead. Be signed in to both installed providers first; an unavailable credential fails startup. These are the same provider accounts and real usage, with separate session history. After credentials expire, stop dev and sign in using the provider CLI with its configuration home set to `~/.foreman-dev/claude` or `~/.foreman-dev/codex` respectively.
+
+Open the dev URL, choose **Continue with Google**, and select **hooong.yang@gmail.com**. Confirm the DEV badge, wait for the Mac to show online, and use the app normally. For the UX sprint, register a disposable project worktree in Settings before creating a session. Keep this Mac awake and connected. Google sign-in is for the hosted URL; `http://127.0.0.1:4178` uses the separate local token at `~/.foreman-dev/local-api-token`.
+
+```sh
+npm run dev:status  # PID, commit, URL, home, port, authenticated relay status
+npm run dev:stop    # gracefully stops only the recorded dev daemon
+npm run dev:start   # resumes the deployed snapshot; preserves dev history
+```
+
+Logs are in `~/.foreman-dev/daemon.log`, replaced at each start. A successful start requires both a health response from the new PID and an online relay. Status queries a dev-only credential-protected endpoint without replacing its WebSocket. Normal browser APIs still require the allowed Google identity. `dev:stop` checks the process start time and command identity before signalling and refuses to kill a reused PID. A failed deploy retains its credential for recovery; a failed teardown retains local state.
+
+### Firebase setup (once per hostname)
+
+The dev hostname **foreman-dev.hooong-yang.workers.dev** has been added to Firebase Authentication authorized domains, preserving all three original domains. The existing configuration procedure above still applies: `npx --yes firebase-tools deploy --only auth --project foreman-hong-2026` enables Google, and `apps:sdkconfig` retrieves its public config. Neither command adds arbitrary authorized domains.
+
+To reproduce the domain step manually, open [Firebase Authentication settings](https://console.firebase.google.com/project/foreman-hong-2026/authentication/settings), choose **Authorized domains → Add domain**, and enter `foreman-dev.hooong-yang.workers.dev` (no scheme or path). Preserve production's domain and both Firebase defaults. This setup was applied and read back using the Firebase CLI's signed-in account and Identity Toolkit `projects.updateConfig` with `updateMask=authorizedDomains`, appending to the existing list. The console is the supported interactive alternative; don't put admin credentials in this repository. Firebase terms acceptance, if ever required for a new account, remains console-only. No additional paid plan or identity allowlist is needed.
+
+### Tear down
+
+```sh
+npm run dev:destroy
+```
+
+This gracefully stops dev, deletes only `foreman-dev` and its Durable Object namespace through Cloudflare's API with `force=false` (refusing dependency-breaking deletion), then removes its local home, snapshots, pairing, provider credential copies and session history. It uses the current Wrangler login, or Cloudflare API credentials from the environment. Cloudflare deletion must succeed before local cleanup. This permanently discards dev history; use `dev:stop` to preserve it. Firebase's authorized domain stays configured so recreation uses the same link without another console change. Shared provider accounts, repositories and production are untouched.
+
+References: [Cloudflare namespace isolation](https://developers.cloudflare.com/durable-objects/reference/environments/), [Worker deletion API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/delete/), [Firebase Google sign-in](https://firebase.google.com/docs/auth/web/google-signin).
