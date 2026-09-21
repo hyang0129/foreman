@@ -96,7 +96,9 @@ test('stop signals the owned daemon and observes its actual graceful exit', asyn
   await once(child.stdout,'data');
   writeFileSync(join(home,'daemon.json'),JSON.stringify({pid:child.pid,id,identity:processIdentity(child.pid)}),{mode:0o600});
   assert.equal(running(home).pid,child.pid);
+  const exited=once(child,'exit');
   await stop(home);
+  await exited;
   assert.equal(readFileSync(stopped,'utf8'),'graceful'); assert.equal(child.exitCode,0);
   assert.equal(processIdentity(child.pid),''); assert.equal(existsSync(join(home,'daemon.json')),false);
 });

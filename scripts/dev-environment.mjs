@@ -105,7 +105,12 @@ function releasePath(home, deployment) {
 }
 export function processIdentity(pid) {
   if (!Number.isSafeInteger(pid) || pid < 2) throw new Error('Invalid daemon PID');
-  try { return run('ps', ['-p', String(pid), '-o', 'lstart=,command=']).trim(); }
+  try {
+    const row = run('ps', ['-p', String(pid), '-o', 'stat=,lstart=,command=']).trim();
+    const match = row.match(/^(\S+)\s+(.*)$/);
+    // A terminated child may briefly remain as a zombie before its parent reaps it.
+    return !match || match[1].startsWith('Z') ? '' : match[2];
+  }
   catch (error) { if (error.status === 1) return ''; throw error; }
 }
 export function running(home) {
@@ -139,7 +144,9 @@ export async function stop(home) {
   if (!daemon) { console.log('DEV daemon is stopped'); return; }
   process.kill(daemon.pid, 'SIGTERM');
   for (let i = 0; i < 100; i++) {
-    if (!running(home)) { rmSync(join(home, 'daemon.json')); console.log('DEV daemon stopped'); return; }
+    // After signalling, macOS may hide argv while the process is exiting.
+    // Only observe disappearance here; never signal again on a changed identity.
+    if (!processIdentity(daemon.pid)) { rmSync(join(home, 'daemon.json')); console.log('DEV daemon stopped'); return; }
     await delay(100);
   }
   throw new Error('DEV daemon did not stop in 10 seconds; refusing forced termination or teardown');
