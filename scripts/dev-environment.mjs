@@ -188,6 +188,18 @@ async function deploy(home, options) {
   save(join(home, 'deployment.json'), { release: snapshot.slice(home.length + 1), commit, source });
   console.log(`DEV deployed ${commit}\n${TARGET.url}\nNext: npm run dev:start`);
 }
+// A copied rotating OAuth refresh token is not an independent login: one
+// installation can invalidate the other's copy. Authenticate dev separately.
+export function requireClaudeAuth(binary, configDir, env = process.env, execute = run) {
+  if (env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_OAUTH_TOKEN) return;
+  try {
+    const status = JSON.parse(execute(binary, ['auth', 'status', '--json'], {
+      env: { ...env, CLAUDE_CONFIG_DIR: configDir },
+    }));
+    if (status.loggedIn === true) return;
+  } catch { /* Never include provider output: it may contain credentials. */ }
+  throw new Error(`DEV Claude is not signed in. Run CLAUDE_CONFIG_DIR="${configDir}" "${binary}" auth login, then run npm run dev:start. Dev requires its own login; production OAuth credentials are never copied.`);
+}
 async function start(home) {
   if (running(home)) throw new Error('DEV daemon already running; use dev:status or dev:stop');
   const deployment = read(join(home, 'deployment.json'));
@@ -202,21 +214,13 @@ async function start(home) {
     if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
     owned(path, true);
   }
-  // Copy only provider authentication, never production Foreman or ~/.claude state.
+  // Codex authentication is separate from Foreman state. Claude must sign in independently.
   const codexAuth = join(home, 'codex/auth.json');
   if (!existsSync(codexAuth)) {
     const auth = readFileSync(join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'auth.json'));
     writeFileSync(codexAuth, auth, { mode: 0o600, flag: 'wx' });
   }
-  const claudeAuth = join(home, 'claude/.credentials.json');
-  if (!existsSync(claudeAuth) && !process.env.ANTHROPIC_API_KEY && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-    let credentials;
-    try { credentials = run('/usr/bin/security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w']); }
-    catch { throw new Error('Sign in to Claude on this Mac, or supply ANTHROPIC_API_KEY; dev cannot read Keychain credentials'); }
-    try { if (!JSON.parse(credentials).claudeAiOauth.accessToken) throw new Error(); }
-    catch { throw new Error('Invalid Claude Keychain credentials'); }
-    writeFileSync(claudeAuth, credentials, { mode: 0o600, flag: 'wx' });
-  }
+  requireClaudeAuth(join(snapshot, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude'), join(home, 'claude'));
   const entry = join(home, 'run.mjs');
   if (existsSync(entry)) owned(entry);
   writeFileSync(entry, `console.log('FOREMAN DEV ${deployment.commit}');\nawait import(${JSON.stringify(pathToFileURL(join(snapshot, 'server/main.ts')).href)});\n`, { mode: 0o600 });

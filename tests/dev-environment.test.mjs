@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { argumentsFor, guardEnvironment, owned, openHome, validatePairing, workerConfig, devEntry, freePort, deleteDevWorker, processIdentity, running, stop, TARGET } from '../scripts/dev-environment.mjs';
+import { argumentsFor, guardEnvironment, owned, openHome, validatePairing, workerConfig, devEntry, freePort, deleteDevWorker, processIdentity, running, stop, TARGET, requireClaudeAuth } from '../scripts/dev-environment.mjs';
 
 function temporary(t) { const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-dev-test-'))); t.after(() => rmSync(dir, { recursive: true, force: true })); return dir; }
 test('dev CLI rejects target and lifecycle overrides before side effects', () => {
@@ -101,4 +101,27 @@ test('stop signals the owned daemon and observes its actual graceful exit', asyn
   await exited;
   assert.equal(readFileSync(stopped,'utf8'),'graceful'); assert.equal(child.exitCode,0);
   assert.equal(processIdentity(child.pid),''); assert.equal(existsSync(join(home,'daemon.json')),false);
+});
+
+
+test('Claude dev authentication checks isolated login and never clones production refresh tokens', () => {
+  let calls = 0;
+  requireClaudeAuth('/sdk/claude', '/owned/dev/claude', { PATH: '/bin' }, (binary, args, options) => {
+    calls++; assert.equal(binary, '/sdk/claude'); assert.deepEqual(args, ['auth', 'status', '--json']);
+    assert.equal(options.env.CLAUDE_CONFIG_DIR, '/owned/dev/claude');
+    return JSON.stringify({ loggedIn: true });
+  });
+  assert.equal(calls, 1);
+  for (const result of ['{}', '{"loggedIn":false}', 'bad-json-secret']) {
+    assert.throws(() => requireClaudeAuth('/sdk/claude', '/owned/dev/claude', {}, () => result), (error) => {
+      assert.match(error.message, /DEV Claude is not signed in/);
+      assert.match(error.message, /CLAUDE_CONFIG_DIR="\/owned\/dev\/claude"/);
+      assert.ok(!error.message.includes('bad-json-secret')); return true;
+    });
+  }
+  assert.throws(() => requireClaudeAuth('/sdk/claude', '/owned/dev/claude', {}, () => { throw new Error('secret-output'); }), (error) => !error.message.includes('secret-output'));
+});
+test('explicit Claude API key or token bypasses credential discovery', () => {
+  for (const env of [{ ANTHROPIC_API_KEY: 'test' }, { CLAUDE_CODE_OAUTH_TOKEN: 'test' }])
+    requireClaudeAuth('/sdk/claude', '/owned/dev/claude', env, () => { assert.fail('Must not consult stored credentials'); });
 });
