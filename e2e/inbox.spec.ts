@@ -61,6 +61,7 @@ async function fixture(
     pmHistory: [{ role: "assistant", text: "How can I help the fleet?" }] as any[],
     pmModel: null as string | null,
     pmBusy: false,
+    pmError: null as string | null,
     failMessages: 0,
     failCreates: 0,
     deny: false,
@@ -161,6 +162,7 @@ async function fixture(
       result = {
         history: state.pmHistory,
         busy: state.pmBusy,
+        error: state.pmError,
         model: state.pmModel,
       };
     else if (path === "/api/pm/message") result = { ok: true };
@@ -1709,4 +1711,16 @@ test("touch clear search is reachable at enlarged text without launching work", 
   await expectNoPageOverflow(page);
   expect(state.calls.filter((call) => call.body)).toHaveLength(0);
   await context.close();
+});
+
+test("PM provider failure is visible after polling and reload", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmError = "Project manager failed: OAuth session expired and could not be refreshed. Retry after signing in.";
+  await page.goto("/");
+  await page.locator('#select-pm').click();
+  await expect(page.locator("#error-banner")).toBeVisible();
+  await expect(page.locator("#error-text")).toContainText("OAuth session expired");
+  await page.reload();
+  await expect(page.locator("#error-banner")).toBeVisible();
+  await expect(page.locator("#error-text")).toContainText("OAuth session expired");
 });
