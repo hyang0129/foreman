@@ -675,6 +675,7 @@ async function refreshSelected() {
     return;
   if (key === "pm") {
     pmBusy = !!result.busy;
+    if (result.error) showError(result.error);
     pmModelReady = true;
     if (!pmModelSaving && revision === modelRevision) {
       pmModel = result.model || "";

@@ -56,6 +56,8 @@ class Inbox {
 export class ProjectManager extends EventEmitter {
   private inbox = new Inbox();
   private q: Query | null = null;
+  private queryFactory = query;
+  lastError: string | null = null;
   sessionId: string | null = null;
   busy = false;
   tools: string[] = [];
@@ -100,9 +102,20 @@ export class ProjectManager extends EventEmitter {
   }
   private record(entry: any) { appendFileSync(PM_HISTORY_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"); }
 
+  private fail(reason: string) {
+    const text = `Project manager failed: ${reason.slice(0, 1500)}. Your message was not completed; retry after resolving the error.`;
+    this.lastError = text;
+    console.error('foreman: pm failure', JSON.stringify({ session_id: this.sessionId, pending_turns: this.pendingTurns, error: reason.slice(0, 1500) }));
+    this.record({ role: "system", text, error: true });
+    this.emit("event", { type: "status", text } as PmEvent);
+  }
+
   send(text: string) {
     if (this.changingModel) throw new Error('Model change in progress; retry your message');
-    if (!this.running || this.closed) throw new Error('Project manager is unavailable');
+    if (!this.running || this.closed) {
+      this.fail('Project manager is unavailable');
+      throw new Error(this.lastError!);
+    }
     this.record({ role: "user", text });
     this.pendingTurns++;
     this.inbox.push(text, this.sessionId ?? "");
@@ -159,10 +172,9 @@ export class ProjectManager extends EventEmitter {
   async start(): Promise<void> {
     if (this.running || this.closed) return;
     this.running = true;
-    const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
-    const resumeId = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
     const run = async (resume?: string) => {
-      this.q = query({
+      const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
+      this.q = this.queryFactory({
         prompt: this.inbox.stream(),
         options: {
           cwd: FOREMAN_HOME,
@@ -183,7 +195,7 @@ export class ProjectManager extends EventEmitter {
           stderr: (chunk: string) => { if (/error|warn/i.test(chunk)) this.emit("event", { type: "status", text: chunk.trim().slice(0, 300) } as PmEvent); },
         },
       });
-      let text = "";
+      let text = "", completeText = "", turnError = "";
       for await (const m of this.q as any) {
         if (m.type === "system" && m.subtype === "init") {
           this.sessionId = m.session_id; writeFileSync(PM_SESSION_FILE, m.session_id);
@@ -195,6 +207,11 @@ export class ProjectManager extends EventEmitter {
           if (ev?.type === "content_block_start" && ev.content_block?.type === "text" && text && !text.endsWith("\n")) { text += "\n\n"; this.emit("event", { type: "delta", text: "\n\n" } as PmEvent); }
           if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") { text += ev.delta.text; this.emit("event", { type: "delta", text: ev.delta.text } as PmEvent); }
         } else if (m.type === "assistant") {
+          const content = (m.message?.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');
+          if (m.error || m.isApiErrorMessage) {
+            turnError = content || String(m.error || 'Provider rejected the turn');
+            this.fail(turnError);
+          } else if (content) completeText += (completeText ? '\n\n' : '') + content;
           for (const b of m.message?.content ?? []) {
             if (b.type === "tool_use") {
               const summary = b.name === "mcp__fleet__spawn_session" ? `${b.input?.name} in ${b.input?.cwd}` : b.name === "SendMessage" ? `→ ${b.input?.to}${b.input?.notify_when_idle ? " (notify when idle)" : ""}` : JSON.stringify(b.input ?? {}).slice(0, 160);
@@ -210,22 +227,31 @@ export class ProjectManager extends EventEmitter {
             this.emit("event", { type: "peer", text: txt.slice(0, 600) } as PmEvent);
           }
         } else if (m.type === "result") {
+          const failed = !!m.is_error || !!turnError;
+          if (failed && !turnError) this.fail((m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`);
+          if (!failed) this.lastError = null;
           this.pendingTurns = Math.max(0, this.pendingTurns - 1);
           this.busy = false;
+          text = text.trim() ? text : completeText || (!failed && typeof m.result === 'string' ? m.result : '');
           if (text.trim()) this.record({ role: "assistant", text });
           this.emit("event", { type: "assistant_text", text } as PmEvent);
-          this.emit("event", { type: "turn_end", ts: new Date().toISOString(), cost_usd: m.total_cost_usd ?? 0, is_error: !!m.is_error, subtype: m.subtype } as PmEvent);
-          text = "";
+          this.emit("event", { type: "turn_end", ts: new Date().toISOString(), cost_usd: m.total_cost_usd ?? 0, is_error: failed, subtype: m.subtype } as PmEvent);
+          text = ""; completeText = ""; turnError = "";
         }
       }
+      if (!this.closed) throw new Error('Provider stream ended unexpectedly');
     };
-    try { await run(resumeId); }
-    catch (e: any) {
-      if (this.closed) return;
-      const msg = String(e?.message ?? e);
-      this.emit("event", { type: "status", text: `PM stopped: ${msg.slice(0, 300)}` } as PmEvent);
-      if (resumeId && /resume|session/i.test(msg)) { writeFileSync(PM_SESSION_FILE, ""); await run(); return; }
-      this.running = false;
-    } finally { this.running = false; this.busy = false; this.pendingTurns = 0; }
+    try {
+      const resumeId = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
+      try { await run(resumeId); }
+      catch (error: any) {
+        // Only a missing saved conversation can safely fall back before input is sent.
+        if (!this.closed && !this.pendingTurns && resumeId && /no conversation found|session.*not found/i.test(String(error?.message ?? error))) {
+          this.q?.close(); writeFileSync(PM_SESSION_FILE, ""); await run();
+        } else throw error;
+      }
+    } catch (error: any) {
+      if (!this.closed) this.fail(String(error?.message ?? error));
+    } finally { this.q?.close(); this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; }
   }
 }
