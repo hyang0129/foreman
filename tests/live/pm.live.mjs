@@ -46,4 +46,34 @@ if (process.env.FOREMAN_LIVE !== '1') {
       }
     } finally { pm.close(); await running; }
   });
+  test('live PM recovers on the same instance after auth rejection exits the stream', { timeout: 150000 }, async t => {
+    writeFileSync(PM_HISTORY_FILE, ''); writeFileSync(PM_SESSION_FILE, '');
+    const pm = new ProjectManager({}); pm.model = 'haiku';
+    let invalid = true, launches = 0;
+    pm.queryFactory = ({ prompt, options }) => {
+      launches++;
+      return query({ prompt, options: { ...options, env: { ...process.env,
+        CLAUDE_CODE_OAUTH_TOKEN: invalid ? 'invalid-live-test-token' : process.env.CLAUDE_CODE_OAUTH_TOKEN } } });
+    };
+    const logs = []; t.mock.method(console, 'error', (...args) => logs.push(args));
+    const waitFor = async (check, label) => {
+      const until = Date.now() + 65000;
+      while (!check() && Date.now() < until) await new Promise(r => setTimeout(r, 100));
+      assert.ok(check(), label);
+    };
+    const running = pm.start();
+    try {
+      pm.send('Reply with FAILED_INPUT_MUST_NOT_REPLAY. Do not call tools.');
+      await waitFor(() => !pm.running, 'The rejected provider must actually exit');
+      await running;
+      assert.match(pm.lastError || '', /auth|token|401|login/i);
+      assert.ok(pm.history().some(e => e.error)); assert.ok(logs.length);
+      invalid = false;
+      pm.send('Reply with exactly FOREMAN_PM_RECOVERED. Do not call tools or change anything.');
+      await waitFor(() => pm.history().some(e => e.role === 'assistant' && e.text.includes('FOREMAN_PM_RECOVERED')), 'New input must receive a real persisted answer on the same PM');
+      assert.equal(launches, 2); assert.equal(pm.lastError, null);
+      assert.equal(pm.history().filter(e => e.role === 'user').length, 2);
+    } finally { pm.close(); await running; }
+  });
+
 }

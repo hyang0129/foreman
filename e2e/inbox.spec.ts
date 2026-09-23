@@ -582,3 +582,17 @@ test("PM provider failure is visible after polling and reload", async ({ page })
   await expect(page.locator("#error-banner")).toBeVisible();
   await expect(page.locator("#error-text")).toContainText("OAuth session expired");
 });
+
+test("PM error clears after recovery and dismissal survives unchanged polling", async ({page})=>{
+  const state=await fixture(page);state.pmError='Project manager failed: temporary outage';
+  await page.goto('/');await page.locator('#select-pm').click();
+  await expect(page.locator('#error-banner')).toBeVisible();
+  state.pmError=null;
+  await expect(page.locator('#error-banner')).toBeHidden();
+  state.pmError='Project manager failed: another outage';
+  await expect(page.locator('#error-banner')).toBeVisible();
+  await page.locator('#dismiss-error').click();
+  const before=state.calls.filter(c=>c.path==='/api/pm/history').length;
+  await expect.poll(()=>state.calls.filter(c=>c.path==='/api/pm/history').length).toBeGreaterThan(before);
+  await expect(page.locator('#error-banner')).toBeHidden();
+});
