@@ -30,7 +30,12 @@
     "cloud:typecheck": "tsc -p cloud/tsconfig.json && tsc -p cloud/tests/tsconfig.json",
     "cloud:test": "vitest run",
     "test:ui": "playwright test",
-    "probe:mvp": "node --experimental-strip-types scripts/probe-mvp.ts"
+    "probe:mvp": "node --experimental-strip-types scripts/probe-mvp.ts",
+    "dev:deploy": "node scripts/dev-environment.mjs deploy",
+    "dev:start": "node scripts/dev-environment.mjs start",
+    "dev:status": "node scripts/dev-environment.mjs status",
+    "dev:stop": "node scripts/dev-environment.mjs stop",
+    "dev:destroy": "node scripts/dev-environment.mjs destroy"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.270",
