@@ -46,7 +46,7 @@ if (process.env.FOREMAN_LIVE !== '1') {
       }
     } finally { pm.close(); await running; }
   });
-  test('live PM recovers on the same instance after auth rejection exits the stream', { timeout: 150000 }, async t => {
+  test('live PM recovers on the same instance after auth rejection and provider shutdown', { timeout: 150000 }, async t => {
     writeFileSync(PM_HISTORY_FILE, ''); writeFileSync(PM_SESSION_FILE, '');
     const pm = new ProjectManager({}); pm.model = 'haiku';
     let invalid = true, launches = 0;
@@ -64,10 +64,15 @@ if (process.env.FOREMAN_LIVE !== '1') {
     const running = pm.start();
     try {
       pm.send('Reply with FAILED_INPUT_MUST_NOT_REPLAY. Do not call tools.');
-      await waitFor(() => !pm.running, 'The rejected provider must actually exit');
-      await running;
+      await waitFor(() => !!pm.lastError, 'Real provider authentication rejection is required');
       assert.match(pm.lastError || '', /auth|token|401|login/i);
       assert.ok(pm.history().some(e => e.error)); assert.ok(logs.length);
+      // This SDK keeps its streaming-input process alive after invalid-token
+      // rejection. Explicitly end the real Query to exercise the incident's EOF
+      // condition as well, without closing the ProjectManager itself.
+      pm.q?.close();
+      await waitFor(() => !pm.running, 'The rejected provider must actually exit');
+      await running;
       invalid = false;
       pm.send('Reply with exactly FOREMAN_PM_RECOVERED. Do not call tools or change anything.');
       await waitFor(() => pm.history().some(e => e.role === 'assistant' && e.text.includes('FOREMAN_PM_RECOVERED')), 'New input must receive a real persisted answer on the same PM');
