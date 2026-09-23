@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Only this file chooses deployment targets. Preview source/config cannot retarget them.
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, lstatSync, realpathSync, renameSync, symlinkSync, openSync, closeSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, lstatSync, realpathSync, renameSync, symlinkSync, openSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -25,7 +25,7 @@ export function argumentsFor(args) {
 }
 export function guardEnvironment(env) {
   for (const key of Object.keys(env)) {
-    if (key.startsWith('FOREMAN_') || ['CLOUDFLARE_ENV', 'CLOUDFLARE_ACCOUNT_ID', 'CF_ACCOUNT_ID', 'WRANGLER_ENV', 'WRANGLER_CONFIG', 'NODE_OPTIONS', 'CLAUDE_CONFIG_DIR'].includes(key)) {
+    if (key.startsWith('FOREMAN_') || ['CLOUDFLARE_ENV', 'CLOUDFLARE_ACCOUNT_ID', 'CF_ACCOUNT_ID', 'WRANGLER_ENV', 'WRANGLER_CONFIG', 'NODE_OPTIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME'].includes(key)) {
       if (env[key]) throw new Error(`Unset ${key}: dev commands use a fixed isolated target`);
     }
   }
@@ -119,7 +119,7 @@ export function running(home) {
   const record = read(file);
   const identity = processIdentity(record.pid);
   if (!identity) return null;
-  if (!/^[a-f0-9-]{36}$/.test(record.id) || !identity.includes(`${join(home, 'run.mjs')} ${record.id}`) || identity !== record.identity) throw new Error('Daemon PID identity changed; refusing to signal an unrelated process');
+  if (!/^[a-f0-9-]{36}$/.test(record.id) || !identity.includes(`${join(home, 'run.mjs')} ${record.id}`) || identity !== record.identity) throw new Error(`Daemon PID identity changed; refusing to signal an unrelated process. Remove only ${file} to discard the stale record, then retry.`);
   return record;
 }
 async function remote(pair) {
@@ -129,12 +129,13 @@ async function remote(pair) {
   if (data.environment !== 'dev') throw new Error('Wrong relay environment');
   return data;
 }
-async function status(home) {
-  const daemon = running(home);
+export async function status(home) {
+  let daemon = null, error;
+  try { daemon = running(home); } catch (e) { error = e.message; }
   const deployment = existsSync(join(home, 'deployment.json')) ? read(join(home, 'deployment.json')) : null;
-  let relay = null, error;
+  let relay = null;
   try { if (existsSync(join(home, 'dev-pairing.json'))) relay = await remote(validatePairing(read(join(home, 'dev-pairing.json')))); }
-  catch (e) { error = e.message; }
+  catch (e) { error = [error, e.message].filter(Boolean).join('; '); }
   const result = { environment: 'DEV', url: TARGET.url, home, port: TARGET.port, pid: daemon?.pid ?? null, commit: deployment?.commit ?? null, relay, ...(error ? { error } : {}), log: join(home, 'daemon.log') };
   console.log(JSON.stringify(result, null, 2));
   return result;
@@ -151,7 +152,7 @@ export async function stop(home) {
   }
   throw new Error('DEV daemon did not stop in 10 seconds; refusing forced termination or teardown');
 }
-async function deploy(home, options) {
+export async function deploy(home, options, deployWorker = wrangler) {
   if (running(home)) throw new Error('Run npm run dev:stop before deploying; UI and daemon must use the same snapshot');
   const source = realpathSync(resolve(options.source));
   const commit = run('git', ['-C', source, 'rev-parse', '--verify', `${options.ref}^{commit}`]).trim();
@@ -160,32 +161,44 @@ async function deploy(home, options) {
   const tree = run('git', ['-C', source, 'ls-tree', '-r', commit]);
   if (/^120000 /m.test(tree)) throw new Error('Preview commits containing symlinks are not supported');
   const snapshot = mkdtempSync(join(home, 'release-'));
-  const archive = join(home, `archive-${randomUUID()}.tar`);
+  let committed = false;
   try {
-    run('git', ['-C', source, 'archive', '--format=tar', '--output', archive, commit]);
-    run('tar', ['-xf', archive, '-C', snapshot]);
-  } finally { rmSync(archive, { force: true }); }
-  // Use dependencies installed for the selected checkout, only with its exact lockfile.
-  if (!readFileSync(join(snapshot, 'package-lock.json')).equals(readFileSync(join(source, 'package-lock.json')))) throw new Error('Install matching dependencies in a worktree for that ref first');
-  symlinkSync(realpathSync(join(source, 'node_modules')), join(snapshot, 'node_modules'));
-  const index = join(snapshot, 'web/index.html');
-  const html = readFileSync(index, 'utf8');
-  if (!html.includes('<body') || !html.includes('<title>')) throw new Error('Preview UI must have a body and title');
-  writeFileSync(index, html.replace('<title>', '<title>[DEV] ').replace(/<body([^>]*)>/, `<body$1><div role="note" style="position:fixed;bottom:0;right:0;z-index:2147483647;background:#713f12;color:#fff;padding:3px 8px;font:12px system-ui;pointer-events:none">DEV · ${commit.slice(0, 8)} · :4178</div>`));
-  writeFileSync(join(snapshot, 'dev-worker.ts'), devEntry(commit));
-  const config = join(snapshot, 'wrangler.dev.json');
-  writeFileSync(config, JSON.stringify(workerConfig(JSON.parse(readFileSync(join(root, 'wrangler.jsonc'), 'utf8'))), null, 2));
-  const pairFile = join(home, 'dev-pairing.json');
-  const pair = existsSync(pairFile) ? validatePairing(read(pairFile)) : { environment: marker, url: TARGET.url, token: randomBytes(32).toString('hex') };
-  // Persist before upload so a partial/failed deployment can reuse its credential.
-  save(pairFile, pair);
-  const secret = join(home, `secrets-${randomUUID()}.json`);
-  writeFileSync(secret, JSON.stringify({ HOST_TOKEN: pair.token }), { mode: 0o600, flag: 'wx' });
-  try {
-    await wrangler(home, config, ['deploy', '--dry-run', '--secrets-file', secret]);
-    await wrangler(home, config, ['deploy', '--secrets-file', secret]);
-  } finally { rmSync(secret, { force: true }); }
-  save(join(home, 'deployment.json'), { release: snapshot.slice(home.length + 1), commit, source });
+    const archive = join(home, `archive-${randomUUID()}.tar`);
+    try {
+      run('git', ['-C', source, 'archive', '--format=tar', '--output', archive, commit]);
+      run('tar', ['-xf', archive, '-C', snapshot]);
+    } finally { rmSync(archive, { force: true }); }
+    // Use dependencies installed for the selected checkout, only with its exact lockfile.
+    if (!readFileSync(join(snapshot, 'package-lock.json')).equals(readFileSync(join(source, 'package-lock.json')))) throw new Error('Install matching dependencies in a worktree for that ref first');
+    symlinkSync(realpathSync(join(source, 'node_modules')), join(snapshot, 'node_modules'));
+    const index = join(snapshot, 'web/index.html');
+    const html = readFileSync(index, 'utf8');
+    if (!html.includes('<body') || !html.includes('<title>')) throw new Error('Preview UI must have a body and title');
+    writeFileSync(index, html.replace('<title>', '<title>[DEV] ').replace(/<body([^>]*)>/, `<body$1><div role="note" style="position:fixed;bottom:0;right:0;z-index:2147483647;background:#713f12;color:#fff;padding:3px 8px;font:12px system-ui;pointer-events:none">DEV · ${commit.slice(0, 8)} · :4178</div>`));
+    writeFileSync(join(snapshot, 'dev-worker.ts'), devEntry(commit));
+    const config = join(snapshot, 'wrangler.dev.json');
+    const { experimental_readRawConfig } = await import('wrangler');
+    const { rawConfig } = experimental_readRawConfig({ config: join(snapshot, 'wrangler.jsonc') });
+    writeFileSync(config, JSON.stringify(workerConfig(rawConfig), null, 2));
+    const pairFile = join(home, 'dev-pairing.json');
+    const pair = existsSync(pairFile) ? validatePairing(read(pairFile)) : { environment: marker, url: TARGET.url, token: randomBytes(32).toString('hex') };
+    // Persist before upload so a partial/failed deployment can reuse its credential.
+    save(pairFile, pair);
+    const secret = join(home, `secrets-${randomUUID()}.json`);
+    writeFileSync(secret, JSON.stringify({ HOST_TOKEN: pair.token }), { mode: 0o600, flag: 'wx' });
+    try {
+      await deployWorker(home, config, ['deploy', '--dry-run', '--secrets-file', secret]);
+      await deployWorker(home, config, ['deploy', '--secrets-file', secret]);
+    } finally { rmSync(secret, { force: true }); }
+    save(join(home, 'deployment.json'), { release: snapshot.slice(home.length + 1), commit, source });
+    committed = true;
+    // Only prune after the replacement record has been atomically published.
+    for (const name of readdirSync(home)) {
+      if (!/^release-[a-zA-Z0-9]+$/.test(name) || join(home, name) === snapshot) continue;
+      const path = join(home, name); owned(path, true);
+      rmSync(path, { recursive: true });
+    }
+  } finally { if (!committed) rmSync(snapshot, { recursive: true, force: true }); }
   console.log(`DEV deployed ${commit}\n${TARGET.url}\nNext: npm run dev:start`);
 }
 // A copied rotating OAuth refresh token is not an independent login: one
@@ -200,27 +213,30 @@ export function requireClaudeAuth(binary, configDir, env = process.env, execute 
   } catch { /* Never include provider output: it may contain credentials. */ }
   throw new Error(`DEV Claude is not signed in. Run CLAUDE_CONFIG_DIR="${configDir}" "${binary}" auth login, then run npm run dev:start. Dev requires its own login; production OAuth credentials are never copied.`);
 }
-async function start(home) {
+export function requireCodexAuth(binary, configDir, env = process.env, execute = run) {
+  try {
+    // login status is local credential inspection, never an inference/refresh call.
+    execute(binary, ['login', 'status'], { env: { ...env, CODEX_HOME: configDir } });
+    return;
+  } catch { /* Never include provider output: it may contain credentials. */ }
+  throw new Error(`DEV Codex is not signed in. Run CODEX_HOME="${configDir}" "${binary}" login, then run npm run dev:start. Dev requires its own login; production OAuth credentials are never copied.`);
+}
+export async function start(home, { relayStatus = remote, checkPort = freePort, execute = run } = {}) {
   if (running(home)) throw new Error('DEV daemon already running; use dev:status or dev:stop');
   const deployment = read(join(home, 'deployment.json'));
   const snapshot = releasePath(home, deployment);
   const pair = validatePairing(read(join(home, 'dev-pairing.json')));
-  const relay = await remote(pair);
+  const relay = await relayStatus(pair);
   if (relay.commit !== deployment.commit) throw new Error('Deployed Worker does not match the local snapshot; redeploy before starting');
   if (relay.relay.online) throw new Error('Another dev host is connected; refusing to replace it');
-  await freePort();
+  await checkPort();
   for (const dir of ['claude', 'codex']) {
     const path = join(home, dir);
     if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
     owned(path, true);
   }
-  // Codex authentication is separate from Foreman state. Claude must sign in independently.
-  const codexAuth = join(home, 'codex/auth.json');
-  if (!existsSync(codexAuth)) {
-    const auth = readFileSync(join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'auth.json'));
-    writeFileSync(codexAuth, auth, { mode: 0o600, flag: 'wx' });
-  }
-  requireClaudeAuth(join(snapshot, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude'), join(home, 'claude'));
+  requireCodexAuth('codex', join(home, 'codex'), process.env, execute);
+  requireClaudeAuth(join(snapshot, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude'), join(home, 'claude'), process.env, execute);
   const entry = join(home, 'run.mjs');
   if (existsSync(entry)) owned(entry);
   writeFileSync(entry, `console.log('FOREMAN DEV ${deployment.commit}');\nawait import(${JSON.stringify(pathToFileURL(join(snapshot, 'server/main.ts')).href)});\n`, { mode: 0o600 });
@@ -267,6 +283,47 @@ async function destroy(home) {
   rmSync(home, { recursive: true });
   console.log('DEV Worker and local dev state removed. Firebase authorized domain retained for reuse.');
 }
+export function acquireLock(home) {
+  const lock = join(home, 'operation.lock');
+  // Publish a complete owner record atomically, avoiding a crash between mkdir
+  // and writing the PID. A nonempty lock directory cannot be replaced by rename.
+  const candidate = mkdtempSync(join(home, 'operation-owner-'));
+  save(join(candidate, 'owner.json'), { pid: process.pid, identity: processIdentity(process.pid), startedAt: new Date().toISOString() });
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (existsSync(lock)) {
+        owned(lock, true);
+        const ownerFile = join(lock, 'owner.json');
+        if (!existsSync(ownerFile)) throw new Error(`Legacy dev lock has no owner. Check for active dev commands, then remove only ${lock}. Status remains available.`);
+        const owner = read(ownerFile);
+        if (processIdentity(owner.pid) === owner.identity) throw new Error(`Another dev operation is active (PID ${owner.pid})`);
+        // Serialize stale-lock recovery too: contenders must not remove a newly
+        // acquired lock after another process has already recovered it.
+        const recovery = join(lock, 'recovery');
+        const claim = mkdtempSync(join(home, 'operation-recovery-'));
+        save(join(claim, 'owner.json'), { pid: process.pid, identity: processIdentity(process.pid) });
+        try {
+          if (existsSync(recovery)) {
+            const recovering = read(join(recovery, 'owner.json'));
+            if (processIdentity(recovering.pid) === recovering.identity) throw new Error('Dev lock recovery in progress; retry');
+            rmSync(recovery, { recursive: true });
+          }
+          try { renameSync(claim, recovery); }
+          catch { throw new Error('Dev lock recovery in progress; retry'); }
+          const current = read(ownerFile);
+          if (current.pid !== owner.pid || current.identity !== owner.identity) {
+            rmSync(recovery, { recursive: true });
+            throw new Error('Dev lock owner changed; retry');
+          }
+        } finally { rmSync(claim, { recursive: true, force: true }); }
+        rmSync(lock, { recursive: true });
+      }
+      try { renameSync(candidate, lock); return () => rmSync(lock, { recursive: true, force: true }); }
+      catch (error) { if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error; }
+    }
+    throw new Error('Another dev operation is active; retry');
+  } finally { rmSync(candidate, { recursive: true, force: true }); }
+}
 export async function main(args = process.argv.slice(2)) {
   const options = argumentsFor(args); guardEnvironment(process.env);
   const home = openHome(homedir(), !['status', 'stop'].includes(options.command));
@@ -275,15 +332,14 @@ export async function main(args = process.argv.slice(2)) {
     else console.log('DEV daemon is stopped');
     return;
   }
-  const lock = join(home, 'operation.lock');
-  try { mkdirSync(lock, { mode: 0o700 }); }
-  catch { throw new Error(`Another dev operation is active. If it crashed, remove only ${lock} after checking for dev commands`); }
+  if (options.command === 'status') return status(home);
+  const releaseLock = acquireLock(home);
   try {
     if (options.command === 'deploy') await deploy(home, options);
     if (options.command === 'start') await start(home);
     if (options.command === 'status') await status(home);
     if (options.command === 'stop') await stop(home);
     if (options.command === 'destroy') await destroy(home);
-  } finally { rmSync(lock, { recursive: true, force: true }); }
+  } finally { releaseLock(); }
 }
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch((error) => { console.error(error.message); process.exitCode = 1; });

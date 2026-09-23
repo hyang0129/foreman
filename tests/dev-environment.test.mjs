@@ -125,3 +125,10 @@ test('explicit Claude API key or token bypasses credential discovery', () => {
   for (const env of [{ ANTHROPIC_API_KEY: 'test' }, { CLAUDE_CODE_OAUTH_TOKEN: 'test' }])
     requireClaudeAuth('/sdk/claude', '/owned/dev/claude', env, () => { assert.fail('Must not consult stored credentials'); });
 });
+
+test('Codex status uses isolated CODEX_HOME and redacts failed provider output', async () => {
+  const {requireCodexAuth}=await import('../scripts/dev-environment.mjs');let calls=0;
+  requireCodexAuth('codex','/dev/codex',{PATH:'/bin'},(binary,args,options)=>{calls++;assert.equal(binary,'codex');assert.deepEqual(args,['login','status']);assert.equal(options.env.CODEX_HOME,'/dev/codex');});
+  assert.equal(calls,1);
+  assert.throws(()=>requireCodexAuth('codex','/dev/codex',{},()=>{throw Error('secret provider output');}),error=>{assert.match(error.message,/CODEX_HOME="\/dev\/codex" "codex" login/);assert.ok(!error.message.includes('secret provider output'));return true;});
+});
