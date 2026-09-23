@@ -40,6 +40,7 @@ function memoryWritePath(p: string): boolean {
 }
 
 class Inbox {
+  delivered = 0;
   private q: SDKUserMessage[] = [];
   private wake: (() => void) | null = null;
   push(text: string, sessionId: string) {
@@ -48,7 +49,7 @@ class Inbox {
   }
   async *stream(): AsyncGenerator<SDKUserMessage> {
     while (true) {
-      if (this.q.length) { yield this.q.shift()!; continue; }
+      if (this.q.length) { this.delivered++; yield this.q.shift()!; continue; }
       await new Promise<void>((r) => (this.wake = r));
     }
   }
@@ -57,11 +58,15 @@ class Inbox {
 export class ProjectManager extends EventEmitter {
   private inbox = new Inbox();
   private q: Query | null = null;
+  private queryFactory = query;
+  lastError: string | null = null;
   sessionId: string | null = null;
   busy = false;
   tools: string[] = [];
   private running = false;
   private closed = false;
+  private interrupting = false;
+  private reconciled = false;
   private pendingTurns = 0;
   private changingModel = false;
   model: string | undefined;
@@ -102,14 +107,45 @@ export class ProjectManager extends EventEmitter {
   }
   private record(entry: any) { appendFileSync(PM_HISTORY_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"); }
 
+  private fail(reason: string) {
+    const text = `Project manager failed: ${reason.slice(0, 1500)}. Your message was not completed; after resolving the error, send a new message to retry. Failed messages are not replayed.`;
+    const duplicateRejection = this.inbox.delivered === 0 && this.lastError === text;
+    this.lastError = text;
+    console.error('foreman: pm failure', JSON.stringify({ session_id: this.sessionId, pending_turns: this.pendingTurns, error: reason.slice(0, 1500) }));
+    if (!duplicateRejection) {
+      this.record({ role: "system", text, error: true });
+      this.emit("event", { type: "status", text } as PmEvent);
+    }
+  }
+
+  private reconcileHistory() {
+    if (this.reconciled) return;
+    this.reconciled = true;
+    const last = this.history().reverse().find((entry) => ['user', 'assistant', 'system'].includes(entry.role));
+    if (last?.role === 'user' && last.delivery !== 'rejected') {
+      const text = 'Foreman restarted; delivery cannot be confirmed. Message was not replayed.';
+      this.record({ role: 'system', text, error: true });
+      this.lastError = text;
+      this.emit('event', { type: 'status', text } as PmEvent);
+    }
+  }
+
   send(text: string) {
+    this.reconcileHistory();
+    this.record({ role: "user", text, ...(this.closed || this.changingModel ? { delivery: 'rejected' } : {}) });
     if (this.changingModel) throw new Error('Model change in progress; retry your message');
-    if (!this.running || this.closed) throw new Error('Project manager is unavailable');
-    this.record({ role: "user", text });
+    if (this.closed) throw new Error('Project manager is unavailable (closed)');
+    // Explicit input is the only restart trigger: no automatic replay or retry loop.
+    if (!this.running) void this.start();
+    if (!this.running) throw new Error(this.lastError || 'Project manager is unavailable');
     this.pendingTurns++;
     this.inbox.push(text, this.sessionId ?? "");
   }
-  async interrupt() { await this.q?.interrupt(); }
+  async interrupt() {
+    if (!this.q || !this.modelBusy) return;
+    this.interrupting = true;
+    try { await this.q.interrupt(); } catch (error) { this.interrupting = false; throw error; }
+  }
   close() { this.closed = true; this.q?.close(); this.q = null; }
 
   private memoryBlock(): string {
@@ -160,11 +196,11 @@ export class ProjectManager extends EventEmitter {
 
   async start(): Promise<void> {
     if (this.running || this.closed) return;
+    this.reconcileHistory();
     this.running = true;
-    const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
-    const resumeId = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
     const run = async (resume?: string) => {
-      this.q = query({
+      const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
+      this.q = this.queryFactory({
         prompt: this.inbox.stream(),
         options: {
           cwd: FOREMAN_HOME,
@@ -185,7 +221,7 @@ export class ProjectManager extends EventEmitter {
           stderr: (chunk: string) => { if (/error|warn/i.test(chunk)) this.emit("event", { type: "status", text: chunk.trim().slice(0, 300) } as PmEvent); },
         },
       });
-      let text = "";
+      let text = "", completeText = "", turnError = "";
       for await (const m of this.q as any) {
         if (m.type === "system" && m.subtype === "init") {
           this.sessionId = m.session_id; writeFileSync(PM_SESSION_FILE, m.session_id);
@@ -197,6 +233,10 @@ export class ProjectManager extends EventEmitter {
           if (ev?.type === "content_block_start" && ev.content_block?.type === "text" && text && !text.endsWith("\n")) { text += "\n\n"; this.emit("event", { type: "delta", text: "\n\n" } as PmEvent); }
           if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") { text += ev.delta.text; this.emit("event", { type: "delta", text: ev.delta.text } as PmEvent); }
         } else if (m.type === "assistant") {
+          const content = (m.message?.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');
+          if (m.error || m.isApiErrorMessage) {
+            turnError = content || String(m.error || 'Provider rejected the turn');
+          } else if (content) completeText += (completeText ? '\n\n' : '') + content;
           for (const b of m.message?.content ?? []) {
             if (b.type === "tool_use") {
               const summary = b.name === "mcp__fleet__spawn_session" ? `${b.input?.name} in ${b.input?.cwd}` : b.name === "SendMessage" ? `→ ${b.input?.to}${b.input?.notify_when_idle ? " (notify when idle)" : ""}` : JSON.stringify(b.input ?? {}).slice(0, 160);
@@ -212,22 +252,41 @@ export class ProjectManager extends EventEmitter {
             this.emit("event", { type: "peer", text: txt.slice(0, 600) } as PmEvent);
           }
         } else if (m.type === "result") {
+          const cancelled = this.interrupting || ['aborted_streaming', 'interrupted', 'cancelled'].includes(m.terminal_reason);
+          const failed = !!m.is_error && !cancelled;
+          text = text.trim() ? text : completeText || (!failed && !cancelled && typeof m.result === 'string' ? m.result : '');
+          // A partial answer must precede its terminal explanation in history.
+          if (text.trim()) this.record({ role: "assistant", text });
+          if (failed) this.fail(turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`);
+          else {
+            this.lastError = null;
+            if (cancelled) {
+              const message = 'Project manager stopped at your request. Message was not replayed.';
+              this.record({ role: 'system', text: message });
+              this.emit('event', { type: 'status', text: message } as PmEvent);
+            }
+          }
+          this.interrupting = false;
           this.pendingTurns = Math.max(0, this.pendingTurns - 1);
           this.busy = false;
-          if (text.trim()) this.record({ role: "assistant", text });
           this.emit("event", { type: "assistant_text", text } as PmEvent);
-          this.emit("event", { type: "turn_end", ts: new Date().toISOString(), cost_usd: m.total_cost_usd ?? 0, is_error: !!m.is_error, subtype: m.subtype } as PmEvent);
-          text = "";
+          this.emit("event", { type: "turn_end", ts: new Date().toISOString(), cost_usd: m.total_cost_usd ?? 0, is_error: failed, subtype: m.subtype } as PmEvent);
+          text = ""; completeText = ""; turnError = "";
         }
       }
+      if (!this.closed && (!this.lastError || this.pendingTurns)) throw new Error('Provider stream ended unexpectedly');
     };
-    try { await run(resumeId); }
-    catch (e: any) {
-      if (this.closed) return;
-      const msg = String(e?.message ?? e);
-      this.emit("event", { type: "status", text: `PM stopped: ${msg.slice(0, 300)}` } as PmEvent);
-      if (resumeId && /resume|session/i.test(msg)) { writeFileSync(PM_SESSION_FILE, ""); await run(); return; }
-      this.running = false;
-    } finally { this.running = false; this.busy = false; this.pendingTurns = 0; }
+    try {
+      const resumeId = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
+      try { await run(resumeId); }
+      catch (error: any) {
+        // Only a missing saved conversation can safely fall back before input is sent.
+        if (!this.closed && !this.pendingTurns && resumeId && /no conversation found|session.*not found/i.test(String(error?.message ?? error))) {
+          this.q?.close(); writeFileSync(PM_SESSION_FILE, ""); await run();
+        } else throw error;
+      }
+    } catch (error: any) {
+      if (!this.closed) this.fail(String(error?.message ?? error));
+    } finally { this.q?.close(); this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; this.interrupting = false; this.inbox = new Inbox(); }
   }
 }

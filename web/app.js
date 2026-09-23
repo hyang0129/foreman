@@ -975,6 +975,7 @@ async function selectSession(key) {
     if (epoch === selectionEpoch) showRefreshError(error);
   }
 }
+let polledPmError = null;
 async function refreshSelected() {
   if (!selected || !authorized || !host.online) return;
   const key = selected,
@@ -995,6 +996,10 @@ async function refreshSelected() {
   conversationLoading = false;
   if (key === "pm") {
     pmBusy = !!result.busy;
+    if (result.error) {
+      if (result.error !== polledPmError) showError(result.error);
+    } else if (polledPmError) clearError();
+    polledPmError = result.error || null;
     pmModelReady = true;
     if (!pmModelSaving && revision === modelRevision) {
       pmModel = result.model || "";

@@ -110,7 +110,7 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname === '/api/models' && req.method === 'GET') return json(res, 200, { models: await modelCatalog.list(url.searchParams.get('provider') ?? '') });
     if (url.pathname === '/api/pm/model' && req.method === 'POST') { const { model } = await body(req); await pm.setModel(model); return json(res, 200, { model: pm.model ?? null }); }
-    if (url.pathname === "/api/pm/history") return json(res, 200, { history: pm.history(), busy: pm.modelBusy, session_id: pm.sessionId, model: pm.model ?? null });
+    if (url.pathname === "/api/pm/history") return json(res, 200, { history: pm.history(), error: pm.lastError, busy: pm.modelBusy, session_id: pm.sessionId, model: pm.model ?? null });
     if (url.pathname === "/api/pm/message" && req.method === "POST") {
       const { text } = await body(req);
       if (!text || typeof text !== "string") return json(res, 400, { error: "text required" });
