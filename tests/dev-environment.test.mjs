@@ -8,7 +8,8 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { argumentsFor, guardEnvironment, owned, openHome, validatePairing, workerConfig, devEntry, freePort, deleteDevWorker, processIdentity, running, stop, TARGET, requireClaudeAuth } from '../scripts/dev-environment.mjs';
+import { argumentsFor, guardEnvironment, owned, openHome, validatePairing, workerConfig, devEntry, freePort, deleteDevWorker, processIdentity, running, stop, TARGET, requireClaudeAuth, SUPPORTED_WORKER_CONTRACT } from '../scripts/dev-environment.mjs';
+const conforming = structuredClone(SUPPORTED_WORKER_CONTRACT);
 
 function temporary(t) { const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-dev-test-'))); t.after(() => rmSync(dir, { recursive: true, force: true })); return dir; }
 test('dev CLI rejects target and lifecycle overrides before side effects', () => {
@@ -38,7 +39,12 @@ test('pairing cannot select production or inject malformed credentials', () => {
   for(const override of [{url:'https://foreman.hooong-yang.workers.dev'},{environment:'production'},{token:'x'},{token:'a'.repeat(64)+'\n'}]) assert.throws(()=>validatePairing({...pair,...override}),/non-dev/);
 });
 test('generated Worker config owns its namespace and ignores dangerous source configuration', () => {
-  const config=workerConfig({name:'foreman',build:{command:'production-deploy'},routes:['production/*'],durable_objects:{bindings:[{script_name:'foreman'}]},vars:{FIREBASE_CONFIG:'public',ALLOWED_EMAIL:'attacker'}});
+  // The external-namespace binding (script_name) is now refused outright
+  // instead of being silently replaced (#31); every guard assertion below
+  // still runs, on the same dangerous input with conforming bindings.
+  const dangerous={name:'foreman',account_id:'production-account',build:{command:'production-deploy'},routes:['production/*'],env:{production:{name:'foreman'}},vars:{FIREBASE_CONFIG:'public',ALLOWED_EMAIL:'attacker'}};
+  assert.throws(()=>workerConfig({...dangerous,durable_objects:{bindings:[{script_name:'foreman'}]}}),/external Durable Object binding.*script_name/);
+  const config=workerConfig({...dangerous,...conforming});
   assert.equal(config.name,'foreman-dev'); assert.equal(config.account_id,TARGET.account);
   assert.deepEqual(config.durable_objects.bindings,[{name:'RELAY',class_name:'HostRelay'}]);
   assert.equal(config.vars.ALLOWED_EMAIL,'hooong.yang@gmail.com'); assert.equal(config.vars.FIREBASE_PROJECT_ID,'foreman-hong-2026');

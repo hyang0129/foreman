@@ -14,7 +14,7 @@ function fixture(t) {
   git('init'); git('config','user.email','fixture@example.com'); git('config','user.name','Fixture');
   mkdirSync(join(source,'web')); mkdirSync(join(source,'node_modules'));
   writeFileSync(join(source,'package-lock.json'),'{}'); writeFileSync(join(source,'web/index.html'),'<title>Test</title><body></body>');
-  writeFileSync(join(source,'wrangler.jsonc'),'{ // selected snapshot\n "vars": {"FIREBASE_CONFIG":"snapshot-public-config",},\n}');
+  writeFileSync(join(source,'wrangler.jsonc'),'{ // selected snapshot\n "vars": {"FIREBASE_CONFIG":"snapshot-public-config",},\n "durable_objects": {"bindings": [{"name": "RELAY", "class_name": "HostRelay"}]}, "migrations": [{"tag": "v1", "new_sqlite_classes": ["HostRelay"]}], "assets": {"directory": "./web", "binding": "ASSETS"},\n}');
   const commit = () => {git('add','.'); git('commit','-m','fixture'); return git('rev-parse','HEAD');};
   return {dir,home,source,git,commit};
 }

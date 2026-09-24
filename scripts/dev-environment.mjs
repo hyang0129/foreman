@@ -58,15 +58,90 @@ export function validatePairing(pair) {
   if (pair?.environment !== marker || pair.url !== TARGET.url || !/^[a-f0-9]{64}$/.test(pair.token)) throw new Error('Refusing non-dev pairing');
   return pair;
 }
+// The only bindings and migrations the generated dev Worker supports. It is
+// both what workerConfig emits and what a snapshot's own wrangler.jsonc must
+// declare exactly: a divergent snapshot is refused rather than deployed with
+// bindings or migrations it did not ask for, or without ones it did.
+export const SUPPORTED_WORKER_CONTRACT = deepFreeze({
+  durable_objects: { bindings: [{ name: 'RELAY', class_name: 'HostRelay' }] },
+  migrations: [{ tag: 'v1', new_sqlite_classes: ['HostRelay'] }],
+  assets: { binding: 'ASSETS' },
+});
+// Every other binding-bearing top-level Wrangler key. The dev config never
+// emits these, so a snapshot declaring any of them would lose them silently.
+// `exports` declares Durable Objects without migrations; `containers` and
+// `cloudchamber` attach to Durable Object classes. Non-binding keys (name,
+// account_id, main, routes, route, triggers, build, env, vars, secrets, ...)
+// stay ignored by construction.
+export const UNSUPPORTED_BINDING_KEYS = Object.freeze(['kv_namespaces', 'r2_buckets', 'd1_databases', 'services', 'queues', 'workflows',
+  'vectorize', 'hyperdrive', 'analytics_engine_datasets', 'ai', 'ai_search', 'ai_search_namespaces', 'agent_memory', 'websearch', 'browser',
+  'images', 'media', 'stream', 'version_metadata', 'send_email', 'mtls_certificates', 'dispatch_namespaces', 'pipelines', 'secrets_store_secrets',
+  'artifacts', 'flagship', 'ratelimits', 'worker_loaders', 'vpc_services', 'vpc_networks', 'connect', 'tail_consumers', 'streaming_tail_consumers',
+  'logfwdr', 'unsafe', 'unsafe_hello_world', 'wasm_modules', 'text_blobs', 'data_blobs', 'containers', 'cloudchamber', 'exports']);
+function deepFreeze(value) {
+  if (value && typeof value === 'object') { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value); }
+  return value;
+}
+const show = value => JSON.stringify(value) ?? 'nothing';
+// Order-insensitive for object keys, order-sensitive for arrays.
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
+  return show(value);
+}
+const same = (a, b) => canonical(a) === canonical(b);
+// Names every way a snapshot's raw Wrangler config diverges from the contract.
+export function contractDivergences(base) {
+  const problems = [], contract = SUPPORTED_WORKER_CONTRACT;
+  const objects = base?.durable_objects;
+  const extra = Object.keys(objects ?? {}).filter(key => key !== 'bindings');
+  if (extra.length) problems.push(`unsupported durable_objects keys ${show(extra)}`);
+  const bindings = objects?.bindings;
+  if (!Array.isArray(bindings)) problems.push(`durable_objects.bindings is ${show(bindings)}, not a list`);
+  else {
+    for (const binding of bindings) {
+      const expected = contract.durable_objects.bindings.find(entry => entry.name === binding?.name);
+      if (binding?.script_name !== undefined) problems.push(`external Durable Object binding ${show(binding)} (script_name is not supported)`);
+      else if (!expected) problems.push(`extra or renamed Durable Object binding ${show(binding)}`);
+      else if (binding.class_name !== expected.class_name) problems.push(`Durable Object binding ${expected.name} uses class ${show(binding.class_name)}, not ${show(expected.class_name)}`);
+      else if (!same(binding, expected)) problems.push(`Durable Object binding ${expected.name} declares unsupported fields ${show(binding)}`);
+    }
+    for (const expected of contract.durable_objects.bindings) {
+      const count = bindings.filter(binding => binding?.name === expected.name).length;
+      if (count !== 1) problems.push(`Durable Object binding ${expected.name} -> ${expected.class_name} is ${count ? 'duplicated' : 'missing'}`);
+    }
+  }
+  const migrations = base?.migrations;
+  if (!Array.isArray(migrations)) problems.push(`migrations is ${show(migrations)}, not a list`);
+  else if (!same(migrations, contract.migrations)) {
+    for (const migration of migrations) {
+      const expected = contract.migrations.find(entry => entry.tag === migration?.tag);
+      if (!expected) problems.push(`extra or different migration ${show(migration)}`);
+      else if (!same(migration, expected)) problems.push(`migration ${expected.tag} is ${show(migration)}, not ${show(expected)}`);
+    }
+    for (const expected of contract.migrations) {
+      const count = migrations.filter(migration => migration?.tag === expected.tag).length;
+      if (count !== 1) problems.push(`migration ${expected.tag} ${show(expected)} is ${count ? 'duplicated' : 'missing'}`);
+    }
+    if (!problems.some(problem => problem.includes('migration'))) problems.push(`migrations are ordered ${show(migrations.map(entry => entry.tag))}, not ${show(contract.migrations.map(entry => entry.tag))}`);
+  }
+  if (base?.assets?.binding !== contract.assets.binding) problems.push(`assets binding is ${show(base?.assets?.binding)}, not ${show(contract.assets.binding)}`);
+  for (const key of UNSUPPORTED_BINDING_KEYS) if (base?.[key] !== undefined) problems.push(`unsupported binding kind ${key} ${show(base[key])}`);
+  return problems;
+}
 export function workerConfig(base) {
+  const problems = contractDivergences(base);
+  if (problems.length) throw new Error(`Refusing preview: the snapshot's wrangler.jsonc diverges from the bindings the dev Worker supports, so they would be silently dropped or changed. Divergence: ${problems.join('; ')}. Dev supports exactly durable_objects.bindings ${show(SUPPORTED_WORKER_CONTRACT.durable_objects.bindings)}, migrations ${show(SUPPORTED_WORKER_CONTRACT.migrations)} and assets binding ${show(SUPPORTED_WORKER_CONTRACT.assets.binding)}, and no other binding kinds. Preview a ref that matches, or extend SUPPORTED_WORKER_CONTRACT in scripts/dev-environment.mjs first.`);
   // Deliberately construct, never spread a branch's Wrangler config: no routes,
   // external DO namespaces, build hooks, environments, or production secrets.
+  // Bindings and migrations come only from the supported contract.
+  const contract = structuredClone(SUPPORTED_WORKER_CONTRACT);
   return {
     name: TARGET.worker, account_id: TARGET.account, main: './dev-worker.ts', compatibility_date: '2026-09-21',
     workers_dev: true, preview_urls: false, secrets: { required: ['HOST_TOKEN'] },
-    assets: { directory: './web', binding: 'ASSETS', run_worker_first: ['/api/*'] },
-    durable_objects: { bindings: [{ name: 'RELAY', class_name: 'HostRelay' }] },
-    migrations: [{ tag: 'v1', new_sqlite_classes: ['HostRelay'] }],
+    assets: { directory: './web', binding: contract.assets.binding, run_worker_first: ['/api/*'] },
+    durable_objects: contract.durable_objects,
+    migrations: contract.migrations,
     vars: { FIREBASE_PROJECT_ID: 'foreman-hong-2026', ALLOWED_EMAIL: 'hooong.yang@gmail.com', FIREBASE_CONFIG: base.vars.FIREBASE_CONFIG },
     observability: { enabled: true, logs: { enabled: true, invocation_logs: true }, traces: { enabled: true } },
   };
