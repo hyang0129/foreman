@@ -882,3 +882,43 @@ test('a missing-conversation error result after system/init fails loudly exactly
   assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
   assert.deepEqual(f.consumed, ['consumed input', 'explicit retry']);
 });
+
+// The SDK's exit echo carries resultDiagnostic(m) (errors[] for an error subtype, `result` for an
+// is_error success). When the failure already recorded for that result is different text, the
+// echo is the only carrier of the result's own diagnostic: it must surface, never be suppressed.
+const errorEntries = (pm: any): string[] => pm.history().filter((e: any) => e.error).map((e: any) => e.text);
+
+test('a result whose errors[] differ from a preceding assistant API error keeps both diagnostics', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    yield { type: 'assistant', error: 'rate_limit', message: { content: [{ type: 'text', text: 'API Error: overloaded' }] } };
+    yield errorResult('DISTINCT: tool runner crashed');
+    throw new Error('Claude Code returned an error result: DISTINCT: tool runner crashed');
+  });
+  f.pm.send('input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  const entries = errorEntries(f.pm);
+  assert.ok(entries.some((e) => /API Error: overloaded/.test(e)), 'the assistant API error is recorded');
+  assert.ok(entries.some((e) => /DISTINCT: tool runner crashed/.test(e)), 'the result errors[] diagnostic is recorded');
+  assert.match(f.pm.lastError!, /DISTINCT: tool runner crashed/);
+  assert.ok(f.diagnostics.some((d) => /DISTINCT: tool runner crashed/.test(String(d[1]))), 'the result errors[] diagnostic is logged');
+});
+
+test('an is_error success result whose errors[] differ from its result text keeps both diagnostics', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    yield { type: 'result', subtype: 'success', is_error: true, num_turns: 1, total_cost_usd: 0, result: 'DISTINCT: API Error 529 overloaded', errors: ['hook runner failed'] };
+    throw new Error('Claude Code returned an error result: DISTINCT: API Error 529 overloaded');
+  });
+  f.pm.send('input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  const entries = errorEntries(f.pm);
+  assert.ok(entries.some((e) => /hook runner failed/.test(e)), 'the errors[] diagnostic is recorded');
+  assert.ok(entries.some((e) => /DISTINCT: API Error 529 overloaded/.test(e)), 'the result text the SDK echoes is recorded');
+  assert.match(f.pm.lastError!, /DISTINCT: API Error 529 overloaded/);
+  assert.ok(f.diagnostics.some((d) => /DISTINCT: API Error 529 overloaded/.test(String(d[1]))), 'the echoed result text is logged');
+});

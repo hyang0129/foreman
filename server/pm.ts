@@ -54,8 +54,9 @@ const INVALID_RESUME_HANDLE = /\binvalid resume handle\b/i;
 // Abandoned session ids are moved here, never deleted: one JSON line per quarantine,
 // `{ ts, session_id, reason }`, with the provider diagnostic truncated.
 const PM_SESSION_QUARANTINE_FILE = `${PM_SESSION_FILE}.quarantine.jsonl`;
-// The diagnostic an error result carries, read the way the SDK reads it (errors[] for an
-// error subtype, `result` for an is_error success), with either as a fallback.
+// The diagnostic an error result carries: primarily the text the SDK's exit echo uses (errors[]
+// for an error subtype, `result` for an is_error success). Unlike the SDK, it falls back to the
+// other field when the primary one is empty; the echo then differs, so it never suppresses one.
 const resultDiagnostic = (m: any): string => {
   const errors = Array.isArray(m.errors) ? m.errors.map((e: unknown) => String(e).trim()).filter(Boolean).join('; ') : '';
   const result = typeof m.result === 'string' ? m.result : '';
@@ -369,9 +370,13 @@ export class ProjectManager extends EventEmitter {
           if (text.trim()) this.record({ role: "assistant", text });
           if (failed) {
             this.providerFailed = true;
-            this.fail(turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`);
+            const failure = turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`;
+            this.fail(failure);
+            // Suppress the SDK's exit echo only when its diagnostic is already fully in what was
+            // recorded (fail() keeps the first 1500 chars). Otherwise the echo is the only carrier
+            // of this result's own diagnostic, so it must surface as its own failure entry.
             const echoed = resultDiagnostic(m);
-            if (echoed) state.reported = sdkErrorResultEcho(echoed);
+            if (echoed && failure.slice(0, 1500).includes(echoed)) state.reported = sdkErrorResultEcho(echoed);
           } else {
             this.providerFailed = false;
             this.lastError = null;
