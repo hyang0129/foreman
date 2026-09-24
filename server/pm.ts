@@ -1,6 +1,6 @@
 // The project manager: one long-lived Claude Agent SDK session in streaming-input mode.
 // Tool access is enforced here (canUseTool), not just prompted.
-import { query, type SDKUserMessage, type Query, type HookCallback } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKUserMessage, type Query, type HookCallback, type TerminalReason } from "@anthropic-ai/claude-agent-sdk";
 import { normalizeModel } from "./models.ts";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -38,19 +38,34 @@ function memoryWritePath(p: string): boolean {
   } catch { return false; }
 }
 
+// The SDK's own abort reasons. Typed against the installed SDK so a typo or an SDK rename
+// fails `npm run typecheck` instead of silently turning a Stop into a failure (or vice versa).
+const SDK_ABORT_REASONS = ['aborted_streaming', 'aborted_tools'] as const satisfies readonly TerminalReason[];
+const isAbortReason = (reason: unknown): boolean => (SDK_ABORT_REASONS as readonly unknown[]).includes(reason);
+const MISSING_CONVERSATION = /no conversation found|session.*not found/i;
+
 class Inbox {
   delivered = 0;
   private q: SDKUserMessage[] = [];
-  private wake: (() => void) | null = null;
+  private waiters: (() => void)[] = [];
+  private generation = 0;
   push(text: string, sessionId: string) {
     this.q.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, session_id: sessionId } as SDKUserMessage);
-    this.wake?.(); this.wake = null;
+    this.notify();
   }
-  async *stream(): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      if (this.q.length) { this.delivered++; yield this.q.shift()!; continue; }
-      await new Promise<void>((r) => (this.wake = r));
-    }
+  private notify() { const waiters = this.waiters; this.waiters = []; for (const wake of waiters) wake(); }
+  // Opening a stream retires every earlier stream at once, so an abandoned provider attempt
+  // (e.g. a rejected resume) can never consume input meant for its replacement.
+  stream(): AsyncGenerator<SDKUserMessage> {
+    const generation = ++this.generation;
+    this.notify();
+    const inbox = this;
+    return (async function* () {
+      while (generation === inbox.generation) {
+        if (inbox.q.length) { inbox.delivered++; yield inbox.q.shift()!; continue; }
+        await new Promise<void>((r) => inbox.waiters.push(r));
+      }
+    })();
   }
 }
 
@@ -64,7 +79,14 @@ export class ProjectManager extends EventEmitter {
   tools: string[] = [];
   private running = false;
   private closed = false;
-  private interrupting = false;
+  // Cancellation is bound to a turn: `dispatched` counts inputs accepted by send(), and an
+  // interrupt remembers the count it was raised at, so any later input invalidates it.
+  private dispatched = 0;
+  private interruptedAt: number | null = null;
+  // Set when the still-running provider rejected a turn; the next explicit send restarts it.
+  private providerFailed = false;
+  // Each start() owns one generation; a retired run must not touch shared state.
+  private generation = 0;
   private reconciled = false;
   private pendingTurns = 0;
   private changingModel = false;
@@ -134,15 +156,29 @@ export class ProjectManager extends EventEmitter {
     if (this.changingModel) throw new Error('Model change in progress; retry your message');
     if (this.closed) throw new Error('Project manager is unavailable (closed)');
     // Explicit input is the only restart trigger: no automatic replay or retry loop.
+    // A provider that rejected a turn but stayed alive is restarted here, once it has settled
+    // every turn it accepted, so only this new input reaches the new process.
+    if (this.running && this.providerFailed && !this.pendingTurns && !this.busy) this.retire();
     if (!this.running) void this.start();
     if (!this.running) throw new Error(this.lastError || 'Project manager is unavailable');
     this.pendingTurns++;
+    this.dispatched++;
     this.inbox.push(text, this.sessionId ?? "");
   }
   async interrupt() {
     if (!this.q || !this.modelBusy) return;
-    this.interrupting = true;
-    try { await this.q.interrupt(); } catch (error) { this.interrupting = false; throw error; }
+    const token = this.dispatched;
+    this.interruptedAt = token;
+    try { await this.q.interrupt(); } catch (error) { if (this.interruptedAt === token) this.interruptedAt = null; throw error; }
+  }
+  // Detach the current run: close its provider and reset per-run state. Its start() keeps
+  // unwinding in the background but no longer owns any PM state.
+  private retire() {
+    const q = this.q;
+    this.generation++;
+    this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0;
+    this.interruptedAt = null; this.providerFailed = false; this.inbox = new Inbox();
+    q?.close();
   }
   close() { this.closed = true; this.q?.close(); this.q = null; }
 
@@ -196,10 +232,15 @@ export class ProjectManager extends EventEmitter {
     if (this.running || this.closed) return;
     this.reconcileHistory();
     this.running = true;
+    this.providerFailed = false;
+    const generation = ++this.generation;
+    const current = () => generation === this.generation;
+    const inbox = this.inbox;
+    let q: Query | null = null;
     const run = async (resume?: string) => {
       const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
-      this.q = this.queryFactory({
-        prompt: this.inbox.stream(),
+      q = this.q = this.queryFactory({
+        prompt: inbox.stream(),
         options: {
           cwd: FOREMAN_HOME,
           resume,
@@ -220,7 +261,8 @@ export class ProjectManager extends EventEmitter {
         },
       });
       let text = "", completeText = "", turnError = "";
-      for await (const m of this.q as any) {
+      for await (const m of q as any) {
+        if (!current()) break; // retired by an explicit send; the replacement owns all state now
         if (m.type === "system" && m.subtype === "init") {
           this.sessionId = m.session_id; writeFileSync(PM_SESSION_FILE, m.session_id);
           this.tools = m.tools ?? [];
@@ -250,13 +292,20 @@ export class ProjectManager extends EventEmitter {
             this.emit("event", { type: "peer", text: txt.slice(0, 600) } as PmEvent);
           }
         } else if (m.type === "result") {
-          const cancelled = this.interrupting || ['aborted_streaming', 'interrupted', 'cancelled'].includes(m.terminal_reason);
+          // Fail closed: an SDK abort reason is authoritative; otherwise cancellation is inferred
+          // only for a result with no terminal_reason, after an interrupt raised against the turn
+          // in flight with no newer input since. Any other terminal_reason is never a Stop.
+          const reason: TerminalReason | undefined = m.terminal_reason;
+          const cancelled = isAbortReason(reason) || (reason == null && this.interruptedAt !== null && this.interruptedAt === this.dispatched);
           const failed = !!m.is_error && !cancelled;
           text = text.trim() ? text : completeText || (!failed && !cancelled && typeof m.result === 'string' ? m.result : '');
           // A partial answer must precede its terminal explanation in history.
           if (text.trim()) this.record({ role: "assistant", text });
-          if (failed) this.fail(turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`);
-          else {
+          if (failed) {
+            this.providerFailed = true;
+            this.fail(turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`);
+          } else {
+            this.providerFailed = false;
             this.lastError = null;
             if (cancelled) {
               const message = 'Project manager stopped at your request. Message was not replayed.';
@@ -264,7 +313,7 @@ export class ProjectManager extends EventEmitter {
               this.emit('event', { type: 'status', text: message } as PmEvent);
             }
           }
-          this.interrupting = false;
+          this.interruptedAt = null; // an interrupt is spent by the first result after it
           this.pendingTurns = Math.max(0, this.pendingTurns - 1);
           this.busy = false;
           this.emit("event", { type: "assistant_text", text } as PmEvent);
@@ -272,19 +321,27 @@ export class ProjectManager extends EventEmitter {
           text = ""; completeText = ""; turnError = "";
         }
       }
-      if (!this.closed && (!this.lastError || this.pendingTurns)) throw new Error('Provider stream ended unexpectedly');
+      if (current() && !this.closed && (!this.lastError || this.pendingTurns)) throw new Error('Provider stream ended unexpectedly');
     };
     try {
       const resumeId = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
+      const deliveredBefore = inbox.delivered;
       try { await run(resumeId); }
       catch (error: any) {
-        // Only a missing saved conversation can safely fall back before input is sent.
-        if (!this.closed && !this.pendingTurns && resumeId && /no conversation found|session.*not found/i.test(String(error?.message ?? error))) {
-          this.q?.close(); writeFileSync(PM_SESSION_FILE, ""); await run();
-        } else throw error;
+        if (!current() || this.closed || !resumeId || !MISSING_CONVERSATION.test(String(error?.message ?? error))) throw error;
+        // The saved conversation is gone: never resume it again. Input still queued in the
+        // inbox was never delivered, so handing it to a fresh session is its first delivery.
+        // Input the rejected attempt already consumed is never re-sent; fail loudly instead.
+        writeFileSync(PM_SESSION_FILE, "");
+        if (inbox.delivered !== deliveredBefore) throw error;
+        (q as Query | null)?.close();
+        await run();
       }
     } catch (error: any) {
-      if (!this.closed) this.fail(String(error?.message ?? error));
-    } finally { this.q?.close(); this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; this.interrupting = false; this.inbox = new Inbox(); }
+      if (current() && !this.closed) this.fail(String(error?.message ?? error));
+    } finally {
+      if (current()) { this.q?.close(); this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; this.interruptedAt = null; this.providerFailed = false; this.inbox = new Inbox(); }
+      else (q as Query | null)?.close();
+    }
   }
 }
