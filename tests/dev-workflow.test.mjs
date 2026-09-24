@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { deploy, start, status, openHome, TARGET, guardEnvironment, processIdentity } from '../scripts/dev-environment.mjs';
+import { deploy, start, status, openHome, TARGET, guardEnvironment, processIdentity, dependencyIdentity } from '../scripts/dev-environment.mjs';
 const script = realpathSync('scripts/dev-environment.mjs');
 function fixture(t) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-workflow-')));
@@ -23,7 +23,8 @@ const save = (path, value) => writeFileSync(path,JSON.stringify(value),{mode:0o6
 test('startup never copies a production Codex rotating credential and requires an isolated login', async t => {
   const f=fixture(t), release='release-fixture', commit='a'.repeat(40);
   mkdirSync(join(f.home,release),{mode:0o700});
-  save(join(f.home,'deployment.json'),{release,commit});
+  symlinkSync(join(f.source,'node_modules'),join(f.home,release,'node_modules'));
+  save(join(f.home,'deployment.json'),{release,commit,dependencies:{realpath:join(f.source,'node_modules'),identity:await dependencyIdentity(join(f.source,'node_modules'))}});
   save(join(f.home,'dev-pairing.json'),{environment:'foreman-dev-v1',url:TARGET.url,token:'a'.repeat(64)});
   const prod=join(f.dir,'production-codex'); mkdirSync(prod);
   const credential='{"tokens":{"refresh_token":"fake-rotating-production-token"},"last_refresh":"now"}';

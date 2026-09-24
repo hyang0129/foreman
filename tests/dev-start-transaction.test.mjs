@@ -3,7 +3,7 @@
 // temporary dev home, and is cleaned up by the PID the test learned from it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { openHome, start, stop, status, running, findOrphans, processIdentity, TARGET } from '../scripts/dev-environment.mjs';
+import { openHome, start, stop, status, running, findOrphans, processIdentity, dependencyIdentity, TARGET } from '../scripts/dev-environment.mjs';
 
 const script = pathToFileURL(realpathSync('scripts/dev-environment.mjs')).href;
 const commit = 'c'.repeat(40);
@@ -48,13 +48,19 @@ async function injectedPort() {
   const { port } = server.address(); await new Promise((r) => server.close(r));
   assert.notEqual(port, TARGET.port); return port;
 }
+const emptyIdentity = await (async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'foreman-dev-empty-'));
+  try { return await dependencyIdentity(dir); } finally { rmSync(dir, { recursive: true }); }
+})();
 function fixture(t, { pairing = true } = {}) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-dev-start-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const home = openHome(dir), release = 'release-fixture';
   mkdirSync(join(home, release, 'server'), { recursive: true, mode: 0o700 });
   writeFileSync(join(home, release, 'server/main.ts'), fakeMain);
-  writeJson(join(home, 'deployment.json'), { release, commit });
+  // A valid (empty) installed-dependency tree linked into the snapshot (#29).
+  const modules = join(dir, 'node_modules'); mkdirSync(modules); symlinkSync(modules, join(home, release, 'node_modules'));
+  writeJson(join(home, 'deployment.json'), { release, commit, dependencies: { realpath: modules, identity: emptyIdentity } });
   if (pairing) writeJson(join(home, 'dev-pairing.json'), { environment: 'foreman-dev-v1', url: TARGET.url, token: 'a'.repeat(64) });
   return { dir, home, daemonFile: join(home, 'daemon.json'), entry: join(home, 'run.mjs') };
 }

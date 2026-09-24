@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Only this file chooses deployment targets. Preview source/config cannot retarget them.
-import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, lstatSync, realpathSync, renameSync, symlinkSync, openSync, closeSync } from 'node:fs';
+import { randomBytes, randomUUID, createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, lstatSync, realpathSync, renameSync, symlinkSync, openSync, closeSync, createReadStream } from 'node:fs';
+import { lstat, readdir, readlink } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -85,6 +87,44 @@ export default {
     return worker.fetch(request, env, ctx);
   }
 };\n`;
+}
+// Content-derived identity of an installed dependency tree. Lockfile equality
+// says what should be installed, not what is; this hashes what is. Walks `dir`
+// (already resolved) without following symlinks: each entry contributes its
+// sorted relative path and type; files add their executable bit and a SHA-256
+// of their contents; symlinks add their target text only, so nothing outside
+// the tree is read. Other special files (FIFOs, sockets, devices) contribute
+// their type only and are never opened, since reading one could block or have
+// side effects. Each entry is hashed as one JSON-framed record. The result
+// does not depend on listing or hashing order.
+export async function dependencyIdentity(dir, { concurrency = 32 } = {}) {
+  const entries = [];
+  async function walk(relative) {
+    for (const name of (await readdir(join(dir, relative))).sort()) {
+      const path = relative ? `${relative}/${name}` : name;
+      const stat = await lstat(join(dir, path));
+      if (stat.isDirectory()) { entries.push({ path, fields: ['d'] }); await walk(path); }
+      else if (stat.isSymbolicLink()) entries.push({ path, fields: ['l', await readlink(join(dir, path))] });
+      else if (stat.isFile()) entries.push({ path, fields: null, exec: (stat.mode & 0o111) ? 'x' : '-' });
+      else entries.push({ path, fields: ['o', stat.isFIFO() ? 'fifo' : stat.isSocket() ? 'socket' : stat.isCharacterDevice() ? 'char' : stat.isBlockDevice() ? 'block' : 'other'] });
+    }
+  }
+  await walk('');
+  const files = entries.filter((entry) => entry.fields === null);
+  let next = 0;
+  async function worker() {
+    while (next < files.length) {
+      const entry = files[next++], hash = createHash('sha256');
+      await pipeline(createReadStream(join(dir, entry.path)), hash);
+      entry.fields = ['f', entry.exec, hash.digest('hex')];
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, files.length) }, worker));
+  const total = createHash('sha256');
+  // One JSON array per entry: every string (path, symlink target) is quoted and
+  // escaped, so no path or target text can forge or merge another entry.
+  for (const entry of entries) total.update(`${JSON.stringify([entry.path, ...entry.fields])}\n`);
+  return `sha256:${total.digest('hex')}`;
 }
 function run(bin, args, options = {}) { return execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...options }); }
 async function wrangler(home, config, args) {
@@ -201,9 +241,13 @@ export async function deploy(home, options, deployWorker = wrangler) {
       run('git', ['-C', source, 'archive', '--format=tar', '--output', archive, commit]);
       run('tar', ['-xf', archive, '-C', snapshot]);
     } finally { rmSync(archive, { force: true }); }
-    // Use dependencies installed for the selected checkout, only with its exact lockfile.
+    // Use dependencies installed for the selected checkout, only with its exact
+    // lockfile. Lockfile equality is a precondition, not proof of what is
+    // installed: record the installed tree's identity so start can re-verify it.
     if (!readFileSync(join(snapshot, 'package-lock.json')).equals(readFileSync(join(source, 'package-lock.json')))) throw new Error('Install matching dependencies in a worktree for that ref first');
-    symlinkSync(realpathSync(join(source, 'node_modules')), join(snapshot, 'node_modules'));
+    const modules = realpathSync(join(source, 'node_modules'));
+    const dependencies = { realpath: modules, identity: await dependencyIdentity(modules) };
+    symlinkSync(modules, join(snapshot, 'node_modules'));
     const index = join(snapshot, 'web/index.html');
     const html = readFileSync(index, 'utf8');
     if (!html.includes('<body') || !html.includes('<title>')) throw new Error('Preview UI must have a body and title');
@@ -223,7 +267,7 @@ export async function deploy(home, options, deployWorker = wrangler) {
       await deployWorker(home, config, ['deploy', '--dry-run', '--secrets-file', secret]);
       await deployWorker(home, config, ['deploy', '--secrets-file', secret]);
     } finally { rmSync(secret, { force: true }); }
-    save(join(home, 'deployment.json'), { release: snapshot.slice(home.length + 1), commit, source });
+    save(join(home, 'deployment.json'), { release: snapshot.slice(home.length + 1), commit, source, dependencies });
     committed = true;
     // Only prune after the replacement record has been atomically published.
     for (const name of readdirSync(home)) {
@@ -266,6 +310,16 @@ async function terminateChild(child) {
   if (await within(5000)) return;
   throw new Error(`DEV daemon PID ${child.pid} did not exit after a failed start; its startup record is kept for npm run dev:stop`);
 }
+const redeploy = 'reinstall matching dependencies and run npm run dev:deploy again';
+export async function verifyDependencies(snapshot, deployment) {
+  const recorded = deployment.dependencies;
+  if (typeof recorded?.realpath !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(recorded?.identity ?? '')) throw new Error('Dev deployment has no installed-dependency record (deployed by an older workflow); run npm run dev:deploy again');
+  let linked;
+  try { linked = realpathSync(join(snapshot, 'node_modules')); } catch { linked = null; }
+  if (linked !== recorded.realpath) throw new Error(`Snapshot node_modules resolves to ${linked ?? 'nothing'}, not the deployed ${recorded.realpath}; ${redeploy}`);
+  const identity = await dependencyIdentity(linked);
+  if (identity !== recorded.identity) throw new Error(`Installed dependencies changed since deploy (${linked}: ${identity} != deployed ${recorded.identity}); ${redeploy}`);
+}
 export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save } = {}) {
   const current = inspect(home);
   if (current.daemon?.state === 'starting') throw new Error(`DEV daemon PID ${current.daemon.pid} was left by an interrupted start; run npm run dev:stop first`);
@@ -274,6 +328,8 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
   if (current.record?.state === 'starting') rmSync(current.file);
   const deployment = read(join(home, 'deployment.json'));
   const snapshot = releasePath(home, deployment);
+  // Before any spawn: the snapshot must still run against the exact installed tree deployed.
+  await verifyDependencies(snapshot, deployment);
   const pair = validatePairing(read(join(home, 'dev-pairing.json')));
   const relay = await relayStatus(pair);
   if (relay.commit !== deployment.commit) throw new Error('Deployed Worker does not match the local snapshot; redeploy before starting');
