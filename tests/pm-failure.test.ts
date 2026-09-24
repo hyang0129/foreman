@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -180,8 +181,10 @@ test('repeated synchronous startup rejection retains input without duplicate fai
 
 // A scripted provider: every launch runs `script` with its own close/interrupt signals, and the
 // harness records each launch's resume id plus exactly which inputs the provider consumed.
-type Launch = { resume?: string; closed: boolean; interrupts: number };
-type Ctx = { launch: number; resume?: string; next: () => Promise<string | undefined>; closed: Promise<void>; interrupted: Promise<void> };
+// `next` is input the provider processed; `pull` is input the SDK read off the prompt iterable
+// (it reads eagerly, like streamInput) that the provider never processed.
+type Launch = { resume?: string; closed: boolean; interrupts: number; consumed: string[]; pulled: string[] };
+type Ctx = { launch: number; resume?: string; next: () => Promise<string | undefined>; pull: () => Promise<string | undefined>; closed: Promise<void>; interrupted: Promise<void> };
 function scripted(t: any, script: (ctx: Ctx) => AsyncGenerator<any>, sessionFile = '') {
   writeFileSync(PM_HISTORY_FILE, ''); writeFileSync(PM_SESSION_FILE, sessionFile);
   const pm = new ProjectManager({} as any);
@@ -189,19 +192,25 @@ function scripted(t: any, script: (ctx: Ctx) => AsyncGenerator<any>, sessionFile
   pm.on('event', (event) => events.push(event));
   t.mock.method(console, 'error', (...args: any[]) => diagnostics.push(args));
   (pm as any).queryFactory = ({ prompt, options }: any) => {
-    const launch: Launch = { resume: options.resume, closed: false, interrupts: 0 };
+    const launch: Launch = { resume: options.resume, closed: false, interrupts: 0, consumed: [], pulled: [] };
     const index = launches.push(launch) - 1;
     let close!: () => void, interrupt!: () => void;
     const closed = new Promise<void>((r) => { close = r; }), interrupted = new Promise<void>((r) => { interrupt = r; });
     const next = async () => {
       const input = await prompt.next();
       if (input.done) return undefined;
-      consumed.push(input.value.message.content); return input.value.message.content;
+      consumed.push(input.value.message.content); launch.consumed.push(input.value.message.content);
+      return input.value.message.content;
+    };
+    const pull = async () => {
+      const input = await prompt.next();
+      if (input.done) return undefined;
+      launch.pulled.push(input.value.message.content); return input.value.message.content;
     };
     return {
       close: () => { launch.closed = true; close(); },
       interrupt: async () => { launch.interrupts++; interrupt(); },
-      [Symbol.asyncIterator]: () => script({ launch: index, resume: options.resume, next, closed, interrupted }),
+      [Symbol.asyncIterator]: () => script({ launch: index, resume: options.resume, next, pull, closed, interrupted }),
     };
   };
   t.after(() => pm.close());
@@ -210,7 +219,7 @@ function scripted(t: any, script: (ctx: Ctx) => AsyncGenerator<any>, sessionFile
 const quiet = () => new Promise((resolve) => setTimeout(resolve, 30));
 const stoppedEntries = (pm: any) => pm.history().filter((e: any) => /stopped at your request/.test(e.text ?? ''));
 
-test('an interrupt whose turn produced no result does not relabel the next turn\'s provider failure as a Stop', async (t) => {
+test('an interrupt whose turn produced no result does not relabel the next turn\'s provider failure as a Stop', { timeout: 10_000 }, async (t) => {
   const f = scripted(t, async function* ({ next, closed }) {
     yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
     await next(); // the interrupted turn: the provider never answers it
@@ -230,7 +239,7 @@ test('an interrupt whose turn produced no result does not relabel the next turn\
   assert.equal(f.diagnostics.length, 1);
 });
 
-test('aborted_tools is an SDK abort and settles as a Stop without a failure', async (t) => {
+test('aborted_tools is an SDK abort and settles as a Stop without a failure', { timeout: 10_000 }, async (t) => {
   const f = fixture(t, [{ type: 'result', is_error: true, subtype: 'error_during_execution', terminal_reason: 'aborted_tools', errors: ['aborted'] }]);
   f.pm.lastError = 'Old failure';
   f.pm.send('stop during a tool round'); // no local interrupt: the terminal_reason alone decides
@@ -241,7 +250,7 @@ test('aborted_tools is an SDK abort and settles as a Stop without a failure', as
   assert.equal(f.events.find((e) => e.type === 'turn_end').is_error, false);
 });
 
-test('a non-abort terminal_reason is a failure even when an interrupt was raised for the turn', async (t) => {
+test('a non-abort terminal_reason is a failure even when an interrupt was raised for the turn', { timeout: 10_000 }, async (t) => {
   const f = scripted(t, async function* ({ next, interrupted, closed }) {
     yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
     await next(); await interrupted;
@@ -259,7 +268,7 @@ test('a non-abort terminal_reason is a failure even when an interrupt was raised
   assert.equal(f.events.find((e) => e.type === 'turn_end').is_error, true);
 });
 
-test('an interrupted turn whose result carries no terminal_reason still settles as a Stop', async (t) => {
+test('an interrupted turn whose result carries no terminal_reason still settles as a Stop', { timeout: 10_000 }, async (t) => {
   const f = scripted(t, async function* ({ next, interrupted, closed }) {
     yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
     await next(); await interrupted;
@@ -275,10 +284,13 @@ test('an interrupted turn whose result carries no terminal_reason still settles 
   assert.equal(stoppedEntries(f.pm).length, 1);
 });
 
-test('a send-triggered restart whose resume is rejected as missing clears the session and answers the new input in a fresh session', async (t) => {
-  const f = scripted(t, async function* ({ launch, next, closed }) {
+test('a send-triggered restart whose resume is rejected as missing clears the session and answers the new input in a fresh session', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ launch, next, pull, closed }) {
     if (launch === 0) return; // the PM's provider exits; the saved session is left behind
-    if (launch === 1) throw new Error('No conversation found with session ID: stale-session');
+    if (launch === 1) {
+      await pull(); // the SDK reads the input eagerly; the CLI then rejects --resume with no frame
+      throw new Error('No conversation found with session ID: stale-session');
+    }
     yield { type: 'system', subtype: 'init', session_id: 'fresh-session', tools: [] };
     await next();
     yield { type: 'assistant', message: { content: [{ type: 'text', text: 'Fresh answer' }] } };
@@ -293,13 +305,21 @@ test('a send-triggered restart whose resume is rejected as missing clears the se
   assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', 'stale-session', undefined]);
   assert.equal(f.launches[1].closed, true);
   assert.deepEqual(f.consumed, ['new input']); // delivered once, to the fresh session only
+  assert.deepEqual(f.launches[1].pulled, ['new input']); // the rejected attempt did read it
+  assert.deepEqual(f.launches[2].consumed, ['new input']);
   assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'fresh-session');
   assert.equal(f.pm.lastError, null);
+  // Only the original PM's exit is an error; the rejected resume is not reported as a failure.
+  assert.equal(f.pm.history().filter((e) => e.error && /No conversation found/.test(e.text)).length, 0);
 });
 
-test('a missing-conversation rejection after input was consumed clears the session, fails loudly and never re-sends', async (t) => {
+for (const [kind, frame] of [
+  ['system/init', { type: 'system', subtype: 'init', session_id: 'stale-session', tools: [] }],
+  ['stream_event', { type: 'stream_event', event: { type: 'message_start' } }],
+] as const) test(`a missing-conversation rejection after a provider frame (${kind}) clears the session, fails loudly and never re-sends`, { timeout: 10_000 }, async (t) => {
   const f = scripted(t, async function* ({ launch, next, closed }) {
     if (launch === 0) {
+      yield frame; // the provider did something, so the input may have been processed
       await next();
       throw new Error('No conversation found with session ID: stale-session');
     }
@@ -313,6 +333,7 @@ test('a missing-conversation rejection after input was consumed clears the sessi
   await quiet();
   assert.equal(f.launches.length, 1); // no fallback run: the consumed input is not replayed
   assert.deepEqual(f.consumed, ['consumed by the rejected attempt']);
+  assert.equal(f.pm.history().filter((e) => e.role === 'assistant').length, 0);
   assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
   assert.match(f.pm.lastError!, /No conversation found/);
   assert.equal(f.pm.history().filter((e) => e.error).length, 1);
@@ -323,7 +344,7 @@ test('a missing-conversation rejection after input was consumed clears the sessi
   assert.deepEqual(f.consumed, ['consumed by the rejected attempt', 'explicit retry']);
 });
 
-test('an explicit send restarts an alive-but-rejecting PM and dispatches only the new input', async (t) => {
+test('an explicit send restarts an alive-but-rejecting PM and dispatches only the new input', { timeout: 10_000 }, async (t) => {
   const f = scripted(t, async function* ({ launch, next, closed }) {
     yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
     await next();
@@ -349,7 +370,7 @@ test('an explicit send restarts an alive-but-rejecting PM and dispatches only th
   assert.equal(f.pm.history().filter((e) => e.error).length, 1);
 });
 
-test('a PM that failed with turns still pending is not restarted, so accepted input is not dropped', async (t) => {
+test('a PM that failed with turns still pending is not restarted, so accepted input is not dropped', { timeout: 10_000 }, async (t) => {
   const f = scripted(t, async function* ({ next, closed }) {
     yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
     await next();
@@ -368,7 +389,7 @@ test('a PM that failed with turns still pending is not restarted, so accepted in
   assert.equal(f.pm.lastError, null);
 });
 
-test('a non-provider error such as the restart notice does not restart a running PM', async (t) => {
+test('a non-provider error such as the restart notice does not restart a running PM', { timeout: 10_000 }, async (t) => {
   const f = scripted(t, async function* ({ next, closed }) {
     yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
     await next();
@@ -383,7 +404,7 @@ test('a non-provider error such as the restart notice does not restart a running
   assert.equal(f.launches.length, 1); assert.deepEqual(f.consumed, ['next message']);
 });
 
-test('a retired provider cannot write into the PM after an explicit restart', async (t) => {
+test('a retired provider cannot write into the PM after an explicit restart', { timeout: 10_000 }, async (t) => {
   let releaseLate!: () => void;
   const late = new Promise<void>((r) => { releaseLate = r; });
   const f = scripted(t, async function* ({ launch, next, closed }) {
@@ -391,7 +412,8 @@ test('a retired provider cannot write into the PM after an explicit restart', as
     await next();
     if (launch === 0) {
       yield { type: 'result', is_error: true, subtype: 'success', result: 'Invalid bearer token' };
-      await late; // a straggling frame from the old process after it was retired
+      await late; // straggling frames from the old process after it was retired
+      yield { type: 'system', subtype: 'init', session_id: 'late-stale-session', tools: [] };
       yield { type: 'result', is_error: true, subtype: 'success', result: 'Late stale failure' };
       return;
     }
@@ -406,4 +428,142 @@ test('a retired provider cannot write into the PM after an explicit restart', as
   assert.equal(f.pm.history().some((e) => /Late stale failure/.test(e.text ?? '')), false);
   assert.equal((f.pm as any).running, true);
   assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'session-1');
+  assert.equal(f.pm.sessionId, 'session-1');
+  assert.equal(f.events.some((e) => e.type === 'status' && /late-sta/.test(e.text)), false);
+});
+
+test('a rejected resume whose fresh session also fails is not requeued again', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ launch, pull }) {
+    await pull();
+    throw new Error(`No conversation found with session ID: ${launch === 0 ? 'stale-session' : 'fresh'}`);
+  }, 'stale-session');
+  f.pm.send('new input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]); // one fallback only
+  assert.deepEqual(f.launches.map((l) => l.pulled), [['new input'], ['new input']]);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
+  assert.match(f.pm.lastError!, /No conversation found/);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+});
+
+test('a peer-triggered turn invalidates a pending interrupt, so its genuine failure is not a Stop', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next, interrupted, closed }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next(); await interrupted; // the interrupted turn: the provider never answers it
+    // A peer message then starts a turn of its own, which genuinely fails without a terminal_reason.
+    yield { type: 'user', message: { role: 'user', content: '<cross-session-message from="worker">Build finished</cross-session-message>' } };
+    yield { type: 'result', is_error: true, subtype: 'error_during_execution', errors: ['Provider unavailable'] };
+    await closed;
+  });
+  const running = f.pm.start(); t.after(() => running);
+  f.pm.send('first'); await settle(() => f.consumed.length === 1);
+  await f.pm.interrupt(); assert.equal(f.launches[0].interrupts, 1);
+  await settle(() => f.events.some((e) => e.type === 'turn_end'));
+  assert.equal(f.pm.history().filter((e) => e.role === 'peer').length, 1);
+  assert.match(f.pm.lastError!, /Provider unavailable/);
+  assert.equal(f.events.find((e) => e.type === 'turn_end').is_error, true);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  assert.equal(stoppedEntries(f.pm).length, 0);
+});
+
+test('retiring a provider ends its parked input reader and ignores its stderr', { timeout: 10_000 }, async (t) => {
+  let released = false;
+  const f = scripted(t, async function* ({ launch, next, closed }) {
+    yield { type: 'system', subtype: 'init', session_id: `session-${launch}`, tools: [] };
+    await next();
+    if (launch === 0) {
+      yield { type: 'result', is_error: true, subtype: 'success', result: 'Invalid bearer token' };
+      // Like the SDK's streamInput, keep reading the prompt after the turn.
+      if (await next() === undefined) released = true;
+      return;
+    }
+    yield { type: 'result', is_error: false, subtype: 'success', result: 'Recovered answer' };
+    await closed;
+  });
+  const stderr: ((chunk: string) => void)[] = [];
+  const factory = (f.pm as any).queryFactory;
+  (f.pm as any).queryFactory = (args: any) => { stderr.push(args.options.stderr); return factory(args); };
+  void f.pm.start();
+  f.pm.send('failed input'); await settle(() => !!f.pm.lastError);
+  f.pm.send('retry'); await settle(() => f.pm.history().some((e) => e.text === 'Recovered answer'));
+  await settle(() => released); // the retired stream completed instead of leaking a stuck reader
+  assert.deepEqual(f.launches[0].consumed, ['failed input']);
+  assert.deepEqual(f.launches[1].consumed, ['retry']);
+  stderr[0]('error: late output from the retired process');
+  assert.equal(f.events.some((e) => e.type === 'status' && /retired process/.test(e.text)), false);
+  stderr[1]('error: output from the live process');
+  assert.equal(f.events.some((e) => e.type === 'status' && /live process/.test(e.text)), true);
+});
+
+// The real SDK reads prompt input eagerly (query() starts streamInput at once). Drive the real
+// query() against a stub CLI so the fallback is proven against that behavior, with no model spend.
+function stubCli(mode: 'reject' | 'init-then-reject') {
+  const dir = mkdtempSync(join(home, 'stub-cli-'));
+  const path = join(dir, 'claude.mjs'), log = join(dir, 'log.jsonl');
+  writeFileSync(path, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+const log = (entry) => appendFileSync(${JSON.stringify(log)}, JSON.stringify(entry) + '\\n');
+const out = (m) => process.stdout.write(JSON.stringify(m) + '\\n');
+const resume = process.argv.slice(2).find((a) => a.startsWith('--resume'));
+log({ resume: resume ? resume.split('=')[1] : null });
+if (resume) {
+  if (${JSON.stringify(mode)} === 'init-then-reject') out({ type: 'system', subtype: 'init', session_id: 'stale-session', tools: [] });
+  process.stderr.write('No conversation found with session ID: ' + resume.split('=')[1] + '\\n');
+  process.exit(1);
+}
+let inited = false;
+for await (const line of createInterface({ input: process.stdin })) {
+  if (!line.trim()) continue;
+  const m = JSON.parse(line);
+  if (m.type === 'control_request') { out({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: {} } }); continue; }
+  if (m.type !== 'user') continue;
+  log({ input: m.message.content });
+  if (!inited) { inited = true; out({ type: 'system', subtype: 'init', session_id: 'fresh-session', tools: [] }); }
+  out({ type: 'assistant', message: { content: [{ type: 'text', text: 'echo: ' + m.message.content }] }, session_id: 'fresh-session' });
+  out({ type: 'result', subtype: 'success', is_error: false, result: 'echo: ' + m.message.content, session_id: 'fresh-session', total_cost_usd: 0 });
+}
+`, { mode: 0o755 });
+  return { path, entries: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []) };
+}
+function realSdkPm(t: any, cli: string) {
+  writeFileSync(PM_HISTORY_FILE, ''); writeFileSync(PM_SESSION_FILE, 'stale-session');
+  const pm = new ProjectManager({} as any);
+  const diagnostics: any[] = [], resumes: (string | undefined)[] = [];
+  t.mock.method(console, 'error', (...args: any[]) => diagnostics.push(args));
+  t.mock.method(process, 'emitWarning', () => {});
+  (pm as any).queryFactory = (args: any) => {
+    resumes.push(args.options.resume);
+    return query({ ...args, options: { ...args.options, pathToClaudeCodeExecutable: cli } });
+  };
+  t.after(() => pm.close());
+  return { pm, diagnostics, resumes };
+}
+
+test('real SDK: a send-triggered resume rejected before any frame is answered once by a fresh session', { timeout: 10_000 }, async (t) => {
+  const cli = stubCli('reject');
+  const f = realSdkPm(t, cli.path);
+  f.pm.send('new input');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant'));
+  await quiet();
+  assert.deepEqual(f.resumes, ['stale-session', undefined]);
+  assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }, { resume: null }, { input: 'new input' }]);
+  assert.equal(f.pm.history().find((e) => e.role === 'assistant').text, 'echo: new input');
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'fresh-session');
+  assert.equal(f.pm.lastError, null);
+  assert.equal(f.diagnostics.length, 0);
+});
+
+test('real SDK: a resume rejected after a provider frame fails loudly without a second launch', { timeout: 10_000 }, async (t) => {
+  const cli = stubCli('init-then-reject');
+  const f = realSdkPm(t, cli.path);
+  f.pm.send('new input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.deepEqual(f.resumes, ['stale-session']);
+  assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }]);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
+  assert.match(f.pm.lastError!, /No conversation found/);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
 });

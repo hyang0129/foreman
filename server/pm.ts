@@ -55,17 +55,29 @@ class Inbox {
   }
   private notify() { const waiters = this.waiters; this.waiters = []; for (const wake of waiters) wake(); }
   // Opening a stream retires every earlier stream at once, so an abandoned provider attempt
-  // (e.g. a rejected resume) can never consume input meant for its replacement.
-  stream(): AsyncGenerator<SDKUserMessage> {
+  // (e.g. a rejected resume) can never consume input meant for its replacement. `taken`
+  // records every message this stream handed to its reader (the SDK reads it eagerly).
+  open(): { prompt: AsyncGenerator<SDKUserMessage>; taken: SDKUserMessage[] } {
     const generation = ++this.generation;
     this.notify();
-    const inbox = this;
-    return (async function* () {
+    const inbox = this, taken: SDKUserMessage[] = [];
+    const prompt = (async function* () {
       while (generation === inbox.generation) {
-        if (inbox.q.length) { inbox.delivered++; yield inbox.q.shift()!; continue; }
+        if (inbox.q.length) { const message = inbox.q.shift()!; taken.push(message); inbox.delivered++; yield message; continue; }
         await new Promise<void>((r) => inbox.waiters.push(r));
       }
     })();
+    return { prompt, taken };
+  }
+  // End every open stream: a reader parked on it wakes and its stream completes.
+  retire() { this.generation++; this.notify(); }
+  // Hand back input a stream took but its provider never processed, ahead of anything queued
+  // after it. The stream is retired first so it cannot take the input again.
+  requeue(taken: SDKUserMessage[]) {
+    this.retire();
+    const returned = taken.splice(0);
+    this.q.unshift(...returned);
+    this.delivered -= returned.length;
   }
 }
 
@@ -177,7 +189,8 @@ export class ProjectManager extends EventEmitter {
     const q = this.q;
     this.generation++;
     this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0;
-    this.interruptedAt = null; this.providerFailed = false; this.inbox = new Inbox();
+    this.interruptedAt = null; this.providerFailed = false;
+    this.inbox.retire(); this.inbox = new Inbox(); // release the old provider's parked input reader
     q?.close();
   }
   close() { this.closed = true; this.q?.close(); this.q = null; }
@@ -237,10 +250,15 @@ export class ProjectManager extends EventEmitter {
     const current = () => generation === this.generation;
     const inbox = this.inbox;
     let q: Query | null = null;
+    // What the latest provider attempt did: the input its stream handed out, and how many
+    // frames the provider emitted. Zero frames means the CLI never processed any input.
+    let attempt = { taken: [] as SDKUserMessage[], frames: 0 };
     const run = async (resume?: string) => {
       const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
+      const stream = inbox.open();
+      const state = attempt = { taken: stream.taken, frames: 0 };
       q = this.q = this.queryFactory({
-        prompt: inbox.stream(),
+        prompt: stream.prompt,
         options: {
           cwd: FOREMAN_HOME,
           resume,
@@ -257,12 +275,13 @@ export class ProjectManager extends EventEmitter {
           maxTurns: 60,
           effort: (process.env.FOREMAN_PM_EFFORT as any) || "medium",
           ...(this.model ? { model: this.model } : {}),
-          stderr: (chunk: string) => { if (/error|warn/i.test(chunk)) this.emit("event", { type: "status", text: chunk.trim().slice(0, 300) } as PmEvent); },
+          stderr: (chunk: string) => { if (current() && /error|warn/i.test(chunk)) this.emit("event", { type: "status", text: chunk.trim().slice(0, 300) } as PmEvent); },
         },
       });
       let text = "", completeText = "", turnError = "";
       for await (const m of q as any) {
         if (!current()) break; // retired by an explicit send; the replacement owns all state now
+        state.frames++;
         if (m.type === "system" && m.subtype === "init") {
           this.sessionId = m.session_id; writeFileSync(PM_SESSION_FILE, m.session_id);
           this.tools = m.tools ?? [];
@@ -288,6 +307,8 @@ export class ProjectManager extends EventEmitter {
           const c = m.message?.content;
           const txt = typeof c === "string" ? c : Array.isArray(c) ? c.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n") : "";
           if (/Cross-session (idle notice|message)|<cross-session-message/i.test(txt.slice(0, 200))) {
+            // A peer message starts a turn send() never dispatched: no pending Stop applies to it.
+            this.interruptedAt = null;
             this.record({ role: "peer", text: txt.slice(0, 600) });
             this.emit("event", { type: "peer", text: txt.slice(0, 600) } as PmEvent);
           }
@@ -325,22 +346,27 @@ export class ProjectManager extends EventEmitter {
     };
     try {
       const resumeId = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
-      const deliveredBefore = inbox.delivered;
       try { await run(resumeId); }
       catch (error: any) {
         if (!current() || this.closed || !resumeId || !MISSING_CONVERSATION.test(String(error?.message ?? error))) throw error;
-        // The saved conversation is gone: never resume it again. Input still queued in the
-        // inbox was never delivered, so handing it to a fresh session is its first delivery.
-        // Input the rejected attempt already consumed is never re-sent; fail loudly instead.
+        // The saved conversation is gone: never resume it again.
         writeFileSync(PM_SESSION_FILE, "");
-        if (inbox.delivered !== deliveredBefore) throw error;
+        // The SDK reads prompt input eagerly, so "taken from the inbox" is not "processed".
+        // Decide by what the provider did: if the rejected attempt emitted no frame at all, the
+        // CLI failed while loading the resume and never processed its input, so that input goes
+        // back to the head of the inbox, once, for its first real delivery to a fresh session.
+        // If any frame arrived, the input may have been processed: fail loudly, never re-send.
+        // This branch runs at most once per start(), and the fresh run() never resumes.
+        const rejected = attempt;
+        if (rejected.frames) throw error;
         (q as Query | null)?.close();
+        inbox.requeue(rejected.taken);
         await run();
       }
     } catch (error: any) {
       if (current() && !this.closed) this.fail(String(error?.message ?? error));
     } finally {
-      if (current()) { this.q?.close(); this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; this.interruptedAt = null; this.providerFailed = false; this.inbox = new Inbox(); }
+      if (current()) { this.q?.close(); this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; this.interruptedAt = null; this.providerFailed = false; this.inbox.retire(); this.inbox = new Inbox(); }
       else (q as Query | null)?.close();
     }
   }
