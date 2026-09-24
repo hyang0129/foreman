@@ -224,3 +224,19 @@ test('bridge authenticates to the local API with a separate local token', async 
   assert.equal(authorization,'Bearer synthetic-local-token');
   assert.equal(f.options[0].headers.authorization,`Bearer ${TOKEN}`);
 });
+
+test('project routes cross the authenticated bridge with only explicit methods', async (t) => {
+  const seen: { method?: string; path?: string; token?: string }[] = [];
+  const port = await local(t, (req, res) => { seen.push({ method: req.method, path: req.url, token: req.headers.authorization }); res.end('{}'); });
+  const f = bridge(t, port, 'synthetic-local-token'), socket = f.sockets[0]; socket.open();
+  const routes = [['GET', '/api/projects'], ...['resolve', 'register', 'update', 'remove'].map((action) => ['POST', `/api/projects/${action}`])];
+  for (const [method, path] of routes) {
+    const reply = response(socket, path); socket.receive({ type: 'request', id: path, method, path, ...(method === 'POST' ? { body: '{}' } : {}) });
+    assert.equal((await reply).status, 200);
+  }
+  assert.equal(seen.length, 5); assert.ok(seen.every((entry) => entry.token === 'Bearer synthetic-local-token'));
+  for (const [method, path] of [['GET', '/api/projects/register'], ['POST', '/api/projects'], ['GET', '/api/projects/list-directory']]) {
+    const reply = response(socket, path); socket.receive({ type: 'request', id: path, method, path, body: '{}' }); assert.equal((await reply).status, 400);
+  }
+  assert.equal(seen.length, 5);
+});
