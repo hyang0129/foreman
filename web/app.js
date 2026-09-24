@@ -602,12 +602,14 @@ function messageNode(entry, receipt, entryKey) {
   const role = ["user", "assistant", "tool", "system"].includes(entry.role)
     ? entry.role
     : "system";
-  const article = node("article", `message ${role}`);
+  const failed = role === "system" && entry.error === true;
+  const article = node("article", `message ${role}${failed ? " error" : ""}`);
+  if (failed) article.setAttribute("aria-label", failureLabel());
   const sender = sourceLabel(entry.source);
   const label = node(
     "div",
     "message-label",
-    sender
+    failed ? failureLabel() : sender
       ? `From ${sender}`
       : role === "user"
         ? "You"
@@ -1000,6 +1002,7 @@ async function refreshSelected() {
       if (result.error !== polledPmError) showError(result.error);
     } else if (polledPmError) clearError();
     polledPmError = result.error || null;
+    setPmRailError(polledPmError);
     pmModelReady = true;
     if (!pmModelSaving && revision === modelRevision) {
       pmModel = result.model || "";
@@ -1014,6 +1017,44 @@ async function refreshSelected() {
     renderApprovals(result.approvals || []);
   }
   renderHeading();
+}
+// A persisted PM failure (history entry `{ role: "system", error: true }`).
+function failureLabel() {
+  return selected === "pm" ? "Project manager error" : "Error";
+}
+// Rail indicator for a PM failure, fed by the full history while the PM is
+// selected and by the lightweight summary read otherwise.
+let pmRailError = null;
+function setPmRailError(error) {
+  pmRailError = error || null;
+  const row = $("#select-pm");
+  let alert = row.querySelector(".pm-alert");
+  if (pmRailError && !alert) {
+    alert = node("span", "pm-alert");
+    const dot = node("span", "pm-alert-dot", "!");
+    dot.setAttribute("aria-hidden", "true");
+    alert.append(dot, node("span", "sr-only", "Project manager has an error"));
+    row.querySelector(".pinned").before(alert);
+  } else if (!pmRailError) alert?.remove();
+  row.classList.toggle("has-error", !!pmRailError);
+  if (pmRailError) {
+    row.setAttribute("aria-label", "Project manager, has an error");
+    row.title = `Project manager error: ${pmRailError}`;
+  } else {
+    row.removeAttribute("aria-label");
+    row.removeAttribute("title");
+  }
+}
+async function refreshPmSummary(epoch) {
+  if (selected === "pm" || !authorized || !host.online) return;
+  const selection = selectionEpoch;
+  try {
+    const result = await api("/api/pm/history?summary=1");
+    if (!authorized || epoch !== authEpoch || selection !== selectionEpoch || selected === "pm") return;
+    setPmRailError(result.error);
+  } catch {
+    /* Keep the last known indicator; the next poll retries. */
+  }
 }
 async function poll() {
   clearTimeout(pollTimer);
@@ -1037,6 +1078,7 @@ async function poll() {
         renderMessages();
         renderHeading();
       }
+      await refreshPmSummary(epoch);
     } else {
       if (conversationLoading) showConversationLoading("Conversation unavailable while your Mac is offline. It will open when your Mac reconnects.", true);
       renderRail();
@@ -1506,6 +1548,7 @@ function enterApp(user) {
   ui.signOut.hidden = !authRequired || localAuthMode;
   $("#account").textContent = user?.email || "Local connection";
   clearError();
+  setPmRailError(null);
   renderHost();
   renderRail();
   renderHeading();
