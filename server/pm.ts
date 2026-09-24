@@ -62,6 +62,7 @@ const resultDiagnostic = (m: any): string => {
   const result = typeof m.result === 'string' ? m.result : '';
   return (m.subtype === 'success' ? result || errors : errors || result);
 };
+const errorText = (error: unknown): string => String((error as any)?.message ?? error);
 // When the CLI exits after an error result, the SDK throws this echo of the result's diagnostic.
 const sdkErrorResultEcho = (diagnostic: string) => `Claude Code returned an error result: ${diagnostic}`;
 
@@ -123,6 +124,12 @@ export class ProjectManager extends EventEmitter {
   private reconciled = false;
   private pendingTurns = 0;
   private changingModel = false;
+  // A provider launch that threw synchronously (spawn ENOENT, unreadable prompt) while send()
+  // was starting it: send() rejects with this cause instead of accepting input no run can read.
+  private launchFailure: string | null = null;
+  // Session ids quarantined by this process. Never resumed again, even when clearing the active
+  // session file failed and it still names one, so the next explicit send starts fresh.
+  private quarantinedIds = new Set<string>();
   model: string | undefined;
   private settingsPath: string;
   get modelBusy() { return this.busy || this.pendingTurns > 0 || this.changingModel; }
@@ -136,11 +143,13 @@ export class ProjectManager extends EventEmitter {
   async setModel(value: unknown) {
     const model = normalizeModel(value);
     if (this.modelBusy) throw new Error('Wait for the project manager to finish before changing its model');
-    if (!this.q || this.closed || !this.running) throw new Error('Project manager is unavailable');
+    if (this.closed) throw this.unavailable(' (closed)');
+    const q = this.q;
+    if (!q || !this.running) throw this.unavailable();
     this.changingModel = true;
     const previous = this.model;
     try {
-      await this.q.setModel(model);
+      await q.setModel(model);
       try {
         const tmp = `${this.settingsPath}.${randomUUID()}.tmp`;
         writeFileSync(tmp, JSON.stringify({ model: model ?? null }), { flag: 'wx', mode: 0o600 });
@@ -148,7 +157,15 @@ export class ProjectManager extends EventEmitter {
         this.model = model;
       } catch (error) {
         // If persistence fails, restore the previous live selection before accepting more messages.
-        try { await this.q.setModel(previous); } catch { this.close(); }
+        try { await q.setModel(previous); }
+        catch (restoreError) {
+          // The live model no longer matches the saved one, so the PM closes. Keep both causes
+          // as the PM's error, so this rejection and every later one carries them.
+          const reason = `the model change could not be saved (${errorText(error).slice(0, 600)}) and restoring the previous model failed (${errorText(restoreError).slice(0, 600)})`;
+          this.fail(reason, 'The project manager was closed so it does not run with an unsaved model; restart Foreman to recover.');
+          this.close();
+          throw new Error(this.lastError!);
+        }
         throw error;
       }
     } finally { this.changingModel = false; }
@@ -169,8 +186,13 @@ export class ProjectManager extends EventEmitter {
   private reportRecord(entry: any) { this.report('history', String(entry.role), () => this.record(entry)); }
   private emitEvent(event: PmEvent) { this.report('event', event.type, () => this.emit("event", event)); }
 
-  private fail(reason: string) {
-    const text = `Project manager failed: ${reason.slice(0, 1500)}. Your message was not completed; after resolving the error, send a new message to retry. Failed messages are not replayed.`;
+  // A rejection that carries the PM's current error, so the caller never gets only generic text.
+  private unavailable(detail = '') { return new Error(`Project manager is unavailable${detail}${this.lastError ? `: ${this.lastError}` : ''}`); }
+  private static failureText(reason: string, next = 'Your message was not completed; after resolving the error, send a new message to retry. Failed messages are not replayed.') {
+    return `Project manager failed: ${reason.slice(0, 1500)}. ${next}`;
+  }
+  private fail(reason: string, next?: string) {
+    const text = ProjectManager.failureText(reason, next);
     const duplicateRejection = this.inbox.delivered === 0 && this.lastError === text;
     this.lastError = text;
     console.error('foreman: pm failure', JSON.stringify({ session_id: this.sessionId, pending_turns: this.pendingTurns, error: reason.slice(0, 1500) }));
@@ -188,6 +210,8 @@ export class ProjectManager extends EventEmitter {
     const entry = { ts: new Date().toISOString(), session_id: sessionId, reason: reason.slice(0, 1500) };
     try { appendFileSync(PM_SESSION_QUARANTINE_FILE, JSON.stringify(entry) + "\n", { mode: 0o600 }); }
     catch (error: any) { console.error('foreman: pm session quarantine record failed', JSON.stringify({ ...entry, error: String(error?.message ?? error) })); }
+    // Remembered in memory first, so the id is never resumed again even if the clear below fails.
+    this.quarantinedIds.add(sessionId);
     // Clearing the active file can fail too; the provider's error stays the cause either way.
     try { writeFileSync(PM_SESSION_FILE, ""); }
     catch (error: any) { console.error('foreman: pm session quarantine clear failed', JSON.stringify({ ...entry, error: String(error?.message ?? error) })); }
@@ -208,18 +232,29 @@ export class ProjectManager extends EventEmitter {
 
   send(text: string) {
     this.reconcileHistory();
-    this.record({ role: "user", text, ...(this.closed || this.changingModel ? { delivery: 'rejected' } : {}) });
-    if (this.changingModel) throw new Error('Model change in progress; retry your message');
-    if (this.closed) throw new Error('Project manager is unavailable (closed)');
+    const rejection = this.dispatchRejection();
+    this.record({ role: "user", text, ...(rejection ? { delivery: 'rejected' } : {}) });
+    if (rejection) throw rejection;
+    this.pendingTurns++;
+    this.dispatched++;
+    this.inbox.push(text, this.sessionId ?? "");
+  }
+  // Why new input cannot be dispatched, or null once a provider is running to take it. A
+  // rejection carries the specific cause, never only generic text, so the caller receives it.
+  private dispatchRejection(): Error | null {
+    if (this.changingModel) return new Error('Model change in progress; retry your message');
+    if (this.closed) return this.unavailable(' (closed)');
     // Explicit input is the only restart trigger: no automatic replay or retry loop.
     // A provider that rejected a turn but stayed alive is restarted here, once it has settled
     // every turn it accepted, so only this new input reaches the new process.
     if (this.running && this.providerFailed && !this.pendingTurns && !this.busy) this.retire();
-    if (!this.running) void this.start();
-    if (!this.running) throw new Error(this.lastError || 'Project manager is unavailable');
-    this.pendingTurns++;
-    this.dispatched++;
-    this.inbox.push(text, this.sessionId ?? "");
+    if (!this.running) {
+      void this.start();
+      // start() launches synchronously; a launch that already threw cannot take this input.
+      if (this.launchFailure !== null) return new Error(ProjectManager.failureText(this.launchFailure));
+    }
+    if (!this.running) return this.unavailable();
+    return null;
   }
   async interrupt() {
     if (!this.q || !this.modelBusy) return;
@@ -290,6 +325,7 @@ export class ProjectManager extends EventEmitter {
     this.reconcileHistory();
     this.running = true;
     this.providerFailed = false;
+    this.launchFailure = null;
     const generation = ++this.generation;
     const current = () => generation === this.generation;
     const inbox = this.inbox;
@@ -300,33 +336,46 @@ export class ProjectManager extends EventEmitter {
     // that result is still the latest frame: the CLI exiting on it must not report it twice.
     type Attempt = { taken: SDKUserMessage[]; frames: number; initialized: boolean; reported?: string };
     let attempt: Attempt = { taken: [], frames: 0, initialized: false };
+    // The latest turn failure this start() reported, until a later turn succeeds. A process error
+    // or stream end after it is reported together with it, so it never replaces that cause.
+    let turnFailure: string | undefined;
+    const launch = (resume?: string): { provider: Query; state: Attempt } => {
+      try {
+        const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
+        const stream = inbox.open();
+        const state: Attempt = attempt = { taken: stream.taken, frames: 0, initialized: false };
+        const provider: Query = q = this.q = this.queryFactory({
+          prompt: stream.prompt,
+          options: {
+            cwd: FOREMAN_HOME,
+            resume,
+            systemPrompt: { type: "preset", preset: "claude_code", append: base + this.memoryBlock() + (this.sessions ? '\n\n' + PEER_INSTRUCTIONS + '\nFor Foreman-managed sessions, use peer tools to request updates and read outcomes. Native SendMessage subscriptions apply only to legacy Claude background sessions. You still must not read or edit source code or bypass your PM tool restrictions.' : '') },
+            settingSources: ["user"],
+            permissionMode: "default",
+            canUseTool: this.canUseTool,
+            hooks: { PreToolUse: [{ hooks: [this.enforceToolBoundary] }] },
+            includePartialMessages: true,
+            mcpServers: { fleet: makeFleetServer(this.fleet, this.sessions), ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, 'foreman-pm') } : {}) },
+            allowedTools: ["mcp__fleet__list_sessions", "mcp__fleet__list_models", "mcp__fleet__session_tail", "mcp__fleet__log_note", "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : [])],
+            disallowedTools: ["Agent", "Bash", "Glob", "Grep"],
+            extraArgs: { name: "foreman-pm" },
+            maxTurns: 60,
+            effort: (process.env.FOREMAN_PM_EFFORT as any) || "medium",
+            ...(this.model ? { model: this.model } : {}),
+            stderr: (chunk: string) => { if (current() && /error|warn/i.test(chunk)) this.emitEvent({ type: "status", text: chunk.trim().slice(0, 300) }); },
+          },
+        });
+        return { provider, state };
+      } catch (error) {
+        // Still synchronous with the send() that started this run: that send rejects with it.
+        if (current() && !MISSING_CONVERSATION.test(errorText(error))) this.launchFailure = errorText(error);
+        throw error;
+      }
+    };
     const run = async (resume?: string) => {
-      const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
-      const stream = inbox.open();
-      const state: Attempt = attempt = { taken: stream.taken, frames: 0, initialized: false };
-      q = this.q = this.queryFactory({
-        prompt: stream.prompt,
-        options: {
-          cwd: FOREMAN_HOME,
-          resume,
-          systemPrompt: { type: "preset", preset: "claude_code", append: base + this.memoryBlock() + (this.sessions ? '\n\n' + PEER_INSTRUCTIONS + '\nFor Foreman-managed sessions, use peer tools to request updates and read outcomes. Native SendMessage subscriptions apply only to legacy Claude background sessions. You still must not read or edit source code or bypass your PM tool restrictions.' : '') },
-          settingSources: ["user"],
-          permissionMode: "default",
-          canUseTool: this.canUseTool,
-          hooks: { PreToolUse: [{ hooks: [this.enforceToolBoundary] }] },
-          includePartialMessages: true,
-          mcpServers: { fleet: makeFleetServer(this.fleet, this.sessions), ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, 'foreman-pm') } : {}) },
-          allowedTools: ["mcp__fleet__list_sessions", "mcp__fleet__list_models", "mcp__fleet__session_tail", "mcp__fleet__log_note", "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : [])],
-          disallowedTools: ["Agent", "Bash", "Glob", "Grep"],
-          extraArgs: { name: "foreman-pm" },
-          maxTurns: 60,
-          effort: (process.env.FOREMAN_PM_EFFORT as any) || "medium",
-          ...(this.model ? { model: this.model } : {}),
-          stderr: (chunk: string) => { if (current() && /error|warn/i.test(chunk)) this.emitEvent({ type: "status", text: chunk.trim().slice(0, 300) }); },
-        },
-      });
+      const { provider, state } = launch(resume);
       let text = "", completeText = "", turnError = "";
-      for await (const m of q as any) {
+      for await (const m of provider as any) {
         if (!current()) break; // retired by an explicit send; the replacement owns all state now
         // The CLI reports a rejected --resume as an error result (then exits 1) before any
         // system/init. That result is the resume rejection itself, not a turn: it is not a turn
@@ -383,12 +432,14 @@ export class ProjectManager extends EventEmitter {
             this.providerFailed = true;
             const failure = turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`;
             this.fail(failure);
+            turnFailure = failure;
             // Suppress the SDK's exit echo only when its diagnostic is already fully in what was
             // recorded (fail() keeps the first 1500 chars). Otherwise the echo is the only carrier
             // of this result's own diagnostic, so it must surface as its own failure entry.
             const echoed = resultDiagnostic(m);
             if (echoed && failure.slice(0, 1500).includes(echoed)) state.reported = sdkErrorResultEcho(echoed);
           } else {
+            turnFailure = undefined;
             this.providerFailed = false;
             this.lastError = null;
             if (cancelled) {
@@ -408,7 +459,9 @@ export class ProjectManager extends EventEmitter {
       if (current() && !this.closed && (!this.lastError || this.pendingTurns)) throw new Error('Provider stream ended unexpectedly');
     };
     try {
-      const resumeId = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
+      const saved = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
+      // A quarantined id is never resumed again, even if clearing the session file failed.
+      const resumeId = saved && !this.quarantinedIds.has(saved) ? saved : undefined;
       try { await run(resumeId); }
       catch (error: any) {
         if (!current() || this.closed || !resumeId) throw error;
@@ -435,13 +488,23 @@ export class ProjectManager extends EventEmitter {
         if (rejected.frames) throw error;
         (q as Query | null)?.close();
         inbox.requeue(rejected.taken);
-        await run();
+        try { await run(); }
+        catch (freshError) {
+          // The fresh session failed too: report its error together with the rejection that led
+          // to it (an echo of an already reported result is passed through for suppression).
+          const message = errorText(freshError);
+          if (!current() || this.closed || message === attempt.reported || message.includes(diagnostic)) throw freshError;
+          throw new Error(`${message.slice(0, 700)} (after the saved session ${resumeId} was rejected and quarantined: ${diagnostic.slice(0, 600)})`);
+        }
       }
     } catch (error: any) {
       // The SDK's exit error that only echoes the failed result already reported is not a
       // second failure of the same attempt.
-      const echo = attempt.reported !== undefined && String(error?.message ?? error) === attempt.reported;
-      if (current() && !this.closed && !echo) this.fail(String(error?.message ?? error));
+      const message = errorText(error);
+      const echo = attempt.reported !== undefined && message === attempt.reported;
+      // A process error or stream end after a reported turn failure keeps that failure as cause.
+      const cause = turnFailure && !message.includes(turnFailure) ? ` (after the provider failure: ${turnFailure.slice(0, 700)})` : '';
+      if (current() && !this.closed && !echo) this.fail(cause ? message.slice(0, 800) + cause : message);
     } finally {
       // Reset lifecycle state before closing, so nothing close() throws can skip it.
       const owned = current() ? this.q : (q as Query | null);

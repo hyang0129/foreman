@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -171,7 +171,9 @@ test('repeated synchronous startup rejection retains input without duplicate fai
   (pm as any).queryFactory = () => { throw new Error('spawn ENOENT'); };
   await pm.start();
   for (const text of ['retry one', 'retry two']) {
-    pm.send(text); // start() settles asynchronously, as it does for provider launch failure.
+    // The launch throws synchronously, so the send is rejected with that specific cause (#33);
+    // start() still settles asynchronously, as it does for provider launch failure.
+    assert.throws(() => pm.send(text), /spawn ENOENT/);
     await settle(() => !(pm as any).running);
   }
   assert.deepEqual(pm.history().filter(e => e.role === 'user').map(e => e.text), ['retry one', 'retry two']);
@@ -1114,4 +1116,152 @@ test('a failed quarantine record logs the session id and diagnostic, and the ses
   await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Fresh answer'));
   assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
   assert.deepEqual(f.consumed, ['explicit retry']);
+});
+
+// Diagnostic preservation (#33). When a retry or restart cannot be dispatched, or a later
+// generic error follows a specific provider failure, the specific cause stays in lastError, in
+// the persisted failure entry, and in what send()/setModel() throw.
+
+test('a stream that ends with turns pending after a turn failure keeps the specific failure as the cause', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    yield { type: 'result', is_error: true, subtype: 'error_during_execution', errors: ['OAuth token revoked by the organization'] };
+    // The stream ends while 'second' is still accepted and pending.
+  });
+  const running = f.pm.start();
+  f.pm.send('first'); f.pm.send('second');
+  await running;
+  assert.deepEqual(f.consumed, ['first']);
+  assert.match(f.pm.lastError!, /Provider stream ended unexpectedly/);
+  assert.match(f.pm.lastError!, /OAuth token revoked by the organization/);
+  assert.match(errorEntries(f.pm).at(-1)!, /Provider stream ended unexpectedly.*OAuth token revoked by the organization/);
+  assert.equal(f.pm.modelBusy, false);
+});
+
+test('a process exit error after a reported turn failure keeps the specific failure as the cause', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    yield { type: 'result', is_error: true, subtype: 'error_during_execution', errors: ['Login expired for account'] };
+    throw new Error('Claude Code process exited with code 1');
+  });
+  const running = f.pm.start();
+  f.pm.send('first');
+  await running;
+  assert.match(f.pm.lastError!, /Claude Code process exited with code 1/);
+  assert.match(f.pm.lastError!, /Login expired for account/);
+  assert.match(errorEntries(f.pm).at(-1)!, /exited with code 1.*Login expired for account/);
+  assert.equal(f.pm.lastError!.match(/Login expired for account/g)!.length, 1);
+});
+
+test('a send whose restart launch throws synchronously (spawn ENOENT) throws that cause and keeps it in lastError', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    yield { type: 'result', is_error: true, subtype: 'error_during_execution', errors: ['Login expired'] };
+  });
+  const running = f.pm.start();
+  f.pm.send('failed input');
+  await running;
+  assert.match(f.pm.lastError!, /Login expired/);
+  let launches = 0;
+  (f.pm as any).queryFactory = () => { launches++; throw new Error('spawn /usr/local/bin/claude ENOENT'); };
+  assert.throws(() => f.pm.send('explicit retry'), (error: any) => /spawn \/usr\/local\/bin\/claude ENOENT/.test(error.message) && !/unavailable/i.test(error.message));
+  assert.equal(launches, 1);
+  await settle(() => !(f.pm as any).running);
+  assert.match(f.pm.lastError!, /spawn \/usr\/local\/bin\/claude ENOENT/);
+  assert.match(errorEntries(f.pm).at(-1)!, /spawn \/usr\/local\/bin\/claude ENOENT/);
+  // The rejected input is marked rejected, so a later restart does not flag it as unconfirmed.
+  const retry = f.pm.history().find((e) => e.role === 'user' && e.text === 'explicit retry');
+  assert.equal(retry.delivery, 'rejected');
+  assert.equal(f.pm.modelBusy, false);
+});
+
+test('setModel on a PM that exited after a provider failure rejects with the specific cause', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    yield { type: 'result', is_error: true, subtype: 'error_during_execution', errors: ['Credit balance is too low'] };
+  });
+  const running = f.pm.start();
+  f.pm.send('failed input');
+  await running;
+  assert.equal((f.pm as any).running, false);
+  await assert.rejects(f.pm.setModel('claude-sonnet-4-5'), /unavailable.*Credit balance is too low/);
+  assert.match(f.pm.lastError!, /Credit balance is too low/);
+});
+
+test('a model change whose save and restore both fail closes the PM and keeps both causes for later rejections', { timeout: 10_000 }, async (t) => {
+  writeFileSync(PM_HISTORY_FILE, ''); writeFileSync(PM_SESSION_FILE, '');
+  const diagnostics: any[] = [];
+  t.mock.method(console, 'error', (...args: any[]) => diagnostics.push(args));
+  // Saving the setting fails: its directory does not exist.
+  const pm = new ProjectManager({} as any, undefined, join(home, 'missing-dir', 'settings.json'));
+  let finish!: () => void; const done = new Promise<void>((r) => { finish = r; });
+  const models: (string | undefined)[] = [];
+  (pm as any).queryFactory = () => ({
+    close: finish,
+    setModel: async (model: string | undefined) => { models.push(model); if (models.length > 1) throw new Error('control channel closed while restoring'); },
+    async *[Symbol.asyncIterator]() { yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] }; await done; },
+  });
+  const running = pm.start(); t.after(async () => { pm.close(); await running; });
+  await settle(() => pm.sessionId === 'test-session');
+  await assert.rejects(pm.setModel('claude-sonnet-4-5'), (error: any) => /ENOENT/.test(error.message) && /control channel closed while restoring/.test(error.message));
+  assert.deepEqual(models, ['claude-sonnet-4-5', undefined]);
+  assert.match(pm.lastError!, /control channel closed while restoring/);
+  assert.match(pm.lastError!, /ENOENT/);
+  assert.match(errorEntries(pm).at(-1)!, /control channel closed while restoring/);
+  assert.ok(diagnostics.some((d) => d[0] === 'foreman: pm failure' && /control channel closed while restoring/.test(d[1])));
+  // Every later send is rejected with the cause, not only "(closed)".
+  assert.throws(() => pm.send('after the failed model change'), /\(closed\).*control channel closed while restoring/);
+});
+
+test('a rejected resume whose fresh session then ends unexpectedly keeps the resume rejection as the cause', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.resume === 'stale-session') {
+      await ctx.pull();
+      throw new Error('Claude Code process exited with code 1. stderr: No conversation found with session ID: stale-session');
+    }
+    await ctx.next(); // the fresh process takes the requeued input, then its stream ends
+  }, 'stale-session');
+  f.pm.send('new input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
+  assert.deepEqual(f.consumed, ['new input']);
+  assert.match(f.pm.lastError!, /Provider stream ended unexpectedly/);
+  assert.match(f.pm.lastError!, /No conversation found with session ID: stale-session/);
+  assert.equal(errorEntries(f.pm).length, 1);
+  assert.match(errorEntries(f.pm)[0], /No conversation found with session ID: stale-session/);
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+});
+
+test('a quarantined session is not resumed again even when clearing the session file failed', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  t.after(() => chmodSync(PM_SESSION_FILE, 0o600));
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.resume === 'stale-session') {
+      await ctx.pull();
+      chmodSync(PM_SESSION_FILE, 0o444); // clearing the active session file now fails
+      throw new Error('Claude Code process exited with code 1. stderr: Invalid resume handle: stale-session');
+    }
+    chmodSync(PM_SESSION_FILE, 0o600); // the fresh session can record its own id
+    yield* freshAnswer(ctx);
+  }, 'stale-session');
+  f.pm.send('failed input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.match(f.pm.lastError!, /Invalid resume handle: stale-session/);
+  // The clear really failed: the stale id is still in the active session file.
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'stale-session');
+  assert.equal(f.diagnostics.filter((d) => d[0] === 'foreman: pm session quarantine clear failed').length, 1);
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Fresh answer'));
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
+  assert.deepEqual(f.consumed, ['explicit retry']);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'fresh-session');
+  assert.equal(f.pm.lastError, null);
 });
