@@ -270,14 +270,14 @@ async function remote(pair) {
   if (data.environment !== 'dev') throw new Error('Wrong relay environment');
   return data;
 }
-export async function status(home) {
+export async function status(home, { relayStatus = remote } = {}) {
   let daemon = null, record = null, error;
   try { ({ daemon, record } = inspect(home)); } catch (e) { error = e.message; }
   if (daemon?.state === 'starting') error = `DEV daemon PID ${daemon.pid} was left by an interrupted start and has no confirmed record; run npm run dev:stop`;
   else if (!daemon && record?.state === 'starting') error = 'An interrupted dev start left no daemon; dev:start or dev:stop will discard its record';
   const deployment = existsSync(join(home, 'deployment.json')) ? read(join(home, 'deployment.json')) : null;
   let relay = null;
-  try { if (existsSync(join(home, 'dev-pairing.json'))) relay = await remote(validatePairing(read(join(home, 'dev-pairing.json')))); }
+  try { if (existsSync(join(home, 'dev-pairing.json'))) relay = await relayStatus(validatePairing(read(join(home, 'dev-pairing.json')))); }
   catch (e) { error = [error, e.message].filter(Boolean).join('; '); }
   const result = { environment: 'DEV', url: TARGET.url, home, port: TARGET.port, pid: daemon?.pid ?? null, commit: deployment?.commit ?? null, relay, ...(error ? { error } : {}), log: join(home, 'daemon.log') };
   console.log(JSON.stringify(result, null, 2));
@@ -395,7 +395,7 @@ export async function verifyDependencies(snapshot, deployment) {
   const identity = await dependencyIdentity(linked);
   if (identity !== recorded.identity) throw new Error(`Installed dependencies changed since deploy (${linked}: ${identity} != deployed ${recorded.identity}); ${redeploy}`);
 }
-export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save } = {}) {
+export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500 } = {}) {
   const current = inspect(home);
   if (current.daemon?.state === 'starting') throw new Error(`DEV daemon PID ${current.daemon.pid} was left by an interrupted start; run npm run dev:stop first`);
   if (current.daemon) throw new Error('DEV daemon already running; use dev:status or dev:stop');
@@ -453,12 +453,12 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
   }
   child.unref();
   try {
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < readyAttempts; i++) {
       if (!running(home)) throw new Error(`DEV daemon exited; see ${logPath}`);
       let health;
       try { health = await (await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1000) })).json(); } catch {}
-      if (health?.pid === child.pid && (await relayStatus(pair)).relay.online) { await status(home); return; }
-      await delay(500);
+      if (health?.pid === child.pid && (await relayStatus(pair)).relay.online) { await status(home, { relayStatus }); return; }
+      await delay(readyInterval);
     }
     throw new Error(`DEV daemon/relay did not become ready; see ${logPath}`);
   } catch (error) { await stop(home); throw error; }
@@ -473,13 +473,14 @@ export async function deleteDevWorker(headers, fetcher = fetch) {
   if (result.errors?.some((error) => error.code === 10007)) return; // already absent
   throw new Error(`Dev Worker deletion refused (${response.status}); local state retained`);
 }
-async function destroy(home) {
+function wranglerAuth(home) { return JSON.parse(run(process.execPath, [join(root, 'node_modules/wrangler/bin/wrangler.js'), 'auth', 'token', '--json'], { cwd: home })); }
+export async function destroy(home, { readAuth = wranglerAuth, deleter = deleteDevWorker } = {}) {
   await stop(home);
   let auth;
-  try { auth = JSON.parse(run(process.execPath, [join(root, 'node_modules/wrangler/bin/wrangler.js'), 'auth', 'token', '--json'], { cwd: home })); }
+  try { auth = await readAuth(home); }
   catch { throw new Error('Cannot retrieve Cloudflare authentication; run npx wrangler login'); }
   const headers = auth.type === 'api_key' ? { 'X-Auth-Key': auth.key, 'X-Auth-Email': auth.email } : { authorization: `Bearer ${auth.token}` };
-  await deleteDevWorker(headers);
+  await deleter(headers);
   rmSync(home, { recursive: true });
   console.log('DEV Worker and local dev state removed. Firebase authorized domain retained for reuse.');
 }
