@@ -42,7 +42,18 @@ function memoryWritePath(p: string): boolean {
 // fails `npm run typecheck` instead of silently turning a Stop into a failure (or vice versa).
 const SDK_ABORT_REASONS = ['aborted_streaming', 'aborted_tools'] as const satisfies readonly TerminalReason[];
 const isAbortReason = (reason: unknown): boolean => (SDK_ABORT_REASONS as readonly unknown[]).includes(reason);
-const MISSING_CONVERSATION = /no conversation found|session.*not found/i;
+// Resume-handle rejections, deliberately narrow. Only diagnostics that name the saved resume
+// handle itself as unusable count; auth, spawn (ENOENT), network and every other provider error
+// never match, so they never quarantine a session. (A bare "session ... not found" is not used:
+// the CLI emits "Session not found" for MCP HTTP transports and remote agents too.)
+// - MISSING_CONVERSATION: the CLI's `--resume` message when the transcript for that id is gone
+//   ("No conversation found with session ID: <id>"). A fresh run can take over the input.
+// - INVALID_RESUME_HANDLE: the provider rejected the handle as malformed/unusable.
+const MISSING_CONVERSATION = /\bno conversation found with session id\b/i;
+const INVALID_RESUME_HANDLE = /\binvalid resume handle\b/i;
+// Abandoned session ids are moved here, never deleted: one JSON line per quarantine,
+// `{ ts, session_id, reason }`, with the provider diagnostic truncated.
+const PM_SESSION_QUARANTINE_FILE = `${PM_SESSION_FILE}.quarantine.jsonl`;
 
 class Inbox {
   delivered = 0;
@@ -148,6 +159,18 @@ export class ProjectManager extends EventEmitter {
       this.record({ role: "system", text, error: true });
       this.emit("event", { type: "status", text } as PmEvent);
     }
+  }
+
+  // Stop resuming a saved session the provider rejected by handle: record the id and the
+  // diagnostic in the quarantine file (evidence is kept), then clear the active session file so
+  // the next start runs fresh. A failed record is logged with the id instead of masking the
+  // provider error, and the session file is still cleared so the PM can heal.
+  private quarantine(sessionId: string, reason: string) {
+    const entry = { ts: new Date().toISOString(), session_id: sessionId, reason: reason.slice(0, 1500) };
+    try { appendFileSync(PM_SESSION_QUARANTINE_FILE, JSON.stringify(entry) + "\n", { mode: 0o600 }); }
+    catch (error: any) { console.error('foreman: pm session quarantine record failed', JSON.stringify({ ...entry, error: String(error?.message ?? error) })); }
+    writeFileSync(PM_SESSION_FILE, "");
+    if (this.sessionId === sessionId) this.sessionId = null;
   }
 
   private reconcileHistory() {
@@ -348,16 +371,27 @@ export class ProjectManager extends EventEmitter {
       const resumeId = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
       try { await run(resumeId); }
       catch (error: any) {
-        if (!current() || this.closed || !resumeId || !MISSING_CONVERSATION.test(String(error?.message ?? error))) throw error;
-        // The saved conversation is gone: never resume it again.
-        writeFileSync(PM_SESSION_FILE, "");
+        if (!current() || this.closed || !resumeId) throw error;
+        const diagnostic = String(error?.message ?? error);
+        const rejected = attempt;
+        if (!MISSING_CONVERSATION.test(diagnostic)) {
+          // An invalid-handle rejection quarantines only when the provider emitted nothing first:
+          // then the CLI failed on the handle before it processed anything. Once a frame arrived
+          // the session was live, so the failure is not attributed to the handle and the saved
+          // session is kept. The failure is loud either way (fail() in the outer catch) and
+          // nothing is replayed; after a quarantine the next explicit send starts fresh.
+          if (INVALID_RESUME_HANDLE.test(diagnostic) && !rejected.frames) this.quarantine(resumeId, diagnostic);
+          throw error;
+        }
+        // The saved conversation is gone: never resume it again (with or without frames, as
+        // before), but keep the id and diagnostic on record instead of wiping them.
+        this.quarantine(resumeId, diagnostic);
         // The SDK reads prompt input eagerly, so "taken from the inbox" is not "processed".
         // Decide by what the provider did: if the rejected attempt emitted no frame at all, the
         // CLI failed while loading the resume and never processed its input, so that input goes
         // back to the head of the inbox, once, for its first real delivery to a fresh session.
         // If any frame arrived, the input may have been processed: fail loudly, never re-send.
         // This branch runs at most once per start(), and the fresh run() never resumes.
-        const rejected = attempt;
         if (rejected.frames) throw error;
         (q as Query | null)?.close();
         inbox.requeue(rejected.taken);

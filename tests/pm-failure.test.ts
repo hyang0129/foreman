@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -498,7 +498,7 @@ test('retiring a provider ends its parked input reader and ignores its stderr', 
 
 // The real SDK reads prompt input eagerly (query() starts streamInput at once). Drive the real
 // query() against a stub CLI so the fallback is proven against that behavior, with no model spend.
-function stubCli(mode: 'reject' | 'init-then-reject') {
+function stubCli(mode: 'reject' | 'init-then-reject' | 'invalid-handle') {
   const dir = mkdtempSync(join(home, 'stub-cli-'));
   const path = join(dir, 'claude.mjs'), log = join(dir, 'log.jsonl');
   writeFileSync(path, `#!/usr/bin/env node
@@ -510,7 +510,7 @@ const resume = process.argv.slice(2).find((a) => a.startsWith('--resume'));
 log({ resume: resume ? resume.split('=')[1] : null });
 if (resume) {
   if (${JSON.stringify(mode)} === 'init-then-reject') out({ type: 'system', subtype: 'init', session_id: 'stale-session', tools: [] });
-  process.stderr.write('No conversation found with session ID: ' + resume.split('=')[1] + '\\n');
+  process.stderr.write((${JSON.stringify(mode)} === 'invalid-handle' ? 'Invalid resume handle: ' : 'No conversation found with session ID: ') + resume.split('=')[1] + '\\n');
   process.exit(1);
 }
 let inited = false;
@@ -566,4 +566,162 @@ test('real SDK: a resume rejected after a provider frame fails loudly without a 
   assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
   assert.match(f.pm.lastError!, /No conversation found/);
   assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+});
+
+// Session quarantine (#34). The record lives next to the session file, one JSON line per
+// abandoned session id: { ts, session_id, reason }.
+const QUARANTINE_FILE = `${PM_SESSION_FILE}.quarantine.jsonl`;
+const quarantined = () => (existsSync(QUARANTINE_FILE) ? readFileSync(QUARANTINE_FILE, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+const freshAnswer = async function* ({ next, closed }: Ctx) {
+  yield { type: 'system', subtype: 'init', session_id: 'fresh-session', tools: [] };
+  await next();
+  yield { type: 'assistant', message: { content: [{ type: 'text', text: 'Fresh answer' }] } };
+  yield { type: 'result', is_error: false, subtype: 'success', result: 'Fresh answer' };
+  await closed;
+};
+
+test('an invalid resume handle quarantines the saved session, fails loudly, replays nothing, and the next send starts fresh', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.resume === 'stale-session') {
+      await ctx.pull(); // the SDK reads the input eagerly; the CLI rejects the handle with no frame
+      throw new Error('Claude Code process exited with code 1. stderr: Invalid resume handle: stale-session');
+    }
+    yield* freshAnswer(ctx);
+  }, 'stale-session');
+  f.pm.send('failed input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  // Loud failure, no automatic fallback run and no replay.
+  assert.equal(f.launches.length, 1);
+  assert.deepEqual(f.launches[0].pulled, ['failed input']);
+  assert.deepEqual(f.consumed, []);
+  assert.match(f.pm.lastError!, /Invalid resume handle/);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  assert.match(f.pm.history().find((e) => e.error).text, /Invalid resume handle/);
+  assert.equal(f.diagnostics.length, 1);
+  // Quarantined, not deleted: the id and diagnostic are on record and the active file is cleared.
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
+  const records = quarantined();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].session_id, 'stale-session');
+  assert.match(records[0].reason, /Invalid resume handle: stale-session/);
+  assert.ok(!Number.isNaN(Date.parse(records[0].ts)));
+  assert.equal(statSync(QUARANTINE_FILE).mode & 0o777, 0o600);
+  // The next explicit send launches without the stale id and delivers only the new input.
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Fresh answer'));
+  await quiet();
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
+  assert.deepEqual(f.launches.map((l) => l.consumed), [[], ['explicit retry']]);
+  assert.deepEqual(f.launches.map((l) => l.pulled), [['failed input'], []]);
+  assert.deepEqual(f.consumed, ['explicit retry']);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'fresh-session');
+  assert.equal(f.pm.lastError, null);
+  assert.equal(quarantined().length, 1);
+});
+
+test('the missing-conversation fallback records the quarantine and still answers the input once', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.resume === 'stale-session') {
+      await ctx.pull();
+      throw new Error('Claude Code process exited with code 1. stderr: No conversation found with session ID: stale-session');
+    }
+    yield* freshAnswer(ctx);
+  }, 'stale-session');
+  f.pm.send('new input');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Fresh answer'));
+  await quiet();
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
+  assert.deepEqual(f.launches.map((l) => l.pulled), [['new input'], []]);
+  assert.deepEqual(f.consumed, ['new input']);
+  assert.equal(f.pm.history().filter((e) => e.role === 'assistant').length, 1);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'fresh-session');
+  assert.equal(f.pm.lastError, null);
+  const records = quarantined();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].session_id, 'stale-session');
+  assert.match(records[0].reason, /No conversation found with session ID: stale-session/);
+});
+
+for (const [kind, message] of [
+  ['authentication', 'Claude Code process exited with code 1. stderr: authentication_failed: Invalid API key · Please run /login'],
+  ['network', 'Claude Code process exited with code 1. stderr: API Error: Connection error. (fetch failed: ECONNRESET)'],
+  ['MCP transport "Session not found"', 'Claude Code process exited with code 1. stderr: MCP server "fleet": Session not found'],
+] as const) test(`a pre-init ${kind} failure does not quarantine the saved session`, { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const f = scripted(t, async function* ({ pull }) {
+    await pull();
+    throw new Error(message);
+  }, 'saved-session');
+  f.pm.send('hello');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.equal(f.launches.length, 1); // no fallback run
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'saved-session');
+  assert.equal(existsSync(QUARANTINE_FILE), false);
+  assert.equal(f.pm.lastError!.includes(message), true);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  // The saved session is still the one the next start resumes.
+  f.pm.send('retry');
+  await settle(() => f.launches.length === 2);
+  assert.deepEqual(f.launches.map((l) => l.resume), ['saved-session', 'saved-session']);
+});
+
+test('a spawn ENOENT failure does not quarantine the saved session', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  writeFileSync(PM_HISTORY_FILE, ''); writeFileSync(PM_SESSION_FILE, 'saved-session');
+  const pm = new ProjectManager({} as any), resumes: (string | undefined)[] = [];
+  t.mock.method(console, 'error', () => {});
+  (pm as any).queryFactory = ({ options }: any) => { resumes.push(options.resume); throw new Error('spawn /usr/local/bin/claude ENOENT'); };
+  t.after(() => pm.close());
+  await pm.start();
+  assert.deepEqual(resumes, ['saved-session']);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'saved-session');
+  assert.equal(existsSync(QUARANTINE_FILE), false);
+  assert.match(pm.lastError!, /ENOENT/);
+});
+
+for (const [kind, message] of [
+  ['an invalid-handle diagnostic', 'Invalid resume handle: saved-session'],
+  ['a provider crash', 'Claude Code process exited with code 1'],
+] as const) test(`a failure after init (${kind}) does not quarantine the saved session`, { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'saved-session', tools: [] };
+    await next();
+    throw new Error(message);
+  }, 'saved-session');
+  f.pm.send('hello');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.equal(f.launches.length, 1);
+  assert.deepEqual(f.consumed, ['hello']);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'saved-session');
+  assert.equal(existsSync(QUARANTINE_FILE), false);
+  assert.equal(f.pm.lastError!.includes(message), true);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+});
+
+test('real SDK: an invalid resume handle before any frame quarantines, fails loudly, and the next send starts fresh', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const cli = stubCli('invalid-handle');
+  const f = realSdkPm(t, cli.path);
+  f.pm.send('failed input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.deepEqual(f.resumes, ['stale-session']);
+  assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }]); // the rejected CLI never read stdin
+  assert.match(f.pm.lastError!, /Invalid resume handle/);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+  assert.match(quarantined()[0].reason, /Invalid resume handle: stale-session/);
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant'));
+  await quiet();
+  assert.deepEqual(f.resumes, ['stale-session', undefined]);
+  assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }, { resume: null }, { input: 'explicit retry' }]);
+  assert.equal(f.pm.history().find((e) => e.role === 'assistant').text, 'echo: explicit retry');
+  assert.equal(f.pm.lastError, null);
 });
