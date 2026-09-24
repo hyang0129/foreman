@@ -32,6 +32,9 @@ test('local daemon shuts down on SIGTERM with an open SSE client and no provider
     const origin = `http://127.0.0.1:${port}`;
     assert.equal((await fetch(`${origin}/api/sessions`)).status, 401, 'reachability must not authorize API access');
     assert.deepEqual(await fetch(`${origin}/api/config`).then((r) => r.json()), { auth: { required: true, kind: 'local' } });
+    for (const [path, method] of [['/api/launch', 'GET'], ['/api/launch/propose', 'POST'], ['/api/launch/cancel', 'POST']]) {
+      assert.equal((await fetch(`${origin}${path}`, { method })).status, 401, 'launcher routes must use unchanged authentication');
+    }
     const headers = {authorization:`Bearer ${readFileSync(join(home, 'local-api-token'), 'utf8').trim()}`};
     const login = await fetch(`${origin}/api/auth/local`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:headers.authorization.slice(7)})});
     assert.equal(login.status,200);
@@ -46,6 +49,12 @@ test('local daemon shuts down on SIGTERM with an open SSE client and no provider
     });
     assert.equal(wrongHostStatus, 403);
     assert.equal((await fetch(`${origin}/api/sessions`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', Origin: origin }, body: '[]' })).status, 400);
+    const requestId = '11111111-1111-4111-8111-111111111111';
+    const cancelled = await fetch(`${origin}/api/launch/cancel`, { method: 'POST', headers, body: JSON.stringify({ id: requestId }) }).then((r) => r.json());
+    assert.equal(cancelled.status, 'cancelled');
+    const late = await fetch(`${origin}/api/launch/propose`, { method: 'POST', headers, body: JSON.stringify({ id: requestId, brief: 'Do not run' }) }).then((r) => r.json());
+    assert.equal(late.status, 'cancelled');
+    assert.deepEqual(await fetch(`${origin}/api/sessions`, { headers }).then((r) => r.json()), []);
     const events = await fetch(`http://127.0.0.1:${port}/api/events`, {headers});
     reader = events.body.getReader(); await reader.read();
     child.kill('SIGTERM');

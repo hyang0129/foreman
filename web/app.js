@@ -20,6 +20,7 @@ const ui = {
   provider: $("#provider"),
   timeline: $("#timeline"),
   messages: $("#messages"),
+  latest: $("#jump-latest"),
   approvals: $("#approvals"),
   input: $("#message-input"),
   send: $("#send"),
@@ -75,8 +76,75 @@ let messageSignature = "",
   pmBusy = false;
 let pmModel = "", pmModelSaving = false, pmModelLoading = false, pmModelReady = false,
   pmModelLoaded = false, modelRevision = 0, newModelRequest = 0;
+let launchRevision = 0, launchJob = null, launchMode = "brief", launchBusy = false, launcherModelRequest = 0;
+let projectRows = [], projectResolution = null, projectSelection = null, projectRevision = 0, projectPending = false;
+const projectName = (s) => s.project_name || (s.cwd || "").split("/").filter(Boolean).at(-1) || "Project unavailable";
 const drafts = new Map(),
   sendAttempts = new Map();
+const actionFeedback = new Map(), approvalFeedback = new Map();
+let conversationLoading = false, hostChecked = false, sessionsLoaded = false;
+let timelineEntries = [], nextEntryKey = 0, newMessages = false;
+const copyStates = new Map();
+function nearLatest() {
+  return ui.timeline.scrollHeight - ui.timeline.scrollTop - ui.timeline.clientHeight < 100;
+}
+function updateLatest() {
+  if (nearLatest()) newMessages = false;
+  ui.latest.hidden = !selected || conversationLoading || nearLatest();
+  const label = newMessages ? "New messages ↓" : "Jump to latest";
+  if (ui.latest.textContent !== label) ui.latest.textContent = label;
+}
+function resetLatest() {
+  for (const state of copyStates.values()) { clearTimeout(state.timer); state.render = () => {}; }
+  copyStates.clear();
+  timelineEntries = [];
+  newMessages = false;
+  ui.latest.hidden = true;
+}
+ui.timeline.addEventListener("scroll", updateLatest, { passive: true });
+ui.latest.addEventListener("click", () => {
+  newMessages = false;
+  // Keep keyboard focus in the history when the button disappears at the bottom.
+  ui.timeline.focus({ preventScroll: true });
+  ui.timeline.scrollTo({ top: ui.timeline.scrollHeight, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
+  updateLatest();
+});
+
+function setActionFeedback(key, action, text, error = false) {
+  const feedback = actionFeedback.get(key) || {};
+  feedback[action] = { text, error };
+  actionFeedback.set(key, feedback);
+  if (key === selected) renderActionFeedback();
+}
+function renderActionFeedback() {
+  for (const action of ["send", "interrupt"]) {
+    const target = $(`#${action}-feedback`);
+    const feedback = actionFeedback.get(selected)?.[action];
+    const text = feedback?.text || "";
+    if (target.textContent !== text) target.textContent = text;
+    target.classList.toggle("error", !!feedback?.error);
+    target.hidden = !text;
+  }
+}
+function showConversationLoading(message = "Opening conversation…", failed = false) {
+  conversationLoading = true;
+  let loading = $("#conversation-loading");
+  if (!loading) {
+    loading = node("div", "loading-state");
+    loading.id = "conversation-loading";
+    loading.setAttribute("role", "status");
+    ui.messages.replaceChildren(loading);
+  }
+  if (loading.dataset.message === message) return;
+  loading.dataset.message = message;
+  const symbol = node("span", failed ? "" : "activity-symbol", failed ? "!" : "");
+  symbol.setAttribute("aria-hidden", "true");
+  loading.replaceChildren(symbol, node("span", "", message));
+}
+function showRefreshError(error) {
+  if (conversationLoading) showConversationLoading(`Could not open conversation. ${errorMessage(error)} Retrying automatically.`, true);
+  else showError(error);
+}
 
 function node(tag, className, text) {
   const el = document.createElement(tag);
@@ -174,17 +242,32 @@ function post(path, body) {
 }
 
 function revokeAccess(message) {
+  cancelLauncher(); launcherModelRequest++;
   authEpoch++;
   authorized = false;
   pmModel = ""; pmModelLoaded = false; pmModelReady = false;
+  sending = false; creating = false; pmModelSaving = false; pmModelLoading = false;
+  newModelRequest++;
+  projectRevision++; projectRows = []; projectResolution = null; projectSelection = null; projectPending = false;
+  $("#project-choices").replaceChildren(); $("#project-status").textContent = ""; $("#project-feedback").textContent = "";
+  ui.interrupt.dataset.busy = "false";
+  $("#create-session").textContent = "Start session";
+  $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved on your Mac.";
   modelOptions($("#pm-model"), []);
   clearTimeout(pollTimer);
   sessions = [];
+  hostChecked = false;
+  sessionsLoaded = false;
   detail = null;
   host = { online: false };
   drafts.clear();
   sendAttempts.clear();
+  actionFeedback.clear();
+  approvalFeedback.clear();
+  conversationLoading = false;
+  renderActionFeedback();
   messageSignature = "";
+  resetLatest();
   approvalSignature = "";
   ui.messages.replaceChildren();
   ui.approvals.replaceChildren();
@@ -200,6 +283,7 @@ function revokeAccess(message) {
   ui.signIn.disabled = false;
   const localForm = $("#local-auth-form");
   if (localForm) localForm.hidden = false;
+  updateControls();
 }
 function setNav(open) {
   ui.app.classList.toggle("nav-open", open);
@@ -212,24 +296,26 @@ function setNav(open) {
 }
 function renderHost() {
   $("#host-dot").className = `dot ${host.online ? "online" : "offline"}`;
-  $("#host-status").textContent = host.online
+  $("#host-status").textContent = !hostChecked ? "Connecting to execution host…" : host.online
     ? `${host.host || "Execution host"} · online`
     : "Execution host offline";
   const banner = $("#connection-banner");
-  banner.hidden = !!host.online;
+  banner.hidden = !!host.online || !hostChecked;
   banner.textContent =
     "Your Mac is disconnected. Showing the last available state. Messages and approvals will be available when it reconnects.";
   updateControls();
+  if (ui.messages.querySelector(".empty-state") && !conversationLoading) renderMessages();
 }
 function renderRail() {
   const focusedKey = document.activeElement?.dataset?.session;
+  const focusedClear = document.activeElement?.hasAttribute("data-clear-search");
   ui.list.replaceChildren();
   const query = ui.search.value.trim().toLowerCase();
   const visible = sessions.filter(
     (s) =>
       s.name !== "foreman-pm" &&
       (!query ||
-        `${s.name} ${s.cwd} ${s.provider}`.toLowerCase().includes(query)),
+        `${s.name} ${s.cwd} ${s.project_name || ""} ${s.provider}`.toLowerCase().includes(query)),
   );
   $("#session-count").textContent = String(
     sessions.filter((s) => s.name !== "foreman-pm").length,
@@ -252,6 +338,8 @@ function renderRail() {
         "button",
         `session-row${selected === s.session_key ? " selected" : ""}`,
       );
+      row.title = s.cwd || "";
+      row.setAttribute("aria-description", s.cwd || "");
       row.type = "button";
       row.dataset.session = s.session_key;
       row.setAttribute("aria-pressed", String(selected === s.session_key));
@@ -269,29 +357,36 @@ function renderRail() {
           ? s.reason || "Waiting for your response"
           : s.state === "working"
             ? s.current_tool || "Working on your task"
-            : s.last_message || shortPath(s.cwd);
+            : s.last_message || projectName(s);
       row.append(
         node("span", "session-sub", summary),
         node(
           "span",
           "session-meta",
-          `${s.provider === "codex" ? "Codex" : "Claude"} · ${s.managed ? `Managed · ${policyLabel(s)}` : "Monitoring"}${!host.online ? " · Last known" : ""}`,
+          `${projectName(s)} · ${s.provider === "codex" ? "Codex" : "Claude"} · ${s.managed ? `Managed · ${policyLabel(s)}` : "Monitoring"}${!host.online ? " · Last known" : ""}`,
         ),
       );
       row.addEventListener("click", () => selectSession(s.session_key));
       ui.list.append(row);
     }
   }
-  if (!visible.length)
-    ui.list.append(
-      node(
-        "p",
-        "rail-empty",
-        query
-          ? "No sessions match your search."
-          : "Your sessions will appear here. Start one above to put an agent to work.",
-      ),
-    );
+  if (!visible.length) {
+    const empty = node("div", "rail-empty");
+    const noMatches = !!query && sessionsLoaded;
+    empty.append(node("p", "", noMatches ? "No sessions match your search."
+      : !hostChecked || (host.online && !sessionsLoaded) ? "Loading sessions…"
+      : !host.online ? "Your Mac is offline. Reconnect to see sessions."
+      : "No sessions yet. Start a session above."));
+    if (noMatches) {
+      const clear = node("button", "btn ghost", "Clear search");
+      clear.type = "button";
+      clear.dataset.clearSearch = "true";
+      clear.addEventListener("click", () => { ui.search.value = ""; renderRail(); ui.search.focus(); });
+      empty.append(clear);
+    }
+    ui.list.append(empty);
+  }
+  if (focusedClear) ui.list.querySelector("[data-clear-search]")?.focus({ preventScroll: true });
   if (focusedKey)
     [...ui.list.querySelectorAll("button")]
       .find((button) => button.dataset.session === focusedKey)
@@ -308,7 +403,11 @@ function updateControls() {
   ui.messages.querySelectorAll("[data-new-session]").forEach((button) => {
     button.disabled = !authorized || !host.online;
   });
-  $("#create-session").disabled = !authorized || !host.online || creating;
+  $("#create-session").disabled = !authorized || !host.online || creating || projectPending || !projectResolution || launchMode === "brief" || launchBusy;
+  $("#propose-session").disabled = !authorized || !host.online || launchBusy || !$("#launch-brief").value.trim();
+  $("#launch-brief").disabled = launchBusy;
+  $("#launcher-model").disabled = launchBusy;
+  if (launchBusy && !host.online) manualLaunch("Host is offline. Your brief is preserved; start manually when it reconnects.");
   ui.input.disabled = !canMessage || sending;
   ui.send.disabled = !canMessage || sending || !ui.input.value.trim();
   ui.send.firstChild.textContent = sending ? "Sending… " : "Send ";
@@ -317,6 +416,8 @@ function updateControls() {
     !host.online ||
     (isPm ? !pmBusy : !session?.capabilities?.interrupt) ||
     ui.interrupt.dataset.busy === "true";
+  ui.interrupt.textContent = ui.interrupt.dataset.busy === "true" ? "Interrupting…" : "Interrupt";
+  renderActionFeedback();
   ui.input.placeholder = !selected
     ? "Choose a session to start a conversation"
     : !host.online
@@ -344,25 +445,62 @@ function updateControls() {
     });
 }
 function renderHeading() {
-  if (selected === "pm") {
-    ui.title.textContent = "Project manager";
-    ui.provider.hidden = false;
-    ui.provider.textContent = "PINNED";
-    ui.subtitle.textContent = pmBusy
-      ? "Working · Planning and delegating"
-      : "Ready · Your view across the fleet";
+  const headingSummary = $("#heading-details summary"), model = $("#header-model");
+  const isPm = selected === "pm";
+  const headingName = detail?.session && !isPm ? projectName(detail.session) : "";
+  const summaryLabel = isPm ? "Model details" : "Session details";
+  const summarySignature = JSON.stringify([summaryLabel, headingName]);
+  if (headingSummary.dataset.signature !== summarySignature) {
+    headingSummary.replaceChildren(node("span", "", summaryLabel), ...(headingName ? [node("span", "", ` · ${headingName}`)] : []));
+    headingSummary.dataset.signature = summarySignature;
+  }
+  const fields = [];
+  let selectedModel = "";
+  if (isPm) {
+    ui.title.textContent = "Claude · Project manager";
+    ui.provider.hidden = true;
+    selectedModel = pmModelReady ? pmModel || "Provider default" : "Loading model…";
+    fields.push(["Selected model", selectedModel]);
+    if (pmModelReady && !pmModel) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
+    fields.push(["Applies to", "The PM’s replies and planning. Newly launched agents have their own model selection."]);
   } else if (detail?.session) {
     const s = detail.session;
     ui.title.textContent = s.name || "Session";
     ui.provider.hidden = false;
     ui.provider.textContent = s.provider === "codex" ? "Codex" : "Claude";
-    ui.subtitle.textContent = `${LABEL[s.state] || s.state || "Unknown"}${!host.online ? " · Last known" : ""} · ${shortPath(s.cwd)}${s.managed ? ` · ${s.model || "Provider default"} · ${policyLabel(s)}` : " · Monitoring only"}`;
+    selectedModel = s.model || (s.managed ? "Provider default" : "Model not reported");
+    fields.push([s.managed ? "Selected model" : "Reported model", selectedModel]);
+    if (!s.model && s.managed) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
+    fields.push(["Project", projectName(s)], ["Directory", s.cwd || "Project unavailable"], ["Permissions", s.managed ? policyLabel(s) : "Monitoring only"]);
   } else {
     ui.title.textContent = selected ? "Loading session…" : "Your session inbox";
     ui.provider.hidden = true;
-    ui.subtitle.textContent = "Choose a session or start something new.";
   }
+  model.hidden = !selectedModel;
+  model.textContent = selectedModel ? `Model · ${selectedModel}` : "";
+  model.title = selectedModel;
+  const detailSignature = JSON.stringify(fields);
+  if (ui.subtitle.dataset.signature !== detailSignature) {
+    ui.subtitle.dataset.signature = detailSignature;
+    const metadata = node("dl", "header-metadata");
+    for (const [label, value] of fields) metadata.append(node("dt", "", label), node("dd", "", value));
+    ui.subtitle.replaceChildren(fields.length ? metadata : node("p", "", "Choose a session or start something new."));
+  }
+  renderActivity();
   updateControls();
+}
+function renderActivity() {
+  const status = $("#activity-status"), label = $("#activity-label");
+  const state = selected === "pm" ? (pmModelReady ? (pmBusy ? "working" : "turn_finished") : null) : detail?.session?.state;
+  const working = state === "working";
+  const tool = working && selected !== "pm" ? detail?.session?.current_tool : null;
+  const text = state ? `${host.online ? "" : "Last known · "}${working ? "Working…" : LABEL[state] || state}${tool ? ` · ${tool}` : ""}` : "";
+  status.hidden = !text;
+  // Keep the live region and symbol mounted; only announce actual transitions.
+  if (label.textContent !== text) label.textContent = text;
+  status.classList.toggle("is-active", working && host.online);
+  status.classList.toggle("is-stale", !!state && !host.online);
+  status.dataset.state = state || "";
 }
 function emptyState(title, text, allowCreate = false) {
   const empty = node("div", "empty-state");
@@ -380,7 +518,49 @@ function emptyState(title, text, allowCreate = false) {
   }
   return empty;
 }
-function appendContent(container, text) {
+function copyControl(text, label, key, entryKey) {
+  const group = node("div", "copy-control");
+  const button = node("button", "btn ghost copy-button", label);
+  button.type = "button";
+  button.dataset.copyKey = key;
+  const feedback = node("span", "copy-feedback");
+  feedback.setAttribute("role", "status");
+  const stateKey = `${entryKey}:${key}`;
+  const state = copyStates.get(stateKey) || { pending: false, text: "", error: false };
+  copyStates.set(stateKey, state);
+  // A streaming message may replace its DOM while clipboard permission is open.
+  // Completion follows the logical control, but always copies the click's text.
+  state.render = () => {
+    feedback.textContent = state.text;
+    feedback.classList.toggle("error", state.error);
+    if (state.pending) button.setAttribute("aria-busy", "true");
+    else button.removeAttribute("aria-busy");
+  };
+  state.render();
+  button.addEventListener("click", async () => {
+    if (state.pending) return;
+    state.pending = true;
+    clearTimeout(state.timer);
+    state.text = "";
+    state.error = false;
+    state.render();
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      state.text = "Copied";
+      state.timer = setTimeout(() => { state.text = ""; state.render(); }, 2500);
+    } catch {
+      state.error = true;
+      state.text = "Could not copy. Allow clipboard access or select and copy the text manually.";
+    } finally {
+      state.pending = false;
+      state.render();
+    }
+  });
+  group.append(button, feedback);
+  return group;
+}
+function appendContent(container, text, entryKey) {
   // Render plain text and fenced code with DOM nodes. Provider output never enters HTML.
   const parts = String(text || "").split(/```[^\n]*\n([\s\S]*?)(?:```|$)/g);
   parts.forEach((part, index) => {
@@ -388,11 +568,37 @@ function appendContent(container, text) {
     if (index % 2) {
       const pre = node("pre");
       pre.append(node("code", "", part));
-      container.append(pre);
+      const block = node("div", "code-block");
+      block.append(copyControl(part, "Copy code", `code-${index}`, entryKey), pre);
+      container.append(block);
     } else container.append(node("div", "message-body", part));
   });
 }
-function messageNode(entry, receipt) {
+function entryDate(entry) {
+  const timestamp = entry.at || entry.ts;
+  if (typeof timestamp !== "string") return null;
+  // History producers use ISO dates. Date alone normalizes impossible days
+  // (February 30 becomes March 2), which would invent a transcript date.
+  const parts = /^(\d{4})-(\d{2})-(\d{2})(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})|)$/.exec(timestamp);
+  if (!parts) return null;
+  const year = Number(parts[1]), month = Number(parts[2]), day = Number(parts[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > days[month - 1]) return null;
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+function localDay(date) {
+  return date ? `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}` : "unknown";
+}
+function dayLabel(date, now) {
+  if (!date) return "Date unavailable";
+  if (localDay(date) === localDay(now)) return "Today";
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  return localDay(date) === localDay(yesterday) ? "Yesterday" : date.toLocaleDateString([], { dateStyle: "medium" });
+}
+function messageNode(entry, receipt, entryKey) {
   const role = ["user", "assistant", "tool", "system"].includes(entry.role)
     ? entry.role
     : "system";
@@ -417,20 +623,23 @@ function messageNode(entry, receipt) {
             ? "Activity"
             : "Session",
   );
-  if (entry.at && !Number.isNaN(Date.parse(entry.at))) {
-    const time = node(
-      "time",
-      "",
-      new Date(entry.at).toLocaleTimeString([], {
-        hour: "numeric",
-        minute: "2-digit",
-      }),
-    );
-    time.dateTime = entry.at;
+  const date = entryDate(entry);
+  if (date) {
+    const time = node("time", "", date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
+    time.dateTime = date.toISOString();
+    const description = date.toLocaleString([], { dateStyle: "full", timeStyle: "long" });
+    time.setAttribute("aria-description", description);
+    time.title = description;
     label.append(time);
-  }
+  } else label.append(node("span", "timestamp-unavailable", "Time unavailable"));
   article.append(label);
-  appendContent(article, entry.text || entry.summary || "");
+  appendContent(article, entry.text || entry.summary || "", entryKey);
+  article.append(copyControl(String(entry.text || entry.summary || ""), "Copy message", "message", entryKey));
+  renderMessageReceipt(article, receipt);
+  return article;
+}
+function renderMessageReceipt(article, receipt) {
+  article.querySelector(".receipt")?.remove();
   if (receipt) {
     const status =
       {
@@ -441,65 +650,109 @@ function messageNode(entry, receipt) {
         uncertain:
           "Delivery uncertain · Check the session before sending again",
       }[receipt.status] || receipt.status;
-    article.append(
-      node(
-        "div",
-        `receipt ${["failed", "uncertain"].includes(receipt.status) ? receipt.status : ""}`,
-        `${status}${receipt.error ? ` · ${receipt.error}` : ""}`,
-      ),
-    );
+    const chip = node("div", `receipt receipt-chip ${["failed", "uncertain"].includes(receipt.status) ? receipt.status : ""}`);
+    const symbol = node("span", "receipt-symbol", { queued: "◷", running: "↻", completed: "✓", failed: "!", uncertain: "?" }[receipt.status] || "·");
+    symbol.setAttribute("aria-hidden", "true");
+    chip.append(symbol, node("span", "receipt-label", status));
+    if (receipt.error) chip.append(node("span", "receipt-error", ` · ${receipt.error}`));
+    article.append(chip);
   }
-  return article;
 }
 function renderMessages(history = [], receipts = []) {
-  const signature = JSON.stringify([selected, history, receipts]);
+  // The observed-session API uses these system sentinels instead of readable history.
+  // Match the exact host-owned shape so actual provider/message text is never hidden.
+  if (detail?.session?.managed === false && history.length === 1 && history[0].id === "observed-tail" && history[0].role === "system"
+    && ["(no transcript available)", "(transcript unavailable)", "(no transcript on disk)", "(no message records found)"].includes(history[0].text)) history = [];
+  const now = new Date();
+  const signature = JSON.stringify([selected, history, receipts, localDay(now), hostChecked, host.online, sessionsLoaded, sessions.length, detail?.session?.capabilities?.message]);
   if (signature === messageSignature) return;
-  const wasNearBottom =
-    ui.timeline.scrollHeight -
-      ui.timeline.scrollTop -
-      ui.timeline.clientHeight <
-    100;
+  const wasNearBottom = nearLatest();
   const firstRender = !messageSignature;
+  const oldTop = ui.timeline.scrollTop;
+  const focusedCopy = ui.messages.contains(document.activeElement) ? document.activeElement : null;
+  const focusEntry = focusedCopy?.closest("[data-entry-key]")?.dataset.entryKey;
+  const focusCopy = focusedCopy?.dataset.copyKey;
+  const viewportTop = ui.timeline.getBoundingClientRect().top;
+  const anchors = timelineEntries.map((item) => ({ key: item.key, top: item.element.getBoundingClientRect().top - viewportTop, bottom: item.element.getBoundingClientRect().bottom - viewportTop }))
+    .filter((item) => item.bottom > 0);
   messageSignature = signature;
-  const fragment = document.createDocumentFragment(),
-    used = new Set();
+  const fragment = document.createDocumentFragment(), used = new Set(), entries = [];
   for (const entry of history) {
-    const receipt =
-      entry.role === "user"
-        ? receipts.find(
-            (r) =>
-              !used.has(r.id) && (r.id === entry.id || r.text === entry.text),
-          )
-        : null;
+    const receipt = entry.role === "user"
+      ? receipts.find((r) => !used.has(r.id) && (r.id === entry.id || r.text === entry.text)) : null;
     if (receipt) used.add(receipt.id);
-    fragment.append(messageNode(entry, receipt));
+    entries.push({ entry, receipt });
   }
   for (const receipt of receipts) {
-    if (!used.has(receipt.id))
-      fragment.append(messageNode({ ...receipt, role: "user" }, receipt));
+    if (!used.has(receipt.id)) entries.push({ entry: { ...receipt, role: "user" }, receipt });
   }
-  if (!history.length && !receipts.length)
-    fragment.append(
-      selected
-        ? emptyState(
-            selected === "pm"
-              ? "A little direction goes a long way."
-              : "Ready when you are.",
-            selected === "pm"
-              ? "Tell your project manager what you want to accomplish. It can check the fleet and delegate the next steps."
-              : detail?.session?.capabilities?.message
-                ? "Send a task or a follow-up to begin the conversation."
-                : "No readable conversation is available yet. Activity will appear as this session runs.",
-          )
-        : emptyState(
-            "Make room for the work.",
-            "Start a Claude or Codex session, or pick an existing conversation. Everything that needs you is one click away.",
-            true,
-          ),
-    );
+  const unmatched = new Set(timelineEntries);
+  const textOf = (entry) => String(entry.text || entry.summary || "");
+  const identityOf = ({ entry, receipt }) => entry.id || receipt?.id;
+  const sameMetadata = (a, b) => a.role === b.role && (a.at || a.ts) === (b.at || b.ts) && JSON.stringify(a.source) === JSON.stringify(b.source);
+  // IDs are authoritative when present. Provider history can omit IDs; match its
+  // unchanged entries before matching a growing final entry, independent of indices.
+  for (const item of entries) {
+    const id = identityOf(item);
+    const previous = [...unmatched].find((old) => id
+      ? identityOf(old) === id
+      : !identityOf(old) && sameMetadata(old.entry, item.entry) && textOf(old.entry) === textOf(item.entry));
+    if (previous) { item.previous = previous; unmatched.delete(previous); }
+  }
+  let previousDay;
+  for (const item of entries) {
+    if (!item.previous && !identityOf(item)) {
+      const previous = [...unmatched].find((old) => !identityOf(old) && sameMetadata(old.entry, item.entry)
+        && textOf(item.entry).startsWith(textOf(old.entry)) && textOf(old.entry));
+      if (previous) { item.previous = previous; unmatched.delete(previous); }
+    }
+    const previous = item.previous;
+    if (!firstRender && !wasNearBottom && (!previous || textOf(previous.entry) !== textOf(item.entry))) newMessages = true;
+    item.key = previous?.key || ++nextEntryKey;
+    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source]);
+    const receiptSignature = JSON.stringify(item.receipt);
+    item.element = previous?.contentSignature === contentSignature ? previous.element : messageNode(item.entry, item.receipt, item.key);
+    if (item.element === previous?.element && previous.receiptSignature !== receiptSignature) renderMessageReceipt(item.element, item.receipt);
+    item.contentSignature = contentSignature;
+    item.receiptSignature = receiptSignature;
+    item.element.dataset.entryKey = String(item.key);
+    const date = entryDate(item.entry), day = localDay(date);
+    if (day !== previousDay) {
+      item.separator = previous?.separator || node("p", "date-separator");
+      const label = dayLabel(date, now);
+      if (item.separator.textContent !== label) item.separator.textContent = label;
+      fragment.append(item.separator);
+    }
+    previousDay = day;
+    delete item.previous;
+    fragment.append(item.element);
+  }
+  timelineEntries = entries;
+  if (!history.length && !receipts.length) {
+    const loading = !hostChecked || (host.online && !sessionsLoaded && !selected);
+    const title = loading ? "Loading sessions…" : !host.online ? "Your Mac is offline"
+      : selected === "pm" ? "A little direction goes a long way."
+      : selected ? (detail?.session?.capabilities?.message ? "Ready when you are." : "No readable history yet.")
+      : sessions.filter((s) => s.name !== "foreman-pm").length ? "Choose a conversation" : "No sessions yet";
+    const text = loading ? "Checking your execution host for sessions."
+      : !host.online ? "Reconnect your Mac to view sessions and continue work."
+      : selected === "pm" ? "Tell your project manager what you want to accomplish. It can check the fleet and delegate the next steps."
+      : selected ? (detail?.session?.capabilities?.message ? "Send a task or a follow-up to begin the conversation." : "No readable conversation is available yet. Activity will appear as this session runs.")
+      : "Choose an existing conversation or start a Claude or Codex session.";
+    fragment.append(emptyState(title, text, !selected && !loading));
+  }
   ui.messages.replaceChildren(fragment);
-  if (wasNearBottom || firstRender)
-    ui.timeline.scrollTop = ui.timeline.scrollHeight;
+  if (focusEntry && focusCopy) {
+    const article = entries.find((item) => String(item.key) === focusEntry)?.element;
+    [...(article?.querySelectorAll("[data-copy-key]") || [])].find((button) => button.dataset.copyKey === focusCopy)?.focus({ preventScroll: true });
+  }
+  if (wasNearBottom || firstRender) ui.timeline.scrollTop = ui.timeline.scrollHeight;
+  else {
+    const anchor = anchors.find((old) => entries.some((item) => item.key === old.key));
+    const element = anchor && entries.find((item) => item.key === anchor.key).element;
+    ui.timeline.scrollTop = element ? ui.timeline.scrollTop + element.getBoundingClientRect().top - viewportTop - anchor.top : oldTop;
+  }
+  updateLatest();
 }
 function renderApprovals(approvals = []) {
   const signature = JSON.stringify([selected, approvals]);
@@ -517,11 +770,17 @@ function renderApprovals(approvals = []) {
       input.value,
     ]),
   );
+  const focused = ui.approvals.contains(document.activeElement) ? document.activeElement : null;
+  const focusKey = focused?.dataset.focusKey;
+  const selectionStart = focused?.selectionStart, selectionEnd = focused?.selectionEnd;
+  const expanded = new Set([...ui.approvals.querySelectorAll("details[open]")].map((el) => el.dataset.focusKey));
   approvalSignature = signature;
   ui.approvals.replaceChildren();
   for (const approval of approvals) {
     const sessionKey = selected;
+    const feedbackKey = JSON.stringify([sessionKey, approval.id]);
     const form = node("form", "approval");
+    form.dataset.approvalKey = feedbackKey;
     form.append(
       node(
         "h3",
@@ -533,13 +792,21 @@ function renderApprovals(approvals = []) {
             : `Permission requested · ${approval.tool || "Tool"}`,
       ),
     );
-    if (approval.reason) form.append(node("p", "", approval.reason));
+    form.append(node("p", "approval-reason", approval.reason || (approval.kind === "question"
+      ? "Your answer is needed before the agent can continue."
+      : approval.kind === "unsupported" ? "This interaction cannot be answered here."
+      : `The agent is requesting permission to use ${approval.tool || "this tool"}.`)));
+    const context = approval.input?.command || approval.input?.file_path || approval.input?.path;
+    if (typeof context === "string" && context) form.append(node("p", "approval-context", context.length > 180 ? `${context.slice(0, 180)}…` : context));
     if (approval.input && Object.keys(approval.input).length) {
       const details = node("details");
+      details.dataset.focusKey = `${feedbackKey}:details`;
+      details.open = expanded.has(details.dataset.focusKey);
       details.append(
-        node("summary", "", "Review request details"),
+        node("summary", "", "Show details"),
         node("pre", "", JSON.stringify(approval.input, null, 2)),
       );
+      details.querySelector("summary").dataset.focusKey = `${feedbackKey}:summary`;
       form.append(details);
     }
     if (approval.kind === "unsupported") {
@@ -569,6 +836,7 @@ function renderApprovals(approvals = []) {
         }
       }
       input.dataset.questionKey = `${approval.id}:${question.id}`;
+      input.dataset.focusKey = `${feedbackKey}:question:${question.id}`;
       input.value = oldAnswers.get(input.dataset.questionKey) || "";
       label.append(input);
       form.append(label);
@@ -581,18 +849,44 @@ function renderApprovals(approvals = []) {
       approval.kind === "question" ? "Send answer" : "Allow once",
     );
     allow.type = "submit";
+    allow.dataset.focusKey = `${feedbackKey}:allow`;
     const deny = node(
       "button",
       "btn ghost",
       approval.kind === "question" ? "Decline" : "Deny",
     );
     deny.type = "button";
+    deny.dataset.focusKey = `${feedbackKey}:deny`;
     actions.append(allow, deny);
     form.append(actions);
-    const respond = async (decision) => {
-      form.dataset.busy = "true";
+    const feedback = node("p", "form-error");
+    feedback.setAttribute("role", "alert");
+    form.append(feedback);
+    const syncFeedback = () => {
+      const state = approvalFeedback.get(feedbackKey);
+      form.dataset.busy = String(!!state?.pending);
+      allow.textContent = state?.pending === "allow"
+        ? (approval.kind === "question" ? "Sending answer…" : "Allowing…")
+        : (approval.kind === "question" ? "Send answer" : "Allow once");
+      deny.textContent = state?.pending === "deny"
+        ? (approval.kind === "question" ? "Declining…" : "Denying…")
+        : (approval.kind === "question" ? "Decline" : "Deny");
+      feedback.textContent = state?.error || "";
+      feedback.hidden = !state?.error;
+    };
+    form.syncFeedback = syncFeedback;
+    syncFeedback();
+    const syncCurrentFeedback = () => {
+      [...ui.approvals.querySelectorAll("form")].find((current) => current.dataset.approvalKey === feedbackKey)?.syncFeedback?.();
       updateControls();
+    };
+    const respond = async (decision) => {
+      if (approvalFeedback.get(feedbackKey)?.pending || !host.online) return;
+      const epoch = authEpoch;
+      approvalFeedback.set(feedbackKey, { pending: decision });
+      syncCurrentFeedback();
       clearError();
+      let accepted = false;
       try {
         const answers = Object.fromEntries(
           answerInputs.map(([id, input]) => [id, input.value]),
@@ -605,16 +899,29 @@ function renderApprovals(approvals = []) {
             ? { answers }
             : {}),
         });
-        form.remove();
+        if (epoch !== authEpoch || !authorized) return;
+        accepted = true;
+        [...ui.approvals.querySelectorAll("form")].find((current) => current.dataset.approvalKey === feedbackKey)?.remove();
+        approvalFeedback.delete(feedbackKey);
         approvalSignature = "";
         await refreshSelected();
       } catch (error) {
-        showError(error);
-        approvalSignature = "";
-        await refreshSelected().catch(() => {});
+        if (epoch !== authEpoch || !authorized) return;
+        if (accepted) showError(`Your response was accepted, but the conversation could not refresh. ${errorMessage(error)}`);
+        else {
+          approvalFeedback.set(feedbackKey, { error: errorMessage(error) });
+          syncCurrentFeedback();
+          approvalSignature = "";
+          await refreshSelected().catch(() => {});
+        }
       } finally {
-        form.dataset.busy = "false";
-        updateControls();
+        if (epoch === authEpoch && authorized) {
+          syncCurrentFeedback();
+          if (selected === sessionKey && document.activeElement === document.body && !ui.dialog.open && !ui.app.classList.contains("nav-open")) {
+            const focusTarget = accepted ? ui.input : [...ui.approvals.querySelectorAll("[data-focus-key]")].find((el) => el.dataset.focusKey === `${feedbackKey}:${decision}`);
+            if (focusTarget && !focusTarget.disabled) focusTarget.focus({ preventScroll: true });
+          }
+        }
       }
     };
     form.addEventListener("submit", (event) => {
@@ -625,17 +932,25 @@ function renderApprovals(approvals = []) {
     ui.approvals.append(form);
   }
   updateControls();
+  if (focusKey) {
+    const next = [...ui.approvals.querySelectorAll("[data-focus-key]")].find((el) => el.dataset.focusKey === focusKey);
+    next?.focus({ preventScroll: true });
+    if (next?.setSelectionRange && selectionStart != null) next.setSelectionRange(selectionStart, selectionEnd);
+  }
   if (approvals.length && wasNearBottom)
     ui.timeline.scrollTop = ui.timeline.scrollHeight;
+  updateLatest();
 }
 async function selectSession(key) {
   if (selected) drafts.set(selected, ui.input.value);
   selected = key;
   selectionEpoch++;
+  const epoch = selectionEpoch;
   detail = null;
   pmBusy = false;
   pmModelReady = false;
   messageSignature = "";
+  resetLatest();
   approvalSignature = "";
   try {
     sessionStorage.setItem("foreman:selected", key);
@@ -645,17 +960,21 @@ async function selectSession(key) {
   ui.input.value = drafts.get(key) || "";
   autosize();
   clearError();
-  ui.messages.replaceChildren(
-    emptyState("Opening conversation…", "Getting the latest messages."),
-  );
+  showConversationLoading();
   ui.approvals.replaceChildren();
   renderRail();
   renderHeading();
+  const returnFocus = ui.app.classList.contains("nav-open") && window.matchMedia("(max-width: 760px)").matches;
   setNav(false);
+  if (returnFocus) {
+    ui.title.tabIndex = -1;
+    ui.title.focus({ preventScroll: true });
+  }
+  if (!host.online) showConversationLoading("Conversation unavailable while your Mac is offline. It will open when your Mac reconnects.", true);
   try {
     await refreshSelected();
   } catch (error) {
-    showError(error);
+    if (epoch === selectionEpoch) showRefreshError(error);
   }
 }
 let polledPmError = null;
@@ -676,6 +995,7 @@ async function refreshSelected() {
     !authorized
   )
     return;
+  conversationLoading = false;
   if (key === "pm") {
     pmBusy = !!result.busy;
     if (result.error) {
@@ -745,29 +1065,35 @@ async function poll() {
     const nextHost = await api("/api/host");
     if (!authorized || epoch !== authEpoch) return;
     host = nextHost;
+    hostChecked = true;
     renderHost();
     if (host.online) {
       const rows = await api("/api/sessions");
       if (!authorized || epoch !== authEpoch) return;
       sessions = Array.isArray(rows) ? rows : [];
+      sessionsLoaded = true;
       renderRail();
-      await refreshSelected().catch(showError);
+      await refreshSelected().catch(showRefreshError);
       if (!selected) {
         renderMessages();
         renderHeading();
       }
       await refreshPmSummary(epoch);
     } else {
+      if (conversationLoading) showConversationLoading("Conversation unavailable while your Mac is offline. It will open when your Mac reconnects.", true);
       renderRail();
       renderHeading();
     }
   } catch (error) {
     if (authorized && epoch === authEpoch) {
       host = { online: false };
+      hostChecked = true;
       renderHost();
+      renderRail();
       renderHeading();
       $("#connection-banner").textContent =
         `Cannot reach the execution host. ${errorMessage(error)} Retrying automatically.`;
+      if (conversationLoading) showConversationLoading("Conversation unavailable while your Mac is offline. Retrying automatically.", true);
     }
   } finally {
     polling = false;
@@ -781,6 +1107,10 @@ function autosize() {
 }
 ui.input.addEventListener("input", () => {
   if (selected) drafts.set(selected, ui.input.value);
+  for (const action of ["send", "interrupt"]) {
+    const feedback = actionFeedback.get(selected)?.[action];
+    if (feedback?.text && !feedback.error) setActionFeedback(selected, action, "");
+  }
   autosize();
   updateControls();
 });
@@ -800,6 +1130,8 @@ $("#composer").addEventListener("submit", async (event) => {
     previous?.text === text ? previous : { id: crypto.randomUUID(), text };
   sendAttempts.set(key, attempt);
   sending = true;
+  const epoch = authEpoch;
+  setActionFeedback(key, "send", "");
   updateControls();
   clearError();
   let accepted = false;
@@ -818,36 +1150,49 @@ $("#composer").addEventListener("submit", async (event) => {
       ui.input.value = "";
       autosize();
     }
+    if (epoch === authEpoch && authorized) setActionFeedback(key, "send", "Message accepted.");
     await refreshSelected();
   } catch (error) {
-    showError(
+    if (epoch === authEpoch && authorized) setActionFeedback(key, "send",
       accepted
         ? `Your message was accepted, but the conversation could not refresh. ${errorMessage(error)}`
         : `${errorMessage(error)} Your message is still in the composer.${key === "pm" ? " Check the conversation before sending again." : " Retry the same message to check delivery without creating a duplicate."}`,
+      true,
     );
   } finally {
-    sending = false;
-    updateControls();
-    if (selected === key && !ui.input.disabled) ui.input.focus();
+    if (epoch === authEpoch) {
+      sending = false;
+      updateControls();
+      if (selected === key && !ui.input.disabled) ui.input.focus();
+    }
   }
 });
 ui.interrupt.addEventListener("click", async () => {
   if (ui.interrupt.disabled) return;
   const key = selected;
+  const epoch = authEpoch;
   ui.interrupt.dataset.busy = "true";
+  setActionFeedback(key, "interrupt", "");
   updateControls();
   clearError();
+  let accepted = false;
   try {
     await post(
       key === "pm" ? "/api/pm/interrupt" : "/api/session/interrupt",
       key === "pm" ? {} : { id: key },
     );
+    accepted = true;
+    if (epoch === authEpoch && authorized) setActionFeedback(key, "interrupt", "Interrupt request accepted.");
     await refreshSelected();
   } catch (error) {
-    showError(error);
+    if (epoch === authEpoch && authorized) setActionFeedback(key, "interrupt", accepted
+      ? `Interrupt request accepted, but the conversation could not refresh. ${errorMessage(error)}`
+      : errorMessage(error), true);
   } finally {
-    ui.interrupt.dataset.busy = "false";
-    updateControls();
+    if (epoch === authEpoch) {
+      ui.interrupt.dataset.busy = "false";
+      updateControls();
+    }
   }
 });
 function retainModel(select, value) {
@@ -865,20 +1210,21 @@ function modelOptions(select, models, value = "") {
   }
   retainModel(select, value);
 }
-async function loadNewModels() {
+async function loadNewModels(value = "") {
+  if (typeof value !== "string") value = "";
   const request = ++newModelRequest, epoch = authEpoch;
   const provider = $("#new-provider").value, select = $("#new-model");
-  modelOptions(select, []);
+  modelOptions(select, [], value);
   select.disabled = true;
   $("#new-model-hint").textContent = "Loading available models…";
   try {
     const result = await api(`/api/models?provider=${provider}`);
     if (request !== newModelRequest || epoch !== authEpoch || !authorized) return;
-    modelOptions(select, result.models || []);
+    modelOptions(select, result.models || [], value);
     $("#new-model-hint").textContent = "Uses your provider settings unless you choose a model.";
   } catch (error) {
     if (request !== newModelRequest || epoch !== authEpoch || !authorized) return;
-    $("#new-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen this dialog to retry, or use the provider default.`;
+    $("#new-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Your selected model is retained. Reopen this dialog to retry.`;
   } finally { if (request === newModelRequest) select.disabled = false; }
 }
 async function loadPmModels() {
@@ -894,12 +1240,13 @@ async function loadPmModels() {
   } catch (error) {
     if (epoch !== authEpoch || !authorized) return;
     $("#pm-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen the project manager to retry.`;
-  } finally { pmModelLoading = false; updateControls(); }
+  } finally { if (epoch === authEpoch) { pmModelLoading = false; updateControls(); } }
 }
 $("#pm-model").addEventListener("change", async () => {
   const value = $("#pm-model").value;
   if (pmModelSaving || pmBusy || !host.online) { retainModel($("#pm-model"), pmModel); return; }
   pmModelSaving = true;
+  $("#pm-model-hint").textContent = "Saving…";
   modelRevision++;
   const epoch = authEpoch;
   updateControls();
@@ -908,12 +1255,14 @@ $("#pm-model").addEventListener("change", async () => {
     if (epoch !== authEpoch || !authorized) return;
     pmModel = result.model || "";
     $("#pm-model-hint").textContent = "Saved. Applies to the next turn.";
-  } catch (error) { if (epoch === authEpoch && authorized) showError(error); }
+  } catch (error) { if (epoch === authEpoch && authorized) $("#pm-model-hint").textContent = `Could not save model. ${errorMessage(error)}`; }
   finally {
-    pmModelSaving = false;
-    retainModel($("#pm-model"), pmModel);
-    updateControls();
-    if (epoch === authEpoch && authorized) await refreshSelected().catch(showError);
+    if (epoch === authEpoch) {
+      pmModelSaving = false;
+      retainModel($("#pm-model"), pmModel);
+      updateControls();
+      if (authorized) await refreshSelected().catch(showError);
+    }
   }
 });
 $("#new-provider").addEventListener("change", loadNewModels);
@@ -925,29 +1274,187 @@ function updateNewPolicy() {
   $("#confirm-bypass").checked = false;
 }
 $("#new-policy").addEventListener("change", updateNewPolicy);
-function openNew() {
+function projectChoices(rows) {
+  const choices = $("#project-choices"); choices.replaceChildren();
+  for (const project of rows) {
+    const button = node("button", "project-choice"); button.type = "button";
+    button.append(node("strong", "", project.name), node("span", "", project.path));
+    button.addEventListener("click", () => { $("#new-cwd").value = project.path; void resolveNewProject(project); });
+    choices.append(button);
+  }
+}
+async function loadProjects() {
+  const epoch = authEpoch;
+  try {
+    const result = await api("/api/projects");
+    if (epoch !== authEpoch || !ui.dialog.open) return;
+    projectRows = result.projects || [];
+    if (!$("#new-cwd").value.trim()) projectChoices(projectRows);
+  } catch (error) { if (epoch === authEpoch) $("#project-status").textContent = `Projects unavailable: ${errorMessage(error)} Enter an absolute directory to try resolving it.`; }
+}
+async function resolveNewProject(selectedProject) {
+  const revision = ++projectRevision, epoch = authEpoch, reference = $("#new-cwd").value.trim();
+  projectResolution = null; projectPending = !!reference;
+  const matches = projectRows.filter((p) => [p.path, p.canonicalPath, p.name, ...(p.aliases || [])].some((v) => v?.toLowerCase() === reference.toLowerCase()));
+  projectSelection = selectedProject || (matches.length === 1 ? matches[0] : null);
+  $("#rename-project").hidden = !projectSelection; $("#remove-project").hidden = !projectSelection; $("#remember-project").hidden = !!projectSelection;
+  $("#project-name").value = projectSelection?.name || ""; $("#project-aliases").value = (projectSelection?.aliases || []).join(", "); $("#project-feedback").textContent = "";
+  $("#project-status").textContent = reference ? "Resolving project…" : "Choose a recent project or search by name, alias, or absolute path.";
+  projectChoices(reference ? projectRows.filter((p) => `${p.name} ${p.path} ${(p.aliases || []).join(" ")}`.toLowerCase().includes(reference.toLowerCase())) : projectRows);
+  updateControls();
+  if (!reference) return;
+  try {
+    const result = await post("/api/projects/resolve", { reference });
+    if (revision !== projectRevision || epoch !== authEpoch || !ui.dialog.open) return;
+    if (result.status === "resolved") {
+      projectResolution = { ...result, reference }; projectSelection = result.project || null;
+      $("#project-status").textContent = `Project: ${result.project?.name || "Unregistered directory"} · ${result.path}`;
+      projectChoices([]);
+      $("#project-name").value = result.project?.name || result.path.split("/").filter(Boolean).at(-1) || "";
+      $("#project-aliases").value = (result.project?.aliases || []).join(", ");
+      $("#rename-project").hidden = !result.project; $("#remove-project").hidden = !result.project; $("#remember-project").hidden = !!result.project;
+    } else {
+      $("#project-status").textContent = result.status === "ambiguous" ? "Several projects match. Which project do you mean?" : "No project matches. Choose a registered project or enter its full absolute directory.";
+      projectChoices(result.candidates || []);
+    }
+  } catch (error) { if (revision === projectRevision && epoch === authEpoch) $("#project-status").textContent = errorMessage(error); }
+  finally { if (revision === projectRevision && epoch === authEpoch) { projectPending = false; updateControls(); } }
+}
+$("#new-cwd").addEventListener("input", () => resolveNewProject());
+async function changeProject(action) {
+  if (projectPending || !authorized || !host.online || (action === "register" ? !projectResolution : !projectSelection)) return;
+  const selection = projectResolution || { project: projectSelection }, epoch = authEpoch, revision = projectRevision;
+  const button = $(action === "register" ? "#remember-project" : action === "update" ? "#rename-project" : "#remove-project");
+  button.disabled = true; $("#project-feedback").textContent = "Saving…";
+  try {
+    const name = $("#project-name").value.trim(), aliases = $("#project-aliases").value.split(",").map((v) => v.trim()).filter(Boolean);
+    const result = await post(`/api/projects/${action}`, action === "register" ? { name, path: selection.reference.startsWith("/") ? selection.reference : selection.path, aliases } : { id: selection.project.id, name, aliases });
+    if (epoch !== authEpoch || revision !== projectRevision || !ui.dialog.open) return;
+    if (action === "remove") { $("#new-cwd").value = ""; await loadProjects(); await resolveNewProject(); }
+    else { $("#new-cwd").value = result.path; await loadProjects(); await resolveNewProject(); }
+    $("#project-feedback").textContent = action === "remove" ? "Project removed. Existing sessions are unchanged." : "Project saved on your Mac.";
+    $("#new-cwd").focus();
+  } catch (error) { if (epoch === authEpoch && revision === projectRevision) $("#project-feedback").textContent = errorMessage(error); }
+  finally { button.disabled = false; }
+}
+$("#remember-project").addEventListener("click", () => changeProject("register"));
+$("#rename-project").addEventListener("click", () => changeProject("update"));
+$("#remove-project").addEventListener("click", () => changeProject("remove"));
+function launchStatus(text, busy = false) {
+  $("#launch-status-label").textContent = text;
+  $("#launch-status").classList.toggle("is-active", busy);
+  $("#launch-status .activity-symbol").hidden = !busy;
+}
+function cancelLauncher() {
+  launchRevision++; launchBusy = false;
+  const id = launchJob; launchJob = null;
+  if (id && authorized) void post("/api/launch/cancel", { id }).catch(() => {});
+}
+function setLaunchMode(mode) {
+  launchMode = mode;
+  $("#launch-brief-panel").hidden = mode !== "brief";
+  $("#session-fields").hidden = mode === "brief";
+  $("#session-fields").disabled = mode === "brief";
+  $("#create-session").hidden = mode === "brief";
+  $("#create-session").textContent = mode === "proposal" ? "Confirm and start" : "Start session";
+  $("#edit-brief").hidden = mode === "brief";
+  $("#start-manually").hidden = mode === "manual";
+  $("#launch-reason").hidden = mode !== "proposal";
+  updateControls();
+}
+function manualLaunch(message = "") {
+  cancelLauncher();
+  if (launchMode === "brief" || !$("#new-prompt").value.trim()) $("#new-prompt").value = $("#launch-brief").value;
+  setLaunchMode("manual"); launchStatus(message);
+  $("#new-name").focus();
+}
+async function loadLauncherModels() {
+  const request = ++launcherModelRequest, epoch = authEpoch, value = $("#launcher-model").value || "claude-sonnet-5";
+  try {
+    const result = await api("/api/models?provider=claude");
+    if (epoch !== authEpoch || request !== launcherModelRequest || !ui.dialog.open) return;
+    const select = $("#launcher-model");
+    select.replaceChildren(new Option("claude-sonnet-5 (default)", "claude-sonnet-5"));
+    for (const model of result.models || []) if (model.value !== "claude-sonnet-5") select.add(new Option(model.displayName, model.value));
+    retainModel(select, value);
+    $("#launcher-model-hint").textContent = "Proposes the setup only. The session has its own model selection.";
+  } catch (error) {
+    if (epoch === authEpoch && request === launcherModelRequest) $("#launcher-model-hint").textContent = `Launcher models unavailable: ${errorMessage(error)} You can start manually.`;
+  }
+}
+$("#launch-brief").addEventListener("input", updateControls);
+$("#start-manually").addEventListener("click", () => manualLaunch());
+$("#edit-brief").addEventListener("click", () => {
+  cancelLauncher(); setLaunchMode("brief"); launchStatus(""); $("#launch-brief").focus();
+});
+$("#propose-session").addEventListener("click", async () => {
+  if (launchBusy || !authorized || !host.online || !$("#launch-brief").value.trim()) return;
+  cancelLauncher();
+  const revision = launchRevision, epoch = authEpoch, id = crypto.randomUUID();
+  launchJob = id; launchBusy = true;
+  $("#new-error").hidden = true;
+  launchStatus("Working… Proposing your session", true); updateControls();
+  const current = () => revision === launchRevision && epoch === authEpoch && authorized && ui.dialog.open;
+  try {
+    let job = await post("/api/launch/propose", { id, brief: $("#launch-brief").value.trim(), model: $("#launcher-model").value });
+    const deadline = Date.now() + 65_000;
+    while (current() && job.status === "working") {
+      if (Date.now() > deadline) throw new Error("Launcher took too long.");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (!current()) return;
+      job = await api(`/api/launch?id=${encodeURIComponent(id)}`);
+    }
+    if (!current()) return;
+    if (job.status !== "ready" || !job.proposal) throw new Error(job.error || "Launcher was cancelled or returned no proposal.");
+    const proposal = job.proposal;
+    $("#new-name").value = proposal.name; $("#new-cwd").value = proposal.cwd;
+    $("#new-prompt").value = proposal.text; $("#new-provider").value = proposal.provider;
+    $("#launch-reason").textContent = proposal.reason;
+    await loadNewModels(proposal.model);
+    if (!current()) return;
+    await resolveNewProject();
+    if (!current()) return;
+    launchBusy = false; launchJob = null;
+    setLaunchMode("proposal"); launchStatus("Proposal ready. Edit any field, then confirm to start.");
+    $("#new-name").focus();
+  } catch (error) {
+    if (current()) manualLaunch(`${errorMessage(error)} Your brief is preserved below; review the manual form.`);
+  }
+});
+let dialogOpener;
+function openNew(event) {
   if (!authorized || !host.online) return;
+  dialogOpener = event?.currentTarget || document.activeElement;
   if (!$("#new-cwd").value && detail?.session?.cwd)
     $("#new-cwd").value = detail.session.cwd;
   $("#new-error").hidden = true;
   $("#new-policy").value = "native";
   updateNewPolicy();
   ui.dialog.showModal();
+  setLaunchMode("brief"); launchStatus("");
+  void loadLauncherModels();
   void loadNewModels();
-  $("#new-name").focus();
+  void loadProjects(); void resolveNewProject();
+  $("#launch-brief").focus();
 }
 ui.newButton.addEventListener("click", openNew);
+ui.dialog.addEventListener("close", () => {
+  cancelLauncher(); launcherModelRequest++;
+  projectRevision++; projectPending = false; projectResolution = null; projectSelection = null;
+  if (!authorized || creating) return;
+  if (dialogOpener?.isConnected && !dialogOpener.closest("[inert]")) dialogOpener.focus({ preventScroll: true });
+});
 for (const selector of ["#close-dialog", "#cancel-new"])
   $(selector).addEventListener("click", () => ui.dialog.close());
 ui.newForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (creating || !host.online || !ui.newForm.reportValidity()) return;
+  if (launchMode === "brief" || launchBusy || creating || !host.online || projectPending || !projectResolution || projectResolution.reference !== $("#new-cwd").value.trim() || !ui.newForm.reportValidity()) return;
   const values = {
     provider: $("#new-provider").value,
     permission_mode: $("#new-policy").value,
     ...($("#new-model").value ? { model: $("#new-model").value } : {}),
     name: $("#new-name").value.trim(),
-    cwd: $("#new-cwd").value.trim(),
+    cwd: projectResolution.path,
     text: $("#new-prompt").value.trim(),
   };
   if (!values.name || !values.cwd || !values.text) return;
@@ -955,6 +1462,7 @@ ui.newForm.addEventListener("submit", async (event) => {
   if (creationAttempt?.signature !== signature)
     creationAttempt = { signature, id: crypto.randomUUID() };
   creating = true;
+  const epoch = authEpoch;
   updateControls();
   $("#new-error").hidden = true;
   $("#create-session").textContent = "Starting…";
@@ -970,16 +1478,19 @@ ui.newForm.addEventListener("submit", async (event) => {
     creationAttempt = undefined;
     ui.dialog.close();
     $("#new-name").value = "";
-    $("#new-prompt").value = "";
+    $("#new-prompt").value = ""; $("#launch-brief").value = "";
     await selectSession(session.session_key);
   } catch (error) {
+    if (epoch !== authEpoch || !authorized) return;
     $("#new-error").textContent =
       `${errorMessage(error)} You can retry with the same details.`;
     $("#new-error").hidden = false;
   } finally {
-    creating = false;
-    $("#create-session").textContent = "Start session";
-    updateControls();
+    if (epoch === authEpoch) {
+      creating = false;
+      $("#create-session").textContent = launchMode === "proposal" ? "Confirm and start" : "Start session";
+      updateControls();
+    }
   }
 });
 $("#select-pm").addEventListener("click", () => { if (!pmModelLoading) pmModelLoaded = false; return selectSession("pm"); });
@@ -992,7 +1503,7 @@ for (const selector of ["#close-nav", "#nav-backdrop"])
     $("#open-nav").focus();
   });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && ui.app.classList.contains("nav-open")) {
+  if (event.key === "Escape" && !ui.dialog.open && ui.app.classList.contains("nav-open")) {
     setNav(false);
     $("#open-nav").focus();
   }
@@ -1041,7 +1552,8 @@ function enterApp(user) {
   renderHost();
   renderRail();
   renderHeading();
-  renderMessages();
+  if (selected) showConversationLoading();
+  else renderMessages();
   poll();
 }
 async function boot() {
@@ -1102,5 +1614,14 @@ async function boot() {
 window
   .matchMedia("(max-width: 760px)")
   .addEventListener("change", () => setNav(false));
+// Android keyboards can resize only the visual viewport. Keep the composer and
+// dialog scroll area inside it without changing browser pinch-zoom behavior.
+function fitViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport || viewport.scale !== 1) return;
+  document.documentElement.style.setProperty("--viewport-height", `${viewport.height}px`);
+}
+window.visualViewport?.addEventListener("resize", fitViewport);
+fitViewport();
 setNav(false);
 boot();

@@ -1,8 +1,9 @@
+import { ProjectRegistry, readableDirectory } from './projects.ts';
 import { permissionMode, type PermissionMode } from './permission-policy.ts';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, statSync, realpathSync, unlinkSync, rmdirSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, rmdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { ClaudeControl, type ClaudeReceipt } from './claude-control.ts';
 import { normalizeModel } from './models.ts';
 import { CodexControl } from './codex-control.ts';
@@ -13,8 +14,8 @@ export type Source = 'user' | { sender: string; chain: string[] };
 export interface Receipt { id: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'uncertain'; text: string; at: string; error?: string; source: Source }
 export interface History { id: string; role: 'user' | 'assistant' | 'system' | 'tool'; text: string; at: string; source?: Source }
 export interface Approval { id: string; kind: 'permission' | 'question' | 'unsupported'; tool: string; input: Record<string, any>; reason?: string; questions?: { id: string; question: string; options?: string[] }[] }
-export type SessionRow = Session & { managed: boolean; model?: string; capabilities: { message: boolean; interrupt: boolean; approvals: boolean }; control_reason?: string };
-interface RecordData { version: 1; creation: { id: string; provider: string; name: string; cwd: string; text: string; model?: string; permission_mode?: PermissionMode }; session: SessionRow; history: History[]; receipts: Receipt[] }
+export type SessionRow = Session & { managed: boolean; model?: string; project_name?: string; capabilities: { message: boolean; interrupt: boolean; approvals: boolean }; control_reason?: string };
+interface RecordData { version: 1; creation: { id: string; provider: string; name: string; cwd: string; text: string; model?: string; permission_mode?: PermissionMode; project_reference?: string }; session: SessionRow; history: History[]; receipts: Receipt[] }
 export interface ProviderSetup {
   claude?: Pick<ConstructorParameters<typeof ClaudeControl>[0], 'mcpServers' | 'allowedTools' | 'systemPrompt'>;
   codexArgs?: string[];
@@ -22,7 +23,7 @@ export interface ProviderSetup {
   cleanup?: () => void;
 }
 interface Runtime { claude?: ClaudeControl; codex?: CodexControl; ready: boolean; stopped?: boolean; active?: string; turn?: string; dispatching: boolean; interrupting?: boolean; setup?: ProviderSetup }
-interface Options { home?: string; fleet?: Fleet; claudeFactory?: (options: ConstructorParameters<typeof ClaudeControl>[0]) => ClaudeControl; codexFactory?: (options: ConstructorParameters<typeof CodexControl>[0]) => CodexControl; prepare?: (session: SessionRow) => ProviderSetup | Promise<ProviderSetup> }
+interface Options { home?: string; projects?: ProjectRegistry; fleet?: Fleet; claudeFactory?: (options: ConstructorParameters<typeof ClaudeControl>[0]) => ClaudeControl; codexFactory?: (options: ConstructorParameters<typeof CodexControl>[0]) => CodexControl; prepare?: (session: SessionRow) => ProviderSetup | Promise<ProviderSetup> }
 const now = () => new Date().toISOString();
 const clone = <T>(value: T): T => structuredClone(value);
 function bounded<T extends { text: string }>(items: T[], bytes = 180000): T[] {
@@ -89,12 +90,12 @@ export class SessionService extends EventEmitter {
   private row(data: RecordData): SessionRow {
     const runtime = this.runtime.get(data.session.session_key);
     const available = !!runtime?.ready && !this.closed;
-    return { ...clone(data.session), capabilities: { message: available, interrupt: available && !!runtime?.active, approvals: available } };
+    return { ...clone(data.session), ...(this.options.projects?.forPath(data.session.cwd) ? { project_name: this.options.projects.forPath(data.session.cwd)!.name } : {}), capabilities: { message: available, interrupt: available && !!runtime?.active, approvals: available } };
   }
   list(): SessionRow[] {
     const managed = [...this.records.values()].map((data) => this.row(data));
     const nativeKeys = new Set(managed.filter((s) => s.session_id).map((s) => `${s.provider}:${s.session_id}`));
-    const observed = (this.options.fleet?.list() ?? []).filter((s) => !nativeKeys.has(s.session_key)).map((s) => ({ ...clone(s), managed: false, capabilities: { message: false, interrupt: false, approvals: false }, control_reason: 'Observed session; Foreman does not own its input connection.' }));
+    const observed = (this.options.fleet?.list() ?? []).filter((s) => !nativeKeys.has(s.session_key)).map((s) => ({ ...clone(s), ...(this.options.projects?.forPath(s.cwd) ? { project_name: this.options.projects.forPath(s.cwd)!.name } : {}), managed: false, capabilities: { message: false, interrupt: false, approvals: false }, control_reason: 'Observed session; Foreman does not own its input connection.' }));
     return [...managed, ...observed].sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? ''));
   }
   detail(id: string) {
@@ -113,23 +114,26 @@ export class SessionService extends EventEmitter {
     const id = textValue(input.id, 'Creation id', 200);
     if (!['claude', 'codex'].includes(input.provider)) throw new Error('Unsupported provider');
     const cwdInput = textValue(input.cwd, 'Project directory', 4096);
-    if (!isAbsolute(cwdInput) || !statSync(cwdInput).isDirectory()) throw new Error('Project directory must be an existing absolute directory');
-    const cwd = realpathSync(cwdInput), text = textValue(input.text, 'Message', 64 * 1024);
+    const previous = [...this.records.values()].find((data) => data.creation.id === id);
+    // A durable retry retains its project identity even after a registry rename/removal.
+    const resolution = previous && (cwdInput === previous.creation.project_reference || cwdInput === previous.creation.cwd)
+      ? { path: previous.creation.cwd } : this.options.projects?.require(cwdInput);
+    const cwd = resolution?.path ?? readableDirectory(cwdInput), text = textValue(input.text, 'Message', 64 * 1024);
     const name = input.name === undefined || input.name === '' ? `${input.provider} session` : textValue(input.name, 'Name', 200);
     const model = normalizeModel(input.model);
     const policy = permissionMode(input.permission_mode);
     const creation = { id, provider: input.provider, name, cwd, text, ...(model ? { model } : {}), permission_mode: policy };
-    const previous = [...this.records.values()].find((data) => data.creation.id === id);
-    if (previous) { if (JSON.stringify(previous.creation) !== JSON.stringify(creation)) throw new Error('Creation id was already used for different input'); return this.row(previous); }
+    if (previous) { const { project_reference, ...original } = previous.creation; if (JSON.stringify(original) !== JSON.stringify(creation)) throw new Error('Creation id was already used for different input'); return this.row(previous); }
     if (this.records.size >= 500) throw new Error('Session limit reached');
     const key = `fm:${randomUUID()}`;
     const session: SessionRow = { session_key: key, session_id: '', provider: input.provider, name, cwd, ...(model ? { model } : {}), state: 'working', reason: 'starting', kind: 'sdk', entrypoint: 'foreman', pid: null, alive: false, tracked: true, current_tool: null, active_subagents: 0, last_message: null, last_error: null, started_at: now(), updated_at: now(), ended_at: null, end_reason: null, permission_mode: policy, bg_id: null, bg_state: null, bg_waiting_for: null, host: HOST, transcript_path: null, managed: true, capabilities: { message: false, interrupt: false, approvals: false } };
     const receipt: Receipt = { id, status: 'queued', text, at: now(), source: 'user' };
-    const data: RecordData = { version: 1, creation, session, receipts: [receipt], history: [{ id, role: 'user', text, at: receipt.at, source: 'user' }] };
+    const data: RecordData = { version: 1, creation: { ...creation, project_reference: cwdInput }, session, receipts: [receipt], history: [{ id, role: 'user', text, at: receipt.at, source: 'user' }] };
+    this.options.projects?.used(cwd);
     this.save(data); this.records.set(key, data);
     const runtime: Runtime = { ready: false, dispatching: false }; this.runtime.set(key, runtime); this.changed(data);
     // Launch independently: creation is durably accepted before slow provider startup.
-    void this.launch(data, runtime);
+    void this.launch(data, runtime, resolution && 'project' in resolution ? resolution.project : undefined);
     return this.row(data);
   }
   send(id: string, text: string, messageId: string, source: Source = 'user'): Receipt {
@@ -145,10 +149,11 @@ export class SessionService extends EventEmitter {
     data.receipts.push(receipt); data.history.push({ id: messageId, role: 'user', text, at: receipt.at, source: clone(source) });
     this.changed(data); void this.dispatch(data, runtime); return clone(receipt);
   }
-  private async launch(data: RecordData, runtime: Runtime) {
+  private async launch(data: RecordData, runtime: Runtime, project?: { path: string; canonicalPath: string; registeredPaths?: string[] }) {
     try {
       runtime.setup = await this.options.prepare?.(this.row(data));
       if (this.closed) { runtime.setup?.cleanup?.(); return; }
+      for (const path of project?.registeredPaths ?? [project?.path ?? data.session.cwd!]) readableDirectory(path, project?.canonicalPath ?? data.session.cwd!);
       if (data.session.provider === 'claude') {
         const control = (this.options.claudeFactory ?? ((options) => new ClaudeControl(options)))({ cwd: data.session.cwd!, pathToClaudeCodeExecutable: CLAUDE_BIN, settingSources: ['user', 'project'], ...runtime.setup?.claude, permission_mode: permissionMode(data.creation.permission_mode), ...(data.session.model ? { model: data.session.model } : {}) });
         runtime.claude = control;
