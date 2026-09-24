@@ -20,7 +20,7 @@ function fixture(t) {
   writeFileSync(join(source, '.gitignore'), 'node_modules\n');
   writeFileSync(join(source, 'package-lock.json'), '{}');
   writeFileSync(join(source, 'web/index.html'), '<title>Test</title><body></body>');
-  writeFileSync(join(source, 'wrangler.jsonc'), '{ "vars": {"FIREBASE_CONFIG":"public-config"} }');
+  writeFileSync(join(source, 'wrangler.jsonc'), '{ "vars": {"FIREBASE_CONFIG":"public-config"}, "durable_objects": {"bindings": [{"name": "RELAY", "class_name": "HostRelay"}]}, "migrations": [{"tag": "v1", "new_sqlite_classes": ["HostRelay"]}], "assets": {"directory": "./web", "binding": "ASSETS"} }');
   // A small installed tree: nested package files and an in-tree .bin symlink.
   mkdirSync(join(modules, 'pkg/lib'), { recursive: true }); mkdirSync(join(modules, '.bin'));
   writeFileSync(join(modules, 'pkg/package.json'), '{"name":"pkg","version":"1.0.0"}');
