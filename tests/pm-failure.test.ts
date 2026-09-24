@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -921,4 +921,197 @@ test('an is_error success result whose errors[] differ from its result text keep
   assert.ok(entries.some((e) => /DISTINCT: API Error 529 overloaded/.test(e)), 'the result text the SDK echoes is recorded');
   assert.match(f.pm.lastError!, /DISTINCT: API Error 529 overloaded/);
   assert.ok(f.diagnostics.some((d) => /DISTINCT: API Error 529 overloaded/.test(String(d[1]))), 'the echoed result text is logged');
+});
+
+// Reporting failures (#35). A history append or a throwing 'event' listener must never replace
+// the provider cause, skip lifecycle cleanup, or block the next explicit send.
+const providerDiagnostics = (diagnostics: any[]) => diagnostics.filter((d) => d[0] === 'foreman: pm failure');
+const reportingFailures = (diagnostics: any[]) => diagnostics.filter((d) => d[0] === 'foreman: pm reporting failed');
+// Replace a file with a directory so any write to it fails with EISDIR; restore returns a file.
+function asDirectory(t: any, path: string) {
+  rmSync(path, { recursive: true, force: true }); mkdirSync(path);
+  const restore = () => { rmSync(path, { recursive: true, force: true }); writeFileSync(path, ''); };
+  t.after(restore);
+  return restore;
+}
+const recovered = async function* ({ next, closed }: Ctx) {
+  yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+  await next();
+  yield { type: 'result', is_error: false, subtype: 'success', result: 'Recovered answer' };
+  await closed;
+};
+
+for (const ending of ['error result', 'thrown error'] as const)
+test(`a history append failure (EISDIR) during a provider failure (${ending}) keeps the provider cause, settles start(), and a later send dispatches`, { timeout: 10_000 }, async (t) => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.launch > 0) return yield* recovered(ctx);
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await ctx.next();
+    await gate;
+    if (ending === 'error result') {
+      yield errorResult('Original provider failure');
+      throw new Error('Claude Code returned an error result: Original provider failure');
+    }
+    throw new Error('Original provider failure');
+  });
+  const running = f.pm.start();
+  f.pm.send('first input');
+  await settle(() => f.consumed.length === 1);
+  const restore = asDirectory(t, PM_HISTORY_FILE);
+  release();
+  await running; // resolves: the filesystem error neither rejects start() nor skips its cleanup
+  assert.match(f.pm.lastError!, /Original provider failure/);
+  assert.doesNotMatch(f.pm.lastError!, /EISDIR/);
+  assert.equal(f.pm.modelBusy, false);
+  assert.equal((f.pm as any).running, false);
+  // The provider diagnostic is logged first and exactly once; the append failure is logged apart.
+  assert.equal(f.diagnostics[0][0], 'foreman: pm failure');
+  assert.equal(providerDiagnostics(f.diagnostics).length, 1);
+  assert.match(f.diagnostics[0][1], /Original provider failure/);
+  assert.ok(reportingFailures(f.diagnostics).some((d) => /"kind":"history"/.test(d[1]) && /EISDIR/.test(d[1])));
+  assert.ok(f.events.some((e) => e.type === 'status' && /Original provider failure/.test(e.text)));
+  restore();
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Recovered answer'));
+  assert.deepEqual(f.launches.map((l) => l.consumed), [['first input'], ['explicit retry']]);
+  assert.equal(f.pm.lastError, null);
+});
+
+test('a throwing event listener during a provider failure keeps the provider cause and settles lifecycle state', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.launch > 0) return yield* recovered(ctx);
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await ctx.next();
+    yield { type: 'stream_event', event: { type: 'message_start' } };
+    yield errorResult('Original provider failure');
+    throw new Error('Claude Code returned an error result: Original provider failure');
+  });
+  f.pm.on('event', () => { throw new Error('listener exploded'); });
+  const running = f.pm.start();
+  f.pm.send('first input');
+  await running;
+  assert.deepEqual(f.consumed, ['first input']);
+  assert.match(f.pm.lastError!, /Original provider failure/);
+  assert.doesNotMatch(f.pm.lastError!, /listener exploded/);
+  assert.equal((f.pm as any).pendingTurns, 0);
+  assert.equal(f.pm.busy, false);
+  assert.equal(f.pm.modelBusy, false);
+  assert.equal((f.pm as any).running, false);
+  const provider = providerDiagnostics(f.diagnostics);
+  assert.equal(provider.length, 1);
+  assert.match(provider[0][1], /Original provider failure/);
+  // Within fail(), the provider diagnostic precedes the failed status emission's report.
+  const at = f.diagnostics.indexOf(provider[0]);
+  assert.equal(f.diagnostics[at + 1][0], 'foreman: pm reporting failed');
+  assert.match(f.diagnostics[at + 1][1], /"kind":"event","detail":"status".*listener exploded/);
+  // Earlier listeners still saw every event, and history still recorded the failure once.
+  assert.deepEqual(f.events.filter((e) => e.type === 'turn_end').map((e) => e.is_error), [true]);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Recovered answer'));
+  assert.deepEqual(f.launches.map((l) => l.consumed), [['first input'], ['explicit retry']]);
+  assert.equal(f.pm.lastError, null);
+});
+
+test('a throwing event listener during a successful turn does not abort the turn state update', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next, closed }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    for (let input = await next(); input !== undefined; input = await next()) {
+      yield { type: 'stream_event', event: { type: 'message_start' } };
+      yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: `answer to ${input}` } } };
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: `answer to ${input}` }, { type: 'tool_use', name: 'mcp__fleet__list_sessions', input: {} }] } };
+      yield { type: 'result', is_error: false, subtype: 'success', result: `answer to ${input}` };
+    }
+    await closed;
+  });
+  f.pm.on('event', () => { throw new Error('listener exploded'); });
+  const running = f.pm.start();
+  f.pm.lastError = 'Old failure';
+  f.pm.send('first');
+  await settle(() => f.events.some((e) => e.type === 'turn_end'));
+  assert.equal(f.pm.lastError, null);
+  assert.equal((f.pm as any).pendingTurns, 0);
+  assert.equal(f.pm.busy, false);
+  assert.equal(f.pm.modelBusy, false);
+  assert.equal((f.pm as any).running, true);
+  assert.deepEqual(f.pm.history().filter((e) => e.role === 'assistant').map((e) => e.text), ['answer to first']);
+  assert.equal(f.pm.history().filter((e) => e.role === 'tool').length, 1);
+  assert.equal(providerDiagnostics(f.diagnostics).length, 0);
+  const reported = reportingFailures(f.diagnostics).map((d) => JSON.parse(d[1]).detail);
+  for (const type of ['status', 'turn_start', 'delta', 'tool', 'assistant_text', 'turn_end']) assert.ok(reported.includes(type), `${type} failure logged`);
+  assert.deepEqual(f.events.filter((e) => e.type === 'assistant_text').map((e) => e.text), ['answer to first']);
+  // The same provider keeps serving explicit input.
+  f.pm.send('second');
+  await settle(() => f.events.filter((e) => e.type === 'turn_end').length === 2);
+  assert.equal(f.launches.length, 1);
+  assert.deepEqual(f.consumed, ['first', 'second']);
+  assert.equal(f.pm.modelBusy, false);
+  assert.deepEqual(f.pm.history().filter((e) => e.role === 'assistant').map((e) => e.text), ['answer to first', 'answer to second']);
+  assert.equal(f.pm.lastError, null);
+  void running;
+});
+
+test('a quarantine whose session-file clear throws keeps the provider cause and the next send still starts fresh', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  let restore!: () => void;
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.resume === 'stale-session') {
+      await ctx.pull();
+      restore = asDirectory(t, PM_SESSION_FILE); // clearing the active session file now fails
+      throw new Error('Claude Code process exited with code 1. stderr: Invalid resume handle: stale-session');
+    }
+    yield* freshAnswer(ctx);
+  }, 'stale-session');
+  const running = f.pm.start();
+  f.pm.send('failed input');
+  await running;
+  assert.match(f.pm.lastError!, /Invalid resume handle: stale-session/);
+  assert.doesNotMatch(f.pm.lastError!, /EISDIR/);
+  assert.equal(f.pm.modelBusy, false);
+  assert.equal(f.pm.sessionId, null);
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+  const cleared = f.diagnostics.filter((d) => d[0] === 'foreman: pm session quarantine clear failed');
+  assert.equal(cleared.length, 1);
+  assert.match(cleared[0][1], /stale-session/);
+  assert.match(cleared[0][1], /EISDIR/);
+  const provider = providerDiagnostics(f.diagnostics);
+  assert.equal(provider.length, 1);
+  assert.match(provider[0][1], /Invalid resume handle/);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  restore();
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Fresh answer'));
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
+  assert.deepEqual(f.consumed, ['explicit retry']);
+});
+
+test('a failed quarantine record logs the session id and diagnostic, and the session is still cleared', { timeout: 10_000 }, async (t) => {
+  t.after(() => rmSync(QUARANTINE_FILE, { recursive: true, force: true }));
+  rmSync(QUARANTINE_FILE, { recursive: true, force: true }); mkdirSync(QUARANTINE_FILE); // appends fail
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.resume === 'stale-session') {
+      await ctx.pull();
+      throw new Error('Claude Code process exited with code 1. stderr: Invalid resume handle: stale-session');
+    }
+    yield* freshAnswer(ctx);
+  }, 'stale-session');
+  const running = f.pm.start();
+  f.pm.send('failed input');
+  await running;
+  assert.match(f.pm.lastError!, /Invalid resume handle: stale-session/);
+  assert.doesNotMatch(f.pm.lastError!, /EISDIR/);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
+  const failed = f.diagnostics.filter((d) => d[0] === 'foreman: pm session quarantine record failed');
+  assert.equal(failed.length, 1);
+  const logged = JSON.parse(failed[0][1]);
+  assert.equal(logged.session_id, 'stale-session');
+  assert.match(logged.reason, /Invalid resume handle: stale-session/);
+  assert.match(logged.error, /EISDIR/);
+  assert.equal(providerDiagnostics(f.diagnostics).length, 1);
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Fresh answer'));
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
+  assert.deepEqual(f.consumed, ['explicit retry']);
 });
