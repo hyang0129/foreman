@@ -184,12 +184,23 @@ test('a starting record never matches a live unrelated process, and stop/start d
   for (const child of children) { assert.equal(child.exitCode, null); assert.equal(child.signalCode, null); assert.equal(alive(child.pid), true); }
 });
 
-test('orphan lookup ignores other users and rows whose live identity does not match', (t) => {
+test('orphan lookup ignores other users and rows whose live identity does not match', async (t) => {
   const f = fixture(t, { pairing: false }), id = randomUUID(), argv = `${process.execPath} ${f.entry} ${id}`;
   const uid = process.getuid();
-  // Exact argv but a foreign uid, and a zombie: never candidates.
-  assert.deepEqual(findOrphans(f.home, id, () => `${process.pid} ${uid + 1} S ${argv}\n${process.pid} ${uid} Z ${argv}\n`), []);
-  // A row claiming our PID with the exact argv is rejected by the live identity re-check.
+  // A real disposable process whose argv is exactly `<home>/run.mjs <id>`, so
+  // only the uid / zombie filters can reject the rows that point at it.
+  const child = spawnIdle(t, f.entry, [id]);
+  await once(child.stdout, 'data');
+  assert.ok(processIdentity(child.pid).endsWith(` ${f.entry} ${id}`));
+  const row = (owner, stat) => () => `${child.pid} ${owner} ${stat} ${argv}\n`;
+  // Positive control: the same row with our uid and a live state is found.
+  assert.deepEqual(findOrphans(f.home, id, row(uid, 'S')).map((o) => o.pid), [child.pid]);
+  // Exact argv and a real matching process, but a foreign uid: never a candidate.
+  assert.deepEqual(findOrphans(f.home, id, row(uid + 1, 'S')), []);
+  // Exact argv and a real matching process, but reported as a zombie: never a candidate.
+  assert.deepEqual(findOrphans(f.home, id, row(uid, 'Z')), []);
+  // A row claiming the runner's PID with the exact argv is rejected by the live identity re-check.
   assert.deepEqual(findOrphans(f.home, id, () => `${process.pid} ${uid} S ${argv}\n`), []);
   assert.throws(() => findOrphans(f.home, 'not-a-uuid'), /Invalid daemon id/);
+  assert.equal(alive(child.pid), true);
 });
