@@ -80,5 +80,39 @@ if (process.env.FOREMAN_LIVE !== '1') {
       assert.equal(pm.history().filter(e => e.role === 'user').length, 2);
     } finally { pm.close(); await running; }
   });
+  test('live PM restarts an alive-but-rejecting provider on the next explicit send', { timeout: 150000 }, async t => {
+    writeFileSync(PM_HISTORY_FILE, ''); writeFileSync(PM_SESSION_FILE, '');
+    const pm = new ProjectManager({}); pm.model = 'haiku';
+    let invalid = true, launches = 0;
+    pm.queryFactory = ({ prompt, options }) => {
+      launches++;
+      return query({ prompt, options: { ...options, env: { ...process.env,
+        CLAUDE_CODE_OAUTH_TOKEN: invalid ? 'invalid-live-test-token' : process.env.CLAUDE_CODE_OAUTH_TOKEN } } });
+    };
+    const logs = []; t.mock.method(console, 'error', (...args) => logs.push(args));
+    const waitFor = async (check, label) => {
+      const until = Date.now() + 65000;
+      while (!check() && Date.now() < until) await new Promise(r => setTimeout(r, 100));
+      assert.ok(check(), label);
+    };
+    const running = pm.start();
+    try {
+      pm.send('Reply with FAILED_INPUT_MUST_NOT_REPLAY. Do not call tools.');
+      await waitFor(() => !!pm.lastError, 'Real provider authentication rejection is required');
+      assert.match(pm.lastError || '', /auth|token|401|login/i);
+      assert.ok(pm.history().some(e => e.error)); assert.ok(logs.length);
+      // No pm.q?.close() here: the real provider must still be alive after rejecting, which
+      // is the shape this case exists to cover. If the SDK ever exits instead, fail loudly.
+      await new Promise(r => setTimeout(r, 2000));
+      assert.equal(pm.running, true, 'The rejecting provider is expected to stay alive');
+      assert.equal(launches, 1);
+      invalid = false;
+      pm.send('Reply with exactly FOREMAN_PM_ALIVE_RECOVERED. Do not call tools or change anything.');
+      await waitFor(() => pm.history().some(e => e.role === 'assistant' && e.text.includes('FOREMAN_PM_ALIVE_RECOVERED')), 'New input must receive a real persisted answer on the same PM');
+      assert.equal(launches, 2); assert.equal(pm.lastError, null);
+      assert.equal(pm.history().filter(e => e.role === 'user').length, 2);
+      assert.ok(!pm.history().some(e => e.role === 'assistant' && e.text.includes('FAILED_INPUT_MUST_NOT_REPLAY')), 'Failed input must not be replayed');
+    } finally { pm.close(); await running; }
+  });
 
 }
