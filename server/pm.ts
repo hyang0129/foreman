@@ -159,6 +159,15 @@ export class ProjectManager extends EventEmitter {
     return readFileSync(PM_HISTORY_FILE, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).slice(-200);
   }
   private record(entry: any) { appendFileSync(PM_HISTORY_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"); }
+  // Reporting (history appends and 'event' listeners) must never replace a provider cause or
+  // skip lifecycle state: EventEmitter.emit rethrows a listener's exception synchronously, and
+  // an append can fail on the filesystem. Each report runs once; a failure is logged on its own.
+  private report(kind: 'history' | 'event', detail: string, action: () => void) {
+    try { action(); }
+    catch (error: any) { console.error('foreman: pm reporting failed', JSON.stringify({ kind, detail, error: String(error?.message ?? error).slice(0, 500) })); }
+  }
+  private reportRecord(entry: any) { this.report('history', String(entry.role), () => this.record(entry)); }
+  private emitEvent(event: PmEvent) { this.report('event', event.type, () => this.emit("event", event)); }
 
   private fail(reason: string) {
     const text = `Project manager failed: ${reason.slice(0, 1500)}. Your message was not completed; after resolving the error, send a new message to retry. Failed messages are not replayed.`;
@@ -166,8 +175,8 @@ export class ProjectManager extends EventEmitter {
     this.lastError = text;
     console.error('foreman: pm failure', JSON.stringify({ session_id: this.sessionId, pending_turns: this.pendingTurns, error: reason.slice(0, 1500) }));
     if (!duplicateRejection) {
-      this.record({ role: "system", text, error: true });
-      this.emit("event", { type: "status", text } as PmEvent);
+      this.reportRecord({ role: "system", text, error: true });
+      this.emitEvent({ type: "status", text });
     }
   }
 
@@ -179,7 +188,9 @@ export class ProjectManager extends EventEmitter {
     const entry = { ts: new Date().toISOString(), session_id: sessionId, reason: reason.slice(0, 1500) };
     try { appendFileSync(PM_SESSION_QUARANTINE_FILE, JSON.stringify(entry) + "\n", { mode: 0o600 }); }
     catch (error: any) { console.error('foreman: pm session quarantine record failed', JSON.stringify({ ...entry, error: String(error?.message ?? error) })); }
-    writeFileSync(PM_SESSION_FILE, "");
+    // Clearing the active file can fail too; the provider's error stays the cause either way.
+    try { writeFileSync(PM_SESSION_FILE, ""); }
+    catch (error: any) { console.error('foreman: pm session quarantine clear failed', JSON.stringify({ ...entry, error: String(error?.message ?? error) })); }
     if (this.sessionId === sessionId) this.sessionId = null;
   }
 
@@ -189,9 +200,9 @@ export class ProjectManager extends EventEmitter {
     const last = this.history().reverse().find((entry) => ['user', 'assistant', 'system'].includes(entry.role));
     if (last?.role === 'user' && last.delivery !== 'rejected') {
       const text = 'Foreman restarted; delivery cannot be confirmed. Message was not replayed.';
-      this.record({ role: 'system', text, error: true });
       this.lastError = text;
-      this.emit('event', { type: 'status', text } as PmEvent);
+      this.reportRecord({ role: 'system', text, error: true });
+      this.emitEvent({ type: 'status', text });
     }
   }
 
@@ -311,7 +322,7 @@ export class ProjectManager extends EventEmitter {
           maxTurns: 60,
           effort: (process.env.FOREMAN_PM_EFFORT as any) || "medium",
           ...(this.model ? { model: this.model } : {}),
-          stderr: (chunk: string) => { if (current() && /error|warn/i.test(chunk)) this.emit("event", { type: "status", text: chunk.trim().slice(0, 300) } as PmEvent); },
+          stderr: (chunk: string) => { if (current() && /error|warn/i.test(chunk)) this.emitEvent({ type: "status", text: chunk.trim().slice(0, 300) }); },
         },
       });
       let text = "", completeText = "", turnError = "";
@@ -331,12 +342,12 @@ export class ProjectManager extends EventEmitter {
           state.initialized = true;
           this.sessionId = m.session_id; writeFileSync(PM_SESSION_FILE, m.session_id);
           this.tools = m.tools ?? [];
-          this.emit("event", { type: "status", text: `PM session ${m.session_id.slice(0, 8)} ready (${this.tools.length} tools${this.tools.includes("SendMessage") ? ", cross-session messaging on" : ""})` } as PmEvent);
+          this.emitEvent({ type: "status", text: `PM session ${m.session_id.slice(0, 8)} ready (${this.tools.length} tools${this.tools.includes("SendMessage") ? ", cross-session messaging on" : ""})` });
         } else if (m.type === "stream_event") {
           const ev = m.event;
-          if (ev?.type === "message_start") { if (!this.busy) { this.busy = true; this.emit("event", { type: "turn_start", ts: new Date().toISOString() } as PmEvent); } }
-          if (ev?.type === "content_block_start" && ev.content_block?.type === "text" && text && !text.endsWith("\n")) { text += "\n\n"; this.emit("event", { type: "delta", text: "\n\n" } as PmEvent); }
-          if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") { text += ev.delta.text; this.emit("event", { type: "delta", text: ev.delta.text } as PmEvent); }
+          if (ev?.type === "message_start") { if (!this.busy) { this.busy = true; this.emitEvent({ type: "turn_start", ts: new Date().toISOString() }); } }
+          if (ev?.type === "content_block_start" && ev.content_block?.type === "text" && text && !text.endsWith("\n")) { text += "\n\n"; this.emitEvent({ type: "delta", text: "\n\n" }); }
+          if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") { text += ev.delta.text; this.emitEvent({ type: "delta", text: ev.delta.text }); }
         } else if (m.type === "assistant") {
           const content = (m.message?.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');
           if (m.error || m.isApiErrorMessage) {
@@ -345,8 +356,8 @@ export class ProjectManager extends EventEmitter {
           for (const b of m.message?.content ?? []) {
             if (b.type === "tool_use") {
               const summary = b.name === "mcp__fleet__spawn_session" ? `${b.input?.name} in ${b.input?.cwd}` : b.name === "SendMessage" ? `→ ${b.input?.to}${b.input?.notify_when_idle ? " (notify when idle)" : ""}` : JSON.stringify(b.input ?? {}).slice(0, 160);
-              this.emit("event", { type: "tool", name: b.name.replace(/^mcp__fleet__/, "fleet."), summary } as PmEvent);
-              this.record({ role: "tool", name: b.name, summary });
+              this.emitEvent({ type: "tool", name: b.name.replace(/^mcp__fleet__/, "fleet."), summary });
+              this.reportRecord({ role: "tool", name: b.name, summary });
             }
           }
         } else if (m.type === "user") {
@@ -355,8 +366,8 @@ export class ProjectManager extends EventEmitter {
           if (/Cross-session (idle notice|message)|<cross-session-message/i.test(txt.slice(0, 200))) {
             // A peer message starts a turn send() never dispatched: no pending Stop applies to it.
             this.interruptedAt = null;
-            this.record({ role: "peer", text: txt.slice(0, 600) });
-            this.emit("event", { type: "peer", text: txt.slice(0, 600) } as PmEvent);
+            this.reportRecord({ role: "peer", text: txt.slice(0, 600) });
+            this.emitEvent({ type: "peer", text: txt.slice(0, 600) });
           }
         } else if (m.type === "result") {
           // Fail closed: an SDK abort reason is authoritative; otherwise cancellation is inferred
@@ -367,7 +378,7 @@ export class ProjectManager extends EventEmitter {
           const failed = !!m.is_error && !cancelled;
           text = text.trim() ? text : completeText || (!failed && !cancelled && typeof m.result === 'string' ? m.result : '');
           // A partial answer must precede its terminal explanation in history.
-          if (text.trim()) this.record({ role: "assistant", text });
+          if (text.trim()) this.reportRecord({ role: "assistant", text });
           if (failed) {
             this.providerFailed = true;
             const failure = turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`;
@@ -382,15 +393,15 @@ export class ProjectManager extends EventEmitter {
             this.lastError = null;
             if (cancelled) {
               const message = 'Project manager stopped at your request. Message was not replayed.';
-              this.record({ role: 'system', text: message });
-              this.emit('event', { type: 'status', text: message } as PmEvent);
+              this.reportRecord({ role: 'system', text: message });
+              this.emitEvent({ type: 'status', text: message });
             }
           }
           this.interruptedAt = null; // an interrupt is spent by the first result after it
           this.pendingTurns = Math.max(0, this.pendingTurns - 1);
           this.busy = false;
-          this.emit("event", { type: "assistant_text", text } as PmEvent);
-          this.emit("event", { type: "turn_end", ts: new Date().toISOString(), cost_usd: m.total_cost_usd ?? 0, is_error: failed, subtype: m.subtype } as PmEvent);
+          this.emitEvent({ type: "assistant_text", text });
+          this.emitEvent({ type: "turn_end", ts: new Date().toISOString(), cost_usd: m.total_cost_usd ?? 0, is_error: failed, subtype: m.subtype });
           text = ""; completeText = ""; turnError = "";
         }
       }
@@ -432,8 +443,11 @@ export class ProjectManager extends EventEmitter {
       const echo = attempt.reported !== undefined && String(error?.message ?? error) === attempt.reported;
       if (current() && !this.closed && !echo) this.fail(String(error?.message ?? error));
     } finally {
-      if (current()) { this.q?.close(); this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; this.interruptedAt = null; this.providerFailed = false; this.inbox.retire(); this.inbox = new Inbox(); }
-      else (q as Query | null)?.close();
+      // Reset lifecycle state before closing, so nothing close() throws can skip it.
+      const owned = current() ? this.q : (q as Query | null);
+      if (current()) { this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; this.interruptedAt = null; this.providerFailed = false; this.inbox.retire(); this.inbox = new Inbox(); }
+      try { owned?.close(); }
+      catch (error: any) { console.error('foreman: pm provider close failed', JSON.stringify({ error: String(error?.message ?? error) })); }
     }
   }
 }
