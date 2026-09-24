@@ -54,6 +54,16 @@ const INVALID_RESUME_HANDLE = /\binvalid resume handle\b/i;
 // Abandoned session ids are moved here, never deleted: one JSON line per quarantine,
 // `{ ts, session_id, reason }`, with the provider diagnostic truncated.
 const PM_SESSION_QUARANTINE_FILE = `${PM_SESSION_FILE}.quarantine.jsonl`;
+// The diagnostic an error result carries: primarily the text the SDK's exit echo uses (errors[]
+// for an error subtype, `result` for an is_error success). Unlike the SDK, it falls back to the
+// other field when the primary one is empty; the echo then differs, so it never suppresses one.
+const resultDiagnostic = (m: any): string => {
+  const errors = Array.isArray(m.errors) ? m.errors.map((e: unknown) => String(e).trim()).filter(Boolean).join('; ') : '';
+  const result = typeof m.result === 'string' ? m.result : '';
+  return (m.subtype === 'success' ? result || errors : errors || result);
+};
+// When the CLI exits after an error result, the SDK throws this echo of the result's diagnostic.
+const sdkErrorResultEcho = (diagnostic: string) => `Claude Code returned an error result: ${diagnostic}`;
 
 class Inbox {
   delivered = 0;
@@ -275,11 +285,14 @@ export class ProjectManager extends EventEmitter {
     let q: Query | null = null;
     // What the latest provider attempt did: the input its stream handed out, and how many
     // frames the provider emitted. Zero frames means the CLI never processed any input.
-    let attempt = { taken: [] as SDKUserMessage[], frames: 0 };
+    // `reported` is the SDK's error echo of a failed result this attempt already reported, while
+    // that result is still the latest frame: the CLI exiting on it must not report it twice.
+    type Attempt = { taken: SDKUserMessage[]; frames: number; initialized: boolean; reported?: string };
+    let attempt: Attempt = { taken: [], frames: 0, initialized: false };
     const run = async (resume?: string) => {
       const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
       const stream = inbox.open();
-      const state = attempt = { taken: stream.taken, frames: 0 };
+      const state: Attempt = attempt = { taken: stream.taken, frames: 0, initialized: false };
       q = this.q = this.queryFactory({
         prompt: stream.prompt,
         options: {
@@ -304,8 +317,18 @@ export class ProjectManager extends EventEmitter {
       let text = "", completeText = "", turnError = "";
       for await (const m of q as any) {
         if (!current()) break; // retired by an explicit send; the replacement owns all state now
+        // The CLI reports a rejected --resume as an error result (then exits 1) before any
+        // system/init. That result is the resume rejection itself, not a turn: it is not a turn
+        // failure, settles no turn, and is not a frame of processed input. Route it to the
+        // resume-rejection handling below. Any other pre-init error result is handled as before.
+        if (resume && !state.initialized && m.type === "result" && m.is_error) {
+          const diagnostic = resultDiagnostic(m);
+          if (MISSING_CONVERSATION.test(diagnostic) || INVALID_RESUME_HANDLE.test(diagnostic)) throw new Error(diagnostic);
+        }
         state.frames++;
+        state.reported = undefined;
         if (m.type === "system" && m.subtype === "init") {
+          state.initialized = true;
           this.sessionId = m.session_id; writeFileSync(PM_SESSION_FILE, m.session_id);
           this.tools = m.tools ?? [];
           this.emit("event", { type: "status", text: `PM session ${m.session_id.slice(0, 8)} ready (${this.tools.length} tools${this.tools.includes("SendMessage") ? ", cross-session messaging on" : ""})` } as PmEvent);
@@ -347,7 +370,13 @@ export class ProjectManager extends EventEmitter {
           if (text.trim()) this.record({ role: "assistant", text });
           if (failed) {
             this.providerFailed = true;
-            this.fail(turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`);
+            const failure = turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`;
+            this.fail(failure);
+            // Suppress the SDK's exit echo only when its diagnostic is already fully in what was
+            // recorded (fail() keeps the first 1500 chars). Otherwise the echo is the only carrier
+            // of this result's own diagnostic, so it must surface as its own failure entry.
+            const echoed = resultDiagnostic(m);
+            if (echoed && failure.slice(0, 1500).includes(echoed)) state.reported = sdkErrorResultEcho(echoed);
           } else {
             this.providerFailed = false;
             this.lastError = null;
@@ -398,7 +427,10 @@ export class ProjectManager extends EventEmitter {
         await run();
       }
     } catch (error: any) {
-      if (current() && !this.closed) this.fail(String(error?.message ?? error));
+      // The SDK's exit error that only echoes the failed result already reported is not a
+      // second failure of the same attempt.
+      const echo = attempt.reported !== undefined && String(error?.message ?? error) === attempt.reported;
+      if (current() && !this.closed && !echo) this.fail(String(error?.message ?? error));
     } finally {
       if (current()) { this.q?.close(); this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; this.interruptedAt = null; this.providerFailed = false; this.inbox.retire(); this.inbox = new Inbox(); }
       else (q as Query | null)?.close();

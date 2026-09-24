@@ -498,7 +498,10 @@ test('retiring a provider ends its parked input reader and ignores its stderr', 
 
 // The real SDK reads prompt input eagerly (query() starts streamInput at once). Drive the real
 // query() against a stub CLI so the fallback is proven against that behavior, with no model spend.
-function stubCli(mode: 'reject' | 'init-then-reject' | 'invalid-handle') {
+// The `-result` modes mirror the installed CLI (0.3.270) in SDK (stream-json) mode: on a rejected
+// --resume it writes the diagnostic to stderr AND prints an `error_during_execution` result whose
+// `errors` is [diagnostic] to stdout, before any system/init and without reading stdin, then exits 1.
+function stubCli(mode: 'reject' | 'init-then-reject' | 'invalid-handle' | 'reject-result' | 'invalid-handle-result' | 'init-then-reject-result') {
   const dir = mkdtempSync(join(home, 'stub-cli-'));
   const path = join(dir, 'claude.mjs'), log = join(dir, 'log.jsonl');
   writeFileSync(path, `#!/usr/bin/env node
@@ -508,9 +511,15 @@ const log = (entry) => appendFileSync(${JSON.stringify(log)}, JSON.stringify(ent
 const out = (m) => process.stdout.write(JSON.stringify(m) + '\\n');
 const resume = process.argv.slice(2).find((a) => a.startsWith('--resume'));
 log({ resume: resume ? resume.split('=')[1] : null });
+const mode = ${JSON.stringify(mode)};
 if (resume) {
-  if (${JSON.stringify(mode)} === 'init-then-reject') out({ type: 'system', subtype: 'init', session_id: 'stale-session', tools: [] });
-  process.stderr.write((${JSON.stringify(mode)} === 'invalid-handle' ? 'Invalid resume handle: ' : 'No conversation found with session ID: ') + resume.split('=')[1] + '\\n');
+  if (mode.startsWith('init-then-reject')) out({ type: 'system', subtype: 'init', session_id: 'stale-session', tools: [] });
+  const diagnostic = (mode.startsWith('invalid-handle') ? 'Invalid resume handle: ' : 'No conversation found with session ID: ') + resume.split('=')[1];
+  process.stderr.write(diagnostic + '\\n');
+  if (mode.endsWith('-result')) {
+    const result = { type: 'result', subtype: 'error_during_execution', duration_ms: 0, duration_api_ms: 0, is_error: true, num_turns: 0, stop_reason: null, session_id: '00000000-0000-4000-8000-000000000000', total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, modelUsage: {}, permission_denials: [], uuid: '00000000-0000-4000-8000-000000000001', errors: [diagnostic], result_index: 0 };
+    await new Promise((flushed) => process.stdout.write(JSON.stringify(result) + '\\n', flushed));
+  }
   process.exit(1);
 }
 let inited = false;
@@ -724,4 +733,192 @@ test('real SDK: an invalid resume handle before any frame quarantines, fails lou
   assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }, { resume: null }, { input: 'explicit retry' }]);
   assert.equal(f.pm.history().find((e) => e.role === 'assistant').text, 'echo: explicit retry');
   assert.equal(f.pm.lastError, null);
+});
+
+// The installed CLI reports a rejected --resume as an error result frame before any system/init
+// (see stubCli). That frame is the resume rejection itself, not a processed turn.
+const errorResult = (diagnostic: string) => ({ type: 'result', subtype: 'error_during_execution', is_error: true, num_turns: 0, total_cost_usd: 0, errors: [diagnostic] });
+
+test('real SDK: a send-triggered restart whose resume the CLI rejects with a pre-init error result is answered once by a fresh session', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const cli = stubCli('reject-result');
+  const f = realSdkPm(t, cli.path);
+  f.pm.send('new input');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant'));
+  await quiet();
+  assert.deepEqual(f.resumes, ['stale-session', undefined]);
+  // Only the fresh process read the input; the rejected one never read stdin.
+  assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }, { resume: null }, { input: 'new input' }]);
+  assert.deepEqual(f.pm.history().filter((e) => e.role === 'assistant').map((e) => e.text), ['echo: new input']);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 0);
+  assert.equal(f.pm.lastError, null);
+  assert.equal(f.diagnostics.length, 0);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'fresh-session');
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+  assert.match(quarantined()[0].reason, /No conversation found with session ID: stale-session/);
+});
+
+test('real SDK: an invalid resume handle reported as a pre-init error result quarantines with exactly one failure', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const cli = stubCli('invalid-handle-result');
+  const f = realSdkPm(t, cli.path);
+  f.pm.send('failed input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.deepEqual(f.resumes, ['stale-session']); // no automatic fresh run
+  assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }]);
+  assert.match(f.pm.lastError!, /Invalid resume handle: stale-session/);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  assert.equal(f.diagnostics.length, 1);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant'));
+  await quiet();
+  assert.deepEqual(f.resumes, ['stale-session', undefined]);
+  assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }, { resume: null }, { input: 'explicit retry' }]);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  assert.equal(f.pm.lastError, null);
+});
+
+test('real SDK: a missing-conversation error result after system/init fails loudly once and is not requeued', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const cli = stubCli('init-then-reject-result');
+  const f = realSdkPm(t, cli.path);
+  f.pm.send('new input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.deepEqual(f.resumes, ['stale-session']);
+  assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }]);
+  assert.match(f.pm.lastError!, /No conversation found with session ID: stale-session/);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  assert.equal(f.pm.history().filter((e) => e.role === 'assistant').length, 0);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+});
+
+test('a pre-init missing-conversation error result on a send-triggered restart is a resume rejection: requeued once, no failure', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.launch === 0) return; // the PM's provider exits; the stale saved session is left behind
+    if (ctx.resume === 'stale-session') {
+      await ctx.pull(); // the SDK reads the input eagerly; the CLI never processes it
+      yield errorResult('No conversation found with session ID: stale-session');
+      throw new Error('Claude Code returned an error result: No conversation found with session ID: stale-session');
+    }
+    yield* freshAnswer(ctx);
+  }, 'stale-session');
+  await f.pm.start();
+  const failuresBefore = f.pm.history().filter((e) => e.error).length; // the original PM's exit
+  f.pm.send('new input');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Fresh answer'));
+  await quiet();
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', 'stale-session', undefined]);
+  assert.deepEqual(f.launches.map((l) => l.pulled), [[], ['new input'], []]);
+  assert.deepEqual(f.consumed, ['new input']); // delivered once, to the fresh session only
+  assert.equal(f.launches[1].closed, true);
+  assert.equal(f.pm.history().filter((e) => e.role === 'assistant').length, 1);
+  assert.equal(f.pm.history().filter((e) => e.error).length, failuresBefore);
+  assert.equal(f.pm.history().filter((e) => e.error && /No conversation found/.test(e.text)).length, 0);
+  // The rejection settled no turn: only the fresh answer ended one.
+  assert.deepEqual(f.events.filter((e) => e.type === 'turn_end').map((e) => e.is_error), [false]);
+  assert.equal(f.pm.lastError, null);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'fresh-session');
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+});
+
+test('a pre-init invalid-handle error result quarantines with one loud failure and no replay', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.resume === 'stale-session') {
+      await ctx.pull();
+      yield errorResult('Invalid resume handle: stale-session');
+      throw new Error('Claude Code returned an error result: Invalid resume handle: stale-session');
+    }
+    yield* freshAnswer(ctx);
+  }, 'stale-session');
+  f.pm.send('failed input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.equal(f.launches.length, 1);
+  assert.deepEqual(f.consumed, []);
+  assert.match(f.pm.lastError!, /Invalid resume handle: stale-session/);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  assert.equal(f.diagnostics.length, 1);
+  assert.equal(f.events.filter((e) => e.type === 'turn_end').length, 0);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Fresh answer'));
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
+  assert.deepEqual(f.consumed, ['explicit retry']);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+});
+
+test('a missing-conversation error result after system/init fails loudly exactly once and is not requeued', { timeout: 10_000 }, async (t) => {
+  rmSync(QUARANTINE_FILE, { force: true });
+  const f = scripted(t, async function* (ctx) {
+    if (ctx.resume === 'stale-session') {
+      yield { type: 'system', subtype: 'init', session_id: 'stale-session', tools: [] };
+      await ctx.next(); // after init the input may have been processed
+      yield errorResult('No conversation found with session ID: stale-session');
+      throw new Error('Claude Code returned an error result: No conversation found with session ID: stale-session');
+    }
+    yield* freshAnswer(ctx);
+  }, 'stale-session');
+  f.pm.send('consumed input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  assert.equal(f.launches.length, 1); // no requeue, no fallback run
+  assert.deepEqual(f.consumed, ['consumed input']);
+  assert.match(f.pm.lastError!, /No conversation found with session ID: stale-session/);
+  assert.equal(f.pm.history().filter((e) => e.error).length, 1);
+  assert.equal(f.diagnostics.length, 1);
+  assert.equal(f.pm.history().filter((e) => e.role === 'assistant').length, 0);
+  assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
+  assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
+  f.pm.send('explicit retry');
+  await settle(() => f.pm.history().some((e) => e.role === 'assistant' && e.text === 'Fresh answer'));
+  assert.deepEqual(f.launches.map((l) => l.resume), ['stale-session', undefined]);
+  assert.deepEqual(f.consumed, ['consumed input', 'explicit retry']);
+});
+
+// The SDK's exit echo carries resultDiagnostic(m) (errors[] for an error subtype, `result` for an
+// is_error success). When the failure already recorded for that result is different text, the
+// echo is the only carrier of the result's own diagnostic: it must surface, never be suppressed.
+const errorEntries = (pm: any): string[] => pm.history().filter((e: any) => e.error).map((e: any) => e.text);
+
+test('a result whose errors[] differ from a preceding assistant API error keeps both diagnostics', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    yield { type: 'assistant', error: 'rate_limit', message: { content: [{ type: 'text', text: 'API Error: overloaded' }] } };
+    yield errorResult('DISTINCT: tool runner crashed');
+    throw new Error('Claude Code returned an error result: DISTINCT: tool runner crashed');
+  });
+  f.pm.send('input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  const entries = errorEntries(f.pm);
+  assert.ok(entries.some((e) => /API Error: overloaded/.test(e)), 'the assistant API error is recorded');
+  assert.ok(entries.some((e) => /DISTINCT: tool runner crashed/.test(e)), 'the result errors[] diagnostic is recorded');
+  assert.match(f.pm.lastError!, /DISTINCT: tool runner crashed/);
+  assert.ok(f.diagnostics.some((d) => /DISTINCT: tool runner crashed/.test(String(d[1]))), 'the result errors[] diagnostic is logged');
+});
+
+test('an is_error success result whose errors[] differ from its result text keeps both diagnostics', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    yield { type: 'result', subtype: 'success', is_error: true, num_turns: 1, total_cost_usd: 0, result: 'DISTINCT: API Error 529 overloaded', errors: ['hook runner failed'] };
+    throw new Error('Claude Code returned an error result: DISTINCT: API Error 529 overloaded');
+  });
+  f.pm.send('input');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  const entries = errorEntries(f.pm);
+  assert.ok(entries.some((e) => /hook runner failed/.test(e)), 'the errors[] diagnostic is recorded');
+  assert.ok(entries.some((e) => /DISTINCT: API Error 529 overloaded/.test(e)), 'the result text the SDK echoes is recorded');
+  assert.match(f.pm.lastError!, /DISTINCT: API Error 529 overloaded/);
+  assert.ok(f.diagnostics.some((d) => /DISTINCT: API Error 529 overloaded/.test(String(d[1]))), 'the echoed result text is logged');
 });
