@@ -1,0 +1,195 @@
+// Startup transaction and orphan recovery for the dev daemon (#30).
+// Every process here is a disposable script spawned by the test itself, in a
+// temporary dev home, and is cleaned up by the PID the test learned from it.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:net';
+import { pathToFileURL } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+import { openHome, start, stop, status, running, findOrphans, processIdentity, TARGET } from '../scripts/dev-environment.mjs';
+
+const script = pathToFileURL(realpathSync('scripts/dev-environment.mjs')).href;
+const commit = 'c'.repeat(40);
+const idle = 'setInterval(() => {}, 1000); console.log("ready");\n';
+// Harmless stand-in for server/main.ts: records its PID, reports a graceful
+// SIGTERM, and otherwise idles. It never listens on any port.
+const fakeMain = `import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const home = process.env.FOREMAN_HOME;
+process.on('SIGTERM', () => { writeFileSync(join(home, 'daemon-sigterm'), String(process.pid)); process.exit(0); });
+writeFileSync(join(home, 'daemon-ready'), String(process.pid));
+setInterval(() => {}, 1000);
+`;
+
+function cleanEnv() {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith('FOREMAN_') || ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'NODE_OPTIONS', 'NODE_TEST_CONTEXT'].includes(key)) delete env[key];
+  return env;
+}
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+}
+async function until(check, what, ms = 10000) {
+  for (let waited = 0; waited < ms; waited += 50) { if (check()) return; await delay(50); }
+  assert.fail(`Timed out waiting for ${what}`);
+}
+// Kill a leftover only if it is still the exact disposable process this test created.
+function reap(t, pid, argvTail) {
+  t.after(() => { if (processIdentity(pid).endsWith(argvTail)) process.kill(pid, 'SIGKILL'); });
+}
+async function injectedPort() {
+  const server = createServer(); await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address(); await new Promise((r) => server.close(r));
+  assert.notEqual(port, TARGET.port); return port;
+}
+function fixture(t, { pairing = true } = {}) {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-dev-start-')));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const home = openHome(dir), release = 'release-fixture';
+  mkdirSync(join(home, release, 'server'), { recursive: true, mode: 0o700 });
+  writeFileSync(join(home, release, 'server/main.ts'), fakeMain);
+  writeJson(join(home, 'deployment.json'), { release, commit });
+  if (pairing) writeJson(join(home, 'dev-pairing.json'), { environment: 'foreman-dev-v1', url: TARGET.url, token: 'a'.repeat(64) });
+  return { dir, home, daemonFile: join(home, 'daemon.json'), entry: join(home, 'run.mjs') };
+}
+function writeJson(path, value) { writeFileSync(path, JSON.stringify(value), { mode: 0o600 }); }
+const mocks = (port) => ({ relayStatus: async () => ({ commit, relay: { online: false } }), checkPort: async () => {}, execute: () => '{"loggedIn":true}', port });
+async function captureLog(fn) {
+  const lines = [], original = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  try { const result = await fn(); return { result, output: lines.join('\n') }; } finally { console.log = original; }
+}
+function spawnIdle(t, file, args) {
+  writeFileSync(file, idle, { mode: 0o600 });
+  const child = spawn(process.execPath, [file, ...args], { stdio: ['ignore', 'pipe', 'ignore'], env: cleanEnv() });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  return child;
+}
+
+test('failed PID record promotion after a real spawn terminates the child and proves it exited', async (t) => {
+  const f = fixture(t);
+  let seen;
+  const saveRecord = (path, value) => {
+    if (value.state === 'running') {
+      const intent = JSON.parse(readFileSync(path, 'utf8'));
+      reap(t, value.pid, ` ${f.entry} ${value.id}`);
+      seen = { pid: value.pid, id: value.id, intent, alive: alive(value.pid), identity: processIdentity(value.pid) };
+      throw new Error('injected promotion failure');
+    }
+    writeJson(path, value);
+  };
+  await assert.rejects(start(f.home, { ...mocks(await injectedPort()), saveRecord }), /injected promotion failure/);
+  // The mechanism ran: intent was published and the child was really alive.
+  assert.ok(seen, 'promotion was attempted');
+  assert.deepEqual(Object.keys(seen.intent).sort(), ['id', 'startedAt', 'state']);
+  assert.equal(seen.intent.state, 'starting'); assert.equal(seen.intent.id, seen.id);
+  assert.equal(seen.alive, true);
+  assert.ok(seen.identity.endsWith(` ${f.entry} ${seen.id}`), seen.identity);
+  // ...and afterwards it is gone, with no record left behind.
+  assert.equal(alive(seen.pid), false);
+  assert.equal(processIdentity(seen.pid), '');
+  assert.equal(existsSync(f.daemonFile), false);
+  assert.equal(running(f.home), null);
+  const { output } = await captureLog(() => stop(f.home));
+  assert.equal(output, 'DEV daemon is stopped');
+});
+
+test('a start killed between spawn and promotion leaves a starting record that stop resolves to exactly its daemon', async (t) => {
+  const f = fixture(t), port = await injectedPort(), pidFile = join(f.dir, 'orphan-pid');
+  const driver = join(f.dir, 'driver.mjs');
+  writeFileSync(driver, `import { writeFileSync } from 'node:fs';
+const [scriptUrl, home, commit, port, pidFile] = process.argv.slice(2);
+const { start } = await import(scriptUrl);
+await start(home, {
+  relayStatus: async () => ({ commit, relay: { online: false } }), checkPort: async () => {}, execute: () => '{"loggedIn":true}', port: Number(port),
+  saveRecord: (path, value) => {
+    if (value.state === 'running') { writeFileSync(pidFile, String(value.pid)); process.kill(process.pid, 'SIGKILL'); }
+    writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+  },
+});
+`);
+  const starter = spawn(process.execPath, [driver, script, f.home, commit, String(port), pidFile], { stdio: ['ignore', 'ignore', 'pipe'], env: cleanEnv() });
+  t.after(() => { if (starter.exitCode === null && starter.signalCode === null) starter.kill('SIGKILL'); });
+  let stderr = ''; starter.stderr.on('data', (d) => { stderr += d; });
+  await once(starter, 'exit');
+  assert.equal(starter.signalCode, 'SIGKILL', stderr);
+  const pid = Number(readFileSync(pidFile, 'utf8'));
+  const record = JSON.parse(readFileSync(f.daemonFile, 'utf8'));
+  const argvTail = ` ${f.entry} ${record.id}`;
+  reap(t, pid, argvTail);
+
+  assert.equal(record.state, 'starting'); assert.equal(record.pid, undefined);
+  await until(() => existsSync(join(f.home, 'daemon-ready')), 'orphan daemon readiness');
+  assert.equal(Number(readFileSync(join(f.home, 'daemon-ready'), 'utf8')), pid);
+  assert.equal(alive(pid), true);
+  assert.deepEqual(running(f.home), { id: record.id, pid, identity: processIdentity(pid), state: 'starting' });
+
+  // start refuses while the orphan lives, and leaves it and its record alone.
+  await assert.rejects(start(f.home, mocks(port)), new RegExp(`PID ${pid} was left by an interrupted start`));
+  assert.equal(alive(pid), true); assert.deepEqual(JSON.parse(readFileSync(f.daemonFile, 'utf8')), record);
+
+  // status reports it without mutating (pairing removed so status stays offline).
+  rmSync(join(f.home, 'dev-pairing.json'));
+  const { result } = await captureLog(() => status(f.home));
+  assert.equal(result.pid, pid); assert.match(result.error, /interrupted start/);
+  assert.equal(alive(pid), true); assert.deepEqual(JSON.parse(readFileSync(f.daemonFile, 'utf8')), record);
+
+  const { output } = await captureLog(() => stop(f.home));
+  assert.equal(output, 'DEV daemon stopped');
+  assert.equal(Number(readFileSync(join(f.home, 'daemon-sigterm'), 'utf8')), pid, 'orphan received SIGTERM from stop');
+  await until(() => !alive(pid), 'orphan exit');
+  assert.equal(processIdentity(pid), '');
+  assert.equal(existsSync(f.daemonFile), false);
+});
+
+test('a starting record never matches a live unrelated process, and stop/start discard it without signalling', async (t) => {
+  const f = fixture(t, { pairing: false }), id = randomUUID(), otherHome = join(f.dir, 'other');
+  mkdirSync(otherHome, { mode: 0o700 });
+  const children = [
+    spawnIdle(t, f.entry, [randomUUID()]), // same home, different id
+    spawnIdle(t, join(otherHome, 'run.mjs'), [id]), // same id, different home
+    spawnIdle(t, join(f.dir, 'run.mjs'), [id, 'extra']), // trailing argument
+  ];
+  // Same home and same id but an extra argument after it.
+  children.push(spawn(process.execPath, [f.entry, id, 'extra'], { stdio: ['ignore', 'pipe', 'ignore'], env: cleanEnv() }));
+  t.after(() => { const c = children[3]; if (c.exitCode === null && c.signalCode === null) c.kill('SIGKILL'); });
+  await Promise.all(children.map((c) => once(c.stdout, 'data')));
+  for (const child of children) assert.equal(alive(child.pid), true);
+
+  const intent = { id, state: 'starting', startedAt: new Date().toISOString() };
+  writeJson(f.daemonFile, intent);
+  assert.deepEqual(findOrphans(f.home, id), []);
+  assert.equal(running(f.home), null);
+
+  const { result } = await captureLog(() => status(f.home));
+  assert.equal(result.pid, null); assert.match(result.error, /interrupted dev start left no daemon/);
+  assert.deepEqual(JSON.parse(readFileSync(f.daemonFile, 'utf8')), intent, 'status does not mutate');
+
+  const { output } = await captureLog(() => stop(f.home));
+  assert.match(output, /stopped; discarded the record of an interrupted start/);
+  assert.equal(existsSync(f.daemonFile), false);
+
+  // start also discards a stale starting record before its own preflights.
+  writeJson(f.daemonFile, intent);
+  writeJson(join(f.home, 'dev-pairing.json'), { environment: 'foreman-dev-v1', url: TARGET.url, token: 'a'.repeat(64) });
+  await assert.rejects(start(f.home, { relayStatus: async () => { throw new Error('injected relay refusal'); } }), /injected relay refusal/);
+  assert.equal(existsSync(f.daemonFile), false);
+
+  for (const child of children) { assert.equal(child.exitCode, null); assert.equal(child.signalCode, null); assert.equal(alive(child.pid), true); }
+});
+
+test('orphan lookup ignores other users and rows whose live identity does not match', (t) => {
+  const f = fixture(t, { pairing: false }), id = randomUUID(), argv = `${process.execPath} ${f.entry} ${id}`;
+  const uid = process.getuid();
+  // Exact argv but a foreign uid, and a zombie: never candidates.
+  assert.deepEqual(findOrphans(f.home, id, () => `${process.pid} ${uid + 1} S ${argv}\n${process.pid} ${uid} Z ${argv}\n`), []);
+  // A row claiming our PID with the exact argv is rejected by the live identity re-check.
+  assert.deepEqual(findOrphans(f.home, id, () => `${process.pid} ${uid} S ${argv}\n`), []);
+  assert.throws(() => findOrphans(f.home, 'not-a-uuid'), /Invalid daemon id/);
+});

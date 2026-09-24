@@ -113,15 +113,41 @@ export function processIdentity(pid) {
   }
   catch (error) { if (error.status === 1) return ''; throw error; }
 }
-export function running(home) {
-  const file = join(home, 'daemon.json');
-  if (!existsSync(file)) return null;
-  const record = read(file);
-  const identity = processIdentity(record.pid);
-  if (!identity) return null;
-  if (!/^[a-f0-9-]{36}$/.test(record.id) || !identity.includes(`${join(home, 'run.mjs')} ${record.id}`) || identity !== record.identity) throw new Error(`Daemon PID identity changed; refusing to signal an unrelated process. Remove only ${file} to discard the stale record, then retry.`);
-  return record;
+// Locate a daemon whose PID was never recorded (start interrupted between
+// spawn and record promotion). Match ONLY the unique `<home>/run.mjs <id>`
+// argv of a live process owned by this user; a PID alone never matches.
+export function findOrphans(home, id, list = () => run('ps', ['-A', '-ww', '-o', 'pid=,uid=,stat=,command='])) {
+  if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('Invalid daemon id');
+  const argv = ` ${join(home, 'run.mjs')} ${id}`, uid = process.getuid(), found = [];
+  for (const line of list().split('\n')) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (!match || Number(match[2]) !== uid || match[3].startsWith('Z') || !match[4].endsWith(argv)) continue;
+    const pid = Number(match[1]);
+    // Re-read through the same identity probe used for recorded daemons.
+    const identity = processIdentity(pid);
+    if (identity.endsWith(argv)) found.push({ pid, identity });
+  }
+  return found;
 }
+function inspect(home) {
+  const file = join(home, 'daemon.json');
+  if (!existsSync(file)) return { file, record: null, daemon: null };
+  const record = read(file);
+  if (record.state === 'starting') {
+    if (!/^[a-f0-9-]{36}$/.test(record.id)) throw new Error(`Unrecognized dev daemon record. Check for a running dev daemon, then remove only ${file} and retry.`);
+    const orphans = findOrphans(home, record.id);
+    if (orphans.length > 1) throw new Error(`Multiple processes match the interrupted dev start ${record.id}; refusing to signal. Stop them manually, then remove only ${file}.`);
+    return { file, record, daemon: orphans.length ? { id: record.id, pid: orphans[0].pid, identity: orphans[0].identity, state: 'starting' } : null };
+  }
+  if (record.state !== undefined && record.state !== 'running') throw new Error(`Unrecognized dev daemon record state. Check for a running dev daemon, then remove only ${file} and retry.`);
+  const identity = processIdentity(record.pid);
+  if (!identity) return { file, record, daemon: null };
+  if (!/^[a-f0-9-]{36}$/.test(record.id) || !identity.includes(`${join(home, 'run.mjs')} ${record.id}`) || identity !== record.identity) throw new Error(`Daemon PID identity changed; refusing to signal an unrelated process. Remove only ${file} to discard the stale record, then retry.`);
+  return { file, record, daemon: record };
+}
+// A `starting` record returns the orphaned daemon found by its unique argv
+// (state 'starting'), or null when no such process exists.
+export function running(home) { return inspect(home).daemon; }
 async function remote(pair) {
   const response = await fetch(`${TARGET.url}/api/dev/status`, { headers: { authorization: `Bearer ${pair.token}` }, redirect: 'error', signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`Dev relay status returned ${response.status}`);
@@ -130,8 +156,10 @@ async function remote(pair) {
   return data;
 }
 export async function status(home) {
-  let daemon = null, error;
-  try { daemon = running(home); } catch (e) { error = e.message; }
+  let daemon = null, record = null, error;
+  try { ({ daemon, record } = inspect(home)); } catch (e) { error = e.message; }
+  if (daemon?.state === 'starting') error = `DEV daemon PID ${daemon.pid} was left by an interrupted start and has no confirmed record; run npm run dev:stop`;
+  else if (!daemon && record?.state === 'starting') error = 'An interrupted dev start left no daemon; dev:start or dev:stop will discard its record';
   const deployment = existsSync(join(home, 'deployment.json')) ? read(join(home, 'deployment.json')) : null;
   let relay = null;
   try { if (existsSync(join(home, 'dev-pairing.json'))) relay = await remote(validatePairing(read(join(home, 'dev-pairing.json')))); }
@@ -141,8 +169,13 @@ export async function status(home) {
   return result;
 }
 export async function stop(home) {
-  const daemon = running(home);
-  if (!daemon) { console.log('DEV daemon is stopped'); return; }
+  const { file, record, daemon } = inspect(home);
+  if (!daemon) {
+    if (record?.state === 'starting') { rmSync(file); console.log('DEV daemon is stopped; discarded the record of an interrupted start'); return; }
+    console.log('DEV daemon is stopped'); return;
+  }
+  // Re-prove identity immediately before signalling.
+  if (processIdentity(daemon.pid) !== daemon.identity) throw new Error(`Daemon PID identity changed; refusing to signal an unrelated process. Remove only ${file} to discard the stale record, then retry.`);
   process.kill(daemon.pid, 'SIGTERM');
   for (let i = 0; i < 100; i++) {
     // After signalling, macOS may hide argv while the process is exiting.
@@ -221,15 +254,31 @@ export function requireCodexAuth(binary, configDir, env = process.env, execute =
   } catch { /* Never include provider output: it may contain credentials. */ }
   throw new Error(`DEV Codex is not signed in. Run CODEX_HOME="${configDir}" "${binary}" login, then run npm run dev:start. Dev requires its own login; production OAuth credentials are never copied.`);
 }
-export async function start(home, { relayStatus = remote, checkPort = freePort, execute = run } = {}) {
-  if (running(home)) throw new Error('DEV daemon already running; use dev:status or dev:stop');
+// Terminate a child this process spawned (and still holds the handle to) and
+// prove it exited. Used only for a daemon whose record was never promoted.
+async function terminateChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exit = new Promise((resolve) => child.once('exit', () => resolve(true)));
+  const within = (ms) => Promise.race([exit, delay(ms, false, { ref: false })]);
+  child.kill('SIGTERM');
+  if (await within(10000)) return;
+  child.kill('SIGKILL');
+  if (await within(5000)) return;
+  throw new Error(`DEV daemon PID ${child.pid} did not exit after a failed start; its startup record is kept for npm run dev:stop`);
+}
+export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save } = {}) {
+  const current = inspect(home);
+  if (current.daemon?.state === 'starting') throw new Error(`DEV daemon PID ${current.daemon.pid} was left by an interrupted start; run npm run dev:stop first`);
+  if (current.daemon) throw new Error('DEV daemon already running; use dev:status or dev:stop');
+  // An interrupted start whose daemon no longer exists: discard its record.
+  if (current.record?.state === 'starting') rmSync(current.file);
   const deployment = read(join(home, 'deployment.json'));
   const snapshot = releasePath(home, deployment);
   const pair = validatePairing(read(join(home, 'dev-pairing.json')));
   const relay = await relayStatus(pair);
   if (relay.commit !== deployment.commit) throw new Error('Deployed Worker does not match the local snapshot; redeploy before starting');
   if (relay.relay.online) throw new Error('Another dev host is connected; refusing to replace it');
-  await checkPort();
+  await (checkPort ?? (() => freePort(port)))();
   for (const dir of ['claude', 'codex']) {
     const path = join(home, dir);
     if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
@@ -242,22 +291,42 @@ export async function start(home, { relayStatus = remote, checkPort = freePort, 
   writeFileSync(entry, `console.log('FOREMAN DEV ${deployment.commit}');\nawait import(${JSON.stringify(pathToFileURL(join(snapshot, 'server/main.ts')).href)});\n`, { mode: 0o600 });
   const logPath = join(home, 'daemon.log');
   if (existsSync(logPath)) owned(logPath);
-  const log = openSync(logPath, 'w', 0o600), id = randomUUID();
-  const child = spawn(process.execPath, ['--experimental-strip-types', entry, id], {
-    cwd: snapshot, detached: true, stdio: ['ignore', log, log],
-    env: { ...process.env, FOREMAN_HOME: home, FOREMAN_PORT: String(TARGET.port), FOREMAN_RELAY_URL: TARGET.url, FOREMAN_HOST_TOKEN: pair.token,
-      CLAUDE_CONFIG_DIR: join(home, 'claude'), CODEX_HOME: join(home, 'codex') },
-  });
-  closeSync(log);
-  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-  save(join(home, 'daemon.json'), { pid: child.pid, id, identity: processIdentity(child.pid) });
+  const daemonFile = join(home, 'daemon.json'), id = randomUUID();
+  // Publish intent before spawning: if this process dies before promotion, the
+  // unique `run.mjs <id>` argv lets stop/start locate the orphan safely.
+  saveRecord(daemonFile, { id, state: 'starting', startedAt: new Date().toISOString() });
+  let child;
+  try {
+    const log = openSync(logPath, 'w', 0o600);
+    try {
+      child = spawn(process.execPath, ['--experimental-strip-types', entry, id], {
+        cwd: snapshot, detached: true, stdio: ['ignore', log, log],
+        env: { ...process.env, FOREMAN_HOME: home, FOREMAN_PORT: String(port), FOREMAN_RELAY_URL: TARGET.url, FOREMAN_HOST_TOKEN: pair.token,
+          CLAUDE_CONFIG_DIR: join(home, 'claude'), CODEX_HOME: join(home, 'codex') },
+      });
+    } finally { closeSync(log); }
+    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  } catch (error) {
+    // No process was created: the intent record is safe to discard.
+    rmSync(daemonFile, { force: true });
+    throw error;
+  }
+  try {
+    saveRecord(daemonFile, { id, pid: child.pid, identity: processIdentity(child.pid), state: 'running' });
+  } catch (error) {
+    // Never leave an untracked daemon: stop the child we hold, prove its exit,
+    // and only then discard the intent record.
+    await terminateChild(child);
+    rmSync(daemonFile, { force: true });
+    throw error;
+  }
   child.unref();
   try {
     for (let i = 0; i < 60; i++) {
       if (!running(home)) throw new Error(`DEV daemon exited; see ${logPath}`);
       let health;
-      try { health = await (await fetch(`http://127.0.0.1:${TARGET.port}/api/health`, { signal: AbortSignal.timeout(1000) })).json(); } catch {}
-      if (health?.pid === child.pid && (await remote(pair)).relay.online) { await status(home); return; }
+      try { health = await (await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1000) })).json(); } catch {}
+      if (health?.pid === child.pid && (await relayStatus(pair)).relay.online) { await status(home); return; }
       await delay(500);
     }
     throw new Error(`DEV daemon/relay did not become ready; see ${logPath}`);
