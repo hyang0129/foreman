@@ -134,3 +134,25 @@ test('identity is deterministic, reads symlink targets without following them, a
   execFileSync('mv', [join(tree, 'a/one'), join(tree, 'a/two')]);
   assert.notEqual(await dependencyIdentity(tree), first);
 });
+
+test('identity frames every variable-length field, so crafted symlink targets and paths cannot forge other entries', async (t) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-dev-framing-')));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const tree = (name) => { const path = join(dir, name); mkdirSync(path); return path; };
+  // A: one symlink whose target text embeds a fake directory entry.
+  // B: symlink x -> t plus a real empty directory y.
+  const a = tree('A'), b = tree('B');
+  symlinkSync('t\n"y" d', join(a, 'x'));
+  symlinkSync('t', join(b, 'x')); mkdirSync(join(b, 'y'));
+  assert.notEqual(await dependencyIdentity(a), await dependencyIdentity(b));
+  // Paths containing a newline or quote must not forge a second entry either.
+  const c = tree('C'), d = tree('D');
+  mkdirSync(join(c, 'p d\n"q"'));
+  mkdirSync(join(d, 'p')); mkdirSync(join(d, 'q'));
+  assert.notEqual(await dependencyIdentity(c), await dependencyIdentity(d));
+  // A symlink target with a newline vs. a symlink plus a sibling whose path continues it.
+  const e = tree('E'), g = tree('G');
+  symlinkSync('t\n"z" l u', join(e, 'x'));
+  symlinkSync('t', join(g, 'x')); symlinkSync('u', join(g, 'z'));
+  assert.notEqual(await dependencyIdentity(e), await dependencyIdentity(g));
+});

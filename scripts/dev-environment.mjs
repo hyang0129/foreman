@@ -95,32 +95,35 @@ export default {
 // of their contents; symlinks add their target text only, so nothing outside
 // the tree is read. Other special files (FIFOs, sockets, devices) contribute
 // their type only and are never opened, since reading one could block or have
-// side effects. The result does not depend on listing or hashing order.
+// side effects. Each entry is hashed as one JSON-framed record. The result
+// does not depend on listing or hashing order.
 export async function dependencyIdentity(dir, { concurrency = 32 } = {}) {
   const entries = [];
   async function walk(relative) {
     for (const name of (await readdir(join(dir, relative))).sort()) {
       const path = relative ? `${relative}/${name}` : name;
       const stat = await lstat(join(dir, path));
-      if (stat.isDirectory()) { entries.push({ path, line: 'd' }); await walk(path); }
-      else if (stat.isSymbolicLink()) entries.push({ path, line: `l ${await readlink(join(dir, path))}` });
-      else if (stat.isFile()) entries.push({ path, line: null, exec: (stat.mode & 0o111) ? 'x' : '-' });
-      else entries.push({ path, line: `o ${stat.isFIFO() ? 'fifo' : stat.isSocket() ? 'socket' : stat.isCharacterDevice() ? 'char' : stat.isBlockDevice() ? 'block' : 'other'}` });
+      if (stat.isDirectory()) { entries.push({ path, fields: ['d'] }); await walk(path); }
+      else if (stat.isSymbolicLink()) entries.push({ path, fields: ['l', await readlink(join(dir, path))] });
+      else if (stat.isFile()) entries.push({ path, fields: null, exec: (stat.mode & 0o111) ? 'x' : '-' });
+      else entries.push({ path, fields: ['o', stat.isFIFO() ? 'fifo' : stat.isSocket() ? 'socket' : stat.isCharacterDevice() ? 'char' : stat.isBlockDevice() ? 'block' : 'other'] });
     }
   }
   await walk('');
-  const files = entries.filter((entry) => entry.line === null);
+  const files = entries.filter((entry) => entry.fields === null);
   let next = 0;
   async function worker() {
     while (next < files.length) {
       const entry = files[next++], hash = createHash('sha256');
       await pipeline(createReadStream(join(dir, entry.path)), hash);
-      entry.line = `f ${entry.exec} ${hash.digest('hex')}`;
+      entry.fields = ['f', entry.exec, hash.digest('hex')];
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, files.length) }, worker));
   const total = createHash('sha256');
-  for (const entry of entries) total.update(`${JSON.stringify(entry.path)} ${entry.line}\n`);
+  // One JSON array per entry: every string (path, symlink target) is quoted and
+  // escaped, so no path or target text can forge or merge another entry.
+  for (const entry of entries) total.update(`${JSON.stringify([entry.path, ...entry.fields])}\n`);
   return `sha256:${total.digest('hex')}`;
 }
 function run(bin, args, options = {}) { return execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...options }); }
