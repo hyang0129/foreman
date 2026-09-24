@@ -1,6 +1,6 @@
 // The project manager: one long-lived Claude Agent SDK session in streaming-input mode.
 // Tool access is enforced here (canUseTool), not just prompted.
-import { query, type SDKUserMessage, type Query, type HookCallback, type TerminalReason } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKUserMessage, type Query, type HookCallback, type TerminalReason, type SDKAssistantMessageError } from "@anthropic-ai/claude-agent-sdk";
 import { normalizeModel } from "./models.ts";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -65,6 +65,24 @@ const resultDiagnostic = (m: any): string => {
 const errorText = (error: unknown): string => String((error as any)?.message ?? error);
 // When the CLI exits after an error result, the SDK throws this echo of the result's diagnostic.
 const sdkErrorResultEcho = (diagnostic: string) => `Claude Code returned an error result: ${diagnostic}`;
+// The SDK's typed assistant error code (`SDKAssistantMessage['error']`, e.g. 'authentication_failed').
+// Only a plain identifier is kept, so a malformed value cannot smuggle text into the diagnostic.
+const assistantErrorCode = (value: unknown): SDKAssistantMessageError | null =>
+  typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/i.test(value) ? value as SDKAssistantMessageError : null;
+// Failure text for an assistant API error: the code and the human prose together, code first
+// (`authentication_failed: OAuth session expired`), and not repeated when the prose names it.
+const codedDiagnostic = (code: string | null, prose: string): string => {
+  if (!code) return prose || 'Provider rejected the turn';
+  if (!prose) return `${code}: provider returned no message`;
+  return prose.includes(code) ? prose : `${code}: ${prose}`;
+};
+// Conservative credential redaction for provider text that is logged or persisted, since it can
+// in principle echo request headers: Anthropic keys and OAuth tokens (`sk-ant-...`), bearer
+// credentials, and the values of token/key/secret/password/authorization fields.
+const redactSecrets = (text: string): string => text
+  .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-[REDACTED]')
+  .replace(/\bBearer\s+[^\s"',;]+/gi, 'Bearer [REDACTED]')
+  .replace(/\b((?:access|refresh|id|auth|session|oauth)?[_-]?token|api[_-]?key|x-api-key|client[_-]?secret|secret|password|authorization)(["']?\s*[=:]\s*["']?)[^\s"',;&]{8,}/gi, '$1$2[REDACTED]');
 
 class Inbox {
   delivered = 0;
@@ -189,13 +207,15 @@ export class ProjectManager extends EventEmitter {
   // A rejection that carries the PM's current error, so the caller never gets only generic text.
   private unavailable(detail = '') { return new Error(`Project manager is unavailable${detail}${this.lastError ? `: ${this.lastError}` : ''}`); }
   private static failureText(reason: string, next = 'Your message was not completed; after resolving the error, send a new message to retry. Failed messages are not replayed.') {
-    return `Project manager failed: ${reason.slice(0, 1500)}. ${next}`;
+    return `Project manager failed: ${redactSecrets(reason.slice(0, 1500))}. ${next}`;
   }
-  private fail(reason: string, next?: string) {
+  // `code` is the SDK's typed assistant error code behind the failure (null when there was none);
+  // `subtype` is the failed result's subtype when the failure came from a result.
+  private fail(reason: string, next?: string, detail: { code?: string | null; subtype?: string | null } = {}) {
     const text = ProjectManager.failureText(reason, next);
     const duplicateRejection = this.inbox.delivered === 0 && this.lastError === text;
     this.lastError = text;
-    console.error('foreman: pm failure', JSON.stringify({ session_id: this.sessionId, pending_turns: this.pendingTurns, error: reason.slice(0, 1500) }));
+    console.error('foreman: pm failure', JSON.stringify({ session_id: this.sessionId, pending_turns: this.pendingTurns, code: detail.code ?? null, subtype: detail.subtype ?? null, error: redactSecrets(reason.slice(0, 1500)) }));
     if (!duplicateRejection) {
       this.reportRecord({ role: "system", text, error: true });
       this.emitEvent({ type: "status", text });
@@ -374,7 +394,7 @@ export class ProjectManager extends EventEmitter {
     };
     const run = async (resume?: string) => {
       const { provider, state } = launch(resume);
-      let text = "", completeText = "", turnError = "";
+      let text = "", completeText = "", turnError = "", turnErrorCode: string | null = null;
       for await (const m of provider as any) {
         if (!current()) break; // retired by an explicit send; the replacement owns all state now
         // The CLI reports a rejected --resume as an error result (then exits 1) before any
@@ -400,7 +420,9 @@ export class ProjectManager extends EventEmitter {
         } else if (m.type === "assistant") {
           const content = (m.message?.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');
           if (m.error || m.isApiErrorMessage) {
-            turnError = content || String(m.error || 'Provider rejected the turn');
+            // The typed code stays with the prose of the same message (the latest error wins).
+            turnErrorCode = assistantErrorCode(m.error);
+            turnError = codedDiagnostic(turnErrorCode, content);
           } else if (content) completeText += (completeText ? '\n\n' : '') + content;
           for (const b of m.message?.content ?? []) {
             if (b.type === "tool_use") {
@@ -431,12 +453,14 @@ export class ProjectManager extends EventEmitter {
           if (failed) {
             this.providerFailed = true;
             const failure = turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`;
-            this.fail(failure);
+            this.fail(failure, undefined, { code: turnError ? turnErrorCode : null, subtype: typeof m.subtype === 'string' ? m.subtype : null });
             turnFailure = failure;
             // Suppress the SDK's exit echo only when its diagnostic is already fully in what was
             // recorded (fail() keeps the first 1500 chars). Otherwise the echo is the only carrier
             // of this result's own diagnostic, so it must surface as its own failure entry.
             const echoed = resultDiagnostic(m);
+            // (A code prefix only adds text before the prose, so containment is unaffected; the
+            // recorded text is redacted but this check compares the raw diagnostics.)
             if (echoed && failure.slice(0, 1500).includes(echoed)) state.reported = sdkErrorResultEcho(echoed);
           } else {
             turnFailure = undefined;
@@ -453,7 +477,7 @@ export class ProjectManager extends EventEmitter {
           this.busy = false;
           this.emitEvent({ type: "assistant_text", text });
           this.emitEvent({ type: "turn_end", ts: new Date().toISOString(), cost_usd: m.total_cost_usd ?? 0, is_error: failed, subtype: m.subtype });
-          text = ""; completeText = ""; turnError = "";
+          text = ""; completeText = ""; turnError = ""; turnErrorCode = null;
         }
       }
       if (current() && !this.closed && (!this.lastError || this.pendingTurns)) throw new Error('Provider stream ended unexpectedly');

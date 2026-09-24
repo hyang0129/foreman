@@ -1265,3 +1265,139 @@ test('a quarantined session is not resumed again even when clearing the session 
   assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), 'fresh-session');
   assert.equal(f.pm.lastError, null);
 });
+
+// Provider error codes (#36). The SDK's typed assistant error code (e.g. authentication_failed)
+// is kept alongside the human prose in lastError, history and the console diagnostic, and
+// nothing that looks like a credential is logged or persisted.
+const failureLogs = (diagnostics: any[]) => diagnostics.filter((d) => d[0] === 'foreman: pm failure').map((d) => JSON.parse(d[1]));
+function codedTurn(t: any, messages: any[]) {
+  return scripted(t, async function* ({ next, closed }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    for (const m of messages) yield m;
+    await closed;
+  });
+}
+
+test('an assistant error with a code and prose keeps both in lastError, history and the console diagnostic', { timeout: 10_000 }, async (t) => {
+  const f = codedTurn(t, [
+    { type: 'assistant', error: 'authentication_failed', message: { content: [{ type: 'text', text: 'OAuth session expired and could not be refreshed' }] } },
+    { type: 'result', is_error: true, subtype: 'success', result: 'OAuth session expired' },
+  ]);
+  f.pm.send('hello');
+  await settle(() => f.events.some((e) => e.type === 'turn_end'));
+  assert.deepEqual(f.consumed, ['hello']);
+  assert.match(f.pm.lastError!, /^Project manager failed: authentication_failed: OAuth session expired and could not be refreshed\. /);
+  const entries = errorEntries(f.pm);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0], f.pm.lastError);
+  const logs = failureLogs(f.diagnostics);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].code, 'authentication_failed');
+  assert.equal(logs[0].subtype, 'success');
+  assert.match(logs[0].error, /authentication_failed: OAuth session expired and could not be refreshed/);
+});
+
+test('prose that already names the code does not repeat it', { timeout: 10_000 }, async (t) => {
+  const f = codedTurn(t, [
+    { type: 'assistant', error: 'billing_error', message: { content: [{ type: 'text', text: 'billing_error: credit balance too low' }] } },
+    { type: 'result', is_error: true, subtype: 'success', result: 'credit balance too low' },
+  ]);
+  f.pm.send('hello');
+  await settle(() => f.events.some((e) => e.type === 'turn_end'));
+  assert.equal(f.pm.lastError!.match(/billing_error/g)!.length, 1);
+  assert.equal(failureLogs(f.diagnostics)[0].code, 'billing_error');
+});
+
+test('an assistant error with a code but no prose reports the code', { timeout: 10_000 }, async (t) => {
+  const f = codedTurn(t, [
+    { type: 'assistant', error: 'account_on_hold', message: { content: [] } },
+    { type: 'result', is_error: true, subtype: 'error_during_execution', errors: [] },
+  ]);
+  f.pm.send('hello');
+  await settle(() => f.events.some((e) => e.type === 'turn_end'));
+  assert.match(f.pm.lastError!, /^Project manager failed: account_on_hold: provider returned no message\. /);
+  assert.match(errorEntries(f.pm)[0], /account_on_hold/);
+  const logs = failureLogs(f.diagnostics);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].code, 'account_on_hold');
+});
+
+test('a failure with no code and no diagnostic keeps the fallback and logs code null', { timeout: 10_000 }, async (t) => {
+  const f = codedTurn(t, [{ type: 'result', is_error: true, subtype: 'error_during_execution', errors: [] }]);
+  f.pm.send('hello');
+  await settle(() => f.events.some((e) => e.type === 'turn_end'));
+  assert.match(f.pm.lastError!, /^Project manager failed: Provider returned error_during_execution without a diagnostic\. /);
+  const logs = failureLogs(f.diagnostics);
+  assert.equal(logs.length, 1);
+  assert.ok('code' in logs[0], 'the diagnostic always carries a code field');
+  assert.equal(logs[0].code, null);
+  assert.equal(logs[0].subtype, 'error_during_execution');
+});
+
+test('an SDK-recovered coded assistant error followed by a success result persists no failure', { timeout: 10_000 }, async (t) => {
+  const f = codedTurn(t, [
+    { type: 'assistant', error: 'rate_limit', message: { content: [{ type: 'text', text: 'API Error: rate limited' }] } },
+    { type: 'result', is_error: false, subtype: 'success', result: 'Recovered answer' },
+  ]);
+  f.pm.send('hello');
+  await settle(() => f.events.some((e) => e.type === 'turn_end'));
+  assert.equal(f.pm.lastError, null);
+  assert.equal(errorEntries(f.pm).length, 0);
+  assert.equal(failureLogs(f.diagnostics).length, 0);
+});
+
+test('credentials in provider text never reach lastError, history, events or the console', { timeout: 10_000 }, async (t) => {
+  const key = 'sk-ant-oat01-AbCdEf_0123456789-ZyXwVu', bearer = 'eyJhbGciOiJIUzI1NiJ9.payloadpart.signaturepart', token = 'ya29a0AfH6SMBx9secretvalue';
+  const f = codedTurn(t, [
+    { type: 'assistant', error: 'authentication_failed', message: { content: [{ type: 'text', text: `Request rejected for ${key}; x-api-key: ${key}; Authorization: Bearer ${bearer}; refresh_token=${token}` }] } },
+    { type: 'result', is_error: true, subtype: 'error_during_execution', errors: [`key ${key} invalid`] },
+  ]);
+  f.pm.send('hello');
+  await settle(() => f.events.some((e) => e.type === 'turn_end'));
+  await quiet();
+  const surfaces = [f.pm.lastError!, readFileSync(PM_HISTORY_FILE, 'utf8'), JSON.stringify(f.events), JSON.stringify(f.diagnostics)];
+  for (const surface of surfaces) {
+    for (const secret of [key, 'AbCdEf_0123456789', bearer, token]) assert.ok(!surface.includes(secret), `a credential leaked: ${surface}`);
+  }
+  // The failure stays specific and coded, with the credentials marked as redacted.
+  assert.match(f.pm.lastError!, /authentication_failed: Request rejected/);
+  assert.match(f.pm.lastError!, /sk-ant-\[REDACTED\]/);
+  assert.match(f.pm.lastError!, /Bearer \[REDACTED\]/);
+  assert.match(f.pm.lastError!, /refresh_token=\[REDACTED\]/);
+  assert.equal(failureLogs(f.diagnostics)[0].code, 'authentication_failed');
+});
+
+test('a credential in an SDK process exit error is redacted too', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    throw new Error('Claude Code process exited with code 1. stderr: 401 Authorization: Bearer sk-ant-api03-SECRETSECRET');
+  });
+  f.pm.send('hello');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  for (const surface of [f.pm.lastError!, readFileSync(PM_HISTORY_FILE, 'utf8'), JSON.stringify(f.diagnostics)]) assert.ok(!surface.includes('SECRETSECRET'), surface);
+  assert.match(f.pm.lastError!, /exited with code 1/);
+  assert.equal(failureLogs(f.diagnostics)[0].code, null);
+});
+
+test('with a coded failure, the SDK exit echo of the result is still suppressed to exactly one entry', { timeout: 10_000 }, async (t) => {
+  const f = scripted(t, async function* ({ next }) {
+    yield { type: 'system', subtype: 'init', session_id: 'test-session', tools: [] };
+    await next();
+    yield { type: 'assistant', error: 'authentication_failed', message: { content: [{ type: 'text', text: 'OAuth session expired and could not be refreshed' }] } };
+    yield { type: 'result', is_error: true, subtype: 'success', result: 'OAuth session expired' };
+    throw new Error('Claude Code returned an error result: OAuth session expired');
+  });
+  f.pm.send('hello');
+  await settle(() => !(f.pm as any).running);
+  await quiet();
+  const entries = errorEntries(f.pm);
+  assert.equal(entries.length, 1, JSON.stringify(entries));
+  assert.match(entries[0], /authentication_failed: OAuth session expired and could not be refreshed/);
+  assert.equal(f.pm.lastError, entries[0]);
+  const logs = failureLogs(f.diagnostics);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].code, 'authentication_failed');
+});
