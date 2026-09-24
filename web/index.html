@@ -2,9 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#142b24" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="theme-color" content="#f8faf8" />
     <title>Foreman · Session inbox</title>
+    <script src="/appearance.js"></script>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
@@ -19,6 +20,9 @@
         </p>
         <p id="auth-status" role="status">Connecting to Foreman…</p>
         <button id="sign-in" class="btn" hidden>Continue with Google</button>
+        <label class="appearance-control">Appearance
+          <select data-appearance><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>
+        </label>
       </div>
     </section>
     <div class="app" id="app" hidden>
@@ -55,6 +59,9 @@
         /></label>
         <nav class="session-list" id="session-list" aria-label="Sessions"></nav>
         <footer class="rail-footer">
+          <label class="appearance-control">Appearance
+            <select data-appearance><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>
+          </label>
           <div class="host-line">
             <span id="host-dot" class="dot"></span
             ><span id="host-status" role="status">Checking host…</span>
@@ -87,14 +94,20 @@
               <h1 id="conversation-title">Your session inbox</h1>
               <span id="provider" class="badge" hidden></span>
             </div>
-            <p id="conversation-subtitle">
-              Choose a session or start something new.
-            </p>
+            <p id="header-model" class="header-model" hidden></p>
+            <div id="activity-status" class="activity-status" role="status" aria-live="polite" aria-atomic="true" hidden>
+              <span class="activity-symbol" aria-hidden="true"></span><span id="activity-label"></span>
+            </div>
+            <details id="heading-details">
+              <summary>Session details</summary>
+              <div id="conversation-subtitle">Choose a session or start something new.</div>
+            </details>
           </div>
-          <button id="interrupt" class="btn ghost small" disabled>
+          <button id="interrupt" class="btn ghost small" aria-describedby="interrupt-feedback" disabled>
             Interrupt
           </button>
         </header>
+        <p id="interrupt-feedback" class="action-feedback" role="status" hidden></p>
         <div
           id="connection-banner"
           class="banner warning"
@@ -124,16 +137,20 @@
             aria-label="Requests needing your response"
           ></section>
         </div>
+        <div class="latest-control"><button id="jump-latest" class="btn ghost" type="button" aria-controls="timeline" aria-live="polite" aria-atomic="true" hidden>Jump to latest</button></div>
         <div id="pm-model-control" class="model-control" hidden>
           <label for="pm-model">Project manager model · Claude</label>
-          <select id="pm-model" disabled><option value="">Provider default</option></select>
+          <select id="pm-model" aria-describedby="pm-model-hint" disabled><option value="">Provider default</option></select>
+          <p class="field-hint pm-model-help">Controls the PM’s replies and planning. Newly launched agents have their own model selection.</p>
           <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn.</span>
         </div>
         <div id="control-note" class="control-note" role="status"></div>
         <form id="composer" class="composer">
+          <p id="send-feedback" class="action-feedback" role="status" hidden></p>
           <label class="sr-only" for="message-input">Message this session</label
           ><textarea
             id="message-input"
+            aria-describedby="send-feedback"
             rows="2"
             placeholder="Choose a session to start a conversation"
             maxlength="60000"
@@ -167,8 +184,24 @@
         </div>
         <p class="dialog-intro">
           Give an agent a project and a clear first task. It runs on your
-          connected Mac.
+          connected Mac. Review and confirm the setup before a session starts.
         </p>
+        <section id="launch-brief-panel" aria-label="Describe the work">
+          <label for="launch-brief">What should the agent work on?</label>
+          <textarea id="launch-brief" rows="4" maxlength="60000" placeholder="Describe the task and name your project"></textarea>
+          <label for="launcher-model">Launcher model · Claude</label>
+          <select id="launcher-model"><option value="claude-sonnet-5">claude-sonnet-5 (default)</option></select>
+          <p id="launcher-model-hint" class="field-hint">Proposes the setup only. The session has its own model selection.</p>
+          <button id="propose-session" class="btn" type="button">Propose session</button>
+        </section>
+        <div class="launch-mode-actions">
+          <button id="start-manually" class="btn ghost" type="button">Start manually</button>
+          <button id="edit-brief" class="btn ghost" type="button" hidden>Edit brief</button>
+        </div>
+        <p id="launch-status" class="activity-status" role="status"><span class="activity-symbol" aria-hidden="true" hidden></span><span id="launch-status-label"></span></p>
+        <p id="launch-reason" class="field-hint" hidden></p>
+        <fieldset id="session-fields" hidden disabled>
+        <legend>Review and edit session</legend>
         <label
           >Agent<select id="new-provider" name="provider">
             <option value="claude">Claude</option>
@@ -191,17 +224,28 @@
             placeholder="e.g. Fix the sign-in flow"
             autocomplete="off" /></label
         ><label
-          >Project directory<input
+          >Project directory or name<input
             id="new-cwd"
             name="cwd"
             required
-            placeholder="/Users/you/code/project"
+            placeholder="Search projects or paste an absolute path"
+            aria-describedby="project-status"
             autocomplete="off"
             spellcheck="false"
         /></label>
-        <p class="field-hint">
-          Use the full path to an existing directory on your Mac.
-        </p>
+        <p id="project-status" class="field-hint" role="status">Choose a recent project or search by name, alias, or absolute path.</p>
+        <div id="project-choices" class="project-choices" aria-label="Matching projects"></div>
+        <details id="project-management">
+          <summary>Remember or manage a project</summary>
+          <label>Short project name<input id="project-name" maxlength="200" autocomplete="off"></label>
+          <label>Aliases (comma separated)<input id="project-aliases" maxlength="1000" autocomplete="off"></label>
+          <div class="project-actions">
+            <button type="button" class="btn ghost" id="remember-project">Remember project</button>
+            <button type="button" class="btn ghost" id="rename-project" hidden>Save project name</button>
+            <button type="button" class="btn ghost" id="remove-project" hidden>Remove project</button>
+          </div>
+          <p id="project-feedback" class="field-hint" role="status"></p>
+        </details>
         <label
           >First task<textarea
             id="new-prompt"
@@ -212,6 +256,7 @@
             placeholder="What should the agent work on?"
           ></textarea>
         </label>
+        </fieldset>
         <p id="new-error" class="form-error" role="alert" hidden></p>
         <div class="dialog-actions">
           <button type="button" class="btn ghost" id="cancel-new">Cancel</button

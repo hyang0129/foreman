@@ -86,6 +86,10 @@ export class Fleet extends EventEmitter {
   private watchers: FSWatcher[] = [];
   private refreshing: Promise<void> | null = null;
 
+  private excludeSession: (session: Session) => boolean;
+  constructor(options: { excludeSession?: (session: Session) => boolean } = {}) {
+    super(); this.excludeSession = options.excludeSession ?? (() => false);
+  }
   list(): Session[] { return this.sessions; }
   get(id: string): Session | undefined {
     const exact = this.sessions.find((s) => s.session_key === id);
@@ -166,6 +170,10 @@ export class Fleet extends EventEmitter {
       }
       bySid.set(s.session_key, s);
     }
+
+    // Internal proposal turns must never enter the public fleet or project seed.
+    // Apply after every discovery source is merged, including stale agent-view rows.
+    for (const [key, session] of bySid) if (this.excludeSession(session)) bySid.delete(key);
 
     // Fallback for sessions that predate the hooks: infer from the transcript.
     for (const s of bySid.values()) {
