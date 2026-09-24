@@ -10,7 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, realpathSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
@@ -30,7 +30,8 @@ globalThis.fetch = (input, init) => {
   if (url.hostname !== '127.0.0.1') { remoteAttempts.push(url.href); return Promise.reject(new Error(`test refused remote fetch ${url.href}`)); }
   return realFetch(input, init);
 };
-test.afterEach(() => assert.deepEqual(remoteAttempts, [], 'no remote fetch was attempted'));
+// Reset per test so one offender cannot cascade into later tests.
+test.afterEach(() => assert.deepEqual(remoteAttempts.splice(0), [], 'no remote fetch was attempted'));
 
 // Stand-in for server/main.ts in the deployed snapshot. It serves only
 // /api/health on the injected FOREMAN_PORT (unless built silent), records its
@@ -48,10 +49,27 @@ ${serve ? `createServer((request, response) => {
 }).listen(Number(process.env.FOREMAN_PORT), '127.0.0.1');` : 'setInterval(() => {}, 1000);'}
 `;
 
-function cleanEnv(extra = {}) {
-  const env = { ...process.env };
-  for (const key of Object.keys(env)) if (key.startsWith('FOREMAN_') || ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'NODE_OPTIONS', 'NODE_TEST_CONTEXT'].includes(key)) delete env[key];
-  return { ...env, ...extra };
+// Child processes never inherit a credential or a route to a stored login:
+// every Cloudflare/Wrangler/provider credential variable is removed, and HOME
+// and XDG_CONFIG_HOME (where Wrangler keeps its OAuth login) point into the
+// test's temporary directory.
+const credential = /^(CLOUDFLARE_|CF_|WRANGLER_|FOREMAN_|ANTHROPIC_|CLAUDE_|CODEX_|OPENAI_)|^(NODE_OPTIONS|NODE_TEST_CONTEXT|XDG_CONFIG_HOME|GH_TOKEN|GITHUB_TOKEN)$/;
+function cleanEnv(dir, base = process.env) {
+  const env = {};
+  for (const [key, value] of Object.entries(base)) if (!credential.test(key)) env[key] = value;
+  return { ...env, HOME: dir, XDG_CONFIG_HOME: join(dir, '.config') };
+}
+// Loaded into CLI children with --import: any non-loopback fetch fails there too.
+function fetchGuard(dir) {
+  const file = join(dir, 'fetch-guard.mjs');
+  if (!existsSync(file)) writeFileSync(file, `const real = globalThis.fetch;
+globalThis.fetch = (input, init) => {
+  const url = new URL(typeof input === 'string' ? input : input.url);
+  if (url.hostname !== '127.0.0.1') return Promise.reject(new Error('test child refused remote fetch ' + url.href));
+  return real(input, init);
+};
+`);
+  return file;
 }
 function alive(pid) {
   try { process.kill(pid, 0); return true; } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
@@ -205,19 +223,20 @@ function lockHolder(t, home) {
 const { acquireLock } = await import(url);
 acquireLock(home); console.log('locked'); setInterval(() => {}, 1000);
 `);
-  const child = spawn(process.execPath, [driver, scriptUrl, home], { stdio: ['ignore', 'pipe', 'pipe'], env: cleanEnv() });
+  const child = spawn(process.execPath, [driver, scriptUrl, home], { stdio: ['ignore', 'pipe', 'pipe'], env: cleanEnv(dirname(home)) });
   t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
   return child;
 }
 function idleProcess(t, dir) {
   const file = join(dir, `idle-${randomUUID()}.mjs`);
   writeFileSync(file, 'console.log("ready"); setInterval(() => {}, 1000);\n');
-  const child = spawn(process.execPath, [file], { stdio: ['ignore', 'pipe', 'ignore'], env: cleanEnv() });
+  const child = spawn(process.execPath, [file], { stdio: ['ignore', 'pipe', 'ignore'], env: cleanEnv(dir) });
   t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
   return child;
 }
+const cliArgs = (f, ...args) => ['--import', pathToFileURL(fetchGuard(f.dir)).href, ...args];
 function cli(f, command) {
-  return execFileSync(process.execPath, [scriptPath, command], { env: cleanEnv({ HOME: f.dir }), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  return execFileSync(process.execPath, cliArgs(f, scriptPath, command), { env: cleanEnv(f.dir), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 async function crash(child) {
   const exited = once(child, 'exit');
@@ -234,6 +253,17 @@ test('a live lock owner process makes acquire and mutating CLI commands refuse; 
   assert.equal(owner.pid, holder.pid); assert.equal(owner.identity, processIdentity(holder.pid));
 
   assert.throws(() => acquireLock(f.home), new RegExp(`Another dev operation is active \\(PID ${holder.pid}\\)`));
+  // The CLI children below run with exactly this environment and preload: prove
+  // it carries no credential, no reachable stored login, and no remote fetch.
+  const polluted = { ...process.env, CLOUDFLARE_API_TOKEN: 'sentinel', CLOUDFLARE_API_KEY: 'sentinel', CF_API_TOKEN: 'sentinel', WRANGLER_OAUTH_TOKEN: 'sentinel', CLOUDFLARE_EMAIL: 'sentinel', XDG_CONFIG_HOME: '/Users/elsewhere/.config' };
+  const probe = JSON.parse(execFileSync(process.execPath, cliArgs(f, '--input-type=module', '-e', `
+    let remote; try { await fetch('https://api.cloudflare.com/client/v4/accounts'); remote = 'reached'; } catch (error) { remote = error.message; }
+    console.log(JSON.stringify({ env: process.env, remote }));`), { env: cleanEnv(f.dir, polluted), encoding: 'utf8' }));
+  assert.deepEqual(Object.keys(probe.env).filter((key) => credential.test(key) && key !== 'XDG_CONFIG_HOME'), []);
+  assert.ok(!Object.values(probe.env).includes('sentinel'));
+  assert.equal(probe.env.HOME, f.dir); assert.equal(probe.env.XDG_CONFIG_HOME, join(f.dir, '.config'));
+  assert.equal(probe.remote, 'test child refused remote fetch https://api.cloudflare.com/client/v4/accounts');
+  assert.deepEqual(Object.keys(cleanEnv(f.dir)).filter((key) => /^(CLOUDFLARE_|CF_|WRANGLER_)/.test(key)), []);
   for (const command of ['stop', 'start', 'destroy']) assert.throws(() => cli(f, command), (error) => {
     assert.match(error.stderr, new RegExp(`Another dev operation is active \\(PID ${holder.pid}\\)`)); return true;
   });
@@ -333,7 +363,9 @@ test('upload succeeds but deployment record publication fails: no new record, sn
 
 // 4. Cleanup publication failure -----------------------------------------------
 
-test('pruning failure after the new record is published: the new record and release stand, the unsafe old release remains, and deploy rejects', async (t) => {
+// Pins KNOWN DEFECT #56 (https://github.com/hyang0129/foreman/issues/56): deploy
+// rejects after it has committed. The fix for #56 must update this test deliberately.
+test('pruning failure after the new record is published (pins known defect #56): the new record and release stand, the unsafe old release remains, and deploy rejects', async (t) => {
   const f = fixture(t);
   const first = await deployed(f, f.commit('first'));
   const second = f.commit('second');
@@ -344,7 +376,7 @@ test('pruning failure after the new record is published: the new record and rele
   let error;
   const { output } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn).catch((e) => { error = e; }));
   assert.equal(d.calls.length, 2);
-  // Current behavior: deploy reports failure even though it has committed.
+  // Known defect #56: deploy reports failure even though it has committed.
   assert.equal(error?.message, `Refusing unsafe dev path: ${oldRelease}`);
   assert.doesNotMatch(output, /DEV deployed/);
   const current = json(f.deploymentFile);
@@ -366,7 +398,7 @@ async function recordedDaemon(t, home) {
 process.on('SIGTERM', () => { writeFileSync(${JSON.stringify(join(home, '..', 'daemon-sigterm'))}, String(process.pid)); process.exit(0); });
 setInterval(() => {}, 1000); console.log('ready');
 `, { mode: 0o600 });
-  const child = spawn(process.execPath, [entry, id], { stdio: ['ignore', 'pipe', 'ignore'], env: cleanEnv() });
+  const child = spawn(process.execPath, [entry, id], { stdio: ['ignore', 'pipe', 'ignore'], env: cleanEnv(dirname(home)) });
   t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
   await once(child.stdout, 'data');
   writeJson(join(home, 'daemon.json'), { id, pid: child.pid, identity: processIdentity(child.pid), state: 'running' });
