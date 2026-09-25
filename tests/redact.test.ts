@@ -26,6 +26,24 @@ const REDACTS: [string, string, string][] = [
   ['query string stops at &', 'url?access_token=abc123def456&x=1', 'url?access_token=[REDACTED]&x=1'],
   ['long lowercase passphrase', 'password=correcthorsebatterystaple', 'password=[REDACTED]'],
   ['mixed-case letters only', 'password=HunterTwoSecret', 'password=[REDACTED]'],
+  // Former positives that a pure "looks opaque" heuristic would miss: short, letters-only,
+  // single-case, capitalised and hyphenated values.
+  ['short bearer token', 'Bearer abc12', 'Bearer [REDACTED]'],
+  ['one-char bearer token', 'Authorization: Bearer x', 'Authorization: Bearer [REDACTED]'],
+  ['lower-case letters-only bearer', 'Bearer abcdefghijklmnop', 'Bearer [REDACTED]'],
+  ['upper-case letters-only bearer', 'Bearer ABCDEFGHIJKLMNOP', 'Bearer [REDACTED]'],
+  ['bearer jwt with dots', 'Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig', 'Bearer [REDACTED]'],
+  ['lower-case letters-only token', 'token=abcdefghijklmnop', 'token=[REDACTED]'],
+  ['upper-case letters-only token', 'token=ABCDEFGHIJKLMNOP', 'token=[REDACTED]'],
+  ['token with trailing dot', 'token=abcdefgh.', 'token=[REDACTED]'],
+  ['dictionary-word password', 'password=dragonfly', 'password=[REDACTED]'],
+  ['lower-case passphrase under 20', 'password=sunshinesunshine', 'password=[REDACTED]'],
+  ['hyphenated password', 'password=my-secret-pass', 'password=[REDACTED]'],
+  ['x-api-key letters only', 'x-api-key: abcdefghijklmnopq', 'x-api-key: [REDACTED]'],
+  ['x-api-key upper case', 'x-api-key: ABCDEFGHIJKLMNOPQRS', 'x-api-key: [REDACTED]'],
+  ['capitalised api key', 'api_key=Abcdefghijk', 'api_key=[REDACTED]'],
+  ['capitalised secret', 'secret=Supersecret', 'secret=[REDACTED]'],
+  ['basic lower-case base64', 'Authorization: Basic abcd', 'Authorization: Basic [REDACTED]'],
   // #63: Authorization: Basic <base64>.
   ['basic auth', 'Authorization: Basic dXNlcjpwYXNz', 'Authorization: Basic [REDACTED]'],
   ['basic auth with padding', 'Authorization: Basic YWRtaW46c2VjcmV0MTIz==', 'Authorization: Basic [REDACTED]'],
@@ -84,12 +102,40 @@ test('redactSecrets is idempotent and total', () => {
   assert.equal(REDACTED, '[REDACTED]');
 });
 
-test('looksLikeCredential separates words from opaque values', () => {
+test('looksLikeCredential passes only prose words and short values', () => {
   assert.equal(looksLikeCredential('required', 8), false);
   assert.equal(looksLikeCredential('token', 6), false);
   assert.equal(looksLikeCredential('Required', 8), false);
+  assert.equal(looksLikeCredential('REQUIRED.', 8), false);
+  assert.equal(looksLikeCredential('not-provided', 8), false);
   assert.equal(looksLikeCredential('abc123de', 8), true);
   assert.equal(looksLikeCredential('dTpw', 4), true);
   assert.equal(looksLikeCredential('abc12', 8), false);
+  assert.equal(looksLikeCredential('dragonfly', 8), true);
+  assert.equal(looksLikeCredential('my-secret-pass', 8), true);
   assert.equal(looksLikeCredential('correcthorsebatterystaple', 8), true);
+});
+
+// The pre-#26 server/pm.ts rule, verbatim, as the regression baseline.
+const preStoryRedact = (text: string): string => text
+  .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-[REDACTED]')
+  .replace(/\bBearer\s+[^\s"',;]+/gi, 'Bearer [REDACTED]')
+  .replace(/\b((?:access|refresh|id|auth|session|oauth)?[_-]?token|api[_-]?key|x-api-key|client[_-]?secret|secret|password|authorization)(["']?\s*[=:]\s*["']?)[^\s"',;&]{8,}/gi, '$1$2[REDACTED]');
+
+test('every string the pre-#26 rule redacted is still redacted (except the listed prose)', () => {
+  // A generated corpus of key/scheme × value shapes, plus the table above.
+  const keys = ['token=', 'access_token: ', 'api_key=', 'x-api-key: ', 'client_secret=', 'secret: ', 'password=', 'Authorization: ', 'Bearer ', 'bearer ', 'Authorization: Bearer '];
+  const values = ['x', 'abc12', 'abcdefgh', 'abcdefghijklmnop', 'ABCDEFGHIJKLMNOP', 'Abcdefghijk', 'dragonfly', 'my-secret-pass', 'a1b2c3d4e5', 'eyJ.a.b', 'ya29.a0Af', 'Zm9vOmJhcg==', 'hunter2', 's3cr3t!', 'sk-ant-abc'];
+  const corpus = [...REDACTS.map(([, input]) => input), ...keys.flatMap((k) => values.map((v) => `${k}${v}`))];
+  const prose = new Set(KEEPS.map(([, input]) => input));
+  let checked = 0;
+  for (const input of corpus) {
+    if (prose.has(input) || preStoryRedact(input) === input) continue;
+    checked++;
+    assert.ok(redactSecrets(input).includes(REDACTED), `regression: ${input} -> ${redactSecrets(input)}`);
+  }
+  assert.ok(checked > 100, String(checked));
+  // And the #63 prose cases are exactly the ones the old rule over-redacted.
+  assert.notEqual(preStoryRedact('Authorization: required'), 'Authorization: required');
+  assert.notEqual(preStoryRedact('Invalid bearer token'), 'Invalid bearer token');
 });

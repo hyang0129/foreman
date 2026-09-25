@@ -26,7 +26,9 @@ test('constants match the sprint contract', () => {
   assert.deepEqual([...PM_MEMORY_TOOLS], ['mcp__fleet__memory_read', 'mcp__fleet__memory_write', 'mcp__fleet__memory_edit', 'mcp__fleet__log_note']);
   assert.equal(PM_HUNG_DEFAULT_MS, 300_000);
   assert.equal(MAX_PM_FRAME, 65536);
-  assert.ok(MAX_PM_IMPORT_FRAME > MAX_PM_FRAME && MAX_PM_RESULT_FRAME > MAX_PM_FRAME);
+  assert.equal(MAX_PM_RESULT_FRAME, 1_048_576);
+  assert.equal(MAX_PM_IMPORT_FRAME, 1_048_576);
+  assert.equal(MAX_PM_IMPORT_FRAME, MAX_PM_RESULT_FRAME);
   assert.deepEqual({ ...PM_DOC_LIMITS }, { projects: 32768, preferences: 8192 });
   assert.equal(MAX_PROJECTS_DOC, 32768); assert.equal(MAX_PREFERENCES_DOC, 8192);
   assert.equal(MIN_LOG_ENTRY, 3); assert.equal(MAX_LOG_ENTRY, 500); assert.equal(MAX_LOG_KEPT, 2000); assert.equal(MAX_LOG_READ, 200);
@@ -229,6 +231,32 @@ test('pm_rpc: over-limit content and oversize frames get code too_large', () => 
     assert.equal(r.ok, false, label);
     if (!r.ok) { assert.equal(r.code, 'too_large', `${label}: ${r.error}`); assert.equal(r.id, 'rpc-1'); }
   }
+});
+
+test('memory.import: the frame bound is 1 MiB and the host trims the oldest log lines to fit', () => {
+  // A full-size import (32 KiB projects + 2000 × 500-char lines) exceeds 1 MiB once the lines are
+  // multibyte (ASCII-only it is ~1.01 MB and fits), and is too_large.
+  const full = Array.from({ length: 2000 }, (_, i) => `${i}:`.padEnd(500, 'é'));
+  const frame = (projects: string, log: string[]) => rpc('memory.import', { projects, log, model: null, source_machine: MID });
+  const size = (raw: unknown) => utf8Length(JSON.stringify(raw));
+  assert.ok(size(frame('x'.repeat(32 * 1024), full)) > MAX_PM_IMPORT_FRAME);
+  const over = parsePmRpc(frame('x'.repeat(32 * 1024), full));
+  assert.ok(!over.ok && over.code === 'too_large' && over.id === 'rpc-1');
+  // Dropping the oldest lines until it fits yields an accepted frame that keeps the newest lines.
+  const base = 'x'.repeat(30 * 1024);
+  let log = full;
+  while (size(frame(base, log)) > MAX_PM_IMPORT_FRAME) log = log.slice(1);
+  assert.ok(log.length > 900 && log.length < 1100, String(log.length));
+  assert.equal(log[log.length - 1], full[full.length - 1]);
+  assert.ok(parsePmRpc(frame(base, log)).ok);
+  // Exactly at the bound is accepted; one byte over is too_large (every field individually valid).
+  const slack = MAX_PM_IMPORT_FRAME - size(frame(base, log));
+  assert.ok(slack >= 0 && slack < 2048, String(slack));
+  const atBound = frame(base + 'x'.repeat(slack), log);
+  assert.equal(size(atBound), MAX_PM_IMPORT_FRAME);
+  assert.ok(parsePmRpc(atBound).ok);
+  const oneOver = parsePmRpc(frame(base + 'x'.repeat(slack + 1), log));
+  assert.ok(!oneOver.ok && oneOver.code === 'too_large', JSON.stringify(oneOver));
 });
 
 test('parsePmOpArgs never throws on hostile input', () => {

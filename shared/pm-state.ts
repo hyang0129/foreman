@@ -20,14 +20,17 @@ import { redactSecrets } from './redact.ts';
 
 /** Serialized (UTF-8 JSON) bound for host→DO PM frames: `hello` v2 and every `pm_rpc` except `memory.import`. */
 export const MAX_PM_FRAME = 64 * 1024;
-/**
- * `memory.import` carries the whole `projects` doc plus up to 2000 log entries, which cannot fit
- * in 64 KiB. It gets its own bound; the importing host drops the oldest log lines until the frame
- * fits (the import is one-time and never merged).
- */
-export const MAX_PM_IMPORT_FRAME = 2 * 1024 * 1024;
 /** DO→host bound for `pm_rpc_result` / `pm_assignment` (a `memory.get` result exceeds 64 KiB). */
 export const MAX_PM_RESULT_FRAME = 1024 * 1024;
+/**
+ * `memory.import` carries the whole `projects` doc plus up to 2000 log entries, which cannot fit
+ * in 64 KiB. It gets its own bound, 1 MiB (equal to `MAX_PM_RESULT_FRAME`). A full import can still
+ * exceed it (2000 × 500-char lines, multibyte text, JSON escaping), so the importing host MUST drop
+ * the oldest log lines until the serialized `memory.import` frame fits within this bound; the
+ * `projects` doc is never trimmed for this (it is already bounded at 32 KiB). A frame over the
+ * bound is rejected with `too_large`. The import is one-time and never merged.
+ */
+export const MAX_PM_IMPORT_FRAME = MAX_PM_RESULT_FRAME;
 
 export const PM_DOC_NAMES = ['projects', 'preferences'] as const;
 export type PmDocName = typeof PM_DOC_NAMES[number];
