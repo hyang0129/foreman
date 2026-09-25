@@ -14,9 +14,11 @@ const managed = {
   updated_at: new Date().toISOString(),
 };
 
-async function fixture(page: Page, options: { pmHistory?: any[] } = {}) {
+async function fixture(page: Page, options: { pmHistory?: any[]; auth?: any } = {}) {
   const state = {
     pmError: null as string | null,
+    // Fails the lightweight summary read: an HTTP 500 or a network error.
+    summaryFailure: null as null | 500 | "network",
     pmHistory: options.pmHistory ?? [
       { role: "assistant", text: "How can I help the fleet?" },
     ],
@@ -27,9 +29,14 @@ async function fixture(page: Page, options: { pmHistory?: any[] } = {}) {
       url = new URL(request.url()),
       path = url.pathname;
     state.calls.push({ path, search: url.search, at: Date.now() });
+    if (path === "/api/pm/history" && url.search === "?summary=1" && state.summaryFailure) {
+      if (state.summaryFailure === "network") await route.abort("failed");
+      else await route.fulfill({ status: 500, json: { error: "Internal relay failure" } });
+      return;
+    }
     let result: any = {},
       status = 200;
-    if (path === "/api/config") result = { auth: { required: false } };
+    if (path === "/api/config") result = { auth: options.auth ?? { required: false } };
     else if (path === "/api/host") result = { online: true, host: "Dev Mac" };
     else if (path === "/api/sessions") result = [structuredClone(managed)];
     else if (path === "/api/session")
@@ -214,4 +221,127 @@ test("summary is not requested while the PM is selected", async ({ page }) => {
   state.pmError = null;
   await expect(page.locator("#select-pm .pm-alert")).toHaveCount(0);
   expect(summaryCalls(state).filter((c) => c.at > selectedAt)).toHaveLength(0);
+});
+
+// #65: every poll makes exactly one summary read. The calls between two consecutive
+// /api/host requests are one complete poll.
+test("each poll requests the PM summary exactly once", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  const hosts = () => state.calls.filter((c) => c.path === "/api/host").length;
+  // Start extra polls instead of waiting for the timer; a poll already in flight ignores them.
+  for (let polls = 1; polls <= 4; polls++) {
+    await expect.poll(() => summaryCalls(state).length).toBeGreaterThanOrEqual(polls);
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await expect.poll(hosts).toBeGreaterThan(polls);
+  }
+  const windows: string[][] = [];
+  for (const call of state.calls) {
+    if (call.path === "/api/host") windows.push([]);
+    else if (windows.length) windows.at(-1)!.push(call.path + call.search);
+  }
+  const complete = windows.slice(0, -1);
+  expect(complete.length).toBeGreaterThanOrEqual(4);
+  for (const poll of complete)
+    expect(poll.filter((call) => call === "/api/pm/history?summary=1")).toHaveLength(1);
+  // The full PM history is never read while the PM is not selected.
+  expect(fullPmCalls(state)).toHaveLength(0);
+});
+
+for (const failure of [500, "network"] as const) {
+  test(`a failed PM summary read (${failure}) leaves the UI usable and the indicator unset`, async ({ page }) => {
+    const state = await fixture(page);
+    state.summaryFailure = failure;
+    await page.goto("/");
+    // The failing read was really made, and more than once: polling continues after it.
+    await expect.poll(() => summaryCalls(state).length).toBeGreaterThanOrEqual(1);
+    const failedAt = summaryCalls(state).length;
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(failedAt);
+    await expect(page.locator("#select-pm .pm-alert")).toHaveCount(0);
+    await expect(page.locator("#select-pm")).not.toHaveClass(/has-error/);
+    await expect(page.locator("#error-banner")).toBeHidden();
+    await expect(page.locator("#host-status")).toHaveText("Dev Mac · online");
+    await expect(page.locator("#connection-banner")).toBeHidden();
+
+    // Still usable: a conversation and the PM open normally.
+    await page.getByRole("button", { name: /Fix sign-in/ }).click();
+    await expect(page.getByText("Working on it.")).toBeVisible();
+    await page.locator("#select-pm").click();
+    await expect(page.getByText("How can I help the fleet?")).toBeVisible();
+
+    // Once reads succeed again, a real error is still flagged (the mechanism was not disabled).
+    await page.getByRole("button", { name: /Fix sign-in/ }).click();
+    state.summaryFailure = null;
+    state.pmError = "Project manager failed: provider outage";
+    await expect(page.locator("#select-pm .pm-alert")).toHaveCount(1);
+  });
+}
+
+test("a known indicator survives a failed summary read", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmError = "Project manager failed: provider outage";
+  await page.goto("/");
+  await expect(page.locator("#select-pm .pm-alert")).toHaveCount(1);
+  state.summaryFailure = 500;
+  const before = summaryCalls(state).length;
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(before);
+  await expect(page.locator("#select-pm .pm-alert")).toHaveCount(1);
+  await expect(page.locator("#error-banner")).toBeHidden();
+});
+
+test("the rail indicator appears even when the PM row has no PINNED tag", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(0);
+  await page.locator("#select-pm .pinned").evaluate((el) => el.remove());
+  state.pmError = "Project manager failed: provider outage";
+  const indicator = page.locator("#select-pm .pm-alert");
+  await expect(indicator).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Project manager, has an error" })).toBeVisible();
+  state.pmError = null;
+  await expect(indicator).toHaveCount(0);
+});
+
+test("a PM error entry that gains its error flag re-renders as a failure", async ({ page }) => {
+  const at = "2026-09-20T10:00:00.000Z";
+  const state = await fixture(page, { pmHistory: [{ role: "system", text: "Project manager stopped.", at }] });
+  await page.goto("/");
+  await page.locator("#select-pm").click();
+  const entry = page.locator(".message.system", { hasText: "Project manager stopped." });
+  await expect(entry).toHaveCount(1);
+  await expect(entry).not.toHaveClass(/\berror\b/);
+  // Same role, text and timestamp: only the error flag changes.
+  state.pmHistory = [{ role: "system", error: true, text: "Project manager stopped.", at }];
+  await expect(entry).toHaveClass(/\berror\b/);
+  await expect(entry.locator(".message-label")).toHaveText(/^Project manager error/);
+});
+
+test("signing out clears the PM failure indicator", async ({ page }) => {
+  await page.route("https://www.gstatic.com/firebasejs/**/firebase-app.js", (route) =>
+    route.fulfill({ contentType: "application/javascript", body: "export const initializeApp = value => value;" }));
+  await page.route("https://www.gstatic.com/firebasejs/**/firebase-auth.js", (route) =>
+    route.fulfill({
+      contentType: "application/javascript",
+      body: `
+    const user = {email:'owner@example.com',getIdToken:async()=> 'fixture-id-token'};
+    let callback;
+    export const getAuth = () => ({currentUser:user});
+    export const onAuthStateChanged = (auth,fn) => { callback=fn; queueMicrotask(()=>fn(user)); };
+    export const signOut = async auth => { auth.currentUser=null; callback(null); };
+  `,
+    }));
+  const state = await fixture(page, { auth: { required: true, firebase: { apiKey: "fixture-api-key" } } });
+  state.pmError = "Project manager failed: provider outage";
+  await page.goto("/");
+  const pmRow = page.locator("#select-pm");
+  await expect(pmRow.locator(".pm-alert")).toHaveCount(1);
+  await page.locator("#sign-out").click();
+  await expect(page.locator("#app")).toBeHidden();
+  // Cleared by sign-out itself, while the host still reports the error.
+  await expect(pmRow.locator(".pm-alert")).toHaveCount(0);
+  await expect(pmRow).not.toHaveClass(/has-error/);
+  expect(await pmRow.getAttribute("aria-label")).toBeNull();
+  expect(await pmRow.getAttribute("title")).toBeNull();
 });

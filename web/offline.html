@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f8faf8" />
+    <title>Foreman · Offline</title>
+    <!-- Served by sw.js when a navigation fails. Self-contained and free of user data. -->
+    <style>
+      :root { color-scheme: light; --bg: #f8faf8; --surface: #fff; --ink: #21372d; --secondary: #5d6e63; --line: #dce5dd; --accent: #256a49; --accent-hover: #1a5538; --on-accent: #fff; }
+      :root[data-theme="dark"] { color-scheme: dark; --bg: #111b16; --surface: #1b2920; --ink: #e1eae2; --secondary: #a9baac; --line: #304436; --accent: #75b58d; --accent-hover: #86c59c; --on-accent: #0c1c12; }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: grid; place-items: center;
+        padding: max(24px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left));
+        font: 0.875rem/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg); color: var(--ink);
+      }
+      main { width: min(100%, 420px); padding: 32px 28px; border: 1px solid var(--line); border-radius: 20px; background: var(--surface); }
+      .mark { display: grid; place-items: center; width: 37px; height: 37px; margin-bottom: 24px; border-radius: 11px; background: var(--ink); color: var(--surface); font: 700 1.8125rem Georgia, serif; padding-bottom: 4px; }
+      h1 { margin: 0 0 10px; font-size: 1.625rem; line-height: 1.2; font-weight: 600; letter-spacing: -0.5px; }
+      p { margin: 0 0 20px; color: var(--secondary); }
+      button { min-height: 44px; padding: 10px 20px; border: 1px solid var(--accent); border-radius: 12px; background: var(--accent); color: var(--on-accent); font: inherit; font-weight: 600; cursor: pointer; touch-action: manipulation; }
+      button:hover { background: var(--accent-hover); }
+      button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+      button:disabled { opacity: 0.7; cursor: progress; }
+    </style>
+    <script>
+      // Appearance preference only (the same key appearance.js uses); no other storage is read.
+      try {
+        const saved = localStorage.getItem("foreman:appearance");
+        const dark = saved === "dark" || (saved !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) document.documentElement.dataset.theme = "dark";
+      } catch { /* Storage may be unavailable. */ }
+    </script>
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true">f.</div>
+      <h1 id="offline-title">You’re offline</h1>
+      <p id="offline-status" role="status">Foreman can’t be reached right now. Check your connection. Anything you typed is kept on this device.</p>
+      <button id="retry" type="button">Retry</button>
+    </main>
+    <script>
+      const button = document.getElementById("retry");
+      function retry() {
+        button.disabled = true;
+        button.textContent = "Retrying…";
+        location.reload();
+      }
+      button.addEventListener("click", retry);
+      // Automatic retry: "online" can fire before the connection really works, and this page
+      // can also load while the device reports online (the host was unreachable). Reload only
+      // once a small same-origin request succeeds, backing off between probes.
+      let probeTimer, probes = 0;
+      async function probe() {
+        clearTimeout(probeTimer);
+        try {
+          const response = await fetch("/manifest.webmanifest", { cache: "no-store" });
+          if (response.ok) return retry();
+        } catch { /* Still unreachable. */ }
+        if (navigator.onLine && probes < 8) probeTimer = setTimeout(probe, 2000 * 2 ** probes++);
+      }
+      window.addEventListener("online", () => { probes = 0; probe(); });
+      if (navigator.onLine) probeTimer = setTimeout(probe, 2000);
+      const dark = document.documentElement.dataset.theme === "dark";
+      document.querySelector('meta[name="theme-color"]').content = dark ? "#111b16" : "#f8faf8";
+    </script>
+  </body>
+</html>

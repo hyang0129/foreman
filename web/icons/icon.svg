@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Foreman brand mark ("f." on ink): the source of icon-192.png and icon-512.png. -->
+  <rect width="512" height="512" rx="112" fill="#21372d"/>
+  <text x="256" y="352" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="700" font-size="300" fill="#ffffff">f.</text>
+</svg>

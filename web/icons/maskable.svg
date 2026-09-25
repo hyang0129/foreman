@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Maskable variant: opaque full-bleed background, and the mark stays inside the central
+       safe zone (a circle of radius 204.8 around the center): the source of maskable-512.png. -->
+  <rect width="512" height="512" fill="#21372d"/>
+  <text x="256" y="325" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="700" font-size="210" fill="#ffffff">f.</text>
+</svg>

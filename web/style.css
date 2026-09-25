@@ -641,6 +641,11 @@ select:focus-visible,
 .banner.error span {
   flex: 1;
 }
+.banner.notice {
+  margin: 0;
+  background: var(--accent-soft);
+  color: var(--ink);
+}
 .approvals {
   display: flex;
   flex-direction: column;
