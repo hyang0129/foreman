@@ -178,6 +178,19 @@ export class CodexControl extends EventEmitter {
     // Socket attachment does not own the external app-server or its processes.
     return this.closing;
   }
+  // A Codex app-server with no login still initializes, lists models and starts
+  // threads; only the first turn fails (401 after retries). Check the local
+  // account first so a signed-out host reports Codex as unavailable up front.
+  // account/read reads local credentials without refreshing them. Only an
+  // explicit "no account, OpenAI auth required" answer refuses; an older
+  // app-server that cannot answer keeps the previous behavior.
+  async requireSignedIn() {
+    let result: { account?: unknown; requiresOpenaiAuth?: unknown } | undefined;
+    try { result = await this.request('account/read', { refreshToken: false }); } catch { return; }
+    if (result?.account === null && result?.requiresOpenaiAuth === true) {
+      throw new Error('Codex is not signed in on this host, so Codex sessions are unavailable. Sign in with `codex login` using the CODEX_HOME this Foreman uses, then try again.');
+    }
+  }
   list(cursor?: string) {
     return this.request<{ data: CodexThread[]; nextCursor: string | null }>('thread/list', { limit: 100, sortKey: 'updated_at', ...(cursor ? { cursor } : {}) });
   }

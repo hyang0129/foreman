@@ -8,7 +8,7 @@
 // and is cleaned up through its own handle or its proven identity.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, realpathSync, chmodSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, realpathSync, chmodSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { deploy, start, stop, status, destroy, deleteDevWorker, acquireLock, running, openHome, processIdentity, TARGET } from '../scripts/dev-environment.mjs';
+import { deploy, shellQuote, start, stop, status, destroy, deleteDevWorker, acquireLock, running, openHome, processIdentity, TARGET } from '../scripts/dev-environment.mjs';
 
 const scriptPath = realpathSync('scripts/dev-environment.mjs');
 const scriptUrl = pathToFileURL(scriptPath).href;
@@ -41,7 +41,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const home = process.env.FOREMAN_HOME;
 process.on('SIGTERM', () => { writeFileSync(join(home, 'fixture-sigterm'), String(process.pid)); process.exit(0); });
-writeFileSync(join(home, 'fixture-env.json'), JSON.stringify({ port: process.env.FOREMAN_PORT, home, claude: process.env.CLAUDE_CONFIG_DIR, codex: process.env.CODEX_HOME, relay: process.env.FOREMAN_RELAY_URL }));
+writeFileSync(join(home, 'fixture-env.json'), JSON.stringify({ port: process.env.FOREMAN_PORT, home, hookHome: process.env.FOREMAN_HOOK_HOME ?? null, claude: process.env.CLAUDE_CONFIG_DIR ?? null, codex: process.env.CODEX_HOME ?? null, relay: process.env.FOREMAN_RELAY_URL }));
 writeFileSync(join(home, 'fixture-pid'), String(process.pid));
 ${serve ? `createServer((request, response) => {
   if (request.url !== '/api/health') { response.statusCode = 404; response.end(); return; }
@@ -84,9 +84,10 @@ async function injectedPort() {
   assert.notEqual(port, TARGET.port); return port;
 }
 async function captureLog(fn) {
-  const lines = [], original = console.log;
+  const lines = [], warnings = [], original = console.log, originalWarn = console.warn;
   console.log = (...args) => lines.push(args.join(' '));
-  try { const result = await fn(); return { result, output: lines.join('\n') }; } finally { console.log = original; }
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try { const result = await fn(); return { result, output: lines.join('\n'), warnings: warnings.join('\n') }; } finally { console.log = original; console.warn = originalWarn; }
 }
 const json = (path) => JSON.parse(readFileSync(path, 'utf8'));
 const writeJson = (path, value) => writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
@@ -149,23 +150,35 @@ function authMock() {
 
 // 1. Actual startup ------------------------------------------------------------
 
-test('actual startup: a real deploy then start runs a real daemon to health and relay readiness, status reflects it, and stop proves exit', async (t) => {
+for (const isolatedLogins of [false, true]) test(`actual startup (${isolatedLogins ? 'isolated logins' : 'host logins, the default'}): a real deploy then start runs a real daemon to health and relay readiness, status reflects it, and stop proves exit`, async (t) => {
   const f = fixture(t), commit = f.commit(), port = await injectedPort();
   const deployment = await deployed(f, commit);
   assert.equal(deployment.commit, commit);
   const pair = json(f.pairFile);
   // Relay offline at preflight and on the first healthy poll; online from the third call.
   const relay = relayMock(commit, 3), auth = authMock();
-  const { output } = await captureLog(() => start(f.home, { relayStatus: relay.fn, execute: auth.fn, port }));
+  // Stray provider directories inherited by start never reach the checks or the
+  // daemon: the host default (unset) or the dev home's own directories apply.
+  const saved = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, CODEX_HOME: process.env.CODEX_HOME };
+  Object.assign(process.env, { CLAUDE_CONFIG_DIR: join(f.dir, 'stray-claude'), CODEX_HOME: join(f.dir, 'stray-codex') });
+  let output;
+  try { ({ output } = await captureLog(() => start(f.home, { relayStatus: relay.fn, execute: auth.fn, port, ...(isolatedLogins ? { isolatedLogins } : {}) }))); }
+  finally { for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+  const claude = isolatedLogins ? join(f.home, 'claude') : null, codex = isolatedLogins ? join(f.home, 'codex') : null;
 
   // start resolved only after the daemon answered health and the relay reported
   // online: calls 2 and 3 happen only once health matched the child PID, and the
   // 4th is the final status report.
   assert.equal(relay.calls, 4);
   assert.deepEqual(relay.tokens, Array(4).fill(pair.token));
-  assert.deepEqual(auth.calls.map((c) => c.args), [['login', 'status'], ['auth', 'status', '--json']]);
-  assert.equal(auth.calls[0].env.CODEX_HOME, join(f.home, 'codex'));
-  assert.equal(auth.calls[1].env.CLAUDE_CONFIG_DIR, join(f.home, 'claude'));
+  // Claude (required) is checked before Codex (optional, notice only; #69).
+  assert.deepEqual(auth.calls.map((c) => c.args), [['auth', 'status', '--json'], ['login', 'status']]);
+  assert.equal(auth.calls[0].env.CLAUDE_CONFIG_DIR ?? null, claude);
+  assert.equal(auth.calls[1].env.CODEX_HOME ?? null, codex);
+  assert.equal(Object.hasOwn(auth.calls[0].env, 'CLAUDE_CONFIG_DIR'), isolatedLogins);
+  assert.equal(Object.hasOwn(auth.calls[1].env, 'CODEX_HOME'), isolatedLogins);
+  // Private provider directories exist only for isolated logins.
+  assert.equal(existsSync(join(f.home, 'claude')), isolatedLogins); assert.equal(existsSync(join(f.home, 'codex')), isolatedLogins);
 
   const pid = Number(readFileSync(join(f.home, 'fixture-pid'), 'utf8'));
   assert.equal(alive(pid), true);
@@ -173,9 +186,13 @@ test('actual startup: a real deploy then start runs a real daemon to health and 
   assert.equal(record.state, 'running'); assert.equal(record.pid, pid);
   assert.ok(record.identity.endsWith(` ${join(f.home, 'run.mjs')} ${record.id}`), record.identity);
   assert.equal(record.identity, processIdentity(pid));
-  assert.deepEqual(json(join(f.home, 'fixture-env.json')), { port: String(port), home: f.home, claude: join(f.home, 'claude'), codex: join(f.home, 'codex'), relay: TARGET.url });
+  assert.equal(record.logins, isolatedLogins ? 'isolated' : 'host');
+  // Hook routing: sessions the daemon launches inherit FOREMAN_HOME (Claude hook)
+  // and FOREMAN_HOOK_HOME (Codex hook), both the dev home, never production.
+  assert.deepEqual(json(join(f.home, 'fixture-env.json')), { port: String(port), home: f.home, hookHome: f.home, claude, codex, relay: TARGET.url });
   const reported = JSON.parse(output.slice(output.indexOf('{')));
   assert.equal(reported.pid, pid); assert.equal(reported.commit, commit); assert.equal(reported.error, undefined);
+  assert.equal(reported.logins, isolatedLogins ? 'isolated' : 'host');
 
   // The daemon really answers health on the injected port.
   assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/api/health`)).json(), { pid });
@@ -363,9 +380,10 @@ test('upload succeeds but deployment record publication fails: no new record, sn
 
 // 4. Cleanup publication failure -----------------------------------------------
 
-// Pins KNOWN DEFECT #56 (https://github.com/hyang0129/foreman/issues/56): deploy
-// rejects after it has committed. The fix for #56 must update this test deliberately.
-test('pruning failure after the new record is published (pins known defect #56): the new record and release stand, the unsafe old release remains, and deploy rejects', async (t) => {
+// #56: once the new deployment record is published the deploy has committed, so
+// pruning superseded releases is best-effort. A refused release is reported with
+// how to remove it, pruning continues past it, and deploy resolves (CLI exit 0).
+test('pruning failure after the new record is published (#56): deploy still succeeds, reports DEV deployed, and warns naming the unsafe old release, which remains', async (t) => {
   const f = fixture(t);
   const first = await deployed(f, f.commit('first'));
   const second = f.commit('second');
@@ -373,20 +391,89 @@ test('pruning failure after the new record is published (pins known defect #56):
   const oldRelease = join(f.home, first.release);
   chmodSync(oldRelease, 0o755);
   const d = deployer();
-  let error;
-  const { output } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn).catch((e) => { error = e; }));
+  // The deploy has committed, so pruning is best-effort: deploy resolves.
+  const { output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn));
   assert.equal(d.calls.length, 2);
-  // Known defect #56: deploy reports failure even though it has committed.
-  assert.equal(error?.message, `Refusing unsafe dev path: ${oldRelease}`);
-  assert.doesNotMatch(output, /DEV deployed/);
+  assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
+  assert.match(warnings, /Warning: DEV deployed, but 1 superseded release directory was not pruned/);
+  assert.ok(warnings.includes(`${oldRelease} (Refusing unsafe dev path: ${oldRelease})`), warnings);
+  assert.ok(warnings.includes(`rm -rf '${oldRelease}'`), warnings);
   const current = json(f.deploymentFile);
   assert.equal(current.commit, second);
   assert.notEqual(current.release, first.release);
   assert.ok(statSync(join(f.home, current.release)).isDirectory(), 'the new release stands');
   assert.ok(existsSync(join(f.home, current.release, 'dev-worker.ts')));
+  assert.ok(!warnings.includes(current.release), 'the new release is never named as unpruned');
   assert.deepEqual(releases(f.home), [first.release, current.release].sort());
   assert.equal(statSync(oldRelease).mode & 0o777, 0o755, 'the refused release is untouched');
   assert.deepEqual(leftovers(f.home), []);
+});
+
+test('pruning continues past refused releases in any listing order (#56): the superseded release between them is still pruned and every refused one is reported', async (t) => {
+  const f = fixture(t);
+  const first = await deployed(f, f.commit('first'));
+  // Two more superseded releases that are not owner-only. Their names sort
+  // before and after every mkdtemp release name. Whatever order the directory
+  // listing yields, pruning that stopped at the first refusal would leave one
+  // refused release unreported (and, on a sorted listing, the real one unpruned).
+  const refused = ['release-000', 'release-zzzzzzzzzz'].map((name) => join(f.home, name));
+  for (const dir of refused) { mkdirSync(dir); writeFileSync(join(dir, 'marker'), 'old'); chmodSync(dir, 0o755); }
+  assert.deepEqual(releases(f.home), ['release-000', first.release, 'release-zzzzzzzzzz']);
+  const second = f.commit('second');
+  const d = deployer();
+  const { output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn));
+  assert.equal(d.calls.length, 2);
+  assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
+  const current = json(f.deploymentFile);
+  assert.equal(current.commit, second);
+  assert.equal(existsSync(join(f.home, first.release)), false, 'the superseded release between the refused ones was pruned');
+  assert.deepEqual(releases(f.home), ['release-000', current.release, 'release-zzzzzzzzzz'].sort());
+  assert.match(warnings, /2 superseded release directories were not pruned/);
+  for (const dir of refused) {
+    assert.ok(warnings.includes(`${dir} (Refusing unsafe dev path: ${dir})`), warnings);
+    assert.ok(warnings.includes(`rm -rf '${dir}'`), warnings);
+    assert.equal(statSync(dir).mode & 0o777, 0o755, 'the refused release is untouched');
+    assert.equal(readFileSync(join(dir, 'marker'), 'utf8'), 'old');
+  }
+  assert.ok(!warnings.includes(first.release) && !warnings.includes(current.release), warnings);
+  assert.deepEqual(leftovers(f.home), []);
+});
+
+test('a directory listing failure after the new record is published (#56) is best-effort: deploy resolves, reports DEV deployed, and warns', async (t) => {
+  const f = fixture(t);
+  const first = await deployed(f, f.commit('first'));
+  const second = f.commit('second');
+  // After the real upload, make the dev home unlistable but still writable and
+  // traversable: the record still publishes, then readdir(home) fails.
+  const d = deployer((call, home) => { if (call === 2) chmodSync(home, 0o300); });
+  let output, warnings;
+  // Always restore listability, so the fixture can clean up even if deploy rejects.
+  try { ({ output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn))); } finally { chmodSync(f.home, 0o700); }
+  assert.equal(d.calls.length, 2);
+  assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
+  const current = json(f.deploymentFile);
+  assert.equal(current.commit, second);
+  assert.ok(existsSync(join(f.home, current.release, 'dev-worker.ts')), 'the new release stands');
+  assert.match(warnings, /superseded releases were not pruned: could not list .*EACCES/);
+  assert.ok(warnings.includes(`except ${current.release} by hand`), warnings);
+  assert.deepEqual(releases(f.home), [first.release, current.release].sort(), 'the superseded release remains');
+  assert.deepEqual(leftovers(f.home), []);
+});
+
+test('shellQuote makes a path a single literal shell word', () => {
+  for (const path of ["/tmp/it's here/release-a", '/tmp/$HOME `id` \\n "q"/release-b', '/plain/release-c']) {
+    assert.equal(execFileSync('sh', ['-c', `printf %s ${shellQuote(path)}`], { encoding: 'utf8' }), path);
+  }
+});
+
+test('a clean prune prints no warning', async (t) => {
+  const f = fixture(t);
+  await deployed(f, f.commit('first'));
+  const second = f.commit('second');
+  const { output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, deployer().fn));
+  assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
+  assert.equal(warnings, '');
+  assert.deepEqual(releases(f.home), [json(f.deploymentFile).release]);
 });
 
 // 5. Teardown ------------------------------------------------------------------
@@ -467,4 +554,37 @@ test('destroy retains local state and names the login step when the auth token c
   assert.equal(deletes, 0);
   assert.equal(processIdentity(daemon.pid), ''); assert.equal(existsSync(f.daemonFile), false);
   assert.ok(existsSync(f.deploymentFile)); assert.ok(existsSync(f.pairFile)); assert.ok(existsSync(f.home));
+});
+
+// Dev uses the host's provider logins by default, so teardown must never reach
+// the host's own ~/.claude or ~/.codex (here: siblings of the dev home in the
+// temporary HOME), even when the dev home links to them.
+function hostProviders(f) {
+  const dirs = { claude: join(f.dir, '.claude'), codex: join(f.dir, '.codex') };
+  for (const dir of Object.values(dirs)) { mkdirSync(dir); writeFileSync(join(dir, 'sentinel'), 'host login'); }
+  return dirs;
+}
+test('destroy removes the dev home but never the host provider directories, even through links in the dev home', async (t) => {
+  const f = fixture(t); devState(f);
+  const host = hostProviders(f);
+  symlinkSync(host.claude, join(f.home, 'claude')); symlinkSync(host.codex, join(f.home, 'codex'));
+  mkdirSync(join(f.home, 'legacy'), { mode: 0o700 }); symlinkSync(host.claude, join(f.home, 'legacy', 'nested-claude'));
+  const api = cloudflare(() => Response.json({ success: true }));
+  await captureLog(() => destroy(f.home, { readAuth: () => ({ type: 'oauth', token: 'fake-oauth' }), deleter: api.deleter }));
+  assert.equal(api.requests.length, 1);
+  assert.equal(existsSync(f.home), false, 'dev home removed');
+  for (const dir of Object.values(host)) assert.equal(readFileSync(join(dir, 'sentinel'), 'utf8'), 'host login');
+});
+test('destroy refuses any path that is not the dev home, before stopping, authenticating or deleting anything', async (t) => {
+  const f = fixture(t); devState(f);
+  const host = hostProviders(f);
+  for (const target of [host.claude, host.codex, f.dir, join(f.dir, 'missing')]) {
+    let reads = 0;
+    const api = cloudflare(() => Response.json({ success: true }));
+    await assert.rejects(captureLog(() => destroy(target, { readAuth: () => { reads++; return { type: 'oauth', token: 'fake-oauth' }; }, deleter: api.deleter })),
+      /Refusing to destroy .*: not the dev home/);
+    assert.equal(reads, 0); assert.equal(api.requests.length, 0);
+  }
+  for (const dir of Object.values(host)) assert.equal(readFileSync(join(dir, 'sentinel'), 'utf8'), 'host login');
+  assert.ok(existsSync(f.deploymentFile)); assert.ok(existsSync(f.pairFile));
 });

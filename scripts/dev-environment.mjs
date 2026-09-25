@@ -20,6 +20,8 @@ export function argumentsFor(args) {
   const options = { command, source: root, ref: 'HEAD' };
   while (rest.length) {
     const flag = rest.shift();
+    // Opt-in: give the dev daemon its own provider logins instead of the host's.
+    if (command === 'start' && flag === '--isolated-logins' && !options.isolatedLogins) { options.isolatedLogins = true; continue; }
     if (command !== 'deploy' || !['--source', '--ref'].includes(flag) || !rest[0] || rest[0].startsWith('-')) throw new Error(`Refusing unsupported argument: ${flag}`);
     options[flag.slice(2)] = rest.shift();
   }
@@ -86,13 +88,25 @@ export const SUPPORTED_WORKER_CONTRACT = deepFreeze({
 // emits these, so a snapshot declaring any of them would lose them silently.
 // `exports` declares Durable Objects without migrations; `containers` and
 // `cloudchamber` attach to Durable Object classes. Non-binding keys (name,
-// account_id, main, routes, route, triggers, build, env, vars, secrets, ...)
-// stay ignored by construction.
+// account_id, main, routes, route, triggers, build, env, ...) stay ignored by
+// construction; vars and secrets are checked against the lists below.
+// Bindings declared only under `env.<name>` are ignored with the rest of
+// `env`: neither dev nor production (deploy-cloud.mjs) passes --env. Dev
+// refuses a CLOUDFLARE_ENV override; production inherits the shell env, so a
+// CLOUDFLARE_ENV there would select an env section (moot while wrangler.jsonc
+// has none).
 export const UNSUPPORTED_BINDING_KEYS = Object.freeze(['kv_namespaces', 'r2_buckets', 'd1_databases', 'services', 'queues', 'workflows',
   'vectorize', 'hyperdrive', 'analytics_engine_datasets', 'ai', 'ai_search', 'ai_search_namespaces', 'agent_memory', 'websearch', 'browser',
   'images', 'media', 'stream', 'version_metadata', 'send_email', 'mtls_certificates', 'dispatch_namespaces', 'pipelines', 'secrets_store_secrets',
   'artifacts', 'flagship', 'ratelimits', 'worker_loaders', 'vpc_services', 'vpc_networks', 'connect', 'tail_consumers', 'streaming_tail_consumers',
   'logfwdr', 'unsafe', 'unsafe_hello_world', 'wasm_modules', 'text_blobs', 'data_blobs', 'containers', 'cloudchamber', 'exports']);
+// The vars the dev Worker emits. Pinned vars are fixed to these values, so a
+// snapshot may omit them but may not declare a different value; FIREBASE_CONFIG
+// is taken from the snapshot. Any other var would be silently dropped.
+export const SUPPORTED_DEV_VARS = deepFreeze({ pinned: { FIREBASE_PROJECT_ID: 'foreman-hong-2026', ALLOWED_EMAIL: 'hooong.yang@gmail.com' }, fromSnapshot: ['FIREBASE_CONFIG'] });
+// The only secrets the dev Worker is given; any other required secret would be
+// missing from the preview.
+export const SUPPORTED_DEV_SECRETS = deepFreeze(['HOST_TOKEN']);
 function deepFreeze(value) {
   if (value && typeof value === 'object') { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value); }
   return value;
@@ -138,26 +152,48 @@ export function contractDivergences(base) {
       const count = migrations.filter(migration => migration?.tag === expected.tag).length;
       if (count !== 1) problems.push(`migration ${expected.tag} ${show(expected)} is ${count ? 'duplicated' : 'missing'}`);
     }
+    // Unreachable while the contract has one migration, and gated on a
+    // substring check; revisit when a second migration exists (#70).
     if (!problems.some(problem => problem.includes('migration'))) problems.push(`migrations are ordered ${show(migrations.map(entry => entry.tag))}, not ${show(contract.migrations.map(entry => entry.tag))}`);
   }
   if (base?.assets?.binding !== contract.assets.binding) problems.push(`assets binding is ${show(base?.assets?.binding)}, not ${show(contract.assets.binding)}`);
   for (const key of UNSUPPORTED_BINDING_KEYS) if (base?.[key] !== undefined) problems.push(`unsupported binding kind ${key} ${show(base[key])}`);
+  const vars = base?.vars, pinned = SUPPORTED_DEV_VARS.pinned;
+  if (!vars || typeof vars !== 'object' || Array.isArray(vars)) problems.push(`vars is ${show(vars)}, not an object`);
+  else {
+    const unknown = Object.keys(vars).filter(key => !Object.hasOwn(pinned, key) && !SUPPORTED_DEV_VARS.fromSnapshot.includes(key));
+    if (unknown.length) problems.push(`unsupported vars ${show(unknown)} (the dev Worker would not define them)`);
+    for (const [key, value] of Object.entries(pinned)) if (Object.hasOwn(vars, key) && vars[key] !== value) problems.push(`var ${key} is ${show(vars[key])}, not ${show(value)}`);
+    for (const key of SUPPORTED_DEV_VARS.fromSnapshot) if (typeof vars[key] !== 'string') problems.push(`var ${key} is ${show(vars[key])}, not a string`);
+  }
+  const secrets = base?.secrets;
+  if (secrets !== undefined) {
+    const extraKeys = Object.keys(secrets ?? {}).filter(key => key !== 'required');
+    if (!secrets || typeof secrets !== 'object' || Array.isArray(secrets)) problems.push(`secrets is ${show(secrets)}, not an object`);
+    else if (extraKeys.length) problems.push(`unsupported secrets keys ${show(extraKeys)}`);
+    const required = secrets?.required;
+    if (required !== undefined && !Array.isArray(required)) problems.push(`secrets.required is ${show(required)}, not a list`);
+    else {
+      const unknown = (required ?? []).filter(name => !SUPPORTED_DEV_SECRETS.includes(name));
+      if (unknown.length) problems.push(`unsupported required secrets ${show(unknown)} (the dev Worker would not be given them)`);
+    }
+  }
   return problems;
 }
 export function workerConfig(base) {
   const problems = contractDivergences(base);
-  if (problems.length) throw new Error(`Refusing preview: the snapshot's wrangler.jsonc diverges from the bindings the dev Worker supports, so they would be silently dropped or changed. Divergence: ${problems.join('; ')}. Dev supports exactly durable_objects.bindings ${show(SUPPORTED_WORKER_CONTRACT.durable_objects.bindings)}, migrations ${show(SUPPORTED_WORKER_CONTRACT.migrations)} and assets binding ${show(SUPPORTED_WORKER_CONTRACT.assets.binding)}, and no other binding kinds. Preview a ref that matches, or extend SUPPORTED_WORKER_CONTRACT in scripts/dev-environment.mjs first.`);
+  if (problems.length) throw new Error(`Refusing preview: the snapshot's wrangler.jsonc diverges from the bindings, vars and secrets the dev Worker supports, so they would be silently dropped or changed. Divergence: ${problems.join('; ')}. Dev supports exactly durable_objects.bindings ${show(SUPPORTED_WORKER_CONTRACT.durable_objects.bindings)}, migrations ${show(SUPPORTED_WORKER_CONTRACT.migrations)} and assets binding ${show(SUPPORTED_WORKER_CONTRACT.assets.binding)}, and no other binding kinds; vars ${show([...Object.keys(SUPPORTED_DEV_VARS.pinned), ...SUPPORTED_DEV_VARS.fromSnapshot])} with ${Object.entries(SUPPORTED_DEV_VARS.pinned).map(([key, value]) => `${key} ${show(value)}`).join(' and ')} fixed; and required secrets ${show(SUPPORTED_DEV_SECRETS)}. Preview a ref that matches, or extend SUPPORTED_WORKER_CONTRACT, SUPPORTED_DEV_VARS or SUPPORTED_DEV_SECRETS (and workerConfig) in scripts/dev-environment.mjs first.`);
   // Deliberately construct, never spread a branch's Wrangler config: no routes,
   // external DO namespaces, build hooks, environments, or production secrets.
   // Bindings and migrations come only from the supported contract.
   const contract = structuredClone(SUPPORTED_WORKER_CONTRACT);
   return {
     name: TARGET.worker, account_id: TARGET.account, main: './dev-worker.ts', compatibility_date: '2026-09-21',
-    workers_dev: true, preview_urls: false, secrets: { required: ['HOST_TOKEN'] },
+    workers_dev: true, preview_urls: false, secrets: { required: [...SUPPORTED_DEV_SECRETS] },
     assets: { directory: './web', binding: contract.assets.binding, run_worker_first: ['/api/*'] },
     durable_objects: contract.durable_objects,
     migrations: contract.migrations,
-    vars: { FIREBASE_PROJECT_ID: 'foreman-hong-2026', ALLOWED_EMAIL: 'hooong.yang@gmail.com', FIREBASE_CONFIG: base.vars.FIREBASE_CONFIG },
+    vars: { ...SUPPORTED_DEV_VARS.pinned, FIREBASE_CONFIG: base.vars.FIREBASE_CONFIG },
     observability: { enabled: true, logs: { enabled: true, invocation_logs: true }, traces: { enabled: true } },
   };
 }
@@ -186,8 +222,10 @@ export default {
 // the tree is read. Other special files (FIFOs, sockets, devices) contribute
 // their type only and are never opened, since reading one could block or have
 // side effects. Each entry is hashed as one JSON-framed record. The result
-// does not depend on listing or hashing order.
-export async function dependencyIdentity(dir, { concurrency = 32 } = {}) {
+// does not depend on listing or hashing order. When one file read fails, the
+// remaining in-flight reads are aborted and no further files are opened; the
+// first error is the one reported. `openFile` is a seam for tests.
+export async function dependencyIdentity(dir, { concurrency = 32, openFile = createReadStream } = {}) {
   const entries = [];
   async function walk(relative) {
     for (const name of (await readdir(join(dir, relative))).sort()) {
@@ -202,10 +240,12 @@ export async function dependencyIdentity(dir, { concurrency = 32 } = {}) {
   await walk('');
   const files = entries.filter((entry) => entry.fields === null);
   let next = 0;
+  const abort = new AbortController();
   async function worker() {
-    while (next < files.length) {
+    while (next < files.length && !abort.signal.aborted) {
       const entry = files[next++], hash = createHash('sha256');
-      await pipeline(createReadStream(join(dir, entry.path)), hash);
+      try { await pipeline(openFile(join(dir, entry.path)), hash, { signal: abort.signal }); }
+      catch (error) { abort.abort(); throw error; }
       entry.fields = ['f', entry.exec, hash.digest('hex')];
     }
   }
@@ -233,10 +273,11 @@ function releasePath(home, deployment) {
   if (!/^release-[a-zA-Z0-9]+$/.test(deployment?.release) || !/^[a-f0-9]{40}$/.test(deployment?.commit)) throw new Error('Invalid dev deployment record');
   const path = join(home, deployment.release); owned(path, true); return path;
 }
-export function processIdentity(pid) {
+export function processIdentity(pid, execute = run) {
   if (!Number.isSafeInteger(pid) || pid < 2) throw new Error('Invalid daemon PID');
   try {
-    const row = run('ps', ['-p', String(pid), '-o', 'stat=,lstart=,command=']).trim();
+    // -ww: never truncate the command line, which must match findOrphans' argv exactly.
+    const row = execute('ps', ['-p', String(pid), '-ww', '-o', 'stat=,lstart=,command=']).trim();
     const match = row.match(/^(\S+)\s+(.*)$/);
     // A terminated child may briefly remain as a zombie before its parent reaps it.
     return !match || match[1].startsWith('Z') ? '' : match[2];
@@ -294,7 +335,9 @@ export async function status(home, { relayStatus = remote } = {}) {
   let relay = null;
   try { if (existsSync(join(home, 'dev-pairing.json'))) relay = await relayStatus(validatePairing(read(join(home, 'dev-pairing.json')))); }
   catch (e) { error = [error, e.message].filter(Boolean).join('; '); }
-  const result = { environment: 'DEV', url: TARGET.url, home, port: TARGET.port, pid: daemon?.pid ?? null, commit: deployment?.commit ?? null, relay, ...(error ? { error } : {}), log: join(home, 'daemon.log') };
+  // Which provider logins the running daemon uses; null when stopped or recorded by an older start.
+  const logins = ['host', 'isolated'].includes(daemon?.logins) ? daemon.logins : null;
+  const result = { environment: 'DEV', url: TARGET.url, home, port: TARGET.port, pid: daemon?.pid ?? null, logins, commit: deployment?.commit ?? null, relay, ...(error ? { error } : {}), log: join(home, 'daemon.log') };
   console.log(JSON.stringify(result, null, 2));
   return result;
 }
@@ -315,6 +358,8 @@ export async function stop(home) {
   }
   throw new Error('DEV daemon did not stop in 10 seconds; refusing forced termination or teardown');
 }
+// POSIX single-quoted shell word: fully literal, including $, ` and \.
+export function shellQuote(value) { return `'${String(value).replaceAll("'", `'\\''`)}'`; }
 export async function deploy(home, options, deployWorker = wrangler) {
   if (running(home)) throw new Error('Run npm run dev:stop before deploying; UI and daemon must use the same snapshot');
   const source = realpathSync(resolve(options.source));
@@ -325,6 +370,8 @@ export async function deploy(home, options, deployWorker = wrangler) {
   if (/^120000 /m.test(tree)) throw new Error('Preview commits containing symlinks are not supported');
   const snapshot = mkdtempSync(join(home, 'release-'));
   let committed = false;
+  const unpruned = [];
+  let listingError = null;
   try {
     const archive = join(home, `archive-${randomUUID()}.tar`);
     try {
@@ -361,57 +408,118 @@ export async function deploy(home, options, deployWorker = wrangler) {
     save(join(home, 'deployment.json'), { release: snapshot.slice(home.length + 1), commit, source, dependencies });
     committed = true;
     // Only prune after the replacement record has been atomically published.
-    for (const name of readdirSync(home)) {
+    // From here the deploy has committed, so pruning is best-effort: a refused
+    // or failed directory is reported and skipped, never a deploy failure.
+    let names = [];
+    try { names = readdirSync(home); } catch (error) { listingError = error.message; }
+    for (const name of names) {
       if (!/^release-[a-zA-Z0-9]+$/.test(name) || join(home, name) === snapshot) continue;
-      const path = join(home, name); owned(path, true);
-      rmSync(path, { recursive: true });
+      const path = join(home, name);
+      try { owned(path, true); rmSync(path, { recursive: true }); } catch (error) { unpruned.push({ path, reason: error.message }); }
     }
   } finally { if (!committed) rmSync(snapshot, { recursive: true, force: true }); }
   console.log(`DEV deployed ${commit}\n${TARGET.url}\nNext: npm run dev:start`);
+  const current = snapshot.slice(home.length + 1);
+  if (listingError) console.warn(`Warning: DEV deployed, but superseded releases were not pruned: could not list ${home} (${listingError}). Remove every release-* directory there except ${current} by hand.`);
+  if (unpruned.length) {
+    console.warn(`Warning: DEV deployed, but ${unpruned.length} superseded release director${unpruned.length === 1 ? 'y was' : 'ies were'} not pruned; the deployment no longer uses ${unpruned.length === 1 ? 'it' : 'them'}. Remove by hand:`);
+    for (const { path, reason } of unpruned) console.warn(`  ${path} (${reason})\n    rm -rf ${shellQuote(path)}`);
+  }
 }
-// A copied rotating OAuth refresh token is not an independent login: one
-// installation can invalidate the other's copy. Authenticate dev separately.
+// Provider logins. By default the dev daemon uses this Mac's normal Claude and
+// Codex logins: CLAUDE_CONFIG_DIR and CODEX_HOME are left unset, so it is the
+// same provider installation a terminal session uses, not a copy of it. (On
+// macOS the Claude CLI keys its Keychain login by config directory, so a
+// private directory would need a second OAuth login.) `dev:start
+// --isolated-logins` instead points both at private directories in the dev
+// home, which need their own logins. Credentials are never copied either way:
+// a copied rotating OAuth refresh token is not an independent login, and one
+// installation can invalidate the other's copy. In the functions below a null
+// configDir means the host's default login.
+function withConfig(env, key, configDir) {
+  const out = { ...env };
+  if (configDir) out[key] = configDir; else delete out[key];
+  return out;
+}
 export function requireClaudeAuth(binary, configDir, env = process.env, execute = run) {
   if (env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_OAUTH_TOKEN) return;
   try {
-    const status = JSON.parse(execute(binary, ['auth', 'status', '--json'], {
-      env: { ...env, CLAUDE_CONFIG_DIR: configDir },
-    }));
+    const status = JSON.parse(execute(binary, ['auth', 'status', '--json'], { env: withConfig(env, 'CLAUDE_CONFIG_DIR', configDir) }));
     if (status.loggedIn === true) return;
   } catch { /* Never include provider output: it may contain credentials. */ }
-  throw new Error(`DEV Claude is not signed in. Run CLAUDE_CONFIG_DIR="${configDir}" "${binary}" auth login, then run npm run dev:start. Dev requires its own login; production OAuth credentials are never copied.`);
+  if (!configDir) throw new Error(`DEV Claude is not signed in: this Mac has no normal Claude CLI login. Run claude auth login (or "${binary}" auth login), then run npm run dev:start. DEV uses the host's own Claude login; credentials are never copied.`);
+  throw new Error(`DEV Claude is not signed in. Run CLAUDE_CONFIG_DIR="${configDir}" "${binary}" auth login, then run npm run dev:start -- --isolated-logins. Dev requires its own login; production OAuth credentials are never copied.`);
 }
 export function requireCodexAuth(binary, configDir, env = process.env, execute = run) {
   try {
     // login status is local credential inspection, never an inference/refresh call.
-    execute(binary, ['login', 'status'], { env: { ...env, CODEX_HOME: configDir } });
+    execute(binary, ['login', 'status'], { env: withConfig(env, 'CODEX_HOME', configDir) });
     return;
   } catch { /* Never include provider output: it may contain credentials. */ }
-  throw new Error(`DEV Codex is not signed in. Run CODEX_HOME="${configDir}" "${binary}" login, then run npm run dev:start. Dev requires its own login; production OAuth credentials are never copied.`);
+  if (!configDir) throw new Error(`DEV Codex is not signed in: this Mac has no normal Codex login. Run "${binary}" login, then run npm run dev:start. DEV uses the host's own Codex login; credentials are never copied.`);
+  throw new Error(`DEV Codex is not signed in. Run CODEX_HOME="${configDir}" "${binary}" login, then run npm run dev:start -- --isolated-logins. Dev requires its own login; production OAuth credentials are never copied.`);
+}
+// The dev Codex login is optional (#69): without it DEV still starts, and only
+// Codex sessions are unavailable. Returns the one-line notice, or null when signed in.
+export function codexLoginNotice(binary, configDir, env = process.env, execute = run) {
+  let missing = false;
+  const probe = (...args) => { try { return execute(...args); } catch (error) { if (error?.code === 'ENOENT') missing = true; throw error; } };
+  try { requireCodexAuth(binary, configDir, env, probe); return null; } catch { /* binary missing or not signed in */ }
+  if (!configDir) {
+    const restart = 'then restart dev (npm run dev:stop && npm run dev:start).';
+    if (missing) return `Notice: the Codex CLI (${binary}) is not installed, so Codex sessions are unavailable in DEV. To enable them install the Codex CLI, run ${binary} login, ${restart}`;
+    return `Notice: Codex is not signed in on this Mac, so Codex sessions are unavailable in DEV. To enable them run ${binary} login, ${restart}`;
+  }
+  const restart = 'then restart dev (npm run dev:stop && npm run dev:start -- --isolated-logins).';
+  if (missing) return `Notice: the Codex CLI (${binary}) is not installed, so Codex sessions are unavailable in DEV. To enable them install the Codex CLI, run CODEX_HOME="${configDir}" ${binary} login, ${restart}`;
+  return `Notice: DEV Codex is not signed in, so Codex sessions are unavailable in DEV. To enable them run CODEX_HOME="${configDir}" ${binary} login, ${restart}`;
+}
+// The dev daemon's environment. FOREMAN_HOME routes the Claude hook records
+// (hooks/foreman-hook) of sessions it launches to the dev home: the SDK passes
+// the daemon's environment to Claude, and Claude to its hooks. The Codex hook
+// command installed in ~/.codex/hooks.json pins FOREMAN_HOME to production, so
+// FOREMAN_HOOK_HOME, which hooks/codex-hook.mjs prefers, carries the dev home
+// past it. Provider config directories are set only for isolated logins;
+// otherwise any inherited value is removed so the host default applies.
+export function daemonEnvironment(home, { port = TARGET.port, token, isolatedLogins = false, env = process.env } = {}) {
+  const out = { ...env, FOREMAN_HOME: home, FOREMAN_HOOK_HOME: home, FOREMAN_PORT: String(port), FOREMAN_RELAY_URL: TARGET.url, FOREMAN_HOST_TOKEN: token };
+  delete out.CLAUDE_CONFIG_DIR; delete out.CODEX_HOME;
+  if (isolatedLogins) Object.assign(out, { CLAUDE_CONFIG_DIR: join(home, 'claude'), CODEX_HOME: join(home, 'codex') });
+  return out;
 }
 // Terminate a child this process spawned (and still holds the handle to) and
 // prove it exited. Used only for a daemon whose record was never promoted.
-async function terminateChild(child) {
+async function terminateChild(child, { term = 10000, kill = 5000 } = {}) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const exit = new Promise((resolve) => child.once('exit', () => resolve(true)));
   const within = (ms) => Promise.race([exit, delay(ms, false, { ref: false })]);
   child.kill('SIGTERM');
-  if (await within(10000)) return;
+  if (await within(term)) return;
   child.kill('SIGKILL');
-  if (await within(5000)) return;
+  if (await within(kill)) return;
+  // Release the handle so this process can exit and report the error instead of
+  // waiting on a child that may never exit (#47). Its stdio is a file, not pipes.
+  child.unref();
   throw new Error(`DEV daemon PID ${child.pid} did not exit after a failed start; its startup record is kept for npm run dev:stop`);
 }
 const redeploy = 'reinstall matching dependencies and run npm run dev:deploy again';
-export async function verifyDependencies(snapshot, deployment) {
+export async function verifyDependencies(snapshot, deployment, identify = dependencyIdentity) {
   const recorded = deployment.dependencies;
   if (typeof recorded?.realpath !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(recorded?.identity ?? '')) throw new Error('Dev deployment has no installed-dependency record (deployed by an older workflow); run npm run dev:deploy again');
   let linked;
   try { linked = realpathSync(join(snapshot, 'node_modules')); } catch { linked = null; }
   if (linked !== recorded.realpath) throw new Error(`Snapshot node_modules resolves to ${linked ?? 'nothing'}, not the deployed ${recorded.realpath}; ${redeploy}`);
-  const identity = await dependencyIdentity(linked);
+  let identity;
+  // Unreadable entries, a node_modules link resolving to a regular file, or an
+  // entry removed mid-walk: refuse with the recovery step, keeping the cause.
+  try { identity = await identify(linked); }
+  catch (error) {
+    const detail = [error?.code, error?.path].filter(Boolean).join(' ') || error?.message || String(error);
+    throw Object.assign(new Error(`Could not read installed dependencies at ${linked} (${detail}); ${redeploy}`, { cause: error }), { code: error?.code, path: error?.path });
+  }
   if (identity !== recorded.identity) throw new Error(`Installed dependencies changed since deploy (${linked}: ${identity} != deployed ${recorded.identity}); ${redeploy}`);
 }
-export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500 } = {}) {
+export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500, spawnChild = spawn, exitGrace, identify, isolatedLogins = false } = {}) {
   const current = inspect(home);
   if (current.daemon?.state === 'starting') throw new Error(`DEV daemon PID ${current.daemon.pid} was left by an interrupted start; run npm run dev:stop first`);
   if (current.daemon) throw new Error('DEV daemon already running; use dev:status or dev:stop');
@@ -420,19 +528,24 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
   const deployment = read(join(home, 'deployment.json'));
   const snapshot = releasePath(home, deployment);
   // Before any spawn: the snapshot must still run against the exact installed tree deployed.
-  await verifyDependencies(snapshot, deployment);
+  await verifyDependencies(snapshot, deployment, identify);
   const pair = validatePairing(read(join(home, 'dev-pairing.json')));
   const relay = await relayStatus(pair);
   if (relay.commit !== deployment.commit) throw new Error('Deployed Worker does not match the local snapshot; redeploy before starting');
   if (relay.relay.online) throw new Error('Another dev host is connected; refusing to replace it');
   await (checkPort ?? (() => freePort(port)))();
-  for (const dir of ['claude', 'codex']) {
+  // Isolated logins only: private provider directories inside the dev home.
+  // By default nothing is created there and the host's normal logins are used.
+  if (isolatedLogins) for (const dir of ['claude', 'codex']) {
     const path = join(home, dir);
     if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
     owned(path, true);
   }
-  requireCodexAuth('codex', join(home, 'codex'), process.env, execute);
-  requireClaudeAuth(join(snapshot, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude'), join(home, 'claude'), process.env, execute);
+  const claudeDir = isolatedLogins ? join(home, 'claude') : null, codexDir = isolatedLogins ? join(home, 'codex') : null;
+  // Claude is required; Codex is optional and only reported.
+  requireClaudeAuth(join(snapshot, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude'), claudeDir, process.env, execute);
+  const codexNotice = codexLoginNotice('codex', codexDir, process.env, execute);
+  if (codexNotice) console.warn(codexNotice);
   const entry = join(home, 'run.mjs');
   if (existsSync(entry)) owned(entry);
   writeFileSync(entry, `console.log('FOREMAN DEV ${deployment.commit}');\nawait import(${JSON.stringify(pathToFileURL(join(snapshot, 'server/main.ts')).href)});\n`, { mode: 0o600 });
@@ -446,10 +559,9 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
   try {
     const log = openSync(logPath, 'w', 0o600);
     try {
-      child = spawn(process.execPath, ['--experimental-strip-types', entry, id], {
+      child = spawnChild(process.execPath, ['--experimental-strip-types', entry, id], {
         cwd: snapshot, detached: true, stdio: ['ignore', log, log],
-        env: { ...process.env, FOREMAN_HOME: home, FOREMAN_PORT: String(port), FOREMAN_RELAY_URL: TARGET.url, FOREMAN_HOST_TOKEN: pair.token,
-          CLAUDE_CONFIG_DIR: join(home, 'claude'), CODEX_HOME: join(home, 'codex') },
+        env: daemonEnvironment(home, { port, token: pair.token, isolatedLogins }),
       });
     } finally { closeSync(log); }
     await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
@@ -459,11 +571,11 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
     throw error;
   }
   try {
-    saveRecord(daemonFile, { id, pid: child.pid, identity: processIdentity(child.pid), state: 'running' });
+    saveRecord(daemonFile, { id, pid: child.pid, identity: processIdentity(child.pid), state: 'running', logins: isolatedLogins ? 'isolated' : 'host' });
   } catch (error) {
     // Never leave an untracked daemon: stop the child we hold, prove its exit,
     // and only then discard the intent record.
-    await terminateChild(child);
+    await terminateChild(child, exitGrace);
     rmSync(daemonFile, { force: true });
     throw error;
   }
@@ -491,6 +603,9 @@ export async function deleteDevWorker(headers, fetcher = fetch) {
 }
 function wranglerAuth(home) { return JSON.parse(run(process.execPath, [join(root, 'node_modules/wrangler/bin/wrangler.js'), 'auth', 'token', '--json'], { cwd: home })); }
 export async function destroy(home, { readAuth = wranglerAuth, deleter = deleteDevWorker } = {}) {
+  // Only ever remove a verified dev home: never a provider directory such as
+  // ~/.claude or ~/.codex, which dev shares with the host by default.
+  if (!existsSync(home) || openHome(dirname(home), false) !== home) throw new Error(`Refusing to destroy ${home}: not the dev home`);
   await stop(home);
   let auth;
   try { auth = await readAuth(home); }
@@ -553,7 +668,7 @@ export async function main(args = process.argv.slice(2)) {
   const releaseLock = acquireLock(home);
   try {
     if (options.command === 'deploy') await deploy(home, options);
-    if (options.command === 'start') await start(home);
+    if (options.command === 'start') await start(home, { isolatedLogins: options.isolatedLogins === true });
     if (options.command === 'status') await status(home);
     if (options.command === 'stop') await stop(home);
     if (options.command === 'destroy') await destroy(home);
