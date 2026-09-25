@@ -5,6 +5,9 @@
 # Depends on jq only. Never exits non-zero (a failing hook must not disturb the session).
 set -u
 EVENT="${1:-unknown}"
+# Story #121: a hook fired by a process under `node --test` (NODE_TEST_CONTEXT is inherited) records
+# only into an explicit FOREMAN_HOME, never the default ~/.foreman.
+[ -n "${NODE_TEST_CONTEXT:-}" ] && [ -z "${FOREMAN_HOME:-}" ] && exit 0
 ROOT="${FOREMAN_HOME:-$HOME/.foreman}"
 DIR="$ROOT/sessions"
 mkdir -p "$DIR" 2>/dev/null || exit 0

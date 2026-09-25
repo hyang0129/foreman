@@ -1,3 +1,5 @@
+// Pin FOREMAN_HOME to a temp dir before any server module loads (story #121 guard).
+import './fixtures/temp-foreman-home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { bindPeerTools, peerMessageId, preparePeerTools, type PeerService, type PeerSource } from '../server/peer-tools.ts';
