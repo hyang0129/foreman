@@ -160,6 +160,39 @@ test('many processes starting at once compile the helper exactly once', { timeou
   assert.deepEqual(readdirSync(s.cacheDir).filter((f) => f.startsWith('.') || f.endsWith('.lock')), [], 'no temp files or locks left behind');
 });
 
+test('a lock left by a dead compiler is broken at once and every waiter gets the helper', { timeout: 60_000 }, async () => {
+  const s = setup();
+  const cc = fakeCompiler(s.dir, { sleep: 1 });
+  // Learn the cache key's file name from a throwaway cache, then plant a lock whose holder is dead.
+  const name = buildProcessHelper({ cacheDir: join(s.dir, 'probe'), source: s.source, compiler: cc.path }).split('/').pop()!;
+  const dead = spawn(process.execPath, ['-e', '']); await once(dead, 'exit');
+  mkdirSync(s.cacheDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(s.cacheDir, `${name}.lock`), String(dead.pid));
+  const module = new URL('../server/process-tree.ts', import.meta.url).href;
+  const script = `import { buildProcessHelper } from ${JSON.stringify(module)};
+    process.stdout.write(buildProcessHelper({ cacheDir: ${JSON.stringify(s.cacheDir)}, source: ${JSON.stringify(s.source)}, compiler: ${JSON.stringify(cc.path)}, compileTimeoutMs: 20_000 }));`;
+  const started = Date.now();
+  const results = await Promise.all(Array.from({ length: 6 }, async () => {
+    const child = spawn(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    child.stdout.on('data', (c) => { out += c; }); child.stderr.on('data', (c) => { err += c; });
+    const [code] = await once(child, 'exit');
+    return { code, out, err };
+  }));
+  for (const r of results) assert.equal(r.code, 0, r.err);
+  assert.equal(new Set(results.map((r) => r.out)).size, 1);
+  assert.ok(Date.now() - started < 20_000, 'did not wait out the stale-lock age');
+  assert.deepEqual(readdirSync(s.cacheDir).filter((f) => f.endsWith('.lock')), []);
+});
+
+test('a non-directory squatting the cache path falls back to a private build', () => {
+  const s = setup();
+  writeFileSync(s.cacheDir, 'not a directory');
+  const helper = buildProcessHelper({ cacheDir: s.cacheDir, source: s.source, run: runner() });
+  assert.ok(!helper.startsWith(s.cacheDir), helper);
+  assert.equal(readFileSync(s.cacheDir, 'utf8'), 'not a directory');
+});
+
 test('macOS: the real helper compiles with cc once and the cached binary is reused', { skip: process.platform !== 'darwin', timeout: 120_000 }, () => {
   const s = setup();
   const source = new URL('../server/process-table-darwin.c', import.meta.url).pathname;

@@ -80,12 +80,21 @@ function sleepSync(ms: number) { Atomics.wait(new Int32Array(new SharedArrayBuff
 
 /** A private directory we own: not a symlink, and no group/other access. */
 function privateDir(dir: string) {
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const stat = lstatSync(dir);
-  const uid = process.getuid?.();
-  if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) return false;
-  if (stat.mode & 0o077) chmodSync(dir, 0o700);
-  return true;
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stat = lstatSync(dir);
+    const uid = process.getuid?.();
+    if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) return false;
+    if (stat.mode & 0o077) chmodSync(dir, 0o700);
+    return true;
+  } catch { return false; } // e.g. a file or dangling symlink squats the path: fall back, don't fail
+}
+/** The lock names a holder that no longer exists (an empty or unreadable lock is not proof). */
+function holderDead(lock: string) {
+  let pid = 0;
+  try { pid = Number(readFileSync(lock, 'utf8')); } catch { return false; }
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
 }
 /** Reuse only a regular, non-empty file we own that nobody else can modify. */
 function trustedBinary(file: string) {
@@ -112,7 +121,7 @@ function cachedBinary(dir: string, compiler: string, source: string, budget: num
   const key = createHash('sha256').update(readFileSync(source)).update(`\0${compiler}\0${process.arch}\0${release()}\0-O2 -Wall -Werror`).digest('hex').slice(0, 32);
   const target = join(dir, `process-table-${key}`);
   const lock = `${target}.lock`;
-  const deadline = Date.now() + budget + LOCK_GRACE_MS;
+  let deadline = Date.now() + budget + LOCK_GRACE_MS;
   for (;;) {
     if (!replace && trustedBinary(target)) return { target, fresh: false };
     let fd: number | undefined;
@@ -130,7 +139,11 @@ function cachedBinary(dir: string, compiler: string, source: string, budget: num
     // waiters racing to break it can at worst compile twice, which is still safe.
     let age = 0;
     try { age = Date.now() - lstatSync(lock).mtimeMs; } catch { continue; }
-    if (age > budget + LOCK_GRACE_MS) { try { unlinkSync(lock); } catch {} continue; }
+    if (age > budget + LOCK_GRACE_MS || holderDead(lock)) {
+      // Waiting on a stale lock was not waiting on a compile: give the next holder a full budget.
+      try { unlinkSync(lock); } catch {}
+      deadline = Date.now() + budget + LOCK_GRACE_MS; continue;
+    }
     if (Date.now() > deadline) throw new ProcessHelperError('timeout', 'compile',
       `Waiting for another process to compile the macOS process identity helper timed out after ${seconds(budget + LOCK_GRACE_MS)} (machine under heavy load?)`);
     sleepSync(LOCK_POLL_MS);
