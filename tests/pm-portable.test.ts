@@ -129,7 +129,7 @@ type Launch = { closed: boolean; consumed: string[]; prompt: string; options: an
  * The provider answers "what is <project> blocked on?" from the memory block in its system prompt,
  * and holds any input containing HOLD until `release()` (or until it is closed).
  */
-function daemon(t: any, relay: FakeRelay, dir: string, name: string, options: { rpcTimeoutMs?: number } = {}) {
+function daemon(t: any, relay: FakeRelay, dir: string, name: string, options: { rpcTimeoutMs?: number; autoStart?: boolean } = {}) {
   const identity = loadMachineIdentity({ home: dir, env: { FOREMAN_MACHINE_NAME: name } });
   const sockets: FakeSocket[] = [];
   let store: InstanceType<typeof RelayPmStore> | undefined;
@@ -169,7 +169,7 @@ function daemon(t: any, relay: FakeRelay, dir: string, name: string, options: { 
       },
     };
   };
-  pm.attach(store, { bridge });
+  pm.attach(store, { bridge, autoStart: options.autoStart });
   bridge.start();
   const h = {
     name, identity, bridge, store, pm, sockets, launches,
@@ -391,6 +391,105 @@ test('local-only mode: a restart mid-turn reports one uncertain entry, with no r
   assert.deepEqual(store.uncertainTurns(), [], 'acknowledged');
   const third = run(new LocalPmStore({ identity, home: dir, log: () => {} }));
   assert.equal(third.pm.history().length, 0, 'shown once');
+});
+
+// ---- #115: move races around send dispatch --------------------------------------------------
+
+function spyEnds(h: ReturnType<typeof daemon>) {
+  const ends: [string, string][] = [];
+  const end = h.store.endTurn.bind(h.store);
+  h.store.endTurn = (id: string, outcome: any) => { ends.push([id, outcome]); return end(id, outcome); };
+  return ends;
+}
+
+test('#115: a send whose epoch changes across beginTurn (A→B→A) is not dispatched, and the relay\'s "moved" entry stands', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const A = daemon(t, relay, home('machine-a', '## p\nx\n'), 'machine-a');
+  await A.connect(); await until(() => A.launches.length === 1, 'A started its PM');
+  const B = daemon(t, relay, home('machine-b'), 'machine-b');
+  await B.connect();
+  const ends = spyEnds(A);
+  // The DO records the turn at epoch 1; the PM then moves to B and back to A (epoch 3) before
+  // A receives the ack.
+  let turnId = '';
+  relay.swallow = (frame) => {
+    if (frame.op !== 'turn.begin') return false;
+    relay.swallow = null;
+    turnId = frame.args.turn_id;
+    const parsed = parsePmRpc(frame);
+    assert.ok(parsed.ok);
+    const ack = (relay as any).apply(parsed.value, A.identity.machine_id);
+    relay.reassign(B.identity.machine_id);
+    relay.reassign(A.identity.machine_id);
+    setTimeout(() => A.sockets.at(-1)!.receive(ack), 50);
+    return true;
+  };
+  await assert.rejects(A.pm.send('must not be dispatched'), /^Error: The PM was moved while your message was being sent\. It was not delivered; send it again\.$/);
+  await until(() => A.launches.length === 2, 'A restarted its PM at epoch 3');
+  await tick(); await tick();
+  for (const launch of A.launches) assert.ok(!launch.consumed.includes('must not be dispatched'), 'never dispatched');
+  assert.deepEqual(A.pm.outstandingTurnIds(), []);
+  assert.equal(A.pm.history().some((e) => e.role === 'user'), false, 'not recorded as sent');
+  // The relay reported it as reassigned; A shows exactly that entry, and never ends it as completed.
+  assert.equal(A.uncertain().length, 1);
+  assert.match(A.uncertain()[0]!, /could not be confirmed \(the PM was moved\)\. It was not replayed\./);
+  assert.equal(ends.some(([id, outcome]) => id === turnId && outcome === 'completed'), false);
+  await until(() => !relay.turns.has(turnId), 'A acknowledged the uncertain turn');
+  // The PM keeps working at the new epoch.
+  await A.pm.send('after the round trip');
+  await until(() => A.answers().length === 1);
+  assert.deepEqual(A.launches[1]!.consumed, ['after the round trip']);
+});
+
+test('#115: a move while the provider is being launched for a send: nothing is recorded or dispatched, the developer is told, and the new host shows no entry', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  // A is the PM host but its provider is not running yet: the next send launches it.
+  const A = daemon(t, relay, home('machine-a', '## p\nx\n'), 'machine-a', { autoStart: false });
+  await A.connect();
+  await until(() => relay.imports.length === 1, 'A imported its memory');
+  await tick();
+  const B = daemon(t, relay, home('machine-b'), 'machine-b');
+  await B.connect();
+  assert.equal(A.launches.length, 0);
+  // The developer moves the PM to B while A reads memory to launch the provider for this send.
+  let armed = true;
+  relay.swallow = (frame) => {
+    if (armed && frame.op === 'memory.get') { armed = false; relay.reassign(B.identity.machine_id); }
+    return false;
+  };
+  await assert.rejects(A.pm.send('sent during the move'), /^Error: The PM was moved to machine-b while your message was being sent\. It was not delivered; send it again there\.$/);
+  assert.equal(armed, false, 'the move happened during the launch');
+  await until(() => B.launches.length === 1, 'B started its PM');
+  await tick(); await tick();
+  assert.equal(relay.frames.some((f) => f.frame.op === 'turn.begin'), false, 'no turn was recorded for it');
+  assert.equal(relay.turns.size, 0);
+  assert.deepEqual(B.uncertain(), [], 'B shows no "could not be confirmed" entry for a message that was never dispatched');
+  assert.deepEqual(B.pm.history(), []);
+  assert.equal(A.launches.length, 0);
+  assert.equal(A.pm.history().some((e) => e.role === 'user'), false);
+});
+
+test('#115: deactivation never ends an in-flight input as completed; the relay reconciles it and the new host reports it', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const A = daemon(t, relay, home('machine-a', '## p\nx\n'), 'machine-a');
+  await A.connect(); await until(() => A.launches.length === 1);
+  const B = daemon(t, relay, home('machine-b'), 'machine-b');
+  await B.connect();
+  const ends = spyEnds(A);
+  await A.pm.send('HOLD: in flight'); await until(() => A.launches[0]!.consumed.length === 1);
+  const inFlight = A.pm.outstandingTurnIds()[0]!;
+  relay.reassign(B.identity.machine_id);
+  await until(() => A.launches[0]!.closed, 'A closed its PM');
+  A.release(); await tick(); await tick();
+  assert.deepEqual(ends, [], 'A sends no outcome for the in-flight input');
+  assert.equal(relay.frames.some((f) => f.machine_id === A.identity.machine_id && f.frame.op === 'turn.end'), false);
+  assert.deepEqual(A.pm.outstandingTurnIds(), []);
+  await until(() => B.uncertain().length === 1, 'B reports the reassigned turn');
+  assert.match(B.uncertain()[0]!, /could not be confirmed \(the PM was moved\)/);
+  await until(() => !relay.turns.has(inFlight), 'B acknowledged it');
 });
 
 // Never two PMs (plan default 5): local-only mode only when no relay is configured at all. A
