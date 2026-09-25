@@ -3,6 +3,12 @@ import { join } from 'node:path';
 import WebSocket from 'ws';
 import { FOREMAN_HOME, HOST } from './paths.ts';
 import { allowedRequest, MAX_BODY, MAX_RESPONSE, MAX_REQUEST_FRAME, type RelayRequest } from '../shared/relay.ts';
+import { parseNotifyFrame, type NotifyFrame } from '../shared/notify.ts';
+
+// Frames held while the relay socket is down: at most this many, none older than this. The relay
+// de-duplicates by frame id, so flushing a frame that also went out before a drop is harmless.
+export const NOTIFY_QUEUE_LIMIT = 20;
+export const NOTIFY_QUEUE_MAX_AGE_MS = 5 * 60_000;
 
 export interface BridgeConfig { url: string; token: string }
 export function readBridgeConfig(): BridgeConfig | null {
@@ -27,6 +33,7 @@ export class HostBridge {
   private attempts = 0;
   private lastPong = 0;
   private inFlight = 0;
+  private notifyQueue: { raw: string; kind: string; queuedAt: number }[] = [];
   private port: number;
   private config: BridgeConfig;
   private localToken?: string;
@@ -47,6 +54,7 @@ export class HostBridge {
       this.attempts = 0; this.lastPong = Date.now();
       console.log('foreman: cloud relay connected');
       socket.send(JSON.stringify({ type: 'hello', host: HOST }));
+      this.flushNotify(socket);
       this.heartbeat = setInterval(() => {
         if (Date.now() - this.lastPong > 60_000) { socket.terminate(); return; }
         if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping' }));
@@ -96,10 +104,44 @@ export class HostBridge {
     } catch { reply(502, JSON.stringify({ error: 'Local host request failed; refresh to check whether work was accepted before retrying.' })); }
     finally { this.inFlight--; }
   }
-  close() { this.stopped = true; clearTimeout(this.reconnect); clearInterval(this.heartbeat); this.socket?.close(1000, 'Host stopping'); }
+  // Send one notify frame to the relay, or hold it until the next open. Validated with the shared
+  // contract first; an invalid frame is dropped. Never throws, and never logs more than the kind.
+  notify(frame: NotifyFrame): void {
+    try {
+      if (this.stopped) return;
+      const valid = parseNotifyFrame(frame);
+      if (!valid) { console.error('foreman: dropped invalid notify frame'); return; }
+      const entry = { raw: JSON.stringify(valid), kind: valid.kind, queuedAt: Date.now() };
+      const socket = this.socket;
+      if (socket && socket.readyState === WebSocket.OPEN && this.sendNotify(socket, entry)) return;
+      this.pruneNotify();
+      this.notifyQueue.push(entry);
+      if (this.notifyQueue.length > NOTIFY_QUEUE_LIMIT) this.notifyQueue.splice(0, this.notifyQueue.length - NOTIFY_QUEUE_LIMIT);
+    } catch {
+      console.error('foreman: notify failed');
+    }
+  }
+  private sendNotify(socket: WebSocket, entry: { raw: string; kind: string }): boolean {
+    try { socket.send(entry.raw); return true; }
+    catch { console.error('foreman: notify send failed', JSON.stringify({ kind: entry.kind })); return false; }
+  }
+  private pruneNotify() {
+    const cutoff = Date.now() - NOTIFY_QUEUE_MAX_AGE_MS;
+    this.notifyQueue = this.notifyQueue.filter((entry) => entry.queuedAt >= cutoff);
+  }
+  private flushNotify(socket: WebSocket) {
+    this.pruneNotify();
+    while (this.notifyQueue.length && socket.readyState === WebSocket.OPEN) {
+      if (!this.sendNotify(socket, this.notifyQueue[0]!)) return;
+      this.notifyQueue.shift();
+    }
+  }
+  close() { this.stopped = true; this.notifyQueue = []; clearTimeout(this.reconnect); clearInterval(this.heartbeat); this.socket?.close(1000, 'Host stopping'); }
 }
 
-export function startHostBridge(port: number, localToken?: string): { close(): void } {
+// Existing callers keep `{ close() }`; `notify` is present only when a relay is configured, so its
+// presence is how callers tell cloud mode from local-only mode.
+export function startHostBridge(port: number, localToken?: string): { close(): void; notify?: (frame: NotifyFrame) => void } {
   try { const config = readBridgeConfig(); return config ? new HostBridge(port, config, { localToken }).start() : { close() {} }; }
   catch (error) { console.error('foreman: cloud bridge configuration error:', (error as Error).message); return { close() {} }; }
 }
