@@ -310,6 +310,7 @@ export async function deploy(home, options, deployWorker = wrangler) {
   if (/^120000 /m.test(tree)) throw new Error('Preview commits containing symlinks are not supported');
   const snapshot = mkdtempSync(join(home, 'release-'));
   let committed = false;
+  const unpruned = [];
   try {
     const archive = join(home, `archive-${randomUUID()}.tar`);
     try {
@@ -345,13 +346,19 @@ export async function deploy(home, options, deployWorker = wrangler) {
     save(join(home, 'deployment.json'), { release: snapshot.slice(home.length + 1), commit, source, dependencies });
     committed = true;
     // Only prune after the replacement record has been atomically published.
+    // From here the deploy has committed, so pruning is best-effort: a refused
+    // or failed directory is reported and skipped, never a deploy failure.
     for (const name of readdirSync(home)) {
       if (!/^release-[a-zA-Z0-9]+$/.test(name) || join(home, name) === snapshot) continue;
-      const path = join(home, name); owned(path, true);
-      rmSync(path, { recursive: true });
+      const path = join(home, name);
+      try { owned(path, true); rmSync(path, { recursive: true }); } catch (error) { unpruned.push({ path, reason: error.message }); }
     }
   } finally { if (!committed) rmSync(snapshot, { recursive: true, force: true }); }
   console.log(`DEV deployed ${commit}\n${TARGET.url}\nNext: npm run dev:start`);
+  if (unpruned.length) {
+    console.warn(`Warning: DEV deployed, but ${unpruned.length} superseded release director${unpruned.length === 1 ? 'y was' : 'ies were'} not pruned; the deployment no longer uses ${unpruned.length === 1 ? 'it' : 'them'}. Remove by hand:`);
+    for (const { path, reason } of unpruned) console.warn(`  ${path} (${reason})\n    rm -rf ${JSON.stringify(path)}`);
+  }
 }
 // A copied rotating OAuth refresh token is not an independent login: one
 // installation can invalidate the other's copy. Authenticate dev separately.
