@@ -210,3 +210,57 @@ test('orphan lookup ignores other users and rows whose live identity does not ma
   assert.throws(() => findOrphans(f.home, 'not-a-uuid'), /Invalid daemon id/);
   assert.equal(alive(child.pid), true);
 });
+
+test('a start whose unconfirmed child survives SIGKILL reports the error and exits instead of hanging (#47)', async (t) => {
+  const f = fixture(t), port = await injectedPort(), pidFile = join(f.dir, 'stuck-pid');
+  const driver = join(f.dir, 'stuck-driver.mjs');
+  // The child is real but its kill() is a no-op, simulating a process that
+  // never exits after SIGTERM or SIGKILL. The driver never calls process.exit:
+  // it can only terminate once nothing holds its event loop open.
+  writeFileSync(driver, `import { writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+const [scriptUrl, home, commit, port, pidFile] = process.argv.slice(2);
+const { start } = await import(scriptUrl);
+const signals = [];
+try {
+  await start(home, {
+    relayStatus: async () => ({ commit, relay: { online: false } }), checkPort: async () => {}, execute: () => '{"loggedIn":true}', port: Number(port),
+    exitGrace: { term: 50, kill: 50 },
+    spawnChild: (...args) => { const child = spawn(...args); child.kill = (signal) => { signals.push(signal); return true; }; return child; },
+    saveRecord: (path, value) => {
+      if (value.state === 'running') { writeFileSync(pidFile, String(value.pid)); throw new Error('injected promotion failure'); }
+      writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+    },
+  });
+} catch (error) { console.error('START FAILED: ' + error.message + ' signals=' + signals.join(',')); }
+`);
+  const starter = spawn(process.execPath, [driver, script, f.home, commit, String(port), pidFile], { stdio: ['ignore', 'ignore', 'pipe'], env: cleanEnv() });
+  t.after(() => { if (starter.exitCode === null && starter.signalCode === null) starter.kill('SIGKILL'); });
+  let stderr = ''; starter.stderr.on('data', (d) => { stderr += d; });
+  let timer;
+  const exited = await Promise.race([once(starter, 'exit').then(() => true), new Promise((resolve) => { timer = setTimeout(resolve, 8000, false); })]);
+  clearTimeout(timer);
+  const pid = Number(readFileSync(pidFile, 'utf8'));
+  const record = JSON.parse(readFileSync(f.daemonFile, 'utf8'));
+  reap(t, pid, ` ${f.entry} ${record.id}`);
+  // The mechanism ran: both signals were attempted and the child really outlived them.
+  assert.match(stderr, new RegExp(`START FAILED: DEV daemon PID ${pid} did not exit after a failed start; .* signals=SIGTERM,SIGKILL`));
+  assert.equal(alive(pid), true);
+  assert.equal(exited, true, `start hung holding the child handle after reporting: ${stderr}`);
+  assert.equal(starter.exitCode, 0, stderr);
+  // The startup record is kept for dev:stop, which still finds and stops the daemon.
+  assert.equal(record.state, 'starting');
+  await until(() => existsSync(join(f.home, 'daemon-ready')), 'daemon readiness');
+  const { output } = await captureLog(() => stop(f.home));
+  assert.equal(output, 'DEV daemon stopped');
+  await until(() => !alive(pid), 'daemon exit');
+});
+
+test('processIdentity asks ps for an untruncated command line (-ww), like findOrphans (#47)', () => {
+  const calls = [];
+  const identity = processIdentity(process.pid, (bin, args) => { calls.push([bin, args]); return 'S    Thu Sep 24 10:00:00 2026 /usr/bin/node run.mjs\n'; });
+  assert.equal(identity, 'Thu Sep 24 10:00:00 2026 /usr/bin/node run.mjs');
+  assert.deepEqual(calls, [['ps', ['-p', String(process.pid), '-ww', '-o', 'stat=,lstart=,command=']]]);
+  // The real ps with -ww still yields this process's identity.
+  assert.ok(processIdentity(process.pid).includes(process.execPath));
+});

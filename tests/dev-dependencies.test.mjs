@@ -3,11 +3,12 @@
 // daemon record writer are injected, and no daemon is ever spawned.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync, symlinkSync, cpSync, chmodSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync, symlinkSync, cpSync, chmodSync, unlinkSync, createReadStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { deploy, start, openHome, dependencyIdentity } from '../scripts/dev-environment.mjs';
+import { Readable } from 'node:stream';
+import { deploy, start, openHome, dependencyIdentity, verifyDependencies } from '../scripts/dev-environment.mjs';
 
 function fixture(t) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-dev-deps-')));
@@ -155,4 +156,74 @@ test('identity frames every variable-length field, so crafted symlink targets an
   symlinkSync('t\n"z" l u', join(e, 'x'));
   symlinkSync('t', join(g, 'x')); symlinkSync('u', join(g, 'z'));
   assert.notEqual(await dependencyIdentity(e), await dependencyIdentity(g));
+});
+
+// Read errors during verification (#50): refuse before spawning with the
+// recovery step, keeping the original code and path as detail and cause.
+const unreadable = (code, path) => new RegExp(`Could not read installed dependencies at .*\\(${code} ${path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\); reinstall matching dependencies and run npm run dev:deploy again$`);
+
+test('start refuses before spawning with an actionable message when an installed file is unreadable', { skip: process.getuid?.() === 0 && 'root ignores file permissions' }, async (t) => {
+  const f = await deployed(t), p = probe(f), file = join(f.modules, 'pkg/lib/index.js');
+  // Restored in finally: the fixture's cleanup hook runs first and needs access.
+  chmodSync(file, 0o000);
+  let error;
+  try { error = await start(f.home, p.options).then(() => assert.fail('start resolved'), (e) => e); }
+  finally { chmodSync(file, 0o644); }
+  assert.match(error.message, unreadable('EACCES', file));
+  assert.equal(error.code, 'EACCES'); assert.equal(error.path, file);
+  assert.equal(error.cause?.code, 'EACCES');
+  p.neverSpawned();
+});
+
+test('start refuses before spawning with an actionable message when an installed directory is unreadable', { skip: process.getuid?.() === 0 && 'root ignores file permissions' }, async (t) => {
+  const f = await deployed(t), p = probe(f), directory = join(f.modules, 'pkg/lib');
+  chmodSync(directory, 0o000);
+  try { await assert.rejects(start(f.home, p.options), unreadable('EACCES', directory)); }
+  finally { chmodSync(directory, 0o755); }
+  p.neverSpawned();
+});
+
+test('start refuses before spawning with an actionable message when node_modules resolves to a regular file', async (t) => {
+  const f = await deployed(t), p = probe(f);
+  // Same realpath as deployed, so only the identity read can refuse it.
+  rmSync(f.modules, { recursive: true }); writeFileSync(f.modules, 'not a directory');
+  assert.equal(realpathSync(join(f.snapshot, 'node_modules')), f.deployment.dependencies.realpath);
+  const error = await start(f.home, p.options).then(() => assert.fail('start resolved'), (e) => e);
+  assert.match(error.message, unreadable('ENOTDIR', f.modules));
+  assert.equal(error.cause?.code, 'ENOTDIR');
+  p.neverSpawned();
+});
+
+test('start refuses before spawning with an actionable message when a file is removed mid-walk', async (t) => {
+  const f = await deployed(t), p = probe(f), removed = join(f.modules, 'pkg/package.json');
+  let opened = 0;
+  // Sequential hashing; the first file opened removes a later one after the walk listed it.
+  const identify = (dir) => dependencyIdentity(dir, { concurrency: 1, openFile: (path) => { if (opened++ === 0) rmSync(removed); return createReadStream(path); } });
+  await assert.rejects(start(f.home, { ...p.options, identify }), unreadable('ENOENT', removed));
+  assert.equal(existsSync(removed), false);
+  p.neverSpawned();
+});
+
+test('verifyDependencies rethrows an error without code or path using its message', async (t) => {
+  const f = await deployed(t);
+  await assert.rejects(verifyDependencies(f.snapshot, f.deployment, async () => { throw new Error('boom'); }),
+    /^Error: Could not read installed dependencies at .* \(boom\); reinstall matching dependencies and run npm run dev:deploy again$/);
+});
+
+test('a failed read aborts the other in-flight reads and reports the first error', async (t) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-dev-abort-')));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, 'a'), ''); writeFileSync(join(dir, 'b'), ''); writeFileSync(join(dir, 'c'), '');
+  const opened = [];
+  // `a` never ends on its own; `b` fails; `c` must never be opened.
+  const endless = new Readable({ read() {} });
+  const openFile = (path) => {
+    opened.push(path.slice(dir.length + 1));
+    if (path.endsWith('/a')) return endless;
+    return Readable.from((async function* () { throw Object.assign(new Error('gone'), { code: 'ENOENT', path }); })());
+  };
+  const hung = new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('in-flight read was not aborted')), 2000); t.after(() => clearTimeout(timer)); });
+  await assert.rejects(Promise.race([dependencyIdentity(dir, { concurrency: 2, openFile }), hung]), { code: 'ENOENT', path: join(dir, 'b') });
+  assert.equal(endless.destroyed, true);
+  assert.deepEqual(opened, ['a', 'b']);
 });
