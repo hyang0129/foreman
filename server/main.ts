@@ -10,6 +10,7 @@ import { ProjectRegistry } from "./projects.ts";
 import { SessionService } from "./session-service.ts";
 import { preparePeerTools } from "./peer-tools.ts";
 import { startHostBridge } from "./host-bridge.ts";
+import { Notifier } from "./notifier.ts";
 import { runClaude } from "./tools.ts";
 import { PORT, REPO_ROOT, ensureDirs, MEMORY_DIR, HOST, FOREMAN_HOME } from "./paths.ts";
 import { writeFileSync } from "node:fs";
@@ -29,7 +30,8 @@ const sessions = new SessionService({ fleet, projects });
 projects.seed(sessions.list());
 sessions.setPrepare((session) => preparePeerTools(sessions, session));
 const pm = new ProjectManager(fleet, sessions, undefined, projects);
-let bridge: { close(): void } | undefined;
+let bridge: ReturnType<typeof startHostBridge> | undefined;
+let notifier: Notifier | undefined;
 const clients = new Set<ServerResponse>();
 
 function sse(res: ServerResponse, event: string, data: unknown) {
@@ -138,12 +140,17 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`foreman: local API token file: ${auth.path}`);
   fleet.start();
   bridge = startHostBridge(PORT, auth.token);
+  // Push notifications only exist in cloud mode; local-only mode constructs no notifier.
+  const notify = bridge.notify?.bind(bridge);
+  if (notify) notifier = new Notifier({ sessions, pm, send: notify }).start();
   if (process.env.FOREMAN_PM_DISABLED !== "1") pm.start().catch((e: unknown) => console.error("pm:", e));
 });
 let stopping = false;
 async function shutdown() {
   if (stopping) return;
   stopping = true;
+  // Detach the notifier first: closing sessions below marks them unavailable, which is not a failure.
+  notifier?.close();
   fleet.stop(); pm.close(); launcher.close(); bridge?.close();
   const providersClosed = sessions.close();
   for (const client of clients) client.end();
