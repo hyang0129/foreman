@@ -106,8 +106,9 @@ state is that memory, not its conversations.
 - `Bash`, `Glob`, `Grep` and `Agent` are denied, and so is any tool not explicitly allowed. The
   denials tell it to delegate the work to a session.
 - It gets an in-process MCP server, `fleet`, with `list_sessions`, `list_models`, `list_projects`,
-  `resolve_project`, `register_project`, `spawn_session`, `session_tail` and `stop_session`, plus the
-  peer tools for managed sessions. A bypass launch is always denied: only the developer can start one.
+  `resolve_project`, `register_project`, `spawn_session`, `session_tail` and `stop_session`, and a
+  second one, `peers`, with the peer tools for managed sessions. A bypass launch is always denied:
+  only the developer can start one.
 - The same server carries the four memory tools, the **only** way to reach memory
   (`server/memory-tools.ts`):
   - `memory_read`;
@@ -146,8 +147,9 @@ Where they are kept depends on the mode (`server/pm-store.ts`):
 - **Local-only mode** (no `cloud.json` and no relay env): in `<FOREMAN_HOME>/pm/state.json`
   (mode 0600), with the same limits and version checks.
 
-Memory holds no filesystem paths. Projects are keyed by name. The PM resolves a name to a directory
-on the current machine with `resolve_project`, and asks when the name is not registered there.
+The PM is told to keep no filesystem paths in memory (a prompt rule; the store does not check it).
+Projects are keyed by name. The PM resolves a name to a directory on the current machine with
+`resolve_project`, and asks when the name is not registered there.
 
 The model chosen in the PM view is saved with the memory, so it follows the PM to another machine.
 If that model is not available there, the provider's error is shown as usual; nothing is
@@ -189,8 +191,9 @@ The Durable Object records exactly one **active PM host**, with an **epoch** (`c
   rejected (`stale_epoch` or `not_active`) and changes nothing, and that machine stops its PM.
 - A host runs a PM only while it is connected to the relay **and** holds the current assignment:
   - A machine that is not the PM host refuses PM sends, from its local UI too, with "The PM runs on
-    <name>." If the PM moves away while this machine is running it and connected, its PM view
-    also gets the entry "The PM now runs on <name>."
+    <name>." If this machine was running the PM and its daemon was not restarted, its PM view also
+    gets the entry "The PM now runs on <name>." when it learns of the move: at once if it was
+    connected during the move, otherwise when it reconnects.
   - A machine that cannot reach the relay refuses them with "The cloud relay is unreachable; the PM
     is unavailable on this machine." It cannot know it is still the PM host, so it fails closed.
 - Local-only mode is always its own PM host, at epoch 1, and there is nowhere to move the PM.
@@ -275,7 +278,8 @@ longer reads or writes them. They are left on disk and are safe to delete by han
 ### Hung provider
 
 Suppose a message is outstanding and the provider has sent nothing for **5 minutes**
-(`FOREMAN_PM_HUNG_MS` overrides this, in milliseconds). The next message you send then acts on it:
+(`FOREMAN_PM_HUNG_MS` overrides this, in milliseconds; the macOS service installer does not pass it
+to the installed service). The next message you send then acts on it:
 
 1. Every outstanding message is reported as uncertain (*the PM stopped responding*).
 2. The provider is retired.

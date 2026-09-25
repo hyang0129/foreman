@@ -40,7 +40,7 @@ Every machine uses the same host token. There are no per-machine tokens. To pair
 1. On the new machine, clone this repository, run `npm install` and `npm run hooks:install`, and sign in to the providers there. Provider logins are per machine; don't copy credential stores.
 2. Copy `cloud.json` from a paired machine's `~/.foreman` into the new machine's `~/.foreman` (or its `FOREMAN_HOME`), and make it private: `chmod 600 ~/.foreman/cloud.json`. The daemon accepts only a regular file (not a symlink) owned by the user running it, with mode 0600. Any other file counts as present-but-invalid, and that machine runs no PM until it is fixed.
 3. Copy **only** `cloud.json`. `machine.json` must be created fresh on each machine, because two machines with the same `machine_id` replace each other's relay connection. Don't copy `vapid.json` either unless the machine will run `cloud:deploy`.
-4. Optionally set `FOREMAN_MACHINE_NAME` to name the machine in the PM view (default: the short hostname).
+4. Optionally set `FOREMAN_MACHINE_NAME` in the daemon's environment to name the machine in the PM view (default: the short hostname). The macOS service installer does not pass this variable to the installed service; it works with `npm start`.
 5. Start the daemon: `npm run service:install` on a Mac, or `npm start` on Linux (see [Linux host](EXECUTION_HOST.md#linux-host)). The log shows `cloud relay connected`.
 
 Never rotate, regenerate or hand-edit the token or `cloud.json`. Every paired machine holds the same token, and the Worker's `HOST_TOKEN` secret must match it. A changed token disconnects every machine that still has the old one.
@@ -53,7 +53,7 @@ The new machine connects as a **standby**: the PM stays on the machine that alre
 
 This release moves PM memory into the relay's Durable Object ([details](DESIGN.md#pm-memory-and-the-pm-host)). Deploy the Worker first, then restart the daemons:
 
-1. `npm run cloud:deploy` on the paired machine.
+1. Update the checkout on each machine to this release. Then run `npm run cloud:deploy` on the paired machine (the one holding `cloud.json` and `vapid.json`).
 2. Restart the daemon of the machine whose PM memory you want to keep (`npm run service:restart`). The first upgraded daemon to connect becomes the PM host, and it imports its own `memory/PROJECTS.md`, `memory/LOG.md` and `pm/settings.json` model into the relay once. The import writes `memory/.imported.json` and leaves the source files untouched. First importer wins: a machine that becomes the PM host later imports nothing.
 3. Start or restart any other machines. They join as standbys.
 
@@ -67,7 +67,7 @@ After the restart the PM conversation starts empty. Earlier PM conversations are
 - The host credential authenticates the outbound relay endpoint only; it is not a browser sign-in token. Static assets and public Firebase configuration reveal no session data.
 - The browser polls authoritative state with bearer headers. Tokens are not embedded in URLs. Session mutations are disabled when the host is offline.
 - Relay requests have bounded bodies and deadlines. Disconnect/timeout can mean delivery is uncertain; refresh the saved receipt before retrying. Managed creation/message IDs deduplicate retries. The relay never replays a mutation.
-- Managed history and receipts live on the Mac. Daemon restart retains them, marks unfinished work uncertain, and makes recovered sessions read-only. Start a new session to continue; automatic resume/takeover is deferred.
+- Managed history and receipts live on the machine that runs the session. Daemon restart retains them, marks unfinished work uncertain, and makes recovered sessions read-only. Start a new session to continue; automatic resume/takeover is deferred.
 - The pinned PM keeps no conversation history. Its memory lives in the relay's Durable Object. A PM message is recorded before it is sent; if its machine restarts or the PM moves before it finishes, the message is reported once as uncertain and never replayed. See [PM memory and the PM host](DESIGN.md#pm-memory-and-the-pm-host).
 - The hosted app talks to one machine at a time: the active PM host. That machine must remain awake, connected, and logged in. A hosted page cannot execute local processes while it is off; move the PM to another online machine instead ([Moving the PM](EXECUTION_HOST.md#moving-the-pm)).
 

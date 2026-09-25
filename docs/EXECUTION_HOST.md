@@ -52,7 +52,7 @@ The authenticated outbound Cloudflare relay, host identity, heartbeat/offline st
 
 ## More than one machine
 
-Several machines can be paired with the same relay at once, for example this Mac and the Linux box `homen`. Each `FOREMAN_HOME` is one machine, identified by `<FOREMAN_HOME>/machine.json` (a random `machine_id` and a display name, created on first start). The display name defaults to the short hostname. Set `FOREMAN_MACHINE_NAME` to choose another name (1–80 printable characters); it is saved to `machine.json`, so later starts keep it. An invalid value means no PM on that machine until it is fixed.
+Several machines can be paired with the same relay at once, for example this Mac and the Linux box `homen`. Each `FOREMAN_HOME` is one machine, identified by `<FOREMAN_HOME>/machine.json` (a random `machine_id` and a display name, created on first start). The display name defaults to the short hostname. Set `FOREMAN_MACHINE_NAME` in the daemon's environment to choose another name (1–80 printable characters); it is saved to `machine.json`, so later starts keep it. An invalid value means no PM on that machine until it is fixed. The macOS service installer does not pass `FOREMAN_MACHINE_NAME` to the installed service, so a variable set in your shell does not reach it.
 
 To pair another machine, copy `cloud.json` to it; see [Add a second machine](CLOUD_SETUP.md#add-a-second-machine). Never copy `machine.json` or a whole `~/.foreman`: two daemons with the same `machine_id` count as one machine and replace each other's relay connection.
 
@@ -77,7 +77,7 @@ After the move:
 
 - The new PM host starts with an empty conversation and a fresh provider session built from the shared memory. Past conversations are not kept anywhere.
 - A message that was still in progress on the old machine appears once on the new one as an uncertain entry: "…could not be confirmed (the PM was moved)", or "(machine went offline)" if the old machine was offline. It is never replayed. Send it again if you still need it.
-- The old machine stops its PM and refuses PM messages from its local UI ("The PM runs on <name>."). If it was online during the move, its PM view also shows "The PM now runs on <name>.". When a lost machine comes back, it is a standby; it never takes the PM back.
+- The old machine stops its PM and refuses PM messages from its local UI ("The PM runs on <name>."). If its daemon kept running, its PM view also shows "The PM now runs on <name>.": at once if it was online during the move, otherwise when it reconnects. A machine whose daemon restarted shows no entry. When a lost machine comes back, it is a standby; it never takes the PM back.
 
 In relay mode the PM can be moved only from the hosted app. The local UI at `localhost` cannot see the other machines. A machine without `cloud.json` (local-only mode) is always its own PM host and has nothing to move to.
 
@@ -85,7 +85,7 @@ Restarting the PM host's daemon keeps the PM there. A message in progress during
 
 ## Linux host
 
-A Linux machine runs the daemon in the foreground with `npm start` (after `npm install`, `npm run hooks:install` and the provider logins). Service management (`npm run service:*`, `scripts/service.mjs`) is macOS-only and refuses to run elsewhere, so keep `npm start` running yourself and restart it by hand.
+A Linux machine runs the daemon in the foreground with `npm start` (after `npm install`, `npm run hooks:install` and the provider logins). Service management (`npm run service:*`, `scripts/service.mjs`) is macOS-only and refuses to run elsewhere, so keep `npm start` running yourself and restart it by hand. Visible-tab launches (`spawn_session` mode `tab`) need `warp-spawn` at `FOREMAN_WARP_SPAWN` (default `~/.claude/warp-playbook/bin/warp-spawn`); without it they fail. Managed launches (the default) do not use it.
 
 ## Validation
 
