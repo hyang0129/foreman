@@ -367,14 +367,14 @@ test.describe("deep links", () => {
   test("Forward after Back from a rejected link repeats the neutral notice", async ({ page }) => {
     const state = await fixture(page);
     await page.goto("/?session=fm:not-on-this-mac");
-    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on your Mac. Showing your inbox.");
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing your inbox.");
     await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
     await expect.poll(() => page.evaluate(() => history.state?.view ?? null)).toBeNull();
     // Dismiss the first notice so the next one is observably new.
     await page.locator("#app-notice").evaluate((notice: HTMLElement) => { notice.hidden = true; });
     await page.goForward();
     await expect(page.locator("#app-notice")).toBeVisible();
-    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on your Mac. Showing your inbox.");
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing your inbox.");
     await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
     await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
     await page.waitForTimeout(300);
