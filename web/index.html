@@ -129,6 +129,11 @@
             Interrupt
           </button>
         </header>
+        <section id="pm-host" class="pm-host" aria-label="Project manager machine" hidden>
+          <p class="pm-host-line"><span id="pm-host-dot" class="dot" aria-hidden="true"></span><span id="pm-host-label"></span></p>
+          <p id="pm-host-offline" class="pm-host-offline" role="status"></p>
+          <button id="move-pm" class="btn ghost small" type="button" aria-haspopup="dialog" hidden>Move PM…</button>
+        </section>
         <p id="interrupt-feedback" class="action-feedback" role="status" hidden></p>
         <div
           id="connection-banner"
@@ -165,7 +170,7 @@
           <label for="pm-model">Project manager model · Claude</label>
           <select id="pm-model" aria-describedby="pm-model-hint" disabled><option value="">Provider default</option></select>
           <p class="field-hint pm-model-help">Controls the PM’s replies and planning. Newly launched agents have their own model selection.</p>
-          <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn.</span>
+          <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn and are saved with the PM.</span>
         </div>
         <div id="control-note" class="control-note" role="status"></div>
         <form id="composer" class="composer">
@@ -286,6 +291,27 @@
           ><button type="submit" class="btn" id="create-session">
             Start session
           </button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="move-pm-dialog" aria-labelledby="move-pm-title" aria-describedby="move-pm-intro">
+      <form id="move-pm-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">PROJECT MANAGER</p>
+            <h2 id="move-pm-title">Move PM</h2>
+          </div>
+          <button id="close-move-pm" type="button" class="icon-btn" aria-label="Close move PM">×</button>
+        </div>
+        <p id="move-pm-intro" class="dialog-intro">The PM starts a fresh conversation on the new machine with the same memory. A message still in progress will be reported as uncertain and not replayed.</p>
+        <fieldset id="move-pm-machines" class="machine-choices">
+          <legend>Choose the machine to run the PM</legend>
+          <div id="move-pm-list" class="machine-list"></div>
+        </fieldset>
+        <p id="move-pm-error" class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn ghost" id="cancel-move-pm">Cancel</button
+          ><button type="submit" class="btn" id="confirm-move-pm" disabled>Move PM</button>
         </div>
       </form>
     </dialog>

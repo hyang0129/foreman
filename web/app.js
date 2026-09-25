@@ -29,6 +29,7 @@ const ui = {
   note: $("#control-note"),
   dialog: $("#new-dialog"),
   newForm: $("#new-form"),
+  moveDialog: $("#move-pm-dialog"),
 };
 const LABEL = {
   needs_input: "Needs you",
@@ -76,6 +77,9 @@ const UNKNOWN_LINK_NOTICE = "That conversation isn’t available on your Mac. Sh
 let sessions = [],
   detail = null,
   host = { online: false },
+  // GET /api/pm/host (epic #26 contract D): which machine runs the PM. null until read, or
+  // when the host or relay does not serve the route.
+  pmHost = null,
   authorized = false,
   authRequired = false,
   localAuthMode = false,
@@ -312,7 +316,7 @@ function revokeAccess(message) {
   $("#project-choices").replaceChildren(); $("#project-status").textContent = ""; $("#project-feedback").textContent = "";
   ui.interrupt.dataset.busy = "false";
   $("#create-session").textContent = "Start session";
-  $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved on your Mac.";
+  $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved with the PM.";
   modelOptions($("#pm-model"), []);
   clearTimeout(pollTimer);
   sessions = [];
@@ -320,6 +324,9 @@ function revokeAccess(message) {
   sessionsLoaded = false;
   detail = null;
   host = { online: false };
+  pmHost = null;
+  renderPmHost();
+  ui.moveDialog.close();
   clearDrafts();
   // A PM failure seen by the previous identity is not shown to the next one.
   polledPmError = null;
@@ -440,12 +447,13 @@ window.addEventListener("popstate", (event) => {
   const state = event.state?.foreman ? event.state : historyState(parseDeepLinkKey(location.search));
   // Back closes the top-most layer first: the dialog, then the drawer, then the conversation.
   if (ui.dialog.open && state.overlay !== "dialog") ui.dialog.close();
+  if (ui.moveDialog.open && state.overlay !== "move") ui.moveDialog.close();
   if (navOpen() && !state.overlay) {
     setNav(false);
     $("#open-nav").focus({ preventScroll: true });
   }
   // Forward into an overlay entry whose layer is gone: keep the entry as a plain view.
-  if ((state.overlay === "nav" && !navOpen()) || (state.overlay === "dialog" && !ui.dialog.open))
+  if ((state.overlay === "nav" && !navOpen()) || (state.overlay === "dialog" && !ui.dialog.open) || (state.overlay === "move" && !ui.moveDialog.open))
     history.replaceState(historyState(state.view), "", location.href);
   const view = state.view || null;
   if (view === selected) return;
@@ -637,6 +645,8 @@ function renderHeading() {
     fields.push(["Selected model", selectedModel]);
     if (pmModelReady && !pmModel) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
     fields.push(["Applies to", "The PM’s replies and planning. Newly launched agents have their own model selection."]);
+    const machine = pmHost?.active;
+    if (machine) fields.push(["Runs on", `${machine.name} · ${machine.online ? "online" : "offline"}${pmHost.mode === "local" ? " · this machine only (no cloud relay)" : ""}`]);
   } else if (detail?.session) {
     const s = detail.session;
     ui.title.textContent = s.name || "Session";
@@ -905,12 +915,12 @@ function renderMessages(history = [], receipts = []) {
   if (!history.length && !receipts.length) {
     const loading = !hostChecked || (host.online && !sessionsLoaded && !selected);
     const title = loading ? "Loading sessions…" : !host.online ? "Your Mac is offline"
-      : selected === "pm" ? "A little direction goes a long way."
+      : selected === "pm" ? "New conversation."
       : selected ? (detail?.session?.capabilities?.message ? "Ready when you are." : "No readable history yet.")
       : sessions.filter((s) => s.name !== "foreman-pm").length ? "Choose a conversation" : "No sessions yet";
     const text = loading ? "Checking your execution host for sessions."
       : !host.online ? "Reconnect your Mac to view sessions and continue work."
-      : selected === "pm" ? "Tell your project manager what you want to accomplish. It can check the fleet and delegate the next steps."
+      : selected === "pm" ? "The PM remembers projects and decisions, not past chats."
       : selected ? (detail?.session?.capabilities?.message ? "Send a task or a follow-up to begin the conversation." : "No readable conversation is available yet. Activity will appear as this session runs.")
       : "Choose an existing conversation or start a Claude or Codex session.";
     fragment.append(emptyState(title, text, !selected && !loading));
@@ -1136,6 +1146,7 @@ async function selectSession(key, record = true) {
   showConversationLoading();
   ui.approvals.replaceChildren();
   renderRail();
+  renderPmHost();
   renderHeading();
   const returnFocus = ui.app.classList.contains("nav-open") && window.matchMedia("(max-width: 760px)").matches;
   setNav(false);
@@ -1169,6 +1180,7 @@ function showInbox() {
   clearError();
   ui.approvals.replaceChildren();
   renderRail();
+  renderPmHost();
   renderMessages();
   renderHeading();
 }
@@ -1260,6 +1272,220 @@ async function refreshPmSummary(epoch) {
     /* Keep the last known indicator; the next poll retries. */
   }
 }
+// PM machine (epic #26 PMM-06). Plain-JS mirror of PmHostResponse / PmHostMoveResponse in
+// shared/pm-state.ts; web/ is static and cannot import it.
+const PLATFORM_LABEL = { darwin: "macOS", linux: "Linux", win32: "Windows", freebsd: "FreeBSD" };
+function pmHostOfflineMessage(name) {
+  return `Your PM's machine (${name}) is offline.`;
+}
+function readPmHostActive(raw) {
+  if (!raw || typeof raw !== "object" || typeof raw.machine_id !== "string" || typeof raw.name !== "string") return null;
+  return { machine_id: raw.machine_id, name: raw.name || "Unnamed machine", online: raw.online === true,
+    epoch: Number.isSafeInteger(raw.epoch) ? raw.epoch : 0, assigned_at: raw.assigned_at, assigned_by: raw.assigned_by };
+}
+function readPmHost(raw) {
+  if (!raw || typeof raw !== "object" || !Array.isArray(raw.machines)) return null;
+  const machines = raw.machines
+    .filter((m) => m && typeof m === "object" && typeof m.machine_id === "string")
+    .map((m) => ({ machine_id: m.machine_id, name: typeof m.name === "string" && m.name ? m.name : "Unnamed machine",
+      platform: typeof m.platform === "string" ? m.platform : "", online: m.online === true,
+      last_seen: typeof m.last_seen === "number" ? m.last_seen : null, active: m.active === true }));
+  return { active: readPmHostActive(raw.active), machines, mode: raw.mode === "local" ? "local" : "relay" };
+}
+// Move needs the relay, a current assignment, and another machine that is online.
+function moveTargets() {
+  if (!pmHost || pmHost.mode === "local" || !pmHost.active) return [];
+  return pmHost.machines.filter((m) => m.online && !m.active && m.machine_id !== pmHost.active.machine_id);
+}
+function lastSeenText(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "Last seen: unknown";
+  const seconds = Math.max(0, (Date.now() - ms) / 1000);
+  return seconds < 60 ? "Last seen just now"
+    : seconds < 3600 ? `Last seen ${Math.floor(seconds / 60)} min ago`
+    : seconds < 86400 ? `Last seen ${Math.floor(seconds / 3600)} h ago`
+    : `Last seen ${Math.floor(seconds / 86400)} d ago`;
+}
+function renderPmHost() {
+  const bar = $("#pm-host"), active = pmHost?.active || null;
+  bar.hidden = selected !== "pm" || !pmHost;
+  const offline = !!active && !active.online;
+  const label = !pmHost ? "" : active ? `PM on ${active.name} · ${active.online ? "online" : "offline"}` : "No machine runs the PM yet";
+  if ($("#pm-host-label").textContent !== label) $("#pm-host-label").textContent = label;
+  $("#pm-host-dot").className = `dot ${active?.online ? "online" : active ? "offline" : "unknown"}`;
+  const offlineText = offline ? pmHostOfflineMessage(active.name) : "";
+  const offlineLine = $("#pm-host-offline");
+  if (offlineLine.textContent !== offlineText) offlineLine.textContent = offlineText;
+  offlineLine.hidden = !offlineText;
+  bar.classList.toggle("is-offline", offline);
+  $("#move-pm").hidden = !moveTargets().length;
+  if (ui.moveDialog.open) renderMoveList();
+}
+async function refreshPmHost(epoch) {
+  try {
+    const result = await api("/api/pm/host");
+    if (!authorized || epoch !== authEpoch) return;
+    pmHost = readPmHost(result);
+  } catch (error) {
+    if (!authorized || epoch !== authEpoch) return;
+    // A host or relay without the route shows no PM machine; other failures keep the last answer.
+    if (error?.status === 404) pmHost = null;
+  }
+  renderPmHost();
+}
+let moveOpener = null, moveBusy = false, moveEpoch = 0, moveChoice = null, moveSignature = "";
+function moveError(text = "") {
+  const target = $("#move-pm-error");
+  target.textContent = text;
+  target.hidden = !text;
+}
+function updateMoveControls() {
+  const confirm = $("#confirm-move-pm");
+  const valid = !!moveChoice && moveTargets().some((m) => m.machine_id === moveChoice);
+  confirm.disabled = moveBusy || !valid || !authorized;
+  confirm.textContent = moveBusy ? "Moving…" : "Move PM";
+  $("#move-pm-form").setAttribute("aria-busy", String(moveBusy));
+}
+function renderMoveList() {
+  const list = $("#move-pm-list");
+  const machines = [...(pmHost?.machines || [])].sort((a, b) =>
+    Number(b.active) - Number(a.active) || Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
+  const selectable = new Set(moveTargets().map((m) => m.machine_id));
+  if (moveChoice && !selectable.has(moveChoice)) moveChoice = null;
+  const rows = machines.map((m) => ({
+    id: m.machine_id, name: m.name, active: m.active, online: m.online, enabled: selectable.has(m.machine_id),
+    meta: [PLATFORM_LABEL[m.platform] || m.platform || "Unknown platform", m.online ? "Online" : "Offline", lastSeenText(m.last_seen)].join(" · "),
+    note: m.active ? "Runs the PM now" : !m.online ? "Offline machines can’t take the PM" : "",
+    seen: m.last_seen,
+  }));
+  moveEpoch = pmHost?.active?.epoch ?? 0;
+  const signature = JSON.stringify([rows.map(({ seen, ...row }) => row), moveChoice, pmHost?.mode, moveEpoch]);
+  if (signature !== moveSignature) {
+    moveSignature = signature;
+    const focused = list.contains(document.activeElement) ? document.activeElement.value : null;
+    list.replaceChildren();
+    for (const row of rows) {
+      const label = node("label", `machine-choice${row.enabled ? "" : " is-disabled"}${row.active ? " is-active" : ""}`);
+      const input = node("input");
+      input.type = "radio";
+      input.name = "pm-machine";
+      input.value = row.id;
+      input.disabled = !row.enabled;
+      input.checked = row.id === moveChoice;
+      const text = node("span", "machine-text");
+      const name = node("span", "machine-name", row.name);
+      const dot = node("span", `dot ${row.online ? "online" : "offline"}`);
+      dot.setAttribute("aria-hidden", "true");
+      name.prepend(dot);
+      const meta = node("span", "machine-meta", row.meta);
+      if (typeof row.seen === "number" && row.seen > 0) meta.title = new Date(row.seen).toLocaleString();
+      text.append(name, meta);
+      if (row.note) text.append(node("span", "machine-note", row.note));
+      label.append(input, text);
+      list.append(label);
+    }
+    if (!rows.length) list.append(node("p", "field-hint", "No machines have connected to the relay yet."));
+    else if (!selectable.size) list.append(node("p", "field-hint", pmHost?.mode === "local"
+      ? "This Foreman runs without the cloud relay, so the PM stays on this machine."
+      : "No other machine is online. Start Foreman on another machine to move the PM there."));
+    if (focused !== null) {
+      const same = [...list.querySelectorAll("input")].find((input) => input.value === focused && !input.disabled);
+      (same || list.querySelector("input:not(:disabled)") || $("#close-move-pm")).focus({ preventScroll: true });
+    }
+  }
+  updateMoveControls();
+}
+function openMovePm(event) {
+  if (!authorized || !moveTargets().length || ui.moveDialog.open) return;
+  moveOpener = event?.currentTarget || document.activeElement;
+  moveChoice = null;
+  moveSignature = "";
+  moveError();
+  renderMoveList();
+  ui.moveDialog.showModal();
+  pushOverlay("move", () => ui.moveDialog.open);
+  (ui.moveDialog.querySelector("#move-pm-list input:not(:disabled)") || $("#close-move-pm")).focus();
+}
+$("#move-pm").addEventListener("click", openMovePm);
+for (const selector of ["#close-move-pm", "#cancel-move-pm"])
+  $(selector).addEventListener("click", () => ui.moveDialog.close());
+ui.moveDialog.addEventListener("close", () => {
+  popOverlay("move");
+  moveChoice = null;
+  moveError();
+  if (!authorized) return;
+  const opener = moveOpener;
+  moveOpener = null;
+  // Back to the Move button, or to the conversation when the button has gone away.
+  if (opener?.isConnected && !opener.hidden && !opener.closest("[hidden], [inert]")) opener.focus({ preventScroll: true });
+  else ui.timeline.focus({ preventScroll: true });
+});
+// Keep Tab and Shift+Tab inside the modal dialog (a radio group is one Tab stop).
+ui.moveDialog.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") return;
+  const checked = ui.moveDialog.querySelector('input[name="pm-machine"]:checked');
+  const focusable = [...ui.moveDialog.querySelectorAll("button, input, select, textarea, [href], [tabindex]:not([tabindex='-1'])")]
+    .filter((el) => !el.disabled && !el.closest("[hidden]") && el.getClientRects().length
+      && (el.type !== "radio" || (checked ? el === checked : el === ui.moveDialog.querySelector('input[name="pm-machine"]:not(:disabled)'))));
+  if (!focusable.length) return;
+  const first = focusable[0], last = focusable.at(-1);
+  if (event.shiftKey && (document.activeElement === first || !ui.moveDialog.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !ui.moveDialog.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
+  }
+});
+$("#move-pm-list").addEventListener("change", (event) => {
+  if (event.target?.name !== "pm-machine") return;
+  moveChoice = event.target.value;
+  moveError();
+  updateMoveControls();
+});
+$("#move-pm-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const target = moveTargets().find((m) => m.machine_id === moveChoice);
+  if (moveBusy || !authorized || !target) return;
+  const epoch = authEpoch;
+  moveBusy = true;
+  moveError();
+  updateMoveControls();
+  try {
+    const result = await post("/api/pm/host", { machine_id: target.machine_id, expected_epoch: moveEpoch });
+    if (epoch !== authEpoch || !authorized) return;
+    const active = readPmHostActive(result?.active)
+      || { ...target, online: true, epoch: Number.isSafeInteger(result?.epoch) ? result.epoch : moveEpoch + 1 };
+    pmHost = { ...pmHost, active, machines: pmHost.machines.map((m) => ({ ...m, active: m.machine_id === active.machine_id })) };
+    moveBusy = false;
+    ui.moveDialog.close();
+    renderPmHost();
+    if (selected === "pm") renderHeading();
+    showNotice(`The PM now runs on ${active.name}. It starts a new conversation with the same memory.`);
+    void poll();
+  } catch (error) {
+    if (epoch !== authEpoch || !authorized) return;
+    moveBusy = false;
+    moveError(errorMessage(error));
+    // The server's view changed (the PM moved, or the machine went offline or away): show it.
+    if (error?.status === 409 || error?.status === 404) {
+      try {
+        const latest = await api("/api/pm/host");
+        if (epoch === authEpoch && authorized) pmHost = readPmHost(latest);
+      } catch { /* The next poll refreshes the list. */ }
+      if (epoch === authEpoch && authorized) renderPmHost();
+    }
+  } finally {
+    if (epoch === authEpoch) {
+      moveBusy = false;
+      if (ui.moveDialog.open) {
+        updateMoveControls();
+        if (!ui.moveDialog.contains(document.activeElement) || document.activeElement?.disabled)
+          (ui.moveDialog.querySelector("#move-pm-list input:checked:not(:disabled)")
+            || ui.moveDialog.querySelector("#move-pm-list input:not(:disabled)") || $("#cancel-move-pm")).focus({ preventScroll: true });
+      }
+    }
+  }
+});
 async function poll() {
   clearTimeout(pollTimer);
   if (!authorized || polling) return;
@@ -1271,6 +1497,10 @@ async function poll() {
     host = nextHost;
     hostChecked = true;
     renderHost();
+    // The PM machine is answered by the relay even while that machine is offline, so it is
+    // read on every poll, exactly once, whether or not the host is online.
+    await refreshPmHost(epoch);
+    if (!authorized || epoch !== authEpoch) return;
     if (host.online) {
       const rows = await api("/api/sessions");
       if (!authorized || epoch !== authEpoch) return;
@@ -1445,7 +1675,7 @@ async function loadPmModels() {
     const result = await api("/api/models?provider=claude");
     if (epoch !== authEpoch || !authorized) return;
     modelOptions($("#pm-model"), result.models || [], pmModel);
-    $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved on your Mac.";
+    $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved with the PM.";
   } catch (error) {
     if (epoch !== authEpoch || !authorized) return;
     $("#pm-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen the project manager to retry.`;
@@ -1714,7 +1944,7 @@ for (const selector of ["#close-nav", "#nav-backdrop"])
     $("#open-nav").focus();
   });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !ui.dialog.open && ui.app.classList.contains("nav-open")) {
+  if (event.key === "Escape" && !ui.dialog.open && !ui.moveDialog.open && ui.app.classList.contains("nav-open")) {
     closeNav();
     $("#open-nav").focus();
   }
@@ -2002,6 +2232,7 @@ function openFromNotification(url) {
   if (target.origin !== location.origin || !["/", "/index.html"].includes(target.pathname)) return;
   const key = parseDeepLinkKey(target.search);
   if (ui.dialog.open) ui.dialog.close();
+  if (ui.moveDialog.open) ui.moveDialog.close();
   if (!key) {
     if (navOpen()) closeNav();
     if (selected) { showInbox(); recordView(null); }
