@@ -53,15 +53,31 @@ function provider(mode: string) {
   const env = { ...process.env, FAKE_CODEX_MODE: mode, FAKE_CODEX_LOG: log };
   return { log, env, calls: () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [] };
 }
-const until = async (check: () => boolean, what: string) => {
-  for (let i = 0; i < 200; i++) { if (check()) return; await new Promise((r) => setTimeout(r, 25)); }
-  assert.fail(`Timed out waiting for ${what}`);
-};
+// Each test spawns real stub processes (via the process supervisor), which can
+// take seconds on a loaded machine. Budgets derive from the test's own timeout
+// instead of fixed ones: every wait still fails, but only once the test's
+// deadline has passed. Codex requests get the remaining budget minus a margin so
+// a stuck request reports its own error before the test itself times out.
+const TEST_TIMEOUT = 30_000;
+const MARGIN = 3_000;
+function budget(t: { signal: AbortSignal }) {
+  const deadline = Date.now() + TEST_TIMEOUT;
+  return {
+    codexTimeoutMs: () => Math.max(1, deadline - Date.now() - MARGIN),
+    async until(check: () => boolean, what: string) {
+      while (!check()) {
+        if (t.signal.aborted || Date.now() > deadline - MARGIN) assert.fail(`Timed out waiting for ${what}`);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    },
+  };
+}
 
-test('requireSignedIn refuses only an explicit signed-out answer', async (t) => {
+test('requireSignedIn refuses only an explicit signed-out answer', { timeout: TEST_TIMEOUT }, async (t) => {
+  const b = budget(t);
   for (const [mode, refused] of [['signed-out', true], ['signed-in', false], ['no-account-method', false]] as const) {
     const p = provider(mode);
-    const control = new CodexControl({ bin: fakeBin, cwd: dir, env: p.env, timeoutMs: 5000 });
+    const control = new CodexControl({ bin: fakeBin, cwd: dir, env: p.env, timeoutMs: b.codexTimeoutMs() });
     t.after(() => control.close());
     await control.connect();
     if (refused) await assert.rejects(control.requireSignedIn(), /Codex is not signed in on this host, so Codex sessions are unavailable/);
@@ -71,13 +87,14 @@ test('requireSignedIn refuses only an explicit signed-out answer', async (t) => 
   }
 });
 
-test('launching a Codex session on a signed-out host fails clearly before any thread starts', async (t) => {
+test('launching a Codex session on a signed-out host fails clearly before any thread starts', { timeout: TEST_TIMEOUT }, async (t) => {
+  const b = budget(t);
   const home = mkdtempSync(join(dir, 'service-'));
   const p = provider('signed-out');
-  const service = new SessionService({ home, codexFactory: (options) => new CodexControl({ ...options, bin: fakeBin, env: p.env, timeoutMs: 5000 }) });
+  const service = new SessionService({ home, codexFactory: (options) => new CodexControl({ ...options, bin: fakeBin, env: p.env, timeoutMs: b.codexTimeoutMs() }) });
   t.after(() => service.close());
   const row = await service.create({ id: 'codex-1', provider: 'codex', cwd: home, name: 'Codex', text: 'Hello' });
-  await until(() => service.detail(row.session_key).session.state === 'unknown', 'launch failure');
+  await b.until(() => service.detail(row.session_key).session.state === 'unknown', 'launch failure');
   const { session, receipts } = service.detail(row.session_key);
   assert.equal(session.alive, false);
   assert.match(session.last_error ?? '', /^Could not start provider: Error: Codex is not signed in on this host, so Codex sessions are unavailable/);
@@ -90,19 +107,21 @@ test('launching a Codex session on a signed-out host fails clearly before any th
   assert.deepEqual(p.calls(), ['initialize', 'account/read']);
 });
 
-test('launching a Codex session on a signed-in host is unchanged', async (t) => {
+test('launching a Codex session on a signed-in host is unchanged', { timeout: TEST_TIMEOUT }, async (t) => {
+  const b = budget(t);
   const home = mkdtempSync(join(dir, 'service-'));
   const p = provider('signed-in');
-  const service = new SessionService({ home, codexFactory: (options) => new CodexControl({ ...options, bin: fakeBin, env: p.env, timeoutMs: 5000 }) });
+  const service = new SessionService({ home, codexFactory: (options) => new CodexControl({ ...options, bin: fakeBin, env: p.env, timeoutMs: b.codexTimeoutMs() }) });
   t.after(() => service.close());
   const row = await service.create({ id: 'codex-2', provider: 'codex', cwd: home, name: 'Codex', text: 'Hello' });
-  await until(() => p.calls().includes('turn/start'), 'first turn dispatch');
+  await b.until(() => p.calls().includes('turn/start'), 'first turn dispatch');
   const { session } = service.detail(row.session_key);
   assert.equal(session.session_id, 'thread-1'); assert.equal(session.last_error, null);
   assert.deepEqual(p.calls(), ['initialize', 'account/read', 'thread/start', 'turn/start']);
 });
 
-test('the Codex model catalog is unavailable on a signed-out host and retries after sign-in', async () => {
+// Discovery uses the production 15s Codex timeout (server/models.ts), twice in sequence.
+test('the Codex model catalog is unavailable on a signed-out host and retries after sign-in', { timeout: 2 * 15_000 + TEST_TIMEOUT }, async () => {
   const catalog = new ModelCatalog();
   const out = provider('signed-out');
   process.env.FOREMAN_CODEX_BIN = fakeBin;
