@@ -55,17 +55,25 @@ Known contingency: sign-in uses a Google popup. If the popup ever fails in the i
 2. Open the session conversation. Follow-up messages queue while it works; saved receipts distinguish queued, running, completed, failed, and uncertain delivery.
 3. Answer inline tool approvals or supported questions. Permission responses apply once. **Interrupt** also cancels queued follow-ups.
 4. Ask a managed session to use Foreman peer tools: `list_sessions`, `session_state`, `session_tail`, `send_message`, `request_update`, and `message_status`. Sender identity is supplied by Foreman. An update is recorded in the target conversation; read it after completion.
-5. Use the pinned **Project manager** to coordinate work. Its default spawns use the same managed Claude/Codex service. Choose its Claude model below the conversation while it is idle; the choice is saved in `~/.foreman/pm/settings.json` and applies to subsequent turns. Before the first saved choice, `FOREMAN_PM_MODEL` supplies the optional default. The PM can discover worker models with `list_models` and pass a model to `spawn_session`. Worker model selection is made when starting a new session.
+5. Use the pinned **Project manager** to coordinate work. Its default spawns use the same managed Claude/Codex service. Choose its Claude model below the conversation while it is idle; the choice is saved with the PM's memory and applies to subsequent turns. Before the first saved choice, `FOREMAN_PM_MODEL` supplies the optional default. The PM can discover worker models with `list_models` and pass a model to `spawn_session`. Worker model selection is made when starting a new session.
 
 The responsive inbox groups work needing your attention and shows provider, project, activity, host availability, and control limitations. Observed external sessions have readable available transcripts and no message controls. Trusting Codex hooks enables additional external-session monitoring; managed Codex sessions also report state directly through their controller.
 
 ## Persistence and boundaries
 
-State lives under `~/.foreman` (override `FOREMAN_HOME`): managed snapshots/receipts, hook observations, PM history/memory, and the private cloud pairing. An exclusive service lock prevents simultaneous writers. Browser refresh restores history. Reusing a managed creation/message ID with identical input returns the existing result; different input is rejected.
+State lives under `~/.foreman` (override `FOREMAN_HOME`): managed snapshots/receipts, hook observations, the project registry, this machine's identity, and the private cloud pairing. The PM's memory lives in the cloud relay, or in `pm/state.json` without one (see [Portable PM](#portable-pm-and-more-machines)). An exclusive service lock prevents simultaneous writers. Browser refresh restores history. Reusing a managed creation/message ID with identical input returns the existing result; different input is rejected.
 
-After daemon restart, unfinished receipts become uncertain and recovered sessions become read-only. Nothing is automatically replayed or resumed. Start a new session to continue. The legacy PM conversation has separate history and does not yet share managed message deduplication. Arbitrary takeover of a live terminal/desktop and multiple users/hosts are deferred. Push notifications exist only on the hosted app (see [Install on Android](#install-on-android)), not at `localhost:4177`.
+After daemon restart, unfinished receipts become uncertain and recovered sessions become read-only. Nothing is automatically replayed or resumed. Start a new session to continue. The PM keeps no conversation history: its conversation starts empty after a restart, and a PM message interrupted by the restart is reported once as uncertain, not replayed. Arbitrary takeover of a live terminal/desktop, multiple users, and seeing or starting sessions on a machine that does not run the PM from the hosted app are deferred. Push notifications exist only on the hosted app (see [Install on Android](#install-on-android)), not at `localhost:4177`.
 
-The PM is a coordinator: specific existing document reads and memory reads only; no Bash, Glob, Grep, code, or subagent tools. Memory writes resolve parent symlinks and stay in its memory directory. It cannot directly read Foreman configuration. Managed sessions perform implementation work under their immutable launch preset and the mandatory protected-path guard.
+The PM is a coordinator: specific existing document reads only; no Bash, Glob, Grep, file writes, code, or subagent tools. It reaches its memory only through its memory tools. It cannot directly read Foreman configuration. Managed sessions perform implementation work under their immutable launch preset and the mandatory protected-path guard.
+
+## Portable PM and more machines
+
+The PM's memory (projects, preferences, its log and its model) lives in the cloud relay, not on one machine (without a relay, in `~/.foreman/pm/state.json`). Several machines can be paired with the relay. Exactly one of them runs the PM, and the hosted app talks to that machine only. You move the PM with **Move PM…** in the PM view. Sessions, transcripts and project paths stay on the machine that owns them. PM conversations are not kept, and an interrupted PM message is reported as uncertain, never replayed.
+
+- [Add a second machine](docs/CLOUD_SETUP.md#add-a-second-machine) and [upgrade order](docs/CLOUD_SETUP.md#upgrading-to-the-portable-pm)
+- [More than one machine](docs/EXECUTION_HOST.md#more-than-one-machine), [moving the PM](docs/EXECUTION_HOST.md#moving-the-pm) and the [Linux host](docs/EXECUTION_HOST.md#linux-host) note
+- [PM memory and the PM host](docs/DESIGN.md#pm-memory-and-the-pm-host): the one-time import, uncertain messages, the hung-provider rule, and the `~/.foreman` layout
 
 ## Verify
 
