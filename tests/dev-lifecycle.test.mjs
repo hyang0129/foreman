@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { deploy, start, stop, status, destroy, deleteDevWorker, acquireLock, running, openHome, processIdentity, TARGET } from '../scripts/dev-environment.mjs';
+import { deploy, shellQuote, start, stop, status, destroy, deleteDevWorker, acquireLock, running, openHome, processIdentity, TARGET } from '../scripts/dev-environment.mjs';
 
 const scriptPath = realpathSync('scripts/dev-environment.mjs');
 const scriptUrl = pathToFileURL(scriptPath).href;
@@ -381,7 +381,7 @@ test('pruning failure after the new record is published (#56): deploy still succ
   assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
   assert.match(warnings, /Warning: DEV deployed, but 1 superseded release directory was not pruned/);
   assert.ok(warnings.includes(`${oldRelease} (Refusing unsafe dev path: ${oldRelease})`), warnings);
-  assert.ok(warnings.includes(`rm -rf ${JSON.stringify(oldRelease)}`), warnings);
+  assert.ok(warnings.includes(`rm -rf '${oldRelease}'`), warnings);
   const current = json(f.deploymentFile);
   assert.equal(current.commit, second);
   assert.notEqual(current.release, first.release);
@@ -393,15 +393,16 @@ test('pruning failure after the new record is published (#56): deploy still succ
   assert.deepEqual(leftovers(f.home), []);
 });
 
-test('pruning continues past a refused release (#56): with two superseded releases, the later one is still pruned and only the refused one is reported', async (t) => {
+test('pruning continues past refused releases in any listing order (#56): the superseded release between them is still pruned and every refused one is reported', async (t) => {
   const f = fixture(t);
   const first = await deployed(f, f.commit('first'));
-  // A second superseded release that is not owner-only. Its name sorts before
-  // every mkdtemp release name, so on a sorted directory listing (APFS) the
-  // prune loop visits it first and must continue past it.
-  const refused = join(f.home, 'release-000');
-  mkdirSync(refused); writeFileSync(join(refused, 'marker'), 'old'); chmodSync(refused, 0o755);
-  assert.deepEqual(releases(f.home), ['release-000', first.release]);
+  // Two more superseded releases that are not owner-only. Their names sort
+  // before and after every mkdtemp release name. Whatever order the directory
+  // listing yields, pruning that stopped at the first refusal would leave one
+  // refused release unreported (and, on a sorted listing, the real one unpruned).
+  const refused = ['release-000', 'release-zzzzzzzzzz'].map((name) => join(f.home, name));
+  for (const dir of refused) { mkdirSync(dir); writeFileSync(join(dir, 'marker'), 'old'); chmodSync(dir, 0o755); }
+  assert.deepEqual(releases(f.home), ['release-000', first.release, 'release-zzzzzzzzzz']);
   const second = f.commit('second');
   const d = deployer();
   const { output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn));
@@ -409,16 +410,44 @@ test('pruning continues past a refused release (#56): with two superseded releas
   assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
   const current = json(f.deploymentFile);
   assert.equal(current.commit, second);
-  // The superseded first release, visited after the refused one, was pruned.
-  assert.equal(existsSync(join(f.home, first.release)), false, 'the later superseded release was pruned');
-  assert.deepEqual(releases(f.home), ['release-000', current.release].sort());
-  assert.match(warnings, /1 superseded release directory was not pruned/);
-  assert.ok(warnings.includes(`${refused} (Refusing unsafe dev path: ${refused})`), warnings);
-  assert.ok(warnings.includes(`rm -rf ${JSON.stringify(refused)}`), warnings);
+  assert.equal(existsSync(join(f.home, first.release)), false, 'the superseded release between the refused ones was pruned');
+  assert.deepEqual(releases(f.home), ['release-000', current.release, 'release-zzzzzzzzzz'].sort());
+  assert.match(warnings, /2 superseded release directories were not pruned/);
+  for (const dir of refused) {
+    assert.ok(warnings.includes(`${dir} (Refusing unsafe dev path: ${dir})`), warnings);
+    assert.ok(warnings.includes(`rm -rf '${dir}'`), warnings);
+    assert.equal(statSync(dir).mode & 0o777, 0o755, 'the refused release is untouched');
+    assert.equal(readFileSync(join(dir, 'marker'), 'utf8'), 'old');
+  }
   assert.ok(!warnings.includes(first.release) && !warnings.includes(current.release), warnings);
-  assert.equal(statSync(refused).mode & 0o777, 0o755, 'the refused release is untouched');
-  assert.equal(readFileSync(join(refused, 'marker'), 'utf8'), 'old');
   assert.deepEqual(leftovers(f.home), []);
+});
+
+test('a directory listing failure after the new record is published (#56) is best-effort: deploy resolves, reports DEV deployed, and warns', async (t) => {
+  const f = fixture(t);
+  const first = await deployed(f, f.commit('first'));
+  const second = f.commit('second');
+  // After the real upload, make the dev home unlistable but still writable and
+  // traversable: the record still publishes, then readdir(home) fails.
+  const d = deployer((call, home) => { if (call === 2) chmodSync(home, 0o300); });
+  let output, warnings;
+  // Always restore listability, so the fixture can clean up even if deploy rejects.
+  try { ({ output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn))); } finally { chmodSync(f.home, 0o700); }
+  assert.equal(d.calls.length, 2);
+  assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
+  const current = json(f.deploymentFile);
+  assert.equal(current.commit, second);
+  assert.ok(existsSync(join(f.home, current.release, 'dev-worker.ts')), 'the new release stands');
+  assert.match(warnings, /superseded releases were not pruned: could not list .*EACCES/);
+  assert.ok(warnings.includes(`except ${current.release} by hand`), warnings);
+  assert.deepEqual(releases(f.home), [first.release, current.release].sort(), 'the superseded release remains');
+  assert.deepEqual(leftovers(f.home), []);
+});
+
+test('shellQuote makes a path a single literal shell word', () => {
+  for (const path of ["/tmp/it's here/release-a", '/tmp/$HOME `id` \\n "q"/release-b', '/plain/release-c']) {
+    assert.equal(execFileSync('sh', ['-c', `printf %s ${shellQuote(path)}`], { encoding: 'utf8' }), path);
+  }
 });
 
 test('a clean prune prints no warning', async (t) => {
