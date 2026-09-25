@@ -188,7 +188,7 @@ export class CodexControl extends EventEmitter {
     let result: { account?: unknown; requiresOpenaiAuth?: unknown } | undefined;
     try { result = await this.request('account/read', { refreshToken: false }); } catch { return; }
     if (result?.account === null && result?.requiresOpenaiAuth === true) {
-      throw new Error('Codex is not signed in on this host, so Codex sessions are unavailable. Sign in with codex login (in DEV: CODEX_HOME="$HOME/.foreman-dev/codex" codex login), then try again.');
+      throw new Error('Codex is not signed in on this host, so Codex sessions are unavailable. Sign in with `codex login` using the CODEX_HOME this Foreman uses, then try again.');
     }
   }
   list(cursor?: string) {

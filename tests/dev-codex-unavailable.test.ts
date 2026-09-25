@@ -83,6 +83,9 @@ test('launching a Codex session on a signed-out host fails clearly before any th
   assert.match(session.last_error ?? '', /^Could not start provider: Error: Codex is not signed in on this host, so Codex sessions are unavailable/);
   assert.equal(receipts[0].status, 'failed');
   assert.throws(() => service.send(row.session_key, 'More', 'more-1'), /Codex is not signed in/);
+  // The reason is neutral: no DEV-specific path or command leaks into production.
+  assert.doesNotMatch(session.last_error ?? '', /foreman-dev|DEV/);
+  assert.match(session.last_error ?? '', /codex login` using the CODEX_HOME this Foreman uses/);
   // The account check happened, and no thread or turn was ever requested.
   assert.deepEqual(p.calls(), ['initialize', 'account/read']);
 });

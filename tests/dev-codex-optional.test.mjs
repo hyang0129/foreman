@@ -115,6 +115,9 @@ for (const codex of ['signed-out', 'missing-binary']) {
     assert.match(notice, noticePattern);
     assert.ok(notice.includes(`CODEX_HOME="${join(f.home, 'codex')}" codex login`), notice);
     assert.match(notice, /restart dev/);
+    // The two causes are distinguished: a missing CLI must be installed first.
+    if (codex === 'missing-binary') { assert.match(notice, /the Codex CLI \(codex\) is not installed/); assert.match(notice, /install the Codex CLI, run CODEX_HOME=/); assert.doesNotMatch(notice, /not signed in/); }
+    else { assert.match(notice, /DEV Codex is not signed in/); assert.doesNotMatch(notice, /install/); }
     assert.doesNotMatch(notice, /\n/);
     assert.ok(!notice.includes('secret-provider-output'), 'provider output is never echoed');
     // No production credential was copied into the isolated Codex home.
@@ -134,8 +137,11 @@ test('the dev Claude login stays required, with or without Codex, and nothing is
   }
 });
 
-test('codexLoginNotice is null when signed in and a single redacted line otherwise', () => {
+test('codexLoginNotice is null when signed in and otherwise a single redacted line that distinguishes a missing CLI', () => {
   assert.equal(codexLoginNotice('codex', '/dev/codex', {}, () => 'Logged in'), null);
   const notice = codexLoginNotice('codex', '/dev/codex', {}, () => { throw new Error('secret provider output'); });
   assert.equal(notice, 'Notice: DEV Codex is not signed in, so Codex sessions are unavailable in DEV. To enable them run CODEX_HOME="/dev/codex" codex login, then restart dev (npm run dev:stop && npm run dev:start).');
+  const missing = codexLoginNotice('codex', '/dev/codex', {}, () => { throw Object.assign(new Error('spawnSync codex ENOENT'), { code: 'ENOENT' }); });
+  assert.equal(missing, 'Notice: the Codex CLI (codex) is not installed, so Codex sessions are unavailable in DEV. To enable them install the Codex CLI, run CODEX_HOME="/dev/codex" codex login, then restart dev (npm run dev:stop && npm run dev:start).');
+  assert.doesNotMatch(missing, /\n/);
 });

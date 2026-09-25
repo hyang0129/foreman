@@ -194,6 +194,8 @@ export class SessionService extends EventEmitter {
         });
         await control.connect();
         if (this.closed) { control.close(); return; }
+        // Optional call: injected test doubles (codexFactory) may not implement it; the
+        // real CodexControl always does. models.ts calls it directly on a real control.
         await control.requireSignedIn?.();
         const thread = await control.start(data.session.cwd!, { ...(data.session.model ? { model: data.session.model } : {}), ...(runtime.setup?.codexTools ? { dynamicTools: runtime.setup.codexTools.dynamicTools, ...(runtime.setup.codexTools.developerInstructions ? { developerInstructions: runtime.setup.codexTools.developerInstructions } : {}) } : {}) }, permissionMode(data.creation.permission_mode));
         data.session.session_id = thread.id;

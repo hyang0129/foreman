@@ -390,8 +390,12 @@ export function requireCodexAuth(binary, configDir, env = process.env, execute =
 // The dev Codex login is optional (#69): without it DEV still starts, and only
 // Codex sessions are unavailable. Returns the one-line notice, or null when signed in.
 export function codexLoginNotice(binary, configDir, env = process.env, execute = run) {
-  try { requireCodexAuth(binary, configDir, env, execute); return null; } catch { /* binary missing or not signed in */ }
-  return `Notice: DEV Codex is not signed in, so Codex sessions are unavailable in DEV. To enable them run CODEX_HOME="${configDir}" ${binary} login, then restart dev (npm run dev:stop && npm run dev:start).`;
+  let missing = false;
+  const probe = (...args) => { try { return execute(...args); } catch (error) { if (error?.code === 'ENOENT') missing = true; throw error; } };
+  try { requireCodexAuth(binary, configDir, env, probe); return null; } catch { /* binary missing or not signed in */ }
+  const restart = 'then restart dev (npm run dev:stop && npm run dev:start).';
+  if (missing) return `Notice: the Codex CLI (${binary}) is not installed, so Codex sessions are unavailable in DEV. To enable them install the Codex CLI, run CODEX_HOME="${configDir}" ${binary} login, ${restart}`;
+  return `Notice: DEV Codex is not signed in, so Codex sessions are unavailable in DEV. To enable them run CODEX_HOME="${configDir}" ${binary} login, ${restart}`;
 }
 // Terminate a child this process spawned (and still holds the handle to) and
 // prove it exited. Used only for a daemon whose record was never promoted.

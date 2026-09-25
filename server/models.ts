@@ -27,7 +27,7 @@ async function discover(provider: 'claude' | 'codex'): Promise<ModelOption[]> {
   const control = new CodexControl({ cwd: FOREMAN_HOME, timeoutMs: 15_000 });
   try {
     await control.connect();
-    await control.requireSignedIn();
+    await control.requireSignedIn(); // Always a real CodexControl here, so no optional call.
     const models: ModelOption[] = [];
     let cursor: string | null = null;
     for (let page = 0; page < 10; page++) {
