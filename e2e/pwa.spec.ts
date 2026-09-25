@@ -288,7 +288,7 @@ test.describe("deep links", () => {
     test(`an ${label} session link falls back to the inbox with a neutral notice`, async ({ page }) => {
       const state = await fixture(page);
       await page.goto(link);
-      await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on your Mac. Showing your inbox.");
+      await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing your inbox.");
       await expect(page.locator("#app-notice")).toHaveAttribute("role", "status");
       await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
       await expect(page.getByRole("heading", { name: "Choose a conversation" })).toBeVisible();

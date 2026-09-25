@@ -47,8 +47,11 @@ export type PmEvent =
 /** One entry of the current conversation (the `/api/pm/history` shape). */
 export interface PmEntry { role: 'user' | 'assistant' | 'system' | 'tool' | 'peer'; ts: string; text?: string; error?: true; name?: string; summary?: string }
 
-/** The part of the host bridge the PM reads: the latest `pm_assignment` on the current connection. */
-export type PmAssignmentSource = { currentAssignment(): PmAssignment | null };
+/**
+ * The part of the host bridge the PM reads: the latest `pm_assignment` on the current connection,
+ * and (#122) why the relay last refused this machine, if it did.
+ */
+export type PmAssignmentSource = { currentAssignment(): PmAssignment | null; refusal?(): { reason: string; retry_at: number } | null };
 
 export interface ProjectManagerOptions {
   sessions?: ManagedFleetService;
@@ -79,16 +82,18 @@ export type PmStoreChoice = { mode: 'relay' | 'local' } | { mode: 'unavailable';
  * A relay that is configured but invalid, or whose bridge did not start, means the relay holds the
  * PM: this machine runs no PM rather than a local one built from its own files.
  */
-export function choosePmStore(readRelayConfig: () => unknown, hasBridge: boolean, env: NodeJS.ProcessEnv = process.env): PmStoreChoice {
+export function choosePmStore(readRelayConfig: () => unknown, hasBridge: boolean, env: NodeJS.ProcessEnv = process.env, bridgeError?: string): PmStoreChoice {
+  const source = env.FOREMAN_RELAY_URL || env.FOREMAN_HOST_TOKEN ? 'the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN)' : 'cloud.json';
   let config: unknown;
   try { config = readRelayConfig(); }
   catch (error) {
     const cause = safe(errorText(error), 300);
-    const source = env.FOREMAN_RELAY_URL || env.FOREMAN_HOST_TOKEN ? 'the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN)' : 'cloud.json';
     return { mode: 'unavailable', reason: `${source} is invalid (${cause}); the PM is unavailable on this machine` };
   }
   if (hasBridge) return { mode: 'relay' };
   if (config === null || config === undefined) return { mode: 'local' };
+  // #122: the config parsed but the bridge refused it (e.g. a non-HTTPS URL or a malformed token).
+  if (bridgeError) return { mode: 'unavailable', reason: `${source} is invalid (${safe(bridgeError, 300)}); the PM is unavailable on this machine` };
   return { mode: 'unavailable', reason: 'the cloud relay is configured but its connection could not be started; the PM is unavailable on this machine' };
 }
 
@@ -227,6 +232,10 @@ export class ProjectManager extends EventEmitter {
   private lastFrameAt = 0;
   private conversation: PmEntry[] = [];
   private freshStarts = 0;
+  // #122: `model` is set by a provider start or a saved model change; until then displayModel()
+  // reads it from the store (cached once the store's memory is initialized).
+  private modelKnown = false;
+  private storedModel: Promise<string | null | undefined> | null = null;
   // The assignment epoch this PM is active for, or null while this machine is not the PM host.
   private activeEpoch: number | null = null;
   private shownUncertain = new Set<string>();
@@ -298,6 +307,7 @@ export class ProjectManager extends EventEmitter {
     if (this.activeEpoch !== null || this.running) this.retire();
     this.activeEpoch = epoch;
     this.conversation = []; this.freshStarts = 0; this.lastError = null; this.sessionId = null; this.tools = [];
+    this.modelKnown = false; this.storedModel = null;
     this.reportUncertain(uncertain);
     if (this.autoStart) void this.start();
   }
@@ -314,19 +324,46 @@ export class ProjectManager extends EventEmitter {
   }
 
   // Each uncertain turn is shown once per process (the store re-sends the list on every connection
-  // or assignment change), then acknowledged.
+  // or assignment change) and acknowledged. #116: the acknowledgement is handed to the store first —
+  // the store records it durably before this reports anything — so a restart never repeats one.
   private reportUncertain(turns: UncertainTurn[]) {
+    if (turns.length && this.store) {
+      this.store.ackUncertain(turns.map((turn) => turn.turn_id)).catch((error) => this.diagnostic('foreman: pm uncertain ack failed', { error: errorText(error) }));
+    }
     for (const turn of turns) {
       if (this.shownUncertain.has(turn.turn_id)) continue;
       this.shownUncertain.add(turn.turn_id);
       this.reportFailureEntry(uncertainText(turn.accepted_at, turn.host, UNCERTAIN_REASON_TEXT[turn.reason] ?? turn.reason));
     }
-    if (turns.length && this.store) {
-      this.store.ackUncertain(turns.map((turn) => turn.turn_id)).catch((error) => this.diagnostic('foreman: pm uncertain ack failed', { error: errorText(error) }));
-    }
   }
 
   // --- Model -----------------------------------------------------------------------------------
+
+  /**
+   * #122: the model `/api/pm/history` reports, without starting a provider. After a provider start
+   * or a saved change, the live selection; otherwise, while this machine is the active PM host, the
+   * store's saved model (as the next start would pick it); else the configured default
+   * (FOREMAN_PM_MODEL), or null. A slow store answers the default this time (bounded by `timeoutMs`).
+   */
+  async displayModel(timeoutMs = 2000): Promise<string | null> {
+    if (this.modelKnown) return this.model ?? null;
+    const fallback = () => { try { return normalizeModel(process.env.FOREMAN_PM_MODEL) ?? null; } catch { return null; } };
+    const store = this.store;
+    if (!store || this.closed || !store.assignment().active) return fallback();
+    if (!this.storedModel) {
+      const pending: Promise<string | null | undefined> = store.read().then((memory) => {
+        // Uninitialized memory may still receive this machine's import (and its model): not cached.
+        if (!memory.initialized && this.storedModel === pending) this.storedModel = null;
+        try { return normalizeModel(memory.model ?? process.env.FOREMAN_PM_MODEL) ?? null; } catch { return null; }
+      }, () => { if (this.storedModel === pending) this.storedModel = null; return undefined; });
+      this.storedModel = pending;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), timeoutMs); timer.unref?.(); });
+    const stored = await Promise.race([this.storedModel, timedOut]).finally(() => clearTimeout(timer));
+    if (this.modelKnown) return this.model ?? null;
+    return stored === undefined ? fallback() : stored;
+  }
 
   async setModel(value: unknown) {
     const model = normalizeModel(value);
@@ -340,7 +377,7 @@ export class ProjectManager extends EventEmitter {
       await q.setModel(model);
       try {
         await store.setModel(model ?? null);
-        this.model = model;
+        this.model = model; this.modelKnown = true;
       } catch (error) {
         // If persistence fails, restore the previous live selection before accepting more messages.
         try { await q.setModel(previous); }
@@ -450,11 +487,41 @@ export class ProjectManager extends EventEmitter {
     if (!store) return this.unavailable();
     if (this.activeEpoch === null) {
       const a = store.assignment();
-      if (store.mode === 'relay' && !a.connected) return new Error(RELAY_UNREACHABLE_MESSAGE);
+      if (store.mode === 'relay' && !a.connected) return this.relayUnreachable();
       if (!a.active) return new Error(a.activeHost && a.activeHost !== this.machineName ? `The PM runs on ${a.activeHost}.` : 'This machine is not the PM host.');
       return this.unavailable(' (starting)');
     }
     return null;
+  }
+  // #122: the relay is unreachable; when it refused this machine by policy, say why and when it retries.
+  private relayUnreachable(): Error {
+    let refusal: { reason: string; retry_at: number } | null = null;
+    try { refusal = this.bridge?.refusal?.() ?? null; } catch { /* no detail */ }
+    if (!refusal) return new Error(RELAY_UNREACHABLE_MESSAGE);
+    const retry = Number.isFinite(refusal.retry_at) ? ` It retries at ${sendTime(new Date(refusal.retry_at).toISOString())}.` : '';
+    return new Error(`${RELAY_UNREACHABLE_MESSAGE} The relay refused this machine: ${safe(refusal.reason, 200)}.${retry}`);
+  }
+  // #115: the PM moved while a send was in progress. The input was not dispatched anywhere.
+  private movedError(): Error {
+    const host = this.store?.assignment().activeHost;
+    const other = host && host !== this.machineName ? host : null;
+    return new Error(other
+      ? `The PM was moved to ${other} while your message was being sent. It was not delivered; send it again there.`
+      : 'The PM was moved while your message was being sent. It was not delivered; send it again.');
+  }
+  // #62: a provider that owes input and has been silent past the threshold is retired, by an
+  // explicit send only; each input it owed is reported once as uncertain. A provider that rejected
+  // a turn but stayed alive is restarted once it has settled every input it accepted, so only new
+  // input reaches the new process. Starts a provider if none runs; true when it started one.
+  private readyProvider(): boolean {
+    if (this.running && this.isHung()) {
+      for (const owed of [...this.outstanding]) this.settleUncertain(owed, UNCERTAIN_REASON_TEXT.hung);
+      this.retire();
+    }
+    if (this.running && this.providerFailed && !this.outstanding.length && !this.busy) this.retire();
+    if (this.running) return false;
+    void this.start();
+    return true;
   }
 
   /**
@@ -465,27 +532,38 @@ export class ProjectManager extends EventEmitter {
     const early = this.sendRejection();
     if (early) throw early;
     const store = this.store!;
+    // #115: the epoch this send is for. A move (even A→B→A) while it is being recorded or launched
+    // means it is not dispatched: the relay has already reconciled any turn recorded for it.
+    const epoch = this.activeEpoch;
+    // The provider is readied before the turn is recorded, so on this path no await separates the
+    // record's ack from dispatch and a move cannot land between them on this host. (Only while the
+    // store is usable: otherwise beginTurn below rejects with the store's own cause.)
+    if (store.assignment().active) {
+      this.readyProvider();
+      await this.launched;
+      if (this.activeEpoch !== epoch) throw this.movedError();
+      const unready = this.sendRejection() ?? (this.launchFailure !== null ? new Error(ProjectManager.failureText(this.launchFailure)) : null);
+      if (unready) throw unready;
+    }
     const input: PmInput = { turnId: randomUUID(), acceptedAt: new Date(this.now()).toISOString(), dispatchedAt: 0, taken: false };
     try { await store.beginTurn(input.turnId, input.acceptedAt); }
     catch (error) {
-      if (error instanceof PmStoreError && error.code === 'disconnected') throw new Error(RELAY_UNREACHABLE_MESSAGE);
+      if (this.activeEpoch !== epoch) throw this.movedError();
+      if (error instanceof PmStoreError && error.code === 'disconnected') throw this.relayUnreachable();
       if (error instanceof PmStoreError && error.code === 'not_active') throw new Error(safe(error.message, 300));
       throw new Error(`The PM could not record your message, so it was not sent: ${safe(errorText(error), 600)}`);
     }
+    // Best-effort and fenced by the store: after a move the relay already marked this turn, so the
+    // end changes nothing there (a stale epoch is refused; turn.end removes only an open record).
     const abandon = (error: Error) => { this.endTurn(input, 'failed'); return error; };
+    if (this.activeEpoch !== epoch) throw abandon(this.movedError());
     const late = this.sendRejection();
     if (late) throw abandon(late);
-    // #62: a provider that owes input and has been silent past the threshold is retired now, by
-    // this explicit send only. Each input it owed is reported once as uncertain.
-    if (this.running && this.isHung()) {
-      for (const owed of [...this.outstanding]) this.settleUncertain(owed, UNCERTAIN_REASON_TEXT.hung);
-      this.retire();
+    // Normally already running (readied above); started here only if it stopped meanwhile.
+    if (this.readyProvider()) {
+      await this.launched;
+      if (this.activeEpoch !== epoch) throw abandon(this.movedError());
     }
-    // A provider that rejected a turn but stayed alive is restarted here, once it has settled every
-    // input it accepted, so only this new input reaches the new process.
-    if (this.running && this.providerFailed && !this.outstanding.length && !this.busy) this.retire();
-    if (!this.running) void this.start();
-    await this.launched;
     const afterLaunch = this.sendRejection();
     if (afterLaunch) throw abandon(afterLaunch);
     if (this.launchFailure !== null) throw abandon(new Error(ProjectManager.failureText(this.launchFailure)));
@@ -581,18 +659,26 @@ export class ProjectManager extends EventEmitter {
     let turnFailure: string | undefined;
     const run = async () => {
       // Memory is read at every fresh start; the one-time import must have settled first.
-      let memory: Awaited<ReturnType<HostPmStore['read']>>;
-      try {
-        await store.ensureImported();
-        memory = await store.read();
-      } catch (error) {
-        if (current()) this.launchFailure = `PM memory could not be read, so the PM did not start: ${errorText(error)}`;
-        throw new Error(`PM memory could not be read, so the PM did not start: ${errorText(error)}`);
+      let memory!: Awaited<ReturnType<HostPmStore['read']>>;
+      // #122: a failed one-time import is reported as such, not as a failed read.
+      let failure: string | null = null;
+      try { await store.ensureImported(); }
+      catch (error) {
+        const target = store.mode === 'relay' ? 'the cloud relay' : 'pm/state.json';
+        failure = `the one-time import of this machine's PM memory into ${target} failed, so the PM did not start (it is retried at the next start): ${errorText(error)}`;
+      }
+      if (failure === null) {
+        try { memory = await store.read(); }
+        catch (error) { failure = `PM memory could not be read, so the PM did not start: ${errorText(error)}`; }
+      }
+      if (failure !== null) {
+        if (current()) this.launchFailure = failure;
+        throw new Error(failure);
       }
       if (!current()) return;
       let provider: Query;
       try {
-        this.model = normalizeModel(memory.model ?? process.env.FOREMAN_PM_MODEL);
+        this.model = normalizeModel(memory.model ?? process.env.FOREMAN_PM_MODEL); this.modelKnown = true;
         const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
         provider = q = this.q = this.queryFactory({
           prompt: inbox.open(),

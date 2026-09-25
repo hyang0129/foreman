@@ -58,6 +58,42 @@ const REDACTS: [string, string, string][] = [
     'x-api-key: [REDACTED]; Authorization: Bearer [REDACTED]; refresh_token=[REDACTED]'],
 ];
 
+// #122: short values of chosen-credential keys (password, secret, api key) are redacted at any
+// length; token/authorization values keep the 8-character minimum. A short plain word in a
+// continuing sentence passes only when it cannot be secret-shaped.
+const REDACTS_122: [string, string, string][] = [
+  ['short password', 'password=abc12', 'password=[REDACTED]'],
+  ['short letters-only password', 'password: hunter', 'password: [REDACTED]'],
+  ['short secret', 'secret=pa55', 'secret=[REDACTED]'],
+  ['short api key', 'api_key=Ab1', 'api_key=[REDACTED]'],
+  ['short client secret in json', '{"client_secret": "x9"}', '{"client_secret": "[REDACTED]"}'],
+  ['passwd key', 'passwd=abc', 'passwd=[REDACTED]'],
+  ['one-char password', 'password=x', 'password=[REDACTED]'],
+  // Secret-shaped values stay redacted even inside a sentence.
+  ['digits in a sentence', 'password: hunter2 was rejected', 'password: [REDACTED] was rejected'],
+  ['mixed case in a sentence', 'password: HuNter was rejected', 'password: [REDACTED] was rejected'],
+  ['all caps in a sentence', 'Bearer ABCDEF was rejected', 'Bearer [REDACTED] was rejected'],
+  ['eight letters in a sentence', 'Bearer dragonfly and more', 'Bearer [REDACTED] and more'],
+  ['symbols in a sentence', 'secret: p@ss is wrong', 'secret: [REDACTED] is wrong'],
+  ['short word at end of text', 'Bearer abcdefg', 'Bearer [REDACTED]'],
+  ['short word before punctuation only', 'Authorization: Basic abcd.', 'Authorization: Basic [REDACTED].'],
+  ['sentence end followed by a lower-case word', 'password: hunter. again', 'password: [REDACTED] again'],
+  // An 8-character key value (7 letters and a full stop) was redacted before #122: it stays redacted.
+  ['seven-letter password ending a sentence', 'password: letmein. Try again', 'password: [REDACTED] Try again'],
+  ['seven-letter token ending a sentence', 'token: letmein. Retry', 'token: [REDACTED] Retry'],
+];
+
+// #122: prose after a credential keyword that the fixed word list alone used to redact.
+const KEEPS_122: [string, string][] = [
+  ['unlisted word, sentence continues', 'Expected Bearer but got Basic'],
+  ['bearer prefix prose', 'Send the Bearer prefix with each request'],
+  ['basic login failed', 'Basic login failed'],
+  ['password reset sentence', 'password: reset. Log in again.'],
+  ['token was refreshed', 'token was refreshed'],
+  ['password is required', 'password is required'],
+  ['password: is required', 'password: is required'],
+];
+
 // Ordinary prose that must pass through unchanged (#63 false redactions).
 const KEEPS: [string, string][] = [
   ['#63 authorization required', 'Authorization: required'],
@@ -85,6 +121,17 @@ test('redactSecrets redacts every credential shape', () => {
 
 test('redactSecrets leaves ordinary words after credential keywords unchanged', () => {
   for (const [label, input] of KEEPS) assert.equal(redactSecrets(input), input, label);
+});
+
+test('#122: short chosen-credential values and secret-shaped words in sentences are redacted', () => {
+  for (const [label, input, expected] of REDACTS_122) assert.equal(redactSecrets(input), expected, label);
+  for (const [label, input] of REDACTS_122.map(([l, i]) => [l, i])) assert.equal(redactSecrets(redactSecrets(input)), redactSecrets(input), `idempotent: ${label}`);
+  // token/authorization values keep the 8-character minimum.
+  assert.equal(redactSecrets('token=abc'), 'token=abc');
+});
+
+test('#122: an unlisted short plain word in a continuing sentence is not redacted', () => {
+  for (const [label, input] of KEEPS_122) assert.equal(redactSecrets(input), input, label);
 });
 
 test('redacted output leaks none of the secret material', () => {

@@ -5,6 +5,7 @@ import { homedir, hostname } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { assertTestHome } from "../server/home-guard.mjs";
 
 export const EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PreCompact", "PostCompact", "SubagentStart", "SubagentStop", "Stop", "Interrupt", "SessionEnd"];
 const short = (value, limit = 256) => typeof value === "string" ? value.slice(0, limit) : null;
@@ -117,8 +118,11 @@ async function acquireLock(path) {
 // A Foreman daemon that shares this CODEX_HOME but keeps its own state (the dev
 // preview) sets FOREMAN_HOOK_HOME for the sessions it launches, so their
 // records reach that daemon rather than the one that installed the hook.
-export async function recordEvent(input, { foremanHome = process.env.FOREMAN_HOOK_HOME || process.env.FOREMAN_HOME || join(homedir(), ".foreman"), codexHome = process.env.CODEX_HOME || join(homedir(), ".codex") } = {}) {
+export async function recordEvent(input, options = {}) {
+  const { foremanHome = process.env.FOREMAN_HOOK_HOME || process.env.FOREMAN_HOME || join(homedir(), ".foreman"), codexHome = process.env.CODEX_HOME || join(homedir(), ".codex") } = options;
   if (!object(input) || !EVENTS.includes(input.hook_event_name) || !/^[a-zA-Z0-9_-]{1,160}$/.test(input.session_id ?? "")) return false;
+  // Story #121: under node --test, never record into the real ~/.foreman.
+  assertTestHome(foremanHome, { explicit: Boolean(options.foremanHome || process.env.FOREMAN_HOOK_HOME || process.env.FOREMAN_HOME), variable: "FOREMAN_HOOK_HOME or FOREMAN_HOME" });
   const dir = join(foremanHome, "sessions");
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const file = join(dir, `codex-${input.session_id}.json`);

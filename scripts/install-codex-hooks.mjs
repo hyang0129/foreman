@@ -6,13 +6,18 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { EVENTS } from "../hooks/codex-hook.mjs";
+import { assertTestHome, realCodexHomes } from "../server/home-guard.mjs";
 
 const marker = "--foreman-codex-hook=v1";
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 const isObject = (value) => value && typeof value === "object" && !Array.isArray(value);
 const hookPath = resolve(dirname(fileURLToPath(import.meta.url)), "../hooks/codex-hook.mjs");
 
-export async function install({ uninstall = false, codexHome = process.env.CODEX_HOME || join(homedir(), ".codex"), foremanHome = process.env.FOREMAN_HOME || join(homedir(), ".foreman") } = {}) {
+export async function install(options = {}) {
+  let { uninstall = false, codexHome = process.env.CODEX_HOME || join(homedir(), ".codex"), foremanHome = process.env.FOREMAN_HOME || join(homedir(), ".foreman") } = options;
+  // Story #121: under node --test, never edit the real ~/.codex/hooks.json or pin the real ~/.foreman.
+  assertTestHome(codexHome, { explicit: Boolean(options.codexHome || process.env.CODEX_HOME), variable: "CODEX_HOME", homes: realCodexHomes() });
+  assertTestHome(foremanHome, { explicit: Boolean(options.foremanHome || process.env.FOREMAN_HOME) });
   codexHome = resolve(codexHome); foremanHome = resolve(foremanHome);
   await fs.mkdir(codexHome, { recursive: true, mode: 0o700 });
   const file = join(codexHome, "hooks.json");

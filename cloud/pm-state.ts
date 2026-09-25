@@ -24,6 +24,14 @@ import { utf8Length } from '../shared/notify.ts';
 type Row = Record<string, SqlStorageValue>;
 const iso = (ms: number) => new Date(ms).toISOString();
 const UNKNOWN_MACHINE_NAME = 'unknown machine';
+/**
+ * #116: at most this many `uncertain` rows are kept. Rows become uncertain only on reassignment or
+ * a restart reconciliation (each marks at most MAX_OPEN_TURNS open rows); beyond the cap the oldest
+ * (by accepted_at, then turn_id) are dropped, so a host that never acknowledges cannot grow the table.
+ */
+export const MAX_UNCERTAIN_TURNS = 256;
+/** #122: heartbeats refresh a machine's stored `last_seen` at most this often. */
+export const LAST_SEEN_WRITE_INTERVAL_MS = 60_000;
 
 export class PmState {
   private readonly storage: DurableObjectStorage;
@@ -75,8 +83,15 @@ export class PmState {
       return true;
     });
   }
-  touch(machineId: string, now: number) {
-    this.sql.exec('UPDATE machines SET last_seen = ? WHERE machine_id = ?', now, machineId);
+  /**
+   * A heartbeat (ping or pm_rpc) from an identified machine. #122: `last_seen` is written at most
+   * once per LAST_SEEN_WRITE_INTERVAL_MS per machine, not on every frame. Online/offline never reads
+   * it (that is the socket's own freshness), so the stored value only feeds the machine list's "last
+   * seen" and the eviction order, where being up to one interval old is harmless. A hello always
+   * writes it (upsertMachine). Returns whether a row was written.
+   */
+  touch(machineId: string, now: number): boolean {
+    return this.sql.exec('UPDATE machines SET last_seen = ? WHERE machine_id = ? AND last_seen <= ?', now, machineId, now - LAST_SEEN_WRITE_INTERVAL_MS).rowsWritten > 0;
   }
 
   /** No assignment yet: the first protocol-v2 machine becomes the PM host at epoch 1. */
@@ -101,6 +116,7 @@ export class PmState {
       this.sql.exec(`INSERT INTO pm_assignment (singleton, machine_id, epoch, assigned_at, assigned_by) VALUES (1, ?, ?, ?, 'developer')
         ON CONFLICT (singleton) DO UPDATE SET machine_id = excluded.machine_id, epoch = excluded.epoch, assigned_at = excluded.assigned_at, assigned_by = excluded.assigned_by`,
       target, epoch, now);
+      this.capUncertain();
       return this.assignment()!;
     });
   }
@@ -118,8 +134,15 @@ export class PmState {
         this.sql.exec("UPDATE pm_turns SET state = 'uncertain', reason = 'restarted' WHERE turn_id = ?", turn.turn_id);
         marked++;
       }
+      if (marked) this.capUncertain();
     });
     return marked;
+  }
+
+  /** Drops the oldest uncertain rows beyond MAX_UNCERTAIN_TURNS (deterministic order). Returns how many. */
+  private capUncertain(): number {
+    return this.sql.exec(`DELETE FROM pm_turns WHERE state = 'uncertain' AND turn_id NOT IN
+      (SELECT turn_id FROM pm_turns WHERE state = 'uncertain' ORDER BY accepted_at DESC, turn_id DESC LIMIT ?)`, MAX_UNCERTAIN_TURNS).rowsWritten;
   }
 
   /** Oldest first, at most MAX_OPEN_TURNS (the frame bound); the rest follow once these are acked. */

@@ -173,8 +173,10 @@ substituted. `FOREMAN_PM_MODEL` is used only while no model has been saved.
 
 Each `FOREMAN_HOME` is one **machine**. `machine.json` holds a random `machine_id` and a display
 name (`server/machine.ts`). The name defaults to the short hostname. `FOREMAN_MACHINE_NAME` overrides
-it, and the override is saved to `machine.json`. Every daemon with a valid identity greets the relay
-with a protocol-2 hello: its `machine_id`, name and platform, and the PM turns it still holds.
+it, and the override is saved to `machine.json`. The macOS service installer copies a
+`FOREMAN_MACHINE_NAME` set at install time into the service (refusing an invalid one), and the
+service saves it when it starts. A service installed without it keeps the saved name. Every daemon
+with a valid identity greets the relay with a protocol-2 hello: its `machine_id`, name and platform, and the PM turns it still holds.
 Several machines can be connected at once, and the relay remembers up to 16.
 
 The Durable Object records exactly one **active PM host**, with an **epoch** (`cloud/worker.ts`,
@@ -225,7 +227,17 @@ After a move, the old machine's sessions keep running, but only its own local UI
 ### The one-time import
 
 The first time a machine becomes the active PM host while the store's memory has never been
-initialized, it imports the pre-portable memory from its own `FOREMAN_HOME` (`server/pm-store.ts`):
+initialized, it imports its own memory from its `FOREMAN_HOME` (`server/pm-store.ts`).
+
+Into the relay, the source is `pm/state.json` when this machine ran local-only and the file is valid
+(what the PM learned in local-only mode, which is newer than the retired files). Its `projects`
+doc, log entries and model are imported with the limits below. Its `preferences` doc follows as the
+first write of the relay's empty `preferences` doc. Log entries get the import time as their
+timestamp. A `pm/state.json` that is a symlink, is not a regular file, is owned by another user,
+does not parse, or fails the local store's validation is not imported. The import logs why, falls
+back to the retired files, and leaves the file alone.
+
+Otherwise, and always for local-only mode, the source is the pre-portable memory:
 
 - `memory/PROJECTS.md` becomes the `projects` doc. Over 32 KiB it is cut at a line boundary, and the
   cut is logged.
@@ -244,6 +256,23 @@ import runs on activation. In local-only mode it runs the first time the daemon 
 
 `pm/history.jsonl`, `pm/session` and `pm/session.quarantine.jsonl` are not imported, and Foreman no
 longer reads or writes them. They are left on disk and are safe to delete by hand.
+
+### Switching between local-only and relay mode
+
+PM memory is never merged between the two modes. Moving from one to the other never loses memory
+silently, and never modifies, renames or deletes a local file:
+
+- **Local-only → relay** (the machine is paired later): if the relay's memory is uninitialized, the
+  one-time import above carries `pm/state.json` into the relay. If the relay already has memory,
+  the relay wins. The import is a logged no-op and `pm/state.json` is left as it is.
+- **Relay → local-only** (the pairing is removed): the daemon uses its local `pm/state.json`, or
+  imports the retired files once as usual if the file does not exist. Memory held in the relay is
+  not available and is not copied down. In relay mode the daemon records this in `memory/.pm-mode.json`
+  (`{ version, mode: 'relay', machine_id, at }`) once the relay memory is known to be initialized.
+  Every local-only start of a machine with that marker logs that the relay's PM memory is not
+  available in local-only mode and is not merged. It logs on every start, not once, because the
+  daemon log is the only place this is shown and the memory stays apart for as long as the machine
+  runs local-only. Deleting `memory/.pm-mode.json` silences it.
 
 ### Conversations are not kept
 
@@ -278,8 +307,9 @@ longer reads or writes them. They are left on disk and are safe to delete by han
 ### Hung provider
 
 Suppose a message is outstanding and the provider has sent nothing for **5 minutes**
-(`FOREMAN_PM_HUNG_MS` overrides this, in milliseconds; the macOS service installer does not pass it
-to the installed service). The next message you send then acts on it:
+(`FOREMAN_PM_HUNG_MS` overrides this, in milliseconds; the macOS service installer copies it into
+the installed service when it is set at install time, and refuses a value that is not a positive
+integer). The next message you send then acts on it:
 
 1. Every outstanding message is reported as uncertain (*the PM stopped responding*).
 2. The provider is retired.
@@ -304,6 +334,7 @@ nothing happens, and Stop still works.
 | `machine.json` | This machine's identity, `{ machine_id, name }`, mode 0600. Never copy it to another machine |
 | `pm/state.json` | Local-only mode only: PM memory, model and in-flight turn records, mode 0600 |
 | `memory/.imported.json` | Written once by the one-time import: `{ machine_id, at, target }` |
+| `memory/.pm-mode.json` | Written in relay mode: this machine's PM memory is in the relay, so a later local-only start logs that it is not merged. Safe to delete |
 | `memory/PROJECTS.md`, `memory/LOG.md` | **Retired.** Import sources only. Kept untouched; no longer the PM's memory |
 | `pm/settings.json` | **Retired.** Only the import reads its `model`; no longer written |
 | `pm/history.jsonl`, `pm/session`, `pm/session.quarantine.jsonl` | **Retired.** Never read or written; safe to delete by hand |

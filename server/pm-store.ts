@@ -1,7 +1,9 @@
 // Host PM state stores (epic #26, contract E): `RelayPmStore` keeps PM memory, settings and the
 // in-flight turn records in the relay Durable Object (over the host bridge's `pm_rpc`), and
 // `LocalPmStore` keeps the same things in `<FOREMAN_HOME>/pm/state.json` for local-only mode.
-// Both perform the one-time import of the pre-#26 file memory.
+// Both perform the one-time import of this machine's memory: the relay store imports pm/state.json
+// (what the PM learned in local-only mode) when it is valid, else the pre-#26 file memory; the local
+// store imports the pre-#26 file memory (#117).
 //
 // Invariants: no PM message text is stored or sent (turn records are ids and timestamps); a turn
 // is begun write-ahead (`beginTurn` resolves only on a durable record); nothing is replayed; the
@@ -9,14 +11,14 @@
 // pm/session.quarantine.jsonl.
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { FOREMAN_HOME } from './paths.ts';
 import { PmRpcError, type HostBridge, type PmRpcFailure } from './host-bridge.ts';
 import { utf8Length } from '../shared/notify.ts';
 import {
-  MAX_LOG_ENTRY, MAX_LOG_KEPT, MAX_LOG_READ, MAX_OPEN_TURNS, MAX_PM_IMPORT_FRAME, MAX_PROJECTS_DOC, MAX_RPC_ID, MIN_LOG_ENTRY,
-  PM_DOC_NAMES, isLogText, isPmId, isPmModel, parsePmOpArgs,
+  MAX_LOG_ENTRY, MAX_LOG_KEPT, MAX_LOG_READ, MAX_OPEN_TURNS, MAX_PM_IMPORT_FRAME, MAX_PREFERENCES_DOC, MAX_PROJECTS_DOC, MAX_RPC_ID, MIN_LOG_ENTRY,
+  PM_DOC_NAMES, TURN_OUTCOMES, isLogText, isPmId, isPmModel, parsePmOpArgs,
   type Doc, type LogEntry, type MachineIdentity, type PmAssignment, type PmDocName, type PmOp, type PmOpArgs, type PmOpResults,
   type PmStateStore, type TurnOutcome, type UncertainTurn,
 } from '../shared/pm-state.ts';
@@ -48,7 +50,18 @@ type Logger = (line: string) => void;
 const defaultLog: Logger = (line) => console.log(line);
 
 export const ALREADY_INITIALIZED_MESSAGE = 'relay memory already initialized; local memory not imported';
+/**
+ * #122: logged instead of ALREADY_INITIALIZED_MESSAGE when this store's own earlier memory.import
+ * may have been applied without its reply arriving (timeout, lost connection): the relay's memory
+ * may be this machine's import, so "not imported" would mislead. Nothing more is sent (a
+ * pm/state.json preferences doc included): the relay's memory is not known to be this machine's.
+ */
+export const IMPORT_REPLY_LOST_MESSAGE = "relay memory already initialized, possibly by this machine's earlier import attempt whose reply was lost; nothing more is imported (a pm/state.json preferences doc, if any, was not sent)";
 export const IMPORT_MARKER_FILE = '.imported.json';
+/** #117: `<home>/memory/.pm-mode.json`, `{ version: 1, mode: 'relay', machine_id, at }`: this machine has used relay PM memory. */
+export const PM_MODE_FILE = '.pm-mode.json';
+/** #117: logged on every local-only start of a machine that has used relay PM memory. */
+export const RELAY_MEMORY_NOT_MERGED_NOTICE = 'this machine has used PM memory held in the cloud relay; that memory is not available in local-only mode and is not merged into pm/state.json. The local PM uses pm/state.json only. Pair this machine with the relay again (cloud.json) to use the relay memory; delete memory/.pm-mode.json to silence this notice.';
 
 // ---------------------------------------------------------------------------------------------
 // One-time import
@@ -128,6 +141,84 @@ export function readImportPayload(home: string, machineId: string, log: Logger =
   return fitted.payload;
 }
 
+/** What the relay import sends: the `memory.import` payload plus, from pm/state.json only, the `preferences` doc. */
+export interface PmImportSource { payload: PmImportPayload; preferences: string; source: 'state' | 'legacy' }
+
+/**
+ * #117: reads `<home>/pm/state.json` for the relay import. Returns null (logging why, unless the
+ * file is simply absent or was never initialized) when it is missing, a symlink or not a regular
+ * file, owned by another user, unparseable, fails LocalPmStore's validation (`parseLocalState`), or
+ * was never initialized. Writes nothing.
+ */
+export function readLocalStateForImport(home: string, log: Logger = defaultLog): LocalState | null {
+  const file = join(home, 'pm', 'state.json');
+  let why: string;
+  try {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) why = 'not a regular file';
+    else if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) why = 'owned by another user';
+    else {
+      let raw: unknown;
+      try { raw = JSON.parse(readFileSync(file, 'utf8')); } catch { raw = undefined; }
+      const state = raw === undefined ? null : parseLocalState(raw);
+      if (!state) why = 'invalid';
+      else return state.initialized ? state : null;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    why = 'unreadable';
+  }
+  log(`foreman: memory import: pm/state.json is ${why}; not importing it, importing memory/PROJECTS.md and memory/LOG.md instead (the file is left untouched)`);
+  return null;
+}
+
+/** #117: the `memory.import` payload (and preferences) from a valid local-only pm/state.json, within the same limits as the legacy import. */
+export function importFromLocalState(state: LocalState, machineId: string, log: Logger = defaultLog): PmImportSource {
+  const text = state.docs.projects.content;
+  const projects = truncateAtLine(text, MAX_PROJECTS_DOC);
+  if (projects.truncated) log(`foreman: memory import: the projects doc in pm/state.json is ${utf8Length(text)} bytes, over the ${MAX_PROJECTS_DOC}-byte limit; importing the first ${utf8Length(projects.content)} bytes, cut at a line boundary`);
+  const prefsText = state.docs.preferences.content;
+  const preferences = truncateAtLine(prefsText, MAX_PREFERENCES_DOC);
+  if (preferences.truncated) log(`foreman: memory import: the preferences doc in pm/state.json is ${utf8Length(prefsText)} bytes, over the ${MAX_PREFERENCES_DOC}-byte limit; importing the first ${utf8Length(preferences.content)} bytes, cut at a line boundary`);
+  const lines = state.log
+    .map((entry) => truncateChars(entry.text.trim(), MAX_LOG_ENTRY).trim())
+    .filter((entry) => entry.length >= MIN_LOG_ENTRY && isLogText(entry))
+    .slice(-MAX_LOG_KEPT);
+  const model = isPmModel(state.model) ? state.model : null;
+  const fitted = fitImportFrame({ projects: projects.content, log: lines, model, source_machine: machineId });
+  if (fitted.dropped) log(`foreman: memory import: dropped the ${fitted.dropped} oldest pm/state.json log entries to fit the import frame`);
+  return { payload: fitted.payload, preferences: preferences.content, source: 'state' };
+}
+
+/**
+ * #117: this machine's memory for the relay import: pm/state.json when it is a valid, initialized,
+ * owned regular file (what the PM learned in local-only mode), else the pre-#26 files, as
+ * `readImportPayload`. Reads only; never modifies, renames or deletes a file.
+ */
+export function readRelayImportSource(home: string, machineId: string, log: Logger = defaultLog): PmImportSource {
+  const state = readLocalStateForImport(home, log);
+  if (state) return importFromLocalState(state, machineId, log);
+  return { payload: readImportPayload(home, machineId, log), preferences: '', source: 'legacy' };
+}
+
+/** #117: records in `<home>/memory/.pm-mode.json` that this machine's PM memory is in the relay (mode 0600). */
+export function writeRelayModeMarker(home: string, machineId: string, at: string): void {
+  atomicWrite(join(home, 'memory', PM_MODE_FILE), JSON.stringify({ version: 1, mode: 'relay', machine_id: machineId, at }) + '\n');
+}
+
+/** #117: the `at` of a valid relay marker in `<home>/memory/.pm-mode.json` (an owned regular file), else null. */
+export function readRelayModeMarker(home: string): { at: string } | null {
+  const file = join(home, 'memory', PM_MODE_FILE);
+  try {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null;
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    if (!isObject(raw) || raw.version !== 1 || raw.mode !== 'relay' || typeof raw.at !== 'string') return null;
+    return { at: raw.at };
+  } catch { return null; }
+}
+
 /** Records the import in `<home>/memory/.imported.json` as `{ machine_id, at, target }` (mode 0600). */
 export function writeImportMarker(home: string, machineId: string, target: PmImportTarget, at: string): void {
   atomicWrite(join(home, 'memory', IMPORT_MARKER_FILE), JSON.stringify({ machine_id: machineId, at, target }) + '\n');
@@ -151,12 +242,38 @@ export type PmBridge = Pick<HostBridge, 'rpc' | 'onAssignment' | 'onConnection' 
 
 export interface RelayPmStoreOptions {
   identity: MachineIdentity;
-  /** FOREMAN_HOME to import from (default the process's). */
+  /** FOREMAN_HOME to import from, and home of `pm/turn-outbox.json` (default the process's). */
   home?: string;
   log?: Logger;
   now?: () => Date;
   /** Import automatically on activation (default true). */
   autoImport?: boolean;
+  /** #116: first retry delay after a turn.end/ack times out while connected (default 1 s), doubling up to `retryMaxMs` (default 30 s). */
+  retryBaseMs?: number;
+  retryMaxMs?: number;
+}
+
+/** #116: the host's durable record of turn updates the relay has not yet confirmed. */
+export const TURN_OUTBOX_FILE = 'turn-outbox.json';
+// Bounds of the outbox: the DO holds at most MAX_OPEN_TURNS open rows (so at most that many ends
+// matter) and caps its uncertain rows at 256 (cloud/pm-state.ts MAX_UNCERTAIN_TURNS).
+const MAX_OUTBOX_ENDS = MAX_OPEN_TURNS;
+const MAX_OUTBOX_ACKS = 256;
+
+interface TurnOutbox { ends: Map<string, TurnOutcome>; acks: Set<string> }
+
+function readTurnOutbox(file: string, log: Logger): TurnOutbox {
+  const outbox: TurnOutbox = { ends: new Map(), acks: new Set() };
+  if (!existsSync(file)) return outbox;
+  try {
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    if (!isObject(raw) || raw.version !== 1 || !Array.isArray(raw.ends) || !Array.isArray(raw.acks)) throw new Error('shape');
+    for (const end of raw.ends) if (isObject(end) && isPmId(end.turn_id) && (TURN_OUTCOMES as readonly unknown[]).includes(end.outcome)) outbox.ends.set(end.turn_id, end.outcome);
+    for (const id of raw.acks) if (isPmId(id)) outbox.acks.add(id);
+  } catch {
+    log('foreman: pm/turn-outbox.json is invalid; ignoring it (queued PM turn updates from a previous run are lost)');
+  }
+  return outbox;
 }
 
 type QueueItem =
@@ -169,6 +286,14 @@ type QueueItem =
  * `ackUncertain` queue while disconnected and flush in order once this machine is active again; a
  * `stale_epoch`/`not_active` reply, or an inactive assignment, drops the queue and the store reports
  * not active.
+ *
+ * #116: every queued end and every acknowledged uncertain turn is also written to
+ * `<home>/pm/turn-outbox.json` until the relay confirms it, so a daemon restart neither reports a
+ * turn it already reported, nor turns a pending end (e.g. the `failed` end of a begin that never
+ * dispatched) into a `restarted` uncertain entry: pending ends are listed as still open in the next
+ * hello and flushed on activation, and an uncertain turn this host already knows the outcome of, or
+ * already reported, is acknowledged without being reported again. A turn.end/ack that times out
+ * while connected is retried with capped exponential backoff.
  */
 export class RelayPmStore implements HostPmStore {
   readonly mode = 'relay' as const;
@@ -190,14 +315,28 @@ export class RelayPmStore implements HostPmStore {
   private flushing = false;
   private importRun: Promise<PmImportOutcome> | null = null;
   private importOutcome: PmImportOutcome | null = null;
+  // #122: a memory.import this store sent may have been applied (no reply: timeout, lost connection).
+  private importUnconfirmed = false;
   private listeners = new Set<PmAssignmentListener>();
   private unsubscribe: (() => void)[] = [];
   private closed = false;
+  private outboxFile: string;
+  private outbox: TurnOutbox;
+  private retryBaseMs: number;
+  private retryMaxMs: number;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryAttempts = 0;
 
   constructor(bridge: PmBridge, options: RelayPmStoreOptions) {
     this.bridge = bridge; this.identity = options.identity;
     this.home = options.home ?? FOREMAN_HOME; this.logger = options.log ?? defaultLog;
     this.now = options.now ?? (() => new Date()); this.autoImport = options.autoImport ?? true;
+    this.retryBaseMs = options.retryBaseMs ?? 1000; this.retryMaxMs = Math.max(this.retryBaseMs, options.retryMaxMs ?? 30_000);
+    this.outboxFile = join(this.home, 'pm', TURN_OUTBOX_FILE);
+    this.outbox = readTurnOutbox(this.outboxFile, this.logger);
+    // Ends a previous run could not deliver: still open as far as this host knows, so the next
+    // hello lists them (the DO does not mark them restarted) and activation flushes them.
+    for (const turnId of this.outbox.ends.keys()) this.open.add(turnId);
     this.connected = bridge.connected;
     this.unsubscribe.push(bridge.onConnection((connected) => this.connectionChanged(connected)));
     this.unsubscribe.push(bridge.onAssignment((assignment) => this.assignmentChanged(assignment)));
@@ -216,7 +355,7 @@ export class RelayPmStore implements HostPmStore {
   }
   openTurnIds(): string[] { return [...this.open]; }
   uncertainTurns(): UncertainTurn[] { return this.uncertain.map((turn) => ({ ...turn })); }
-  close(): void { this.closed = true; for (const off of this.unsubscribe.splice(0)) off(); this.listeners.clear(); }
+  close(): void { this.closed = true; this.clearRetry(); for (const off of this.unsubscribe.splice(0)) off(); this.listeners.clear(); }
 
   async read() {
     await this.importSettled();
@@ -251,21 +390,78 @@ export class RelayPmStore implements HostPmStore {
       if (code === 'disconnected' || code === 'timeout' || code === 'invalid_result') {
         // The DO may have recorded it: keep it listed as open and end it as failed when possible,
         // so the record is removed without ever surfacing as uncertain.
-        void this.enqueue({ kind: 'end', epoch: this.epoch, turnId, outcome: 'failed', settled: false, resolve: () => {} });
+        void this.queueEnd(turnId, 'failed');
       } else this.open.delete(turnId);
       throw error;
     }
   }
   /** Sends the outcome now, or queues it while disconnected (resolving once queued). Never rejects. */
   endTurn(turnId: string, outcome: TurnOutcome): Promise<void> {
-    return this.enqueue({ kind: 'end', epoch: this.epoch, turnId, outcome, settled: false, resolve: () => {} });
+    return this.queueEnd(turnId, outcome);
   }
+  /** Records the acknowledgement durably (synchronously, before it is sent), so a reported turn is never reported again. */
   ackUncertain(turnIds: string[]): Promise<void> {
     const ids = [...new Set(turnIds)];
     if (ids.length === 0) return Promise.resolve();
+    for (const id of ids) this.outbox.acks.add(id);
+    this.saveOutbox();
+    return this.queueAcks(ids);
+  }
+  private queueEnd(turnId: string, outcome: TurnOutcome): Promise<void> {
+    this.outbox.ends.set(turnId, outcome);
+    this.saveOutbox();
+    return this.enqueue({ kind: 'end', epoch: this.epoch, turnId, outcome, settled: false, resolve: () => {} });
+  }
+  private queueAcks(ids: string[]): Promise<void> {
     const batches: Promise<void>[] = [];
     for (let i = 0; i < ids.length; i += MAX_OPEN_TURNS) batches.push(this.enqueue({ kind: 'ack', epoch: this.epoch, turnIds: ids.slice(i, i + MAX_OPEN_TURNS), settled: false, resolve: () => {} }));
     return Promise.all(batches).then(() => {});
+  }
+  // The relay confirmed (or finally refused) this update: forget it.
+  private confirmed(item: QueueItem) {
+    const changed = item.kind === 'end' ? this.outbox.ends.delete(item.turnId) : item.turnIds.map((id) => this.outbox.acks.delete(id)).some(Boolean);
+    if (changed) this.saveOutbox();
+  }
+  // Best effort: a failed write keeps the in-memory outbox (per-process dedup still holds).
+  private saveOutbox() {
+    const ends = [...this.outbox.ends].slice(-MAX_OUTBOX_ENDS);
+    const acks = [...this.outbox.acks].slice(-MAX_OUTBOX_ACKS);
+    if (ends.length < this.outbox.ends.size) this.outbox.ends = new Map(ends);
+    if (acks.length < this.outbox.acks.size) this.outbox.acks = new Set(acks);
+    try {
+      // Nothing pending: no file (so an idle host's pm/ holds nothing new).
+      if (!ends.length && !acks.length) { rmSync(this.outboxFile, { force: true }); return; }
+      atomicWrite(this.outboxFile, JSON.stringify({ version: 1, ends: ends.map(([turn_id, outcome]) => ({ turn_id, outcome })), acks }) + '\n');
+    } catch {
+      this.logger('foreman: could not save pm/turn-outbox.json; pending PM turn updates are kept in memory only');
+    }
+  }
+  // Activation: queue every recorded update not yet queued for the current epoch (after a restart,
+  // after a move dropped the queue, or when an item queued at an older epoch will be refused).
+  private requeueOutbox() {
+    const queuedEnds = new Set<string>(), queuedAcks = new Set<string>();
+    for (const item of this.queue) {
+      if (item.epoch !== this.epoch) continue;
+      if (item.kind === 'end') queuedEnds.add(item.turnId); else for (const id of item.turnIds) queuedAcks.add(id);
+    }
+    for (const [turnId, outcome] of this.outbox.ends) {
+      if (queuedEnds.has(turnId)) continue;
+      this.open.add(turnId);
+      void this.enqueue({ kind: 'end', epoch: this.epoch, turnId, outcome, settled: false, resolve: () => {} });
+    }
+    const acks = [...this.outbox.acks].filter((id) => !queuedAcks.has(id));
+    if (acks.length) void this.queueAcks(acks);
+  }
+  private clearRetry() {
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+  }
+  // A timed-out update while still connected: retry with capped exponential backoff (one timer).
+  private scheduleRetry() {
+    if (this.closed || this.retryTimer || !this.usable()) return;
+    const delay = Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** Math.min(this.retryAttempts, 16));
+    this.retryAttempts++;
+    this.retryTimer = setTimeout(() => { this.retryTimer = null; void this.flush(); }, delay);
+    this.retryTimer.unref?.();
   }
 
   /** Imports this machine's file memory if the DO's memory is uninitialized. Once per store. */
@@ -279,19 +475,37 @@ export class RelayPmStore implements HostPmStore {
     return this.importRun;
   }
 
+  // #117: the relay wins when it already has memory (local files are left untouched); otherwise
+  // pm/state.json is imported when valid, else the pre-#26 files.
   private async runImport(): Promise<PmImportOutcome> {
     const memory = await this.request('memory.get', {});
-    if (memory.initialized) { this.logger(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`); return 'already_initialized'; }
-    const payload = readImportPayload(this.home, this.identity.machine_id, this.logger);
+    if (memory.initialized) { this.logger(`foreman: ${this.importUnconfirmed ? IMPORT_REPLY_LOST_MESSAGE : ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
+    const { payload, preferences, source } = readRelayImportSource(this.home, this.identity.machine_id, this.logger);
     try {
       await this.request('memory.import', payload);
     } catch (error) {
-      if ((error as PmStoreError).code === 'already_initialized') { this.logger(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`); return 'already_initialized'; }
+      const code = (error as PmStoreError).code;
+      if (code === 'already_initialized') { this.logger(`foreman: ${this.importUnconfirmed ? IMPORT_REPLY_LOST_MESSAGE : ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
+      if (code === 'timeout' || code === 'disconnected' || code === 'invalid_result') this.importUnconfirmed = true;
       throw error;
     }
+    // memory.import carries no preferences doc: a non-empty one from pm/state.json follows as the
+    // first write of the fresh doc (expected version 0). Best effort: a failure is logged.
+    let prefs = '';
+    if (preferences) {
+      try { await this.request('memory.put', { doc: 'preferences', content: preferences, expected_version: 0 }); prefs = `, ${utf8Length(preferences)} bytes of preferences`; }
+      catch (error) { this.logger(`foreman: memory import: the preferences doc from pm/state.json was not imported (${(error as PmStoreError).code ?? 'error'})`); }
+    }
     writeImportMarker(this.home, this.identity.machine_id, 'relay', this.now().toISOString());
-    this.logger(`foreman: imported local PM memory into the relay (${utf8Length(payload.projects)} bytes of projects, ${payload.log.length} log entries)`);
+    this.markRelayMode();
+    const from = source === 'state' ? 'pm/state.json (local-only PM memory)' : 'memory/PROJECTS.md and memory/LOG.md';
+    this.logger(`foreman: imported local PM memory into the relay from ${from} (${utf8Length(payload.projects)} bytes of projects, ${payload.log.length} log entries${prefs})`);
     return 'imported';
+  }
+  // #117: remember that this machine's PM memory is in the relay, for a later local-only start.
+  private markRelayMode() {
+    try { writeRelayModeMarker(this.home, this.identity.machine_id, this.now().toISOString()); }
+    catch { this.logger('foreman: could not save memory/.pm-mode.json'); }
   }
   private async importSettled() {
     if (this.importRun) await this.importRun.catch(() => {});
@@ -360,29 +574,36 @@ export class RelayPmStore implements HostPmStore {
         } catch (error) {
           const code = error instanceof PmRpcError ? error.code : 'unavailable';
           if (code === 'disconnected' || code === 'timeout') {
-            // Held at the head for the next connection (turn.end/ack are idempotent in the DO).
+            // Held at the head (turn.end/ack are idempotent in the DO): retried with backoff while
+            // still connected, else on the next connection.
             for (const held of this.queue) this.settle(held);
+            this.scheduleRetry();
             return;
           }
           if (code === 'stale_epoch' || code === 'not_active') {
             if (item.epoch === this.epoch) { this.fence(); return; }
-            // Older than the current assignment: that turn was already reconciled by the DO.
+            // Older than the current assignment: that turn was already reconciled by the DO. The
+            // outbox keeps it, so the next activation resends it with the current epoch.
             this.queue.shift(); if (item.kind === 'end') this.open.delete(item.turnId); this.settle(item);
             continue;
           }
           this.queue.shift(); if (item.kind === 'end') this.open.delete(item.turnId); this.settle(item);
+          this.confirmed(item);
           this.logger(`foreman: PM turn update rejected by the relay (${code})`);
           continue;
         }
+        this.retryAttempts = 0;
         this.queue.shift();
         if (item.kind === 'end') this.open.delete(item.turnId);
         else this.uncertain = this.uncertain.filter((turn) => !item.turnIds.includes(turn.turn_id));
+        this.confirmed(item);
         this.settle(item);
       }
     } finally { this.flushing = false; }
   }
   private connectionChanged(connected: boolean) {
     if (this.closed) return;
+    this.clearRetry(); this.retryAttempts = 0; // the next connection flushes the queue
     this.connected = connected;
     this.assigned = false; this.active = false;
     if (!connected) this.uncertain = [];
@@ -394,7 +615,7 @@ export class RelayPmStore implements HostPmStore {
     this.connected = true; this.assigned = true;
     this.epoch = assignment.epoch; this.active = assignment.active; this.fenced = false;
     this.activeHost = assignment.active_machine?.host ?? null;
-    this.uncertain = assignment.active ? assignment.uncertain_turns.map((turn) => ({ ...turn })) : [];
+    this.uncertain = assignment.active ? this.unreported(assignment.uncertain_turns) : [];
     if (!assignment.active) {
       this.dropQueue(`the PM runs on ${this.activeHost ?? 'no machine'}`);
       // Turns this machine held were reconciled by the DO on reassignment.
@@ -402,11 +623,31 @@ export class RelayPmStore implements HostPmStore {
     }
     this.emit();
     if (this.usable()) {
+      this.requeueOutbox();
       void this.flush();
       if (this.autoImport && !wasActive && !this.importOutcome) {
         this.ensureImported().catch((error) => this.logger(`foreman: memory import did not complete (${(error as PmStoreError).code ?? 'error'}); it will be retried on the next activation`));
       }
     }
+  }
+  // #116: an uncertain turn this host already reported (ack recorded) or already knows the outcome
+  // of (end recorded, e.g. a begin that failed so nothing was dispatched) is not reported again: it
+  // is only acknowledged, on activation.
+  private unreported(turns: readonly UncertainTurn[]): UncertainTurn[] {
+    let changed = false;
+    const fresh: UncertainTurn[] = [];
+    for (const turn of turns) {
+      if (this.outbox.ends.has(turn.turn_id)) {
+        // turn.end removes only open rows: this one needs the ack instead.
+        this.outbox.ends.delete(turn.turn_id); this.outbox.acks.add(turn.turn_id); changed = true;
+        // A queued end for it is left in place: it removes nothing now and is harmless.
+        this.open.delete(turn.turn_id);
+      }
+      if (this.outbox.acks.has(turn.turn_id)) continue;
+      fresh.push({ ...turn });
+    }
+    if (changed) this.saveOutbox();
+    return fresh;
   }
   private call(listener: PmAssignmentListener) {
     try { listener(this.assignment(), this.uncertainTurns()); } catch { console.error('foreman: PM assignment listener failed'); }
@@ -419,7 +660,7 @@ export class RelayPmStore implements HostPmStore {
 // ---------------------------------------------------------------------------------------------
 
 interface LocalTurn { turn_id: string; accepted_at: string; state: 'open' | 'uncertain'; reason: 'restarted' | null }
-interface LocalState {
+export interface LocalState {
   version: 1;
   initialized: boolean;
   docs: Record<PmDocName, Doc>;
@@ -480,6 +721,9 @@ export class LocalPmStore implements HostPmStore {
     this.identity = options.identity; this.home = options.home ?? FOREMAN_HOME;
     this.file = options.file ?? join(this.home, 'pm', 'state.json');
     this.log_ = options.log ?? defaultLog; this.now = options.now ?? (() => new Date());
+    // #117: relay → local-only never merges; say so on every local-only start while the marker applies.
+    const relayMarker = readRelayModeMarker(this.home);
+    if (relayMarker) this.log_(`foreman: PM memory: ${RELAY_MEMORY_NOT_MERGED_NOTICE} (relay mode last used ${relayMarker.at})`);
     let state = freshState();
     if (existsSync(this.file)) {
       let raw: unknown;

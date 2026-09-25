@@ -2,9 +2,13 @@ import { homedir, hostname } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync, existsSync } from "node:fs";
+import { assertTestHome } from "./home-guard.mjs";
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const FOREMAN_HOME = process.env.FOREMAN_HOME || join(homedir(), ".foreman");
+// Story #121: under `node --test`, refuse the default or the real ~/.foreman (~/.foreman-dev) at
+// import, before any server module can write there. Tests pin FOREMAN_HOME to a mkdtemp dir.
+assertTestHome(FOREMAN_HOME, { explicit: Boolean(process.env.FOREMAN_HOME) });
 export const SESSIONS_DIR = join(FOREMAN_HOME, "sessions");
 export const MEMORY_DIR = join(FOREMAN_HOME, "memory");
 export const PM_DIR = join(FOREMAN_HOME, "pm");
