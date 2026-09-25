@@ -1,17 +1,39 @@
-// The project manager: one long-lived Claude Agent SDK session in streaming-input mode.
+// The project manager: a disposable Claude Agent SDK session in streaming-input mode (epic #26).
 // Tool access is enforced here (canUseTool), not just prompted.
+//
+// Lifecycle (PMM-05, #83):
+// - The PM keeps no transcript and never resumes a provider session. Every provider start is a fresh
+//   session whose memory block is read from the PM state store (`HostPmStore`: the relay DO, or
+//   pm/state.json in local-only mode). This file writes nothing to disk.
+// - The current conversation is an in-memory list (≤ MAX_PM_HISTORY entries) scoped to the PM's
+//   activation: empty on daemon start and whenever this machine becomes the active PM host. An
+//   in-process provider restart keeps it and appends a neutral "fresh session" entry.
+// - Every input is recorded write-ahead (`store.beginTurn`) before it is dispatched, and tracked
+//   individually (turn id, dispatch time, whether the provider took it). A result settles exactly
+//   the inputs it names (the SDK echoes each input's uuid in `user_message_uuids`); a result that
+//   names none settles nothing during a peer turn and otherwise resolves the oldest taken input as
+//   uncertain, never completed. Nothing is ever replayed or retried automatically.
+// - #62: when inputs are outstanding and the provider has been silent for ≥ the hung threshold,
+//   the next explicit send marks each outstanding input uncertain, retires the provider, starts a
+//   fresh session and dispatches only the new input. Nothing is timer-driven.
 import { query, type SDKUserMessage, type Query, type HookCallback, type TerminalReason, type SDKAssistantMessageError } from "@anthropic-ai/claude-agent-sdk";
 import { normalizeModel } from "./models.ts";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFileSync, writeFileSync, existsSync, appendFileSync, realpathSync, statSync, renameSync } from "node:fs";
-import { join, resolve, sep, dirname, basename } from "node:path";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { join, resolve, sep, basename } from "node:path";
 import { homedir } from "node:os";
-import { Fleet } from "./fleet.ts";
-import { ProjectRegistry } from "./projects.ts";
+import type { Fleet } from "./fleet.ts";
+import type { ProjectRegistry } from "./projects.ts";
 import { makeFleetServer, type ManagedFleetService } from "./tools.ts";
 import { makePeerMcpServer, PEER_ALLOWED_TOOLS, PEER_INSTRUCTIONS } from "./peer-tools.ts";
-import { FOREMAN_HOME, MEMORY_DIR, PM_SESSION_FILE, PM_HISTORY_FILE, REPO_ROOT } from "./paths.ts";
+import { FOREMAN_HOME, HOST, REPO_ROOT } from "./paths.ts";
+import { PmStoreError, type HostPmStore } from "./pm-store.ts";
+import { redactSecrets } from "../shared/redact.ts";
+import {
+  MAX_PM_HISTORY, PM_HUNG_DEFAULT_MS, PM_MEMORY_TOOLS,
+  type Doc, type HostUncertainReason, type LogEntry, type PmAssignment, type TurnOutcome, type UncertainTurn,
+} from "../shared/pm-state.ts";
 
 export type PmEvent =
   | { type: "turn_start"; ts: string }
@@ -22,39 +44,86 @@ export type PmEvent =
   | { type: "status"; text: string }
   | { type: "peer"; text: string };
 
+/** One entry of the current conversation (the `/api/pm/history` shape). */
+export interface PmEntry { role: 'user' | 'assistant' | 'system' | 'tool' | 'peer'; ts: string; text?: string; error?: true; name?: string; summary?: string }
+
+/** The part of the host bridge the PM reads: the latest `pm_assignment` on the current connection. */
+export type PmAssignmentSource = { currentAssignment(): PmAssignment | null };
+
+export interface ProjectManagerOptions {
+  sessions?: ManagedFleetService;
+  projects?: ProjectRegistry;
+  /** This machine's display name (names the host in uncertain entries). Default HOST. */
+  machineName?: string;
+  /** Injectable clock (epoch ms) for the hung rule and timestamps. */
+  now?: () => number;
+  /** #62 threshold. Default FOREMAN_PM_HUNG_MS, else PM_HUNG_DEFAULT_MS. */
+  hungMs?: number;
+}
+
+export interface PmAttachOptions {
+  /** Relay mode: the bridge, to tell "awaiting this connection's assignment" from "moved away". */
+  bridge?: PmAssignmentSource | null;
+  /** Start the provider as soon as the PM is active (default true). Otherwise the first send starts it. */
+  autoStart?: boolean;
+}
+
+/** A fresh provider session in the same conversation (not an error). */
+export const FRESH_SESSION_NOTICE = 'Started a fresh PM session. It answers from memory, not from the messages above.';
+export const RELAY_UNREACHABLE_MESSAGE = 'The cloud relay is unreachable; the PM is unavailable on this machine.';
+
+export type PmStoreChoice = { mode: 'relay' | 'local' } | { mode: 'unavailable'; reason: string };
+/**
+ * Which PM state store this daemon may use (epic #26: never two PMs). Local-only mode applies only
+ * when no relay is configured at all (`readRelayConfig` returns null: no cloud.json, no relay env).
+ * A relay that is configured but invalid, or whose bridge did not start, means the relay holds the
+ * PM: this machine runs no PM rather than a local one built from its own files.
+ */
+export function choosePmStore(readRelayConfig: () => unknown, hasBridge: boolean, env: NodeJS.ProcessEnv = process.env): PmStoreChoice {
+  let config: unknown;
+  try { config = readRelayConfig(); }
+  catch (error) {
+    const cause = safe(errorText(error), 300);
+    const source = env.FOREMAN_RELAY_URL || env.FOREMAN_HOST_TOKEN ? 'the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN)' : 'cloud.json';
+    return { mode: 'unavailable', reason: `${source} is invalid (${cause}); the PM is unavailable on this machine` };
+  }
+  if (hasBridge) return { mode: 'relay' };
+  if (config === null || config === undefined) return { mode: 'local' };
+  return { mode: 'unavailable', reason: 'the cloud relay is configured but its connection could not be started; the PM is unavailable on this machine' };
+}
+
+// Human text for each uncertain reason, used in "could not be confirmed (<reason>)".
+export const UNCERTAIN_REASON_TEXT: Readonly<Record<HostUncertainReason, string>> = {
+  restarted: 'Foreman restarted',
+  reassigned: 'the PM was moved',
+  host_lost: 'machine went offline',
+  hung: 'the PM stopped responding',
+};
+const UNMATCHED_REPLY = 'the reply could not be matched to your message';
+
+/** "2026-09-24 12:00 UTC" for an ISO timestamp (the input unchanged if it does not parse). */
+export function sendTime(iso: string): string {
+  const at = new Date(iso);
+  return Number.isNaN(at.getTime()) ? iso : `${at.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+}
+export function uncertainText(acceptedAt: string, host: string, reason: string): string {
+  return `Your message sent at ${sendTime(acceptedAt)} to the PM on ${host} could not be confirmed (${reason}). It was not replayed.`;
+}
+function undeliveredText(acceptedAt: string, host: string, reason: string): string {
+  return `Your message sent at ${sendTime(acceptedAt)} to the PM on ${host} was not delivered (${reason}). It was not replayed.`;
+}
+
 const DOC_FILE = /\.(md|mdx|markdown|txt|rst|adoc)$|^(readme|changelog|contributing|license|todo|roadmap)$/i;
 
 const home = homedir();
 const under = (p: string, dir: string) => { const a = resolve(p); const d = resolve(dir); return a === d || a.startsWith(d + sep); };
 const expand = (p: string) => (p === '~' ? home : p.startsWith("~/") ? join(home, p.slice(2)) : p);
 const canonical = (p: string) => realpathSync(resolve(FOREMAN_HOME, p));
-function memoryWritePath(p: string): boolean {
-  try {
-    const target = resolve(FOREMAN_HOME, p);
-    if (existsSync(target)) return under(canonical(target), canonical(MEMORY_DIR));
-    // Check the nearest existing parent too, so a symlink cannot escape the memory directory.
-    let parent = dirname(target);
-    while (!existsSync(parent) && parent !== dirname(parent)) parent = dirname(parent);
-    return under(target, MEMORY_DIR) && under(canonical(parent), canonical(MEMORY_DIR));
-  } catch { return false; }
-}
 
 // The SDK's own abort reasons. Typed against the installed SDK so a typo or an SDK rename
 // fails `npm run typecheck` instead of silently turning a Stop into a failure (or vice versa).
 const SDK_ABORT_REASONS = ['aborted_streaming', 'aborted_tools'] as const satisfies readonly TerminalReason[];
 const isAbortReason = (reason: unknown): boolean => (SDK_ABORT_REASONS as readonly unknown[]).includes(reason);
-// Resume-handle rejections, deliberately narrow. Only diagnostics that name the saved resume
-// handle itself as unusable count; auth, spawn (ENOENT), network and every other provider error
-// never match, so they never quarantine a session. (A bare "session ... not found" is not used:
-// the CLI emits "Session not found" for MCP HTTP transports and remote agents too.)
-// - MISSING_CONVERSATION: the CLI's `--resume` message when the transcript for that id is gone
-//   ("No conversation found with session ID: <id>"). A fresh run can take over the input.
-// - INVALID_RESUME_HANDLE: the provider rejected the handle as malformed/unusable.
-const MISSING_CONVERSATION = /\bno conversation found with session id\b/i;
-const INVALID_RESUME_HANDLE = /\binvalid resume handle\b/i;
-// Abandoned session ids are moved here, never deleted: one JSON line per quarantine,
-// `{ ts, session_id, reason }`, with the provider diagnostic truncated.
-const PM_SESSION_QUARANTINE_FILE = `${PM_SESSION_FILE}.quarantine.jsonl`;
 // The diagnostic an error result carries: primarily the text the SDK's exit echo uses (errors[]
 // for an error subtype, `result` for an is_error success). Unlike the SDK, it falls back to the
 // other field when the primary one is empty; the echo then differs, so it never suppresses one.
@@ -64,6 +133,8 @@ const resultDiagnostic = (m: any): string => {
   return (m.subtype === 'success' ? result || errors : errors || result);
 };
 const errorText = (error: unknown): string => String((error as any)?.message ?? error);
+// Provider- or store-derived text that is logged, emitted or stored: redacted, then bounded.
+const safe = (text: string, max: number): string => redactSecrets(text).slice(0, max);
 // When the CLI exits after an error result, the SDK throws this echo of the result's diagnostic.
 const sdkErrorResultEcho = (diagnostic: string) => `Claude Code returned an error result: ${diagnostic}`;
 // The SDK's typed assistant error code (`SDKAssistantMessage['error']`, e.g. 'authentication_failed').
@@ -77,59 +148,65 @@ const codedDiagnostic = (code: string | null, prose: string): string => {
   if (!prose) return `${code}: provider returned no message`;
   return prose.includes(code) ? prose : `${code}: ${prose}`;
 };
-// Conservative credential redaction for provider text that is logged or persisted, since it can
-// in principle echo request headers: Anthropic keys and OAuth tokens (`sk-ant-...`), bearer
-// credentials, and the values of token/key/secret/password/authorization fields.
-const redactSecrets = (text: string): string => text
-  .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-[REDACTED]')
-  .replace(/\bBearer\s+[^\s"',;]+/gi, 'Bearer [REDACTED]')
-  .replace(/\b((?:access|refresh|id|auth|session|oauth)?[_-]?token|api[_-]?key|x-api-key|client[_-]?secret|secret|password|authorization)(["']?\s*[=:]\s*["']?)[^\s"',;&]{8,}/gi, '$1$2[REDACTED]');
+// The client uuids a result says its turn consumed (SDK ≥ the `user_message_uuids` echo), or null
+// when it names none (a peer or system turn, a zeroed crash result, or an older producer).
+function echoedInputs(m: any): string[] | null {
+  if (Array.isArray(m.user_message_uuids)) {
+    const ids = m.user_message_uuids.filter((id: unknown): id is string => typeof id === 'string');
+    if (ids.length) return ids;
+  }
+  return typeof m.user_message_uuid === 'string' && m.user_message_uuid ? [m.user_message_uuid] : null;
+}
+
+/** One accepted input: recorded in the store, then dispatched to the provider. */
+interface PmInput { turnId: string; acceptedAt: string; dispatchedAt: number; taken: boolean }
 
 class Inbox {
   delivered = 0;
   private q: SDKUserMessage[] = [];
   private waiters: (() => void)[] = [];
   private generation = 0;
-  push(text: string, sessionId: string) {
-    this.q.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, session_id: sessionId } as SDKUserMessage);
+  private onTake: (turnId: string) => void;
+  constructor(onTake: (turnId: string) => void = () => {}) { this.onTake = onTake; }
+  // The input's turn id is also its SDK uuid, which the CLI echoes on the result that answers it.
+  push(text: string, sessionId: string, turnId: string) {
+    this.q.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, session_id: sessionId, uuid: turnId } as SDKUserMessage);
     this.notify();
   }
   private notify() { const waiters = this.waiters; this.waiters = []; for (const wake of waiters) wake(); }
-  // Opening a stream retires every earlier stream at once, so an abandoned provider attempt
-  // (e.g. a rejected resume) can never consume input meant for its replacement. `taken`
-  // records every message this stream handed to its reader (the SDK reads it eagerly).
-  open(): { prompt: AsyncGenerator<SDKUserMessage>; taken: SDKUserMessage[] } {
+  // Opening a stream retires every earlier stream at once, so an abandoned provider can never
+  // consume input meant for its replacement. Each message handed to the reader is reported taken
+  // (the SDK reads eagerly, so "taken" is not "processed").
+  open(): AsyncGenerator<SDKUserMessage> {
     const generation = ++this.generation;
     this.notify();
-    const inbox = this, taken: SDKUserMessage[] = [];
-    const prompt = (async function* () {
+    const inbox = this;
+    return (async function* () {
       while (generation === inbox.generation) {
-        if (inbox.q.length) { const message = inbox.q.shift()!; taken.push(message); inbox.delivered++; yield message; continue; }
+        if (inbox.q.length) {
+          const message = inbox.q.shift()!;
+          inbox.delivered++;
+          if (typeof message.uuid === 'string') inbox.onTake(message.uuid);
+          yield message;
+          continue;
+        }
         await new Promise<void>((r) => inbox.waiters.push(r));
       }
     })();
-    return { prompt, taken };
   }
   // End every open stream: a reader parked on it wakes and its stream completes.
   retire() { this.generation++; this.notify(); }
-  // Hand back input a stream took but its provider never processed, ahead of anything queued
-  // after it. The stream is retired first so it cannot take the input again.
-  requeue(taken: SDKUserMessage[]) {
-    this.retire();
-    const returned = taken.splice(0);
-    this.q.unshift(...returned);
-    this.delivered -= returned.length;
-  }
 }
 
 export class ProjectManager extends EventEmitter {
-  private inbox = new Inbox();
+  private inbox: Inbox;
   private q: Query | null = null;
   private queryFactory = query;
   lastError: string | null = null;
   sessionId: string | null = null;
   busy = false;
   tools: string[] = [];
+  model: string | undefined;
   private running = false;
   private closed = false;
   // Cancellation is bound to a turn: `dispatched` counts inputs accepted by send(), and an
@@ -140,40 +217,129 @@ export class ProjectManager extends EventEmitter {
   private providerFailed = false;
   // Each start() owns one generation; a retired run must not touch shared state.
   private generation = 0;
-  private reconciled = false;
-  private pendingTurns = 0;
   private changingModel = false;
-  // A provider launch that threw synchronously (spawn ENOENT, unreadable prompt) while send()
-  // was starting it: send() rejects with this cause instead of accepting input no run can read.
+  // A provider launch (or its memory read) that failed while send() was starting it: send()
+  // rejects with this cause instead of accepting input no run can read.
   private launchFailure: string | null = null;
-  // Session ids quarantined by this process. Never resumed again, even when clearing the active
-  // session file failed and it still names one, so the next explicit send starts fresh.
-  private quarantinedIds = new Set<string>();
-  model: string | undefined;
-  private settingsPath: string;
-  get modelBusy() { return this.busy || this.pendingTurns > 0 || this.changingModel; }
+  private launched: Promise<void> = Promise.resolve();
+  // Per-input tracking (#62), in dispatch order, for the current provider.
+  private outstanding: PmInput[] = [];
+  private lastFrameAt = 0;
+  private conversation: PmEntry[] = [];
+  private freshStarts = 0;
+  // The assignment epoch this PM is active for, or null while this machine is not the PM host.
+  private activeEpoch: number | null = null;
+  private shownUncertain = new Set<string>();
+  private store: HostPmStore | null = null;
+  private bridge: PmAssignmentSource | null = null;
+  private autoStart = true;
+  private detach: (() => void) | null = null;
+  private readonly machineName: string;
+  private readonly now: () => number;
+  private readonly hungMs: number;
+  get modelBusy() { return this.busy || this.outstanding.length > 0 || this.changingModel; }
 
   private fleet: Fleet;
   private sessions?: ManagedFleetService;
   private projects?: ProjectRegistry;
-  constructor(fleet: Fleet, sessions?: ManagedFleetService, settingsPath = join(FOREMAN_HOME, 'pm', 'settings.json'), projects?: ProjectRegistry) {
-    super(); this.fleet = fleet; this.sessions = sessions; this.projects = projects; this.settingsPath = settingsPath;
-    this.model = normalizeModel(existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf8')).model : process.env.FOREMAN_PM_MODEL);
+  constructor(fleet: Fleet, options: ProjectManagerOptions = {}) {
+    super();
+    this.fleet = fleet; this.sessions = options.sessions; this.projects = options.projects;
+    this.machineName = options.machineName ?? HOST;
+    this.now = options.now ?? (() => Date.now());
+    const envHung = Number(process.env.FOREMAN_PM_HUNG_MS);
+    this.hungMs = options.hungMs ?? (Number.isFinite(envHung) && envHung > 0 ? envHung : PM_HUNG_DEFAULT_MS);
+    this.inbox = this.newInbox();
   }
+  private newInbox() {
+    return new Inbox((turnId) => { const input = this.outstanding.find((i) => i.turnId === turnId); if (input) input.taken = true; });
+  }
+
+  /** The current conversation (in memory only, ≤ MAX_PM_HISTORY entries). */
+  history(): PmEntry[] { return this.conversation.map((entry) => ({ ...entry })); }
+  /** Turn ids of inputs dispatched and not yet settled. */
+  outstandingTurnIds(): string[] { return this.outstanding.map((input) => input.turnId); }
+
+  // --- Activation ------------------------------------------------------------------------------
+
+  /**
+   * Binds the PM to its state store: it runs only while the store reports this machine as the
+   * active PM host. Returns an unsubscribe. In relay mode pass the bridge, so a new connection that
+   * has not yet received its assignment is not mistaken for a move.
+   */
+  attach(store: HostPmStore, options: PmAttachOptions = {}): () => void {
+    this.detach?.();
+    this.store = store; this.bridge = options.bridge ?? null; this.autoStart = options.autoStart ?? true;
+    const current = store.assignment();
+    if (current.active) this.assignmentChanged(current, store.uncertainTurns());
+    const off = store.onAssignment((assignment, uncertain) => this.assignmentChanged(assignment, uncertain));
+    this.detach = off;
+    return off;
+  }
+
+  private assignmentChanged(a: ReturnType<HostPmStore['assignment']>, uncertain: UncertainTurn[]) {
+    if (this.closed || !this.store) return;
+    if (a.active) {
+      if (this.activeEpoch !== a.epoch) this.activate(a.epoch, uncertain);
+      else this.reportUncertain(uncertain);
+      return;
+    }
+    if (this.activeEpoch === null) return;
+    // Disconnected: the PM keeps running (a turn in flight may finish) and the store refuses new
+    // sends until the relay is back. The same holds on a new connection until its assignment arrives.
+    if (!a.connected) return;
+    if (this.store.mode === 'relay' && this.bridge && this.bridge.currentAssignment() === null) return;
+    // An assignment on this connection names another machine, or the relay fenced this one.
+    this.deactivate(a.activeHost);
+  }
+
+  private activate(epoch: number, uncertain: UncertainTurn[]) {
+    // A new epoch while this PM was still active means the relay already reconciled its turns.
+    if (this.activeEpoch !== null || this.running) this.retire();
+    this.activeEpoch = epoch;
+    this.conversation = []; this.freshStarts = 0; this.lastError = null; this.sessionId = null; this.tools = [];
+    this.reportUncertain(uncertain);
+    if (this.autoStart) void this.start();
+  }
+
+  // This machine is no longer the PM host: close the provider. Outstanding inputs are left to the
+  // relay's reconciliation (reassigned or host_lost), never reported here as completed.
+  private deactivate(activeHost: string | null) {
+    this.retire();
+    this.activeEpoch = null;
+    const other = activeHost && activeHost !== this.machineName ? activeHost : null;
+    const text = other ? `The PM now runs on ${other}. This machine no longer runs it; messages sent here are refused.` : 'This machine is no longer the PM host; messages sent here are refused.';
+    this.record({ role: 'system', text });
+    this.emitEvent({ type: 'status', text });
+  }
+
+  // Each uncertain turn is shown once per process (the store re-sends the list on every connection
+  // or assignment change), then acknowledged.
+  private reportUncertain(turns: UncertainTurn[]) {
+    for (const turn of turns) {
+      if (this.shownUncertain.has(turn.turn_id)) continue;
+      this.shownUncertain.add(turn.turn_id);
+      this.reportFailureEntry(uncertainText(turn.accepted_at, turn.host, UNCERTAIN_REASON_TEXT[turn.reason] ?? turn.reason));
+    }
+    if (turns.length && this.store) {
+      this.store.ackUncertain(turns.map((turn) => turn.turn_id)).catch((error) => this.diagnostic('foreman: pm uncertain ack failed', { error: errorText(error) }));
+    }
+  }
+
+  // --- Model -----------------------------------------------------------------------------------
+
   async setModel(value: unknown) {
     const model = normalizeModel(value);
     if (this.modelBusy) throw new Error('Wait for the project manager to finish before changing its model');
     if (this.closed) throw this.unavailable(' (closed)');
-    const q = this.q;
-    if (!q || !this.running) throw this.unavailable();
+    const q = this.q, store = this.store;
+    if (!q || !this.running || !store) throw this.unavailable();
     this.changingModel = true;
     const previous = this.model;
     try {
       await q.setModel(model);
       try {
-        const tmp = `${this.settingsPath}.${randomUUID()}.tmp`;
-        writeFileSync(tmp, JSON.stringify({ model: model ?? null }), { flag: 'wx', mode: 0o600 });
-        renameSync(tmp, this.settingsPath);
+        await store.setModel(model ?? null);
         this.model = model;
       } catch (error) {
         // If persistence fails, restore the previous live selection before accepting more messages.
@@ -191,92 +357,144 @@ export class ProjectManager extends EventEmitter {
     } finally { this.changingModel = false; }
   }
 
-  history(): any[] {
-    if (!existsSync(PM_HISTORY_FILE)) return [];
-    return readFileSync(PM_HISTORY_FILE, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).slice(-200);
+  // --- Reporting -------------------------------------------------------------------------------
+
+  private record(entry: Omit<PmEntry, 'ts'>) {
+    this.conversation.push({ ts: new Date(this.now()).toISOString(), ...entry } as PmEntry);
+    if (this.conversation.length > MAX_PM_HISTORY) this.conversation.splice(0, this.conversation.length - MAX_PM_HISTORY);
   }
-  private record(entry: any) { appendFileSync(PM_HISTORY_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"); }
-  // Reporting (history appends and 'event' listeners) must never replace a provider cause or
-  // skip lifecycle state: EventEmitter.emit rethrows a listener's exception synchronously, and
-  // an append can fail on the filesystem. Each report runs once; a failure is logged on its own.
-  private report(kind: 'history' | 'event', detail: string, action: () => void) {
-    try { action(); }
-    catch (error: any) { console.error('foreman: pm reporting failed', JSON.stringify({ kind, detail, error: String(error?.message ?? error).slice(0, 500) })); }
+  private diagnostic(label: string, detail: Record<string, unknown>) {
+    const redacted = Object.fromEntries(Object.entries(detail).map(([k, v]) => [k, typeof v === 'string' ? safe(v, 1500) : v]));
+    try { console.error(label, JSON.stringify(redacted)); } catch { /* never let logging fail the PM */ }
   }
-  private reportRecord(entry: any) { this.report('history', String(entry.role), () => this.record(entry)); }
-  private emitEvent(event: PmEvent) { this.report('event', event.type, () => this.emit("event", event)); }
+  // 'event' listeners must never replace a provider cause or skip lifecycle state: EventEmitter.emit
+  // rethrows a listener's exception synchronously. A failure is logged on its own.
+  private emitEvent(event: PmEvent) {
+    try { this.emit("event", event); }
+    catch (error: any) { this.diagnostic('foreman: pm reporting failed', { kind: 'event', detail: event.type, error: String(error?.message ?? error).slice(0, 500) }); }
+  }
+  // A system entry the developer must see: error entry, current PM error, status event.
+  private reportFailureEntry(text: string) {
+    this.lastError = text;
+    this.record({ role: 'system', text, error: true });
+    this.emitEvent({ type: 'status', text });
+  }
 
   // A rejection that carries the PM's current error, so the caller never gets only generic text.
   private unavailable(detail = '') { return new Error(`Project manager is unavailable${detail}${this.lastError ? `: ${this.lastError}` : ''}`); }
   private static failureText(reason: string, next = 'Your message was not completed; after resolving the error, send a new message to retry. Failed messages are not replayed.') {
-    return `Project manager failed: ${redactSecrets(reason.slice(0, 1500))}. ${next}`;
+    return `Project manager failed: ${safe(reason, 1500)}. ${next}`;
   }
+  /** Reports a PM failure that is not about one input (e.g. a missing machine identity). */
+  failUnavailable(reason: string) { this.fail(reason, 'The project manager cannot run on this machine until this is fixed.'); }
   // `code` is the SDK's typed assistant error code behind the failure (null when there was none);
   // `subtype` is the failed result's subtype when the failure came from a result.
   private fail(reason: string, next?: string, detail: { code?: string | null; subtype?: string | null } = {}) {
     const text = ProjectManager.failureText(reason, next);
     const duplicateRejection = this.inbox.delivered === 0 && this.lastError === text;
     this.lastError = text;
-    console.error('foreman: pm failure', JSON.stringify({ session_id: this.sessionId, pending_turns: this.pendingTurns, code: detail.code ?? null, subtype: detail.subtype ?? null, error: redactSecrets(reason.slice(0, 1500)) }));
+    this.diagnostic('foreman: pm failure', { session_id: this.sessionId, outstanding: this.outstanding.length, code: detail.code ?? null, subtype: detail.subtype ?? null, error: reason.slice(0, 1500) });
     if (!duplicateRejection) {
-      this.reportRecord({ role: "system", text, error: true });
+      this.record({ role: "system", text, error: true });
       this.emitEvent({ type: "status", text });
     }
   }
 
-  // Stop resuming a saved session the provider rejected by handle: record the id and the
-  // diagnostic in the quarantine file (evidence is kept), then clear the active session file so
-  // the next start runs fresh. A failed record is logged with the id instead of masking the
-  // provider error, and the session file is still cleared so the PM can heal.
-  private quarantine(sessionId: string, reason: string) {
-    const entry = { ts: new Date().toISOString(), session_id: sessionId, reason: reason.slice(0, 1500) };
-    try { appendFileSync(PM_SESSION_QUARANTINE_FILE, JSON.stringify(entry) + "\n", { mode: 0o600 }); }
-    catch (error: any) { console.error('foreman: pm session quarantine record failed', JSON.stringify({ ...entry, error: String(error?.message ?? error) })); }
-    // Remembered in memory first, so the id is never resumed again even if the clear below fails.
-    this.quarantinedIds.add(sessionId);
-    // Clearing the active file can fail too; the provider's error stays the cause either way.
-    try { writeFileSync(PM_SESSION_FILE, ""); }
-    catch (error: any) { console.error('foreman: pm session quarantine clear failed', JSON.stringify({ ...entry, error: String(error?.message ?? error) })); }
-    if (this.sessionId === sessionId) this.sessionId = null;
-  }
+  // --- Turns -----------------------------------------------------------------------------------
 
-  private reconcileHistory() {
-    if (this.reconciled) return;
-    this.reconciled = true;
-    const last = this.history().reverse().find((entry) => ['user', 'assistant', 'system'].includes(entry.role));
-    if (last?.role === 'user' && last.delivery !== 'rejected') {
-      const text = 'Foreman restarted; delivery cannot be confirmed. Message was not replayed.';
-      this.lastError = text;
-      this.reportRecord({ role: 'system', text, error: true });
-      this.emitEvent({ type: 'status', text });
+  private endTurn(input: PmInput, outcome: TurnOutcome) {
+    this.store?.endTurn(input.turnId, outcome).catch((error) => this.diagnostic('foreman: pm turn end failed', { outcome, error: errorText(error) }));
+  }
+  private settle(input: PmInput, outcome: TurnOutcome) {
+    const at = this.outstanding.indexOf(input);
+    if (at >= 0) this.outstanding.splice(at, 1);
+    this.endTurn(input, outcome);
+  }
+  private settleUncertain(input: PmInput, reason: string) {
+    this.reportFailureEntry(uncertainText(input.acceptedAt, this.machineName, reason));
+    this.settle(input, 'uncertain');
+  }
+  // A result settles exactly the inputs it names. One that names none is not attributable: during a
+  // peer-initiated turn it settles nothing; otherwise the oldest input the provider took becomes
+  // uncertain (ambiguity never resolves to completed).
+  private settleResult(m: any, outcome: TurnOutcome, peerTurn: boolean) {
+    const echoed = echoedInputs(m);
+    if (echoed) {
+      for (const input of this.outstanding.filter((i) => echoed.includes(i.turnId))) this.settle(input, outcome);
+      return;
+    }
+    if (peerTurn) return;
+    const oldest = this.outstanding.find((i) => i.taken);
+    if (oldest) this.settleUncertain(oldest, UNMATCHED_REPLY);
+  }
+  // The provider stopped with inputs still owed: one entry per input. Input the provider took may
+  // have been processed (uncertain); input it never read was not delivered (failed).
+  private settleOrphans(cause: string) {
+    const reason = `the PM stopped: ${safe(cause, 300)}`;
+    for (const input of this.outstanding.splice(0)) {
+      if (input.taken) { this.reportFailureEntry(uncertainText(input.acceptedAt, this.machineName, reason)); this.endTurn(input, 'uncertain'); }
+      else { this.reportFailureEntry(undeliveredText(input.acceptedAt, this.machineName, reason)); this.endTurn(input, 'failed'); }
     }
   }
-
-  send(text: string) {
-    this.reconcileHistory();
-    const rejection = this.dispatchRejection();
-    this.record({ role: "user", text, ...(rejection ? { delivery: 'rejected' } : {}) });
-    if (rejection) throw rejection;
-    this.pendingTurns++;
-    this.dispatched++;
-    this.inbox.push(text, this.sessionId ?? "");
+  private isHung(): boolean {
+    const oldest = this.outstanding[0];
+    if (!oldest) return false;
+    return this.now() - Math.max(this.lastFrameAt, oldest.dispatchedAt) >= this.hungMs;
   }
-  // Why new input cannot be dispatched, or null once a provider is running to take it. A
-  // rejection carries the specific cause, never only generic text, so the caller receives it.
-  private dispatchRejection(): Error | null {
+
+  // Why new input cannot be accepted right now, or null. Carries the specific cause.
+  private sendRejection(): Error | null {
     if (this.changingModel) return new Error('Model change in progress; retry your message');
     if (this.closed) return this.unavailable(' (closed)');
-    // Explicit input is the only restart trigger: no automatic replay or retry loop.
-    // A provider that rejected a turn but stayed alive is restarted here, once it has settled
-    // every turn it accepted, so only this new input reaches the new process.
-    if (this.running && this.providerFailed && !this.pendingTurns && !this.busy) this.retire();
-    if (!this.running) {
-      void this.start();
-      // start() launches synchronously; a launch that already threw cannot take this input.
-      if (this.launchFailure !== null) return new Error(ProjectManager.failureText(this.launchFailure));
+    const store = this.store;
+    if (!store) return this.unavailable();
+    if (this.activeEpoch === null) {
+      const a = store.assignment();
+      if (store.mode === 'relay' && !a.connected) return new Error(RELAY_UNREACHABLE_MESSAGE);
+      if (!a.active) return new Error(a.activeHost && a.activeHost !== this.machineName ? `The PM runs on ${a.activeHost}.` : 'This machine is not the PM host.');
+      return this.unavailable(' (starting)');
     }
-    if (!this.running) return this.unavailable();
     return null;
+  }
+
+  /**
+   * Accepts one input. Resolves only after the store durably recorded its turn and the input was
+   * dispatched; rejects (with the cause, nothing dispatched) otherwise.
+   */
+  async send(text: string): Promise<void> {
+    const early = this.sendRejection();
+    if (early) throw early;
+    const store = this.store!;
+    const input: PmInput = { turnId: randomUUID(), acceptedAt: new Date(this.now()).toISOString(), dispatchedAt: 0, taken: false };
+    try { await store.beginTurn(input.turnId, input.acceptedAt); }
+    catch (error) {
+      if (error instanceof PmStoreError && error.code === 'disconnected') throw new Error(RELAY_UNREACHABLE_MESSAGE);
+      if (error instanceof PmStoreError && error.code === 'not_active') throw new Error(safe(error.message, 300));
+      throw new Error(`The PM could not record your message, so it was not sent: ${safe(errorText(error), 600)}`);
+    }
+    const abandon = (error: Error) => { this.endTurn(input, 'failed'); return error; };
+    const late = this.sendRejection();
+    if (late) throw abandon(late);
+    // #62: a provider that owes input and has been silent past the threshold is retired now, by
+    // this explicit send only. Each input it owed is reported once as uncertain.
+    if (this.running && this.isHung()) {
+      for (const owed of [...this.outstanding]) this.settleUncertain(owed, UNCERTAIN_REASON_TEXT.hung);
+      this.retire();
+    }
+    // A provider that rejected a turn but stayed alive is restarted here, once it has settled every
+    // input it accepted, so only this new input reaches the new process.
+    if (this.running && this.providerFailed && !this.outstanding.length && !this.busy) this.retire();
+    if (!this.running) void this.start();
+    await this.launched;
+    const afterLaunch = this.sendRejection();
+    if (afterLaunch) throw abandon(afterLaunch);
+    if (this.launchFailure !== null) throw abandon(new Error(ProjectManager.failureText(this.launchFailure)));
+    if (!this.running) throw abandon(this.unavailable());
+    input.dispatchedAt = this.now();
+    this.outstanding.push(input);
+    this.dispatched++;
+    this.record({ role: "user", text });
+    this.inbox.push(text, this.sessionId ?? "", input.turnId);
   }
   async interrupt() {
     if (!this.q || !this.modelBusy) return;
@@ -285,20 +503,23 @@ export class ProjectManager extends EventEmitter {
     try { await this.q.interrupt(); } catch (error) { if (this.interruptedAt === token) this.interruptedAt = null; throw error; }
   }
   // Detach the current run: close its provider and reset per-run state. Its start() keeps
-  // unwinding in the background but no longer owns any PM state.
+  // unwinding in the background but no longer owns any PM state. Inputs still tracked are dropped
+  // without an outcome here: callers settle them first, or leave them to the store's reconciliation.
   private retire() {
     const q = this.q;
     this.generation++;
-    this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0;
+    this.q = null; this.running = false; this.busy = false; this.outstanding = [];
     this.interruptedAt = null; this.providerFailed = false;
-    this.inbox.retire(); this.inbox = new Inbox(); // release the old provider's parked input reader
-    q?.close();
+    this.inbox.retire(); this.inbox = this.newInbox(); // release the old provider's parked input reader
+    try { q?.close(); } catch (error) { this.diagnostic('foreman: pm provider close failed', { error: errorText(error) }); }
   }
-  close() { this.closed = true; this.q?.close(); this.q = null; }
+  /** Permanent (daemon shutdown). Open turns stay open in the store, which reconciles them. */
+  close() { this.closed = true; this.detach?.(); this.detach = null; const q = this.q; this.q = null; try { q?.close(); } catch { /* closing */ } }
 
-  private memoryBlock(): string {
-    const read = (f: string) => (existsSync(join(MEMORY_DIR, f)) ? readFileSync(join(MEMORY_DIR, f), "utf8").trim() : "(empty)");
-    return `\n\n# Memory (from ~/.foreman/memory, read at start)\n\n## PROJECTS.md\n${read("PROJECTS.md")}\n\n## LOG.md (last 40 lines)\n${read("LOG.md").split("\n").slice(-40).join("\n")}\n`;
+  private memoryBlock(memory: { projects: Doc; preferences: Doc; log: LogEntry[] }): string {
+    const doc = (d: Doc) => d.content.trim() || '(empty)';
+    const log = memory.log.slice(-40).map((e) => `- ${e.at} ${e.text}`).join('\n') || '(empty)';
+    return `\n\n# Memory (portable PM memory, read from the PM state store at the start of this session)\n\n## projects (version ${memory.projects.version})\n${doc(memory.projects)}\n\n## preferences (version ${memory.preferences.version})\n${doc(memory.preferences)}\n\n## log (newest ${Math.min(40, memory.log.length)} entries)\n${log}\n`;
   }
 
   private canUseTool = async (name: string, input: Record<string, any>) => {
@@ -316,17 +537,13 @@ export class ProjectManager extends EventEmitter {
       try {
         const actual = canonical(p);
         if (!statSync(actual).isFile()) return deny('Read requires an existing document file.');
-        if (under(actual, canonical(MEMORY_DIR))) return allow();
-        if (under(actual, canonical(FOREMAN_HOME))) return deny('Use session tools for session history. Foreman configuration and credentials are unavailable to the PM.');
+        if (under(actual, canonical(FOREMAN_HOME))) return deny('Use session tools for session history and the memory tools for PM memory. Foreman configuration and credentials are unavailable to the PM.');
         if (DOC_FILE.test(basename(actual))) return allow();
       } catch { return deny('Read requires an existing document file.'); }
-      return deny(`${delegate} (Read is limited to document files and PM memory.)`);
+      return deny(`${delegate} (Read is limited to document files.)`);
     }
-    if (name === "Write" || name === "Edit" || name === "MultiEdit" || name === "NotebookEdit") {
-      const p = expand(String(input.file_path ?? ""));
-      if (p && memoryWritePath(p)) return allow();
-      return deny(`${delegate} (Writes are limited to ~/.foreman/memory.)`);
-    }
+    if (name === "Write" || name === "Edit" || name === "MultiEdit" || name === "NotebookEdit")
+      return deny(`${delegate} (The PM writes nothing on disk; use memory_write, memory_edit and log_note for PM memory.)`);
     if (["Bash", "Glob", "Grep"].includes(name)) return deny(`${delegate} (Use the fleet and peer tools to inspect sessions, and Read for a specific document.)`);
     if (name === "Agent") return deny("Denied: no subagents for the PM; spawn a tracked session with spawn_session so the user can see it.");
     return deny(`Denied: ${name} is not available to the project manager.`);
@@ -342,81 +559,82 @@ export class ProjectManager extends EventEmitter {
       : {};
   };
 
+  /** Starts a fresh provider session (never a resume) while this machine is the active PM host. Resolves when that run ends. */
   async start(): Promise<void> {
-    if (this.running || this.closed) return;
-    this.reconcileHistory();
+    if (this.running || this.closed || this.activeEpoch === null || !this.store) return;
+    const store = this.store;
     this.running = true;
     this.providerFailed = false;
     this.launchFailure = null;
+    this.lastFrameAt = 0;
     const generation = ++this.generation;
     const current = () => generation === this.generation;
     const inbox = this.inbox;
+    let launched!: () => void;
+    this.launched = new Promise<void>((resolve) => { launched = resolve; });
     let q: Query | null = null;
-    // What the latest provider attempt did: the input its stream handed out, and how many
-    // frames the provider emitted. Zero frames means the CLI never processed any input.
-    // `reported` is the SDK's error echo of a failed result this attempt already reported, while
-    // that result is still the latest frame: the CLI exiting on it must not report it twice.
-    type Attempt = { taken: SDKUserMessage[]; frames: number; initialized: boolean; reported?: string };
-    let attempt: Attempt = { taken: [], frames: 0, initialized: false };
+    // The SDK's error echo of a failed result this run already reported, while that result is
+    // still the latest frame: the CLI exiting on it must not report it twice.
+    let reported: string | undefined;
     // The latest turn failure this start() reported, until a later turn succeeds. A process error
     // or stream end after it is reported together with it, so it never replaces that cause.
     let turnFailure: string | undefined;
-    const launch = (resume?: string): { provider: Query; state: Attempt } => {
+    const run = async () => {
+      // Memory is read at every fresh start; the one-time import must have settled first.
+      let memory: Awaited<ReturnType<HostPmStore['read']>>;
       try {
+        await store.ensureImported();
+        memory = await store.read();
+      } catch (error) {
+        if (current()) this.launchFailure = `PM memory could not be read, so the PM did not start: ${errorText(error)}`;
+        throw new Error(`PM memory could not be read, so the PM did not start: ${errorText(error)}`);
+      }
+      if (!current()) return;
+      let provider: Query;
+      try {
+        this.model = normalizeModel(memory.model ?? process.env.FOREMAN_PM_MODEL);
         const base = readFileSync(join(REPO_ROOT, "agents", "pm-system-prompt.md"), "utf8");
-        const stream = inbox.open();
-        const state: Attempt = attempt = { taken: stream.taken, frames: 0, initialized: false };
-        const provider: Query = q = this.q = this.queryFactory({
-          prompt: stream.prompt,
+        provider = q = this.q = this.queryFactory({
+          prompt: inbox.open(),
           options: {
             cwd: FOREMAN_HOME,
-            resume,
-            systemPrompt: { type: "preset", preset: "claude_code", append: base + '\nUse list_projects and resolve_project for project references; ask when ambiguous or missing. When the developer gives a name or alias for their current known project, register_project records it. Never invent directories.' + this.memoryBlock() + (this.sessions ? '\n\n' + PEER_INSTRUCTIONS + '\nFor Foreman-managed sessions, use peer tools to request updates and read outcomes. Native SendMessage subscriptions apply only to legacy Claude background sessions. You still must not read or edit source code or bypass your PM tool restrictions.' : '') },
+            systemPrompt: { type: "preset", preset: "claude_code", append: base + '\nUse list_projects and resolve_project for project references; ask when ambiguous or missing. When the developer gives a name or alias for their current known project, register_project records it. Never invent directories.' + this.memoryBlock(memory) + (this.sessions ? '\n\n' + PEER_INSTRUCTIONS + '\nFor Foreman-managed sessions, use peer tools to request updates and read outcomes. Native SendMessage subscriptions apply only to legacy Claude background sessions. You still must not read or edit source code or bypass your PM tool restrictions.' : '') },
             settingSources: ["user"],
             permissionMode: "default",
             canUseTool: this.canUseTool,
             hooks: { PreToolUse: [{ hooks: [this.enforceToolBoundary] }] },
             includePartialMessages: true,
-            mcpServers: { fleet: makeFleetServer(this.fleet, this.sessions, this.projects), ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, 'foreman-pm') } : {}) },
-            allowedTools: ["mcp__fleet__list_projects", "mcp__fleet__resolve_project", "mcp__fleet__register_project", "mcp__fleet__list_sessions", "mcp__fleet__list_models", "mcp__fleet__session_tail", "mcp__fleet__log_note", "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : [])],
+            mcpServers: { fleet: makeFleetServer(this.fleet, this.sessions, this.projects, store), ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, 'foreman-pm') } : {}) },
+            allowedTools: ["mcp__fleet__list_projects", "mcp__fleet__resolve_project", "mcp__fleet__register_project", "mcp__fleet__list_sessions", "mcp__fleet__list_models", "mcp__fleet__session_tail", ...PM_MEMORY_TOOLS, "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : [])],
             disallowedTools: ["Agent", "Bash", "Glob", "Grep"],
             extraArgs: { name: "foreman-pm" },
             maxTurns: 60,
             effort: (process.env.FOREMAN_PM_EFFORT as any) || "medium",
             ...(this.model ? { model: this.model } : {}),
-            stderr: (chunk: string) => { if (current() && /error|warn/i.test(chunk)) this.emitEvent({ type: "status", text: chunk.trim().slice(0, 300) }); },
+            stderr: (chunk: string) => { if (current() && /error|warn/i.test(chunk)) this.emitEvent({ type: "status", text: safe(chunk.trim(), 300) }); },
           },
         });
-        return { provider, state };
       } catch (error) {
-        // Still synchronous with the send() that started this run: that send rejects with it.
-        if (current() && !MISSING_CONVERSATION.test(errorText(error))) this.launchFailure = errorText(error);
+        // Still before this start's `launched` resolved: the send that started it rejects with it.
+        if (current()) this.launchFailure = errorText(error);
         throw error;
       }
-    };
-    const run = async (resume?: string) => {
-      const { provider, state } = launch(resume);
+      if (this.freshStarts++ > 0 && this.conversation.length) this.record({ role: 'system', text: FRESH_SESSION_NOTICE });
+      launched();
       let text = "", completeText = "", turnError = "", turnErrorCode: string | null = null;
+      // A peer message starts a turn send() never dispatched; its result names none of our inputs.
+      let peerTurn = false;
       for await (const m of provider as any) {
         if (!current()) break; // retired by an explicit send; the replacement owns all state now
-        // The CLI reports a rejected --resume as an error result (then exits 1) before any
-        // system/init. That result is the resume rejection itself, not a turn: it is not a turn
-        // failure, settles no turn, and is not a frame of processed input. Route it to the
-        // resume-rejection handling below. Any other pre-init error result is handled as before.
-        if (resume && !state.initialized && m.type === "result" && m.is_error) {
-          const diagnostic = resultDiagnostic(m);
-          if (MISSING_CONVERSATION.test(diagnostic) || INVALID_RESUME_HANDLE.test(diagnostic)) throw new Error(diagnostic);
-        }
-        state.frames++;
-        state.reported = undefined;
+        this.lastFrameAt = this.now();
+        reported = undefined;
         if (m.type === "system" && m.subtype === "init") {
-          state.initialized = true;
-          this.sessionId = m.session_id; writeFileSync(PM_SESSION_FILE, m.session_id);
+          this.sessionId = m.session_id;
           this.tools = m.tools ?? [];
-          this.emitEvent({ type: "status", text: `PM session ${m.session_id.slice(0, 8)} ready (${this.tools.length} tools${this.tools.includes("SendMessage") ? ", cross-session messaging on" : ""})` });
+          this.emitEvent({ type: "status", text: `PM session ${String(m.session_id).slice(0, 8)} ready (${this.tools.length} tools${this.tools.includes("SendMessage") ? ", cross-session messaging on" : ""})` });
         } else if (m.type === "stream_event") {
           const ev = m.event;
-          if (ev?.type === "message_start") { if (!this.busy) { this.busy = true; this.emitEvent({ type: "turn_start", ts: new Date().toISOString() }); } }
+          if (ev?.type === "message_start") { if (!this.busy) { this.busy = true; this.emitEvent({ type: "turn_start", ts: new Date(this.now()).toISOString() }); } }
           if (ev?.type === "content_block_start" && ev.content_block?.type === "text" && text && !text.endsWith("\n")) { text += "\n\n"; this.emitEvent({ type: "delta", text: "\n\n" }); }
           if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") { text += ev.delta.text; this.emitEvent({ type: "delta", text: ev.delta.text }); }
         } else if (m.type === "assistant") {
@@ -428,9 +646,9 @@ export class ProjectManager extends EventEmitter {
           } else if (content) completeText += (completeText ? '\n\n' : '') + content;
           for (const b of m.message?.content ?? []) {
             if (b.type === "tool_use") {
-              const summary = b.name === "mcp__fleet__spawn_session" ? `${b.input?.name} in ${b.input?.cwd}` : b.name === "SendMessage" ? `→ ${b.input?.to}${b.input?.notify_when_idle ? " (notify when idle)" : ""}` : JSON.stringify(b.input ?? {}).slice(0, 160);
+              const summary = safe(b.name === "mcp__fleet__spawn_session" ? `${b.input?.name} in ${b.input?.cwd}` : b.name === "SendMessage" ? `→ ${b.input?.to}${b.input?.notify_when_idle ? " (notify when idle)" : ""}` : JSON.stringify(b.input ?? {}), 160);
               this.emitEvent({ type: "tool", name: b.name.replace(/^mcp__fleet__/, "fleet."), summary });
-              this.reportRecord({ role: "tool", name: b.name, summary });
+              this.record({ role: "tool", name: b.name, summary });
             }
           }
         } else if (m.type === "user") {
@@ -439,7 +657,8 @@ export class ProjectManager extends EventEmitter {
           if (/Cross-session (idle notice|message)|<cross-session-message/i.test(txt.slice(0, 200))) {
             // A peer message starts a turn send() never dispatched: no pending Stop applies to it.
             this.interruptedAt = null;
-            this.reportRecord({ role: "peer", text: txt.slice(0, 600) });
+            peerTurn = true;
+            this.record({ role: "peer", text: txt.slice(0, 600) });
             this.emitEvent({ type: "peer", text: txt.slice(0, 600) });
           }
         } else if (m.type === "result") {
@@ -450,8 +669,8 @@ export class ProjectManager extends EventEmitter {
           const cancelled = isAbortReason(reason) || (reason == null && this.interruptedAt !== null && this.interruptedAt === this.dispatched);
           const failed = !!m.is_error && !cancelled;
           text = text.trim() ? text : completeText || (!failed && !cancelled && typeof m.result === 'string' ? m.result : '');
-          // A partial answer must precede its terminal explanation in history.
-          if (text.trim()) this.reportRecord({ role: "assistant", text });
+          // A partial answer must precede its terminal explanation.
+          if (text.trim()) this.record({ role: "assistant", text });
           if (failed) {
             this.providerFailed = true;
             const failure = turnError || (m.errors ?? []).join('; ') || m.result || `Provider returned ${m.subtype || 'an error'} without a diagnostic`;
@@ -461,82 +680,49 @@ export class ProjectManager extends EventEmitter {
             // recorded (fail() keeps the first 1500 chars). Otherwise the echo is the only carrier
             // of this result's own diagnostic, so it must surface as its own failure entry.
             const echoed = resultDiagnostic(m);
-            // (A code prefix only adds text before the prose, so containment is unaffected; the
-            // recorded text is redacted but this check compares the raw diagnostics.)
-            if (echoed && failure.slice(0, 1500).includes(echoed)) state.reported = sdkErrorResultEcho(echoed);
+            if (echoed && failure.slice(0, 1500).includes(echoed)) reported = sdkErrorResultEcho(echoed);
           } else {
             turnFailure = undefined;
             this.providerFailed = false;
             this.lastError = null;
             if (cancelled) {
               const message = 'Project manager stopped at your request. Message was not replayed.';
-              this.reportRecord({ role: 'system', text: message });
+              this.record({ role: 'system', text: message });
               this.emitEvent({ type: 'status', text: message });
             }
           }
           this.interruptedAt = null; // an interrupt is spent by the first result after it
-          this.pendingTurns = Math.max(0, this.pendingTurns - 1);
+          this.settleResult(m, failed ? 'failed' : cancelled ? 'cancelled' : 'completed', peerTurn);
+          peerTurn = false;
           this.busy = false;
           this.emitEvent({ type: "assistant_text", text });
-          this.emitEvent({ type: "turn_end", ts: new Date().toISOString(), cost_usd: m.total_cost_usd ?? 0, is_error: failed, subtype: m.subtype });
+          this.emitEvent({ type: "turn_end", ts: new Date(this.now()).toISOString(), cost_usd: m.total_cost_usd ?? 0, is_error: failed, subtype: m.subtype });
           text = ""; completeText = ""; turnError = ""; turnErrorCode = null;
         }
       }
-      if (current() && !this.closed && (!this.lastError || this.pendingTurns)) throw new Error('Provider stream ended unexpectedly');
+      if (current() && !this.closed && (!this.lastError || this.outstanding.length)) throw new Error('Provider stream ended unexpectedly');
     };
     try {
-      const saved = existsSync(PM_SESSION_FILE) ? readFileSync(PM_SESSION_FILE, "utf8").trim() || undefined : undefined;
-      // A quarantined id is never resumed again, even if clearing the session file failed.
-      const resumeId = saved && !this.quarantinedIds.has(saved) ? saved : undefined;
-      try { await run(resumeId); }
-      catch (error: any) {
-        if (!current() || this.closed || !resumeId) throw error;
-        const diagnostic = String(error?.message ?? error);
-        const rejected = attempt;
-        if (!MISSING_CONVERSATION.test(diagnostic)) {
-          // An invalid-handle rejection quarantines only when the provider emitted nothing first:
-          // then the CLI failed on the handle before it processed anything. Once a frame arrived
-          // the session was live, so the failure is not attributed to the handle and the saved
-          // session is kept. The failure is loud either way (fail() in the outer catch) and
-          // nothing is replayed; after a quarantine the next explicit send starts fresh.
-          if (INVALID_RESUME_HANDLE.test(diagnostic) && !rejected.frames) this.quarantine(resumeId, diagnostic);
-          throw error;
-        }
-        // The saved conversation is gone: never resume it again (with or without frames, as
-        // before), but keep the id and diagnostic on record instead of wiping them.
-        this.quarantine(resumeId, diagnostic);
-        // The SDK reads prompt input eagerly, so "taken from the inbox" is not "processed".
-        // Decide by what the provider did: if the rejected attempt emitted no frame at all, the
-        // CLI failed while loading the resume and never processed its input, so that input goes
-        // back to the head of the inbox, once, for its first real delivery to a fresh session.
-        // If any frame arrived, the input may have been processed: fail loudly, never re-send.
-        // This branch runs at most once per start(), and the fresh run() never resumes.
-        if (rejected.frames) throw error;
-        (q as Query | null)?.close();
-        inbox.requeue(rejected.taken);
-        try { await run(); }
-        catch (freshError) {
-          // The fresh session failed too: report its error together with the rejection that led
-          // to it (an echo of an already reported result is passed through for suppression).
-          const message = errorText(freshError);
-          if (!current() || this.closed || message === attempt.reported || message.includes(diagnostic)) throw freshError;
-          throw new Error(`${message.slice(0, 700)} (after the saved session ${resumeId} was rejected and quarantined: ${diagnostic.slice(0, 600)})`);
-        }
-      }
+      await run();
     } catch (error: any) {
       // The SDK's exit error that only echoes the failed result already reported is not a
-      // second failure of the same attempt.
+      // second failure of the same run.
       const message = errorText(error);
-      const echo = attempt.reported !== undefined && message === attempt.reported;
+      const echo = reported !== undefined && message === reported;
       // A process error or stream end after a reported turn failure keeps that failure as cause.
       const cause = turnFailure && !message.includes(turnFailure) ? ` (after the provider failure: ${turnFailure.slice(0, 700)})` : '';
-      if (current() && !this.closed && !echo) this.fail(cause ? message.slice(0, 800) + cause : message);
+      if (current() && !this.closed) {
+        // Every input the provider still owed gets its own entry before the run's failure.
+        this.settleOrphans(message);
+        if (!echo) this.fail(cause ? message.slice(0, 800) + cause : message);
+      }
     } finally {
+      launched();
       // Reset lifecycle state before closing, so nothing close() throws can skip it.
       const owned = current() ? this.q : (q as Query | null);
-      if (current()) { this.q = null; this.running = false; this.busy = false; this.pendingTurns = 0; this.interruptedAt = null; this.providerFailed = false; this.inbox.retire(); this.inbox = new Inbox(); }
+      if (current()) { this.q = null; this.running = false; this.busy = false; this.outstanding = []; this.interruptedAt = null; this.providerFailed = false; this.inbox.retire(); this.inbox = this.newInbox(); }
       try { owned?.close(); }
-      catch (error: any) { console.error('foreman: pm provider close failed', JSON.stringify({ error: String(error?.message ?? error) })); }
+      catch (error: any) { this.diagnostic('foreman: pm provider close failed', { error: String(error?.message ?? error) }); }
     }
   }
 }
