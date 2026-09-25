@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
@@ -13,47 +13,124 @@ test('relay allowlist admits the PM status summary query', () => {
   assert.equal(allowedRequest('GET', '/api/pm/history?summary=1'), true);
 });
 
-test('GET /api/pm/history?summary=1 returns only error and busy; the plain request keeps history', { timeout:15000 }, async () => {
+// A local-only daemon (no cloud.json, no relay env) on a temp FOREMAN_HOME. FOREMAN_PM_DISABLED
+// defers the provider launch, so no provider ever runs here.
+async function daemon(t, prepare = () => {}) {
   const home = mkdtempSync(join(tmpdir(), 'foreman-pm-status-'));
+  prepare(home);
   const reservation = createServer(); reservation.listen(0, '127.0.0.1'); await once(reservation, 'listening');
   const port = reservation.address().port; await new Promise((resolve) => reservation.close(resolve));
   const child = spawn(process.execPath, ['--experimental-strip-types', 'server/main.ts'], {
-    env:{ ...process.env, FOREMAN_HOME:home, CLAUDE_CONFIG_DIR:join(home, 'claude'), FOREMAN_PORT:String(port), FOREMAN_PM_DISABLED:'1', FOREMAN_CLAUDE_BIN:process.execPath },
+    env:{ ...process.env, FOREMAN_HOME:home, CLAUDE_CONFIG_DIR:join(home, 'claude'), FOREMAN_PORT:String(port), FOREMAN_PM_DISABLED:'1', FOREMAN_CLAUDE_BIN:process.execPath, FOREMAN_RELAY_URL:'', FOREMAN_HOST_TOKEN:'', FOREMAN_MACHINE_NAME:'status-test-mac' },
     stdio:['ignore', 'pipe', 'pipe'],
   });
-  child.stdout.resume(); child.stderr.resume();
+  let stderr = '';
+  child.stdout.resume(); child.stderr.on('data', (chunk) => { stderr += chunk; });
   const exited = once(child, 'exit');
-  try {
-    const origin = `http://127.0.0.1:${port}`;
-    let health;
-    for (let attempts = 0; attempts < 80; attempts++) {
-      health = await fetch(`${origin}/api/health`).then((r) => r.json()).catch(() => null);
-      if (health) break;
-      await delay(100);
-    }
-    assert.equal(health?.ok, true);
-    const headers = { authorization:`Bearer ${readFileSync(join(home, 'local-api-token'), 'utf8').trim()}` };
-
-    assert.equal((await fetch(`${origin}/api/pm/history?summary=1`)).status, 401, 'summary must stay behind auth');
-
-    const fullRes = await fetch(`${origin}/api/pm/history`, { headers });
-    assert.equal(fullRes.status, 200);
-    const full = await fullRes.json();
-    assert.ok(Array.isArray(full.history), 'plain request must still carry the history array');
-    assert.deepEqual(Object.keys(full).sort(), ['busy', 'error', 'history', 'model', 'session_id']);
-
-    const summaryRes = await fetch(`${origin}/api/pm/history?summary=1`, { headers });
-    assert.equal(summaryRes.status, 200);
-    const summary = await summaryRes.json();
-    assert.deepEqual(Object.keys(summary).sort(), ['busy', 'error']);
-    assert.equal('history' in summary, false);
-    assert.equal(summary.error, full.error);
-    assert.equal(summary.busy, full.busy);
-    assert.equal(typeof summary.busy, 'boolean');
-    assert.ok(summary.error === null || typeof summary.error === 'string');
-  } finally {
+  t.after(async () => {
     if (child.exitCode === null) { child.kill('SIGTERM'); await Promise.race([exited, delay(5000, undefined, { ref:false })]); }
     if (child.exitCode === null) child.kill('SIGKILL');
     rmSync(home, { recursive:true, force:true });
+  });
+  const origin = `http://127.0.0.1:${port}`;
+  let health;
+  for (let attempts = 0; attempts < 80; attempts++) {
+    health = await fetch(`${origin}/api/health`).then((r) => r.json()).catch(() => null);
+    if (health) break;
+    await delay(100);
   }
+  assert.equal(health?.ok, true);
+  const headers = { authorization:`Bearer ${readFileSync(join(home, 'local-api-token'), 'utf8').trim()}` };
+  return { home, origin, headers, stderr: () => stderr };
+}
+
+test('GET /api/pm/history?summary=1 returns only error and busy; the plain request keeps history', { timeout:15000 }, async (t) => {
+  const { origin, headers } = await daemon(t);
+
+  assert.equal((await fetch(`${origin}/api/pm/history?summary=1`)).status, 401, 'summary must stay behind auth');
+
+  const fullRes = await fetch(`${origin}/api/pm/history`, { headers });
+  assert.equal(fullRes.status, 200);
+  const full = await fullRes.json();
+  assert.ok(Array.isArray(full.history), 'plain request must still carry the history array');
+  assert.deepEqual(Object.keys(full).sort(), ['busy', 'error', 'history', 'model', 'session_id']);
+
+  const summaryRes = await fetch(`${origin}/api/pm/history?summary=1`, { headers });
+  assert.equal(summaryRes.status, 200);
+  const summary = await summaryRes.json();
+  assert.deepEqual(Object.keys(summary).sort(), ['busy', 'error']);
+  assert.equal('history' in summary, false);
+  assert.equal(summary.error, full.error);
+  assert.equal(summary.busy, full.busy);
+  assert.equal(typeof summary.busy, 'boolean');
+  assert.ok(summary.error === null || typeof summary.error === 'string');
+});
+
+test('local-only daemon: store-backed memory, a single-machine PM host, an empty conversation, and no transcript or seeded files', { timeout:15000 }, async (t) => {
+  const { home, origin, headers } = await daemon(t, (dir) => {
+    mkdirSync(join(dir, 'memory'), { recursive:true });
+    writeFileSync(join(dir, 'memory', 'PROJECTS.md'), '# Projects\n\n## zebra-project\nStatus: blocked on review\n');
+  });
+  const history = await fetch(`${origin}/api/pm/history`, { headers }).then((r) => r.json());
+  assert.deepEqual(history.history, [], 'a fresh daemon starts with an empty conversation');
+  assert.equal(history.error, null);
+
+  const memoryRes = await fetch(`${origin}/api/memory`, { headers });
+  assert.equal(memoryRes.status, 200);
+  const memory = await memoryRes.json();
+  assert.deepEqual(Object.keys(memory).sort(), ['log', 'preferences', 'projects']);
+  assert.equal(memory.projects, '# Projects\n\n## zebra-project\nStatus: blocked on review\n', 'imported once into the store');
+  assert.equal(memory.log, '');
+  assert.equal(memory.preferences, '');
+
+  const hostRes = await fetch(`${origin}/api/pm/host`, { headers });
+  assert.equal(hostRes.status, 200);
+  const host = await hostRes.json();
+  assert.equal(host.mode, 'local');
+  assert.equal(host.machines.length, 1);
+  assert.equal(host.active.name, 'status-test-mac');
+  assert.equal(host.active.online, true);
+  assert.equal(host.active.machine_id, host.machines[0].machine_id);
+  assert.equal(host.machines[0].active, true);
+  assert.deepEqual(Object.keys(host).sort(), ['active', 'machines', 'mode', 'open_turns', 'uncertain_turns']);
+  assert.equal(host.open_turns, 0); assert.equal(host.uncertain_turns, 0);
+  const move = await fetch(`${origin}/api/pm/host`, { method:'POST', headers:{ ...headers, 'content-type':'application/json' }, body:JSON.stringify({ machine_id:host.active.machine_id, expected_epoch:1 }) });
+  assert.equal(move.status, 400);
+  assert.deepEqual(await move.json(), { error:'Reassignment needs the cloud relay' });
+
+  // No seeding, no transcript, no session file: pm/ holds only the store's state.json.
+  assert.equal(existsSync(join(home, 'memory', 'LOG.md')), false, 'LOG.md is no longer seeded');
+  assert.deepEqual(readdirSync(join(home, 'pm')), ['state.json']);
+  assert.ok(existsSync(join(home, 'machine.json')));
+  assert.equal(statSync(join(home, 'machine.json')).mode & 0o777, 0o600);
+  assert.ok(existsSync(join(home, 'memory', '.imported.json')));
+});
+
+test('POST /api/pm/message answers 503 with the cause and dispatches nothing when the turn cannot be recorded', { timeout:15000 }, async (t) => {
+  const { home, origin, headers } = await daemon(t);
+  const pmDir = join(home, 'pm');
+  chmodSync(pmDir, 0o500); // pm/state.json can no longer be written
+  t.after(() => { try { chmodSync(pmDir, 0o700); } catch { /* already removed */ } });
+  const res = await fetch(`${origin}/api/pm/message`, { method:'POST', headers:{ ...headers, 'content-type':'application/json' }, body:JSON.stringify({ text:'not recorded' }) });
+  assert.equal(res.status, 503);
+  const body = await res.json();
+  assert.match(body.error, /could not record your message, so it was not sent: Could not save pm\/state\.json/);
+  chmodSync(pmDir, 0o700);
+  const history = await fetch(`${origin}/api/pm/history`, { headers }).then((r) => r.json());
+  assert.deepEqual(history.history, [], 'nothing was dispatched');
+  assert.equal(history.busy, false);
+  assert.equal((await fetch(`${origin}/api/pm/message`, { method:'POST', headers:{ ...headers, 'content-type':'application/json' }, body:'{}' })).status, 400, 'a missing text is still a 400');
+});
+
+test('an invalid machine.json is logged and the daemon runs without a PM, whose error names the cause', { timeout:15000 }, async (t) => {
+  const { home, origin, headers, stderr } = await daemon(t, (dir) => { writeFileSync(join(dir, 'machine.json'), 'not json', { mode:0o600 }); });
+  const history = await fetch(`${origin}/api/pm/history?summary=1`, { headers }).then((r) => r.json());
+  assert.match(history.error, /machine\.json is invalid \(Invalid machine\.json\)/);
+  const res = await fetch(`${origin}/api/pm/message`, { method:'POST', headers:{ ...headers, 'content-type':'application/json' }, body:JSON.stringify({ text:'hello' }) });
+  assert.equal(res.status, 503);
+  assert.match((await res.json()).error, /machine\.json is invalid/);
+  assert.equal((await fetch(`${origin}/api/memory`, { headers })).status, 503);
+  assert.equal(readFileSync(join(home, 'machine.json'), 'utf8'), 'not json', 'the bad file is never replaced');
+  assert.equal((await fetch(`${origin}/api/sessions`, { headers })).status, 200, 'the rest of the daemon keeps working');
+  assert.match(stderr(), /machine identity error: Invalid machine\.json/);
 });

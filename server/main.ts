@@ -12,16 +12,18 @@ import { preparePeerTools } from "./peer-tools.ts";
 import { startHostBridge } from "./host-bridge.ts";
 import { Notifier } from "./notifier.ts";
 import { runClaude } from "./tools.ts";
-import { PORT, REPO_ROOT, ensureDirs, MEMORY_DIR, HOST, FOREMAN_HOME } from "./paths.ts";
-import { writeFileSync } from "node:fs";
+import { PORT, REPO_ROOT, ensureDirs, HOST, FOREMAN_HOME } from "./paths.ts";
+import { loadMachineIdentity, type MachineIdentity } from "./machine.ts";
+import { createPmStore, type HostPmStore } from "./pm-store.ts";
+import { redactSecrets } from "../shared/redact.ts";
+import { PM_HOST_LOCAL_ONLY_ERROR, type MemoryResponse, type PmHostResponse } from "../shared/pm-state.ts";
 
 import { localAuth } from './local-auth.ts';
 
 ensureDirs();
 const auth = localAuth(FOREMAN_HOME);
-for (const [f, seed] of [["PROJECTS.md", "# Projects\n\n(none yet)\n"], ["LOG.md", "# Log\n"]] as const) {
-  const p = join(MEMORY_DIR, f); if (!existsSync(p)) writeFileSync(p, seed);
-}
+// Epic #26: PM memory lives in the PM state store (the relay DO, or pm/state.json in local-only
+// mode). The daemon no longer seeds or reads memory/PROJECTS.md or LOG.md; the store imports them once.
 
 const projects = new ProjectRegistry();
 const launcher = new Launcher(projects, { identityFile: join(FOREMAN_HOME, 'launcher-sessions.json') });
@@ -29,7 +31,17 @@ const fleet = new Fleet({ excludeSession: (session) => launcher.ownsSession(sess
 const sessions = new SessionService({ fleet, projects });
 projects.seed(sessions.list());
 sessions.setPrepare((session) => preparePeerTools(sessions, session));
-const pm = new ProjectManager(fleet, sessions, undefined, projects);
+// Machine identity (machine.json). As with an invalid cloud.json (logged, and the daemon runs
+// without the relay), an invalid, symlinked or foreign-owned machine.json is logged and the daemon
+// keeps running: without an identity it speaks the legacy relay protocol and runs no PM, and the
+// PM's error names the cause. machine.json is never regenerated over a bad file.
+let identity: MachineIdentity | null = null;
+let identityError: string | null = null;
+try { identity = loadMachineIdentity(); }
+catch (error) { identityError = redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300); console.error('foreman: machine identity error:', identityError); }
+const pm = new ProjectManager(fleet, { sessions, projects, machineName: identity?.name ?? HOST });
+let store: HostPmStore | null = null;
+const startedAt = Date.now();
 let bridge: ReturnType<typeof startHostBridge> | undefined;
 let notifier: Notifier | undefined;
 const clients = new Set<ServerResponse>();
@@ -117,12 +129,24 @@ const server = createServer(async (req, res) => {
     if (url.pathname === "/api/pm/message" && req.method === "POST") {
       const { text } = await body(req);
       if (!text || typeof text !== "string") return json(res, 400, { error: "text required" });
-      pm.send(text); return json(res, 202, { ok: true });
+      // 202 only once the in-flight turn is recorded and the message dispatched; otherwise 503 with the cause.
+      try { await pm.send(text); }
+      catch (error) { return json(res, 503, { error: String((error as Error)?.message ?? error) }); }
+      return json(res, 202, { ok: true });
     }
     if (url.pathname === "/api/pm/interrupt" && req.method === "POST") { await pm.interrupt(); return json(res, 200, { ok: true }); }
-    if (url.pathname === "/api/memory") {
-      const read = (f: string) => (existsSync(join(MEMORY_DIR, f)) ? readFileSync(join(MEMORY_DIR, f), "utf8") : "");
-      return json(res, 200, { projects: read("PROJECTS.md"), log: read("LOG.md") });
+    if (url.pathname === '/api/pm/host' && req.method === 'GET') return pmHost(res);
+    if (url.pathname === '/api/pm/host' && req.method === 'POST') {
+      // Only the relay reassigns the PM; the Worker answers this route for the hosted app.
+      return json(res, 400, { error: store?.mode === 'relay' ? 'Move the PM from the hosted app; the cloud relay makes that change.' : PM_HOST_LOCAL_ONLY_ERROR });
+    }
+    if (url.pathname === "/api/memory" && req.method === 'GET') {
+      if (!store) return json(res, 503, { error: pm.lastError ?? 'PM memory is unavailable on this machine' });
+      let memory;
+      try { memory = await store.read(); }
+      catch (error) { return json(res, 503, { error: redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300) }); }
+      const response: MemoryResponse = { projects: memory.projects.content, log: memory.log.map((entry) => `- ${entry.at} ${entry.text}`).join('\n'), preferences: memory.preferences.content };
+      return json(res, 200, response);
     }
     // static
     let p = url.pathname === "/" ? "/index.html" : url.pathname;
@@ -135,15 +159,52 @@ const server = createServer(async (req, res) => {
   }
 });
 
+// GET /api/pm/host. Local-only mode answers for its single machine. In relay mode the Worker/DO
+// answers this route for the hosted app (it is never relayed); a request that reaches this host
+// directly (the local UI) gets 404 with this host's own view of the assignment, which the PM view
+// treats as "no machine line": this host cannot see the other machines or whether they are online.
+function pmHost(res: ServerResponse) {
+  if (store?.mode === 'local' && identity) {
+    const response: PmHostResponse = {
+      active: { machine_id: identity.machine_id, name: identity.name, online: true, epoch: 1, assigned_at: startedAt, assigned_by: 'bootstrap' },
+      machines: [{ machine_id: identity.machine_id, name: identity.name, platform: process.platform, online: true, last_seen: Date.now(), active: true }],
+      open_turns: store.openTurnIds().length, uncertain_turns: store.uncertainTurns().length, mode: 'local',
+    };
+    return json(res, 200, response);
+  }
+  if (store?.mode === 'relay') {
+    const a = store.assignment(), frame = bridge?.bridge?.currentAssignment() ?? null;
+    return json(res, 404, {
+      error: 'The cloud relay answers /api/pm/host; open the hosted app to see every machine or move the PM.',
+      view: { mode: 'relay', connected: a.connected, this_machine_active: a.active, epoch: frame?.epoch ?? null, active_machine: frame?.active_machine ?? null },
+    });
+  }
+  return json(res, 404, { error: pm.lastError ?? 'The PM is unavailable on this machine.' });
+}
+
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`foreman: http://localhost:${PORT}`);
   console.log(`foreman: local API token file: ${auth.path}`);
   fleet.start();
-  bridge = startHostBridge(PORT, auth.token);
-  // Push notifications only exist in cloud mode; local-only mode constructs no notifier.
+  // Every hello lists the PM's open turns, so a socket blip is never reported as a restart.
+  bridge = startHostBridge(PORT, auth.token, identity ? { identity, pmOpenTurns: () => store?.openTurnIds() ?? [] } : {});
+  // Push notifications only exist in cloud mode; local-only mode constructs no notifier. It starts
+  // before the PM is attached, so an uncertain turn reported at activation is a pm_failed edge.
   const notify = bridge.notify?.bind(bridge);
   if (notify) notifier = new Notifier({ sessions, pm, send: notify }).start();
-  if (process.env.FOREMAN_PM_DISABLED !== "1") pm.start().catch((e: unknown) => console.error("pm:", e));
+  if (!identity) { pm.failUnavailable(`machine.json is invalid (${identityError})`); return; }
+  try {
+    // RelayPmStore when the relay is configured (a v2 bridge), else LocalPmStore (pm/state.json).
+    store = createPmStore({ identity, bridge: bridge.bridge ?? null });
+  } catch (error) {
+    const reason = redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300);
+    console.error('foreman: PM state store error:', reason);
+    pm.failUnavailable(`the PM state store could not be opened (${reason})`);
+    return;
+  }
+  // The PM runs only while this machine is the active PM host. FOREMAN_PM_DISABLED=1 only defers
+  // the provider launch to the first message, as before.
+  pm.attach(store, { bridge: bridge.bridge ?? null, autoStart: process.env.FOREMAN_PM_DISABLED !== "1" });
 });
 let stopping = false;
 async function shutdown() {
@@ -151,7 +212,7 @@ async function shutdown() {
   stopping = true;
   // Detach the notifier first: closing sessions below marks them unavailable, which is not a failure.
   notifier?.close();
-  fleet.stop(); pm.close(); launcher.close(); bridge?.close();
+  fleet.stop(); pm.close(); store?.close(); launcher.close(); bridge?.close();
   const providersClosed = sessions.close();
   for (const client of clients) client.end();
   clients.clear();
