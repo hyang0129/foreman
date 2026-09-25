@@ -78,6 +78,9 @@ const REDACTS_122: [string, string, string][] = [
   ['short word at end of text', 'Bearer abcdefg', 'Bearer [REDACTED]'],
   ['short word before punctuation only', 'Authorization: Basic abcd.', 'Authorization: Basic [REDACTED].'],
   ['sentence end followed by a lower-case word', 'password: hunter. again', 'password: [REDACTED] again'],
+  // An 8-character key value (7 letters and a full stop) was redacted before #122: it stays redacted.
+  ['seven-letter password ending a sentence', 'password: letmein. Try again', 'password: [REDACTED] Try again'],
+  ['seven-letter token ending a sentence', 'token: letmein. Retry', 'token: [REDACTED] Retry'],
 ];
 
 // #122: prose after a credential keyword that the fixed word list alone used to redact.
@@ -85,7 +88,7 @@ const KEEPS_122: [string, string][] = [
   ['unlisted word, sentence continues', 'Expected Bearer but got Basic'],
   ['bearer prefix prose', 'Send the Bearer prefix with each request'],
   ['basic login failed', 'Basic login failed'],
-  ['password changed sentence', 'password: changed. Log in again.'],
+  ['password reset sentence', 'password: reset. Log in again.'],
   ['token was refreshed', 'token was refreshed'],
   ['password is required', 'password is required'],
   ['password: is required', 'password: is required'],

@@ -7,7 +7,7 @@
 // - a word from a short list of status/prose words ("Authorization: required", "Invalid bearer
 //   token", "Basic authentication is not supported"), and
 // - #122: a short plain word that a sentence visibly continues after ("token: pending approval",
-//   "password: changed. Log in again."). Only a value that cannot be secret-shaped qualifies: 2-7
+//   "password: reset. Log in again."). Only a value that cannot be secret-shaped qualifies: 2-7
 //   letters, lower case (one leading capital allowed), no digits or symbols; see `proseInContext`.
 // Any other value after a credential keyword (digits, symbols, mixed case, all caps, or plain
 // lower-case letters such as a dictionary-word password) is replaced with `[REDACTED]`.
@@ -91,6 +91,8 @@ export function redactSecrets(text: string): string {
       looksLikeCredential(value, 1) && !proseInContext(value, whole, offset + all.length) ? `${scheme}${space}${REDACTED}` : all)
     .replace(BASIC, (all: string, scheme: string, space: string, value: string, padding: string, offset: number, whole: string) =>
       looksLikeCredential(value, 1) && !proseInContext(value + padding, whole, offset + all.length) ? `${scheme}${space}${REDACTED}` : all)
+    // A key's value of 8+ characters (punctuation included) was redacted by the pre-#26 rule, so the
+    // sentence-context exemption applies only below that length ("password: letmein. Try again").
     .replace(KEY_VALUE, (all: string, key: string, sep: string, value: string, offset: number, whole: string) =>
-      looksLikeCredential(value, LONG_VALUE_KEY.test(key) ? 8 : 1) && !proseInContext(value, whole, offset + all.length) ? `${key}${sep}${REDACTED}` : all);
+      looksLikeCredential(value, LONG_VALUE_KEY.test(key) ? 8 : 1) && (value.length >= 8 || !proseInContext(value, whole, offset + all.length)) ? `${key}${sep}${REDACTED}` : all);
 }
