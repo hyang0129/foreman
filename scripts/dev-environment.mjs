@@ -74,7 +74,10 @@ export const SUPPORTED_WORKER_CONTRACT = deepFreeze({
 // account_id, main, routes, route, triggers, build, env, ...) stay ignored by
 // construction; vars and secrets are checked against the lists below.
 // Bindings declared only under `env.<name>` are ignored with the rest of
-// `env`: neither dev nor production (deploy-cloud.mjs) deploys with --env.
+// `env`: neither dev nor production (deploy-cloud.mjs) passes --env. Dev
+// refuses a CLOUDFLARE_ENV override; production inherits the shell env, so a
+// CLOUDFLARE_ENV there would select an env section (moot while wrangler.jsonc
+// has none).
 export const UNSUPPORTED_BINDING_KEYS = Object.freeze(['kv_namespaces', 'r2_buckets', 'd1_databases', 'services', 'queues', 'workflows',
   'vectorize', 'hyperdrive', 'analytics_engine_datasets', 'ai', 'ai_search', 'ai_search_namespaces', 'agent_memory', 'websearch', 'browser',
   'images', 'media', 'stream', 'version_metadata', 'send_email', 'mtls_certificates', 'dispatch_namespaces', 'pipelines', 'secrets_store_secrets',
