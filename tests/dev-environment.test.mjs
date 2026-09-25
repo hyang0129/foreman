@@ -42,8 +42,11 @@ test('generated Worker config owns its namespace and ignores dangerous source co
   // The external-namespace binding (script_name) is now refused outright
   // instead of being silently replaced (#31); every guard assertion below
   // still runs, on the same dangerous input with conforming bindings.
-  const dangerous={name:'foreman',account_id:'production-account',build:{command:'production-deploy'},routes:['production/*'],env:{production:{name:'foreman'}},vars:{FIREBASE_CONFIG:'public',ALLOWED_EMAIL:'attacker'}};
+  // A retargeted ALLOWED_EMAIL is likewise refused rather than silently
+  // replaced with the pinned owner (#53); the guards then run without it.
+  const dangerous={name:'foreman',account_id:'production-account',build:{command:'production-deploy'},routes:['production/*'],env:{production:{name:'foreman'}},vars:{FIREBASE_CONFIG:'public'}};
   assert.throws(()=>workerConfig({...dangerous,durable_objects:{bindings:[{script_name:'foreman'}]}}),/external Durable Object binding.*script_name/);
+  assert.throws(()=>workerConfig({...dangerous,...conforming,vars:{FIREBASE_CONFIG:'public',ALLOWED_EMAIL:'attacker'}}),/var ALLOWED_EMAIL is "attacker", not "hooong\.yang@gmail\.com"/);
   const config=workerConfig({...dangerous,...conforming});
   assert.equal(config.name,'foreman-dev'); assert.equal(config.account_id,TARGET.account);
   assert.deepEqual(config.durable_objects.bindings,[{name:'RELAY',class_name:'HostRelay'}]);
