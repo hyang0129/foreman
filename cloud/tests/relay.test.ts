@@ -67,9 +67,18 @@ describe('Durable Object host relay with real WebSocket pairs', () => {
     expect(result.headers.get('cache-control')).toBe('no-store');
   });
   it('replacing the host fails in-flight delivery and routes new requests to the replacement', async () => {
+    // #26: sockets are keyed by machine_id, so a replacement is a reconnect from the same machine.
+    const machine_id = crypto.randomUUID();
+    const hello = async (socket: WebSocket) => {
+      const pong = new Promise<void>((resolve) => socket.addEventListener('message', (event) => { if (JSON.parse(String(event.data)).type === 'pong') resolve(); }));
+      socket.send(JSON.stringify({ type: 'hello', protocol: 2, machine_id, host: 'Test Mac', platform: 'darwin', pm_open_turns: [] }));
+      await pong;
+    };
     const stub = relay(), original = await connect(stub);
+    await hello(original);
     const first = await request(stub, original);
     const replacement = await connect(stub);
+    await hello(replacement);
     expect((await first.response).status).toBe(503);
     const second = await request(stub, replacement);
     replacement.send(JSON.stringify({ type: 'response', id: second.message.id, status: 200, body: '[]' }));
