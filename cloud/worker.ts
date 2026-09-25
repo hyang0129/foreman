@@ -183,12 +183,13 @@ export class HostRelay extends DurableObject<Env> {
     if (url.pathname.startsWith('/api/push/')) return this.pushRequest(request, url);
     // The PM host record is answered here, never relayed, and works while every host is offline.
     if (url.pathname === PM_HOST_ROUTE) return this.pmHostRequest(request, url);
-    const socket = this.hostSocket();
-    if (url.pathname === '/api/host') return json(this.hostStatus(socket));
-    if (!socket) {
+    const offline = () => {
       const assignment = this.pm.assignment();
       return json({ error: assignment ? pmHostOfflineMessage(this.pm.machineName(assignment.machine_id)) : 'Your Mac is offline. Open Foreman on the Mac and reconnect.' }, 503);
-    }
+    };
+    let socket = this.hostSocket();
+    if (url.pathname === '/api/host') return json(this.hostStatus(socket));
+    if (!socket) return offline();
     if (this.pending.size >= 64) return json({ error: 'Host is busy; try again shortly' }, 429);
     if (!allowedRequest(request.method, url.pathname + url.search)) return json({ error: 'Unknown API route' }, 404);
     if (Number(request.headers.get('content-length') ?? 0) > MAX_BODY) return json({ error: 'Request too large' }, 413);
@@ -204,6 +205,9 @@ export class HostRelay extends DurableObject<Env> {
       const bytes = new Uint8Array(length); let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       body = new TextDecoder().decode(bytes);
+      // #115: the PM may have moved while the body was read; route to the host that is the target now.
+      socket = this.hostSocket();
+      if (!socket) return offline();
     }
     const id = crypto.randomUUID();
     return new Promise<Response>((resolve) => {

@@ -456,6 +456,28 @@ export class ProjectManager extends EventEmitter {
     }
     return null;
   }
+  // #115: the PM moved while a send was in progress. The input was not dispatched anywhere.
+  private movedError(): Error {
+    const host = this.store?.assignment().activeHost;
+    const other = host && host !== this.machineName ? host : null;
+    return new Error(other
+      ? `The PM was moved to ${other} while your message was being sent. It was not delivered; send it again there.`
+      : 'The PM was moved while your message was being sent. It was not delivered; send it again.');
+  }
+  // #62: a provider that owes input and has been silent past the threshold is retired, by an
+  // explicit send only; each input it owed is reported once as uncertain. A provider that rejected
+  // a turn but stayed alive is restarted once it has settled every input it accepted, so only new
+  // input reaches the new process. Starts a provider if none runs; true when it started one.
+  private readyProvider(): boolean {
+    if (this.running && this.isHung()) {
+      for (const owed of [...this.outstanding]) this.settleUncertain(owed, UNCERTAIN_REASON_TEXT.hung);
+      this.retire();
+    }
+    if (this.running && this.providerFailed && !this.outstanding.length && !this.busy) this.retire();
+    if (this.running) return false;
+    void this.start();
+    return true;
+  }
 
   /**
    * Accepts one input. Resolves only after the store durably recorded its turn and the input was
@@ -465,27 +487,38 @@ export class ProjectManager extends EventEmitter {
     const early = this.sendRejection();
     if (early) throw early;
     const store = this.store!;
+    // #115: the epoch this send is for. A move (even A→B→A) while it is being recorded or launched
+    // means it is not dispatched: the relay has already reconciled any turn recorded for it.
+    const epoch = this.activeEpoch;
+    // The provider is readied before the turn is recorded, so on this path no await separates the
+    // record's ack from dispatch and a move cannot land between them on this host. (Only while the
+    // store is usable: otherwise beginTurn below rejects with the store's own cause.)
+    if (store.assignment().active) {
+      this.readyProvider();
+      await this.launched;
+      if (this.activeEpoch !== epoch) throw this.movedError();
+      const unready = this.sendRejection() ?? (this.launchFailure !== null ? new Error(ProjectManager.failureText(this.launchFailure)) : null);
+      if (unready) throw unready;
+    }
     const input: PmInput = { turnId: randomUUID(), acceptedAt: new Date(this.now()).toISOString(), dispatchedAt: 0, taken: false };
     try { await store.beginTurn(input.turnId, input.acceptedAt); }
     catch (error) {
+      if (this.activeEpoch !== epoch) throw this.movedError();
       if (error instanceof PmStoreError && error.code === 'disconnected') throw new Error(RELAY_UNREACHABLE_MESSAGE);
       if (error instanceof PmStoreError && error.code === 'not_active') throw new Error(safe(error.message, 300));
       throw new Error(`The PM could not record your message, so it was not sent: ${safe(errorText(error), 600)}`);
     }
+    // Best-effort and fenced by the store: after a move the relay already marked this turn, so the
+    // end changes nothing there (a stale epoch is refused; turn.end removes only an open record).
     const abandon = (error: Error) => { this.endTurn(input, 'failed'); return error; };
+    if (this.activeEpoch !== epoch) throw abandon(this.movedError());
     const late = this.sendRejection();
     if (late) throw abandon(late);
-    // #62: a provider that owes input and has been silent past the threshold is retired now, by
-    // this explicit send only. Each input it owed is reported once as uncertain.
-    if (this.running && this.isHung()) {
-      for (const owed of [...this.outstanding]) this.settleUncertain(owed, UNCERTAIN_REASON_TEXT.hung);
-      this.retire();
+    // Normally already running (readied above); started here only if it stopped meanwhile.
+    if (this.readyProvider()) {
+      await this.launched;
+      if (this.activeEpoch !== epoch) throw abandon(this.movedError());
     }
-    // A provider that rejected a turn but stayed alive is restarted here, once it has settled every
-    // input it accepted, so only this new input reaches the new process.
-    if (this.running && this.providerFailed && !this.outstanding.length && !this.busy) this.retire();
-    if (!this.running) void this.start();
-    await this.launched;
     const afterLaunch = this.sendRejection();
     if (afterLaunch) throw abandon(afterLaunch);
     if (this.launchFailure !== null) throw abandon(new Error(ProjectManager.failureText(this.launchFailure)));

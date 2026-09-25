@@ -150,3 +150,53 @@ it('permits launcher proposal/status/cancel but no arbitrary launch endpoints', 
   expect(allowedRequest('GET', '/api/launch/propose')).toBe(false);
   expect(allowedRequest('POST', '/api/launch/execute')).toBe(false);
 });
+
+// #115: a relayed request picks its target only after its body is read, so a PM move during the
+// read sends it to the machine that is the PM host now, never to the one that just became standby.
+describe('PM move during a relayed request body read', () => {
+  type Host = { socket: WebSocket; frames: any[]; machine_id: string };
+  async function until(check: () => boolean, what: string) {
+    for (let waited = 0; waited < 3000 && !check(); waited += 10) await new Promise((r) => setTimeout(r, 10));
+    expect(check(), what).toBe(true);
+  }
+  async function host(stub: ReturnType<typeof relay>, name: string): Promise<Host> {
+    const socket = await connect(stub);
+    const frames: any[] = [];
+    socket.addEventListener('message', (event) => { frames.push(JSON.parse(String(event.data))); });
+    const machine_id = crypto.randomUUID();
+    socket.send(JSON.stringify({ type: 'hello', protocol: 2, machine_id, host: name, platform: 'darwin', pm_open_turns: [] }));
+    await until(() => frames.some((frame) => frame.type === 'pong'), `${name} hello`);
+    return { socket, frames, machine_id };
+  }
+  const requests = (h: Host) => h.frames.filter((frame) => frame.type === 'request');
+  // A ping round trip proves the DO processed every frame sent before it.
+  async function flush(h: Host) {
+    const pongs = () => h.frames.filter((frame) => frame.type === 'pong').length;
+    const before = pongs();
+    h.socket.send(JSON.stringify({ type: 'ping' }));
+    await until(() => pongs() > before, 'ping pong');
+  }
+
+  it('POST /api/sessions whose body finishes after a move reaches the new PM host only', async () => {
+    const stub = relay();
+    const a = await host(stub, 'machine-a'); // bootstrap: A is the PM host at epoch 1
+    const b = await host(stub, 'machine-b');
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let pulled = false;
+    const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; }, pull() { pulled = true; } });
+    const response = stub.fetch('https://foreman.test/api/sessions', { method: 'POST', body, duplex: 'half' } as RequestInit);
+    // The DO has the request and is waiting on its body.
+    await until(() => pulled, 'the body read started');
+    await new Promise((r) => setTimeout(r, 50));
+    const moved = await stub.fetch('https://foreman.test/api/pm/host', { method: 'POST', body: JSON.stringify({ machine_id: b.machine_id, expected_epoch: 1 }) });
+    expect(moved.status).toBe(200);
+    controller.enqueue(new TextEncoder().encode('{"name":"after-the-move"}'));
+    controller.close();
+    await until(() => requests(b).length === 1, 'the request reaches B');
+    expect(requests(b)[0]).toMatchObject({ method: 'POST', path: '/api/sessions', body: '{"name":"after-the-move"}' });
+    b.socket.send(JSON.stringify({ type: 'response', id: requests(b)[0].id, status: 201, body: '{}' }));
+    expect((await response).status).toBe(201);
+    await flush(a);
+    expect(requests(a)).toEqual([]);
+  });
+});
