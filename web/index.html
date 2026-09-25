@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#f8faf8" />
     <title>Foreman · Session inbox</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
     <script src="/appearance.js"></script>
     <link rel="stylesheet" href="/style.css" />
   </head>
@@ -62,6 +65,25 @@
           <label class="appearance-control">Appearance
             <select data-appearance><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>
           </label>
+          <details id="notify-settings" class="notify-settings" data-state="unsupported" hidden>
+            <summary>Notifications <span id="notify-summary" class="notify-summary">Off</span></summary>
+            <div class="notify-panel">
+              <p id="notify-status" class="field-hint"></p>
+              <button id="notify-enable" class="btn" type="button">Turn on notifications</button>
+              <fieldset id="notify-kinds" class="notify-kinds" hidden>
+                <legend>Notify me about</legend>
+                <label><input type="checkbox" data-kinds="approval_requested question_asked" checked />Approvals and questions</label>
+                <label><input type="checkbox" data-kinds="session_failed" checked />A session failed</label>
+                <label><input type="checkbox" data-kinds="pm_failed" checked />Project manager errors</label>
+                <label><input type="checkbox" data-kinds="host_offline" checked />Mac offline</label>
+              </fieldset>
+              <div id="notify-actions" class="notify-actions" hidden>
+                <button id="notify-test" class="btn ghost" type="button">Send test notification</button>
+                <button id="notify-disable" class="btn ghost" type="button">Turn off</button>
+              </div>
+              <p id="notify-feedback" class="field-hint" role="status"></p>
+            </div>
+          </details>
           <div class="host-line">
             <span id="host-dot" class="dot"></span
             ><span id="host-status" role="status">Checking host…</span>
@@ -114,6 +136,7 @@
           role="status"
           hidden
         ></div>
+        <p id="app-notice" class="banner notice" role="status" hidden></p>
         <div id="error-banner" class="banner error" role="alert" hidden>
           <span id="error-text"></span
           ><button

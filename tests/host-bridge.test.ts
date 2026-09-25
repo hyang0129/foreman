@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HostBridge } from '../server/host-bridge.ts';
 import { MAX_BODY, MAX_RESPONSE, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME } from '../shared/relay.ts';
+import { notifyId, type NotifyFrame } from '../shared/notify.ts';
 
 const TOKEN = 'synthetic-test-host-credential'.repeat(2);
 class FakeSocket extends EventEmitter {
@@ -239,4 +240,103 @@ test('project routes cross the authenticated bridge with only explicit methods',
     const reply = response(socket, path); socket.receive({ type: 'request', id: path, method, path, body: '{}' }); assert.equal((await reply).status, 400);
   }
   assert.equal(seen.length, 5);
+});
+
+const frame = (n: number, overrides: Record<string, unknown> = {}): NotifyFrame => ({ type: 'notify', id: notifyId('approval_requested', 'fm:a', String(n)), kind: 'approval_requested', host: 'test-mac', session_key: 'fm:a', session_name: `session ${n}`, at: new Date().toISOString(), ...overrides } as NotifyFrame);
+const notifies = (socket: FakeSocket) => socket.sent.filter((entry) => entry.type === 'notify');
+
+test('notify on an open relay sends the validated frame after hello', (t) => {
+  const f = bridge(t), socket = f.sockets[0]!; socket.open();
+  f.instance.notify(frame(1));
+  assert.equal(socket.sent[0].type, 'hello');
+  assert.deepEqual(notifies(socket), [frame(1, { at: notifies(socket)[0].at })]);
+});
+
+test('notify while disconnected queues and flushes once on the next open, without replay', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  t.mock.method(Math, 'random', () => 0);
+  const f = bridge(t), first = f.sockets[0]!;
+  f.instance.notify(frame(1));
+  assert.equal(first.sent.length, 0, 'nothing is sent before the socket opens');
+  first.open();
+  assert.deepEqual(first.sent.map((entry) => entry.type), ['hello', 'notify']);
+  first.close();
+  f.instance.notify(frame(2)); f.instance.notify(frame(3));
+  t.mock.timers.tick(1000);
+  const second = f.sockets[1]!; second.open();
+  assert.deepEqual(second.sent.map((entry) => entry.type), ['hello', 'notify', 'notify']);
+  assert.deepEqual(notifies(second).map((entry) => entry.session_name), ['session 2', 'session 3']);
+  second.close(); t.mock.timers.tick(2000);
+  const third = f.sockets[2]!; third.open();
+  assert.equal(notifies(third).length, 0, 'flushed frames are not re-sent on later connections');
+});
+
+test('the notify queue keeps only the newest 20 frames', (t) => {
+  const f = bridge(t), socket = f.sockets[0]!;
+  for (let n = 1; n <= 25; n++) f.instance.notify(frame(n));
+  socket.open();
+  assert.deepEqual(notifies(socket).map((entry) => entry.session_name), Array.from({ length: 20 }, (_, i) => `session ${i + 6}`));
+});
+
+test('queued frames older than five minutes are dropped', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  const f = bridge(t), socket = f.sockets[0]!;
+  f.instance.notify(frame(1));
+  t.mock.timers.tick(4 * 60_000);
+  f.instance.notify(frame(2));
+  t.mock.timers.tick(60_000 + 1);
+  socket.open();
+  assert.deepEqual(notifies(socket).map((entry) => entry.session_name), ['session 2']);
+});
+
+test('invalid notify frames are dropped, never sent or queued, and never logged with content', (t) => {
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => errors.push(args.map(String).join(' ')));
+  const f = bridge(t), socket = f.sockets[0]!;
+  const invalid = [
+    frame(1, { input: { command: 'SECRET-COMMAND' } }),
+    frame(2, { kind: 'turn_finished' }),
+    frame(3, { at: '2026-09-24T00:00:00.123456Z' }),
+    frame(4, { session_key: undefined }),
+    frame(5, { id: 'has spaces SECRET-ID' }),
+    null as any,
+  ];
+  for (const value of invalid) assert.doesNotThrow(() => f.instance.notify(value));
+  socket.open();
+  for (const value of invalid) assert.doesNotThrow(() => f.instance.notify(value));
+  assert.equal(notifies(socket).length, 0);
+  assert.ok(errors.length > 0);
+  assert.ok(!errors.join('\n').includes('SECRET'));
+});
+
+test('a send that throws never throws into the caller, and the frame is retried on the next open', (t) => {
+  t.mock.method(console, 'error', () => {});
+  const f = bridge(t), socket = f.sockets[0]!; socket.open();
+  const original = socket.send.bind(socket);
+  socket.send = () => { throw new Error('socket exploded'); };
+  assert.doesNotThrow(() => f.instance.notify(frame(1)));
+  socket.send = original;
+  socket.close(1000, 'test'); t.mock.timers.enable({ apis: ['setTimeout'] });
+  (f.instance as any).connect();
+  const replacement = f.sockets[1]!; replacement.open();
+  assert.deepEqual(notifies(replacement).map((entry) => entry.session_name), ['session 1']);
+});
+
+test('notify after close is a no-op', (t) => {
+  const f = bridge(t), socket = f.sockets[0]!; socket.open();
+  f.instance.close();
+  assert.doesNotThrow(() => f.instance.notify(frame(1)));
+  assert.equal(notifies(socket).length, 0);
+});
+
+test('startHostBridge keeps its shape and exposes notify only when a relay is configured', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'foreman-bridge-start-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const moduleUrl = new URL('../server/host-bridge.ts', import.meta.url).href;
+  const code = `import {startHostBridge} from ${JSON.stringify(moduleUrl)}; const b = startHostBridge(1, 'local'); console.log(typeof b.close, typeof b.notify); b.close(); process.exit(0);`;
+  const env: NodeJS.ProcessEnv = { ...process.env, FOREMAN_HOME: home };
+  delete env.FOREMAN_RELAY_URL; delete env.FOREMAN_HOST_TOKEN;
+  const run = (overrides = {}) => execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', code], { env: { ...env, ...overrides }, encoding: 'utf8' }).trim().split('\n').at(-1);
+  assert.equal(run(), 'function undefined', 'local-only mode: no notify, so no notifier is wired');
+  assert.equal(run({ FOREMAN_RELAY_URL: 'https://foreman.invalid', FOREMAN_HOST_TOKEN: TOKEN }), 'function function');
 });
