@@ -137,9 +137,28 @@ test("CLI fails open with neutral JSON and never echoes invalid sensitive input"
   assert.ok(!result.stderr.includes("invalid-secret-input"));
 });
 
-function run(command, args, body) {
+// The dev preview shares the host's CODEX_HOME, whose installed hook command
+// pins FOREMAN_HOME to production. Sessions the dev daemon launches inherit
+// FOREMAN_HOOK_HOME (scripts/dev-environment.mjs daemonEnvironment), which must
+// route their records to the dev home and leave production untouched.
+test("installed hook command routes to FOREMAN_HOOK_HOME when the launching daemon sets it, else to the installed home", async (t) => {
+  const dirs = await fixture(t), devHome = join(dirs.root, "dev home ' $(no-command)");
+  await install(dirs);
+  const command = JSON.parse(await fs.readFile(join(dirs.codexHome, "hooks.json"), "utf8")).hooks.SessionStart[0].hooks[0].command;
+  const base = { ...process.env }; delete base.FOREMAN_HOOK_HOME; delete base.FOREMAN_HOME;
+  const dev = await run("/bin/sh", ["-c", command], JSON.stringify(input("SessionStart", { session_id: "thr_dev" })), { ...base, FOREMAN_HOME: devHome, FOREMAN_HOOK_HOME: devHome });
+  assert.equal(dev.code, 0); assert.equal(dev.stderr, "");
+  assert.equal(JSON.parse(await fs.readFile(join(devHome, "sessions/codex-thr_dev.json"), "utf8")).provider, "codex");
+  await assert.rejects(fs.access(join(dirs.foremanHome, "sessions/codex-thr_dev.json")), "the installed (production) home never sees the dev session");
+  const plain = await run("/bin/sh", ["-c", command], JSON.stringify(input("SessionStart", { session_id: "thr_plain" })), base);
+  assert.equal(plain.code, 0);
+  assert.equal(JSON.parse(await fs.readFile(join(dirs.foremanHome, "sessions/codex-thr_plain.json"), "utf8")).provider, "codex");
+  await assert.rejects(fs.access(join(devHome, "sessions/codex-thr_plain.json")));
+});
+
+function run(command, args, body, env = process.env) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], env });
     let stdout = "", stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });

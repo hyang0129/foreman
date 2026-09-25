@@ -8,7 +8,7 @@
 // and is cleaned up through its own handle or its proven identity.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, realpathSync, chmodSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, realpathSync, chmodSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -41,7 +41,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const home = process.env.FOREMAN_HOME;
 process.on('SIGTERM', () => { writeFileSync(join(home, 'fixture-sigterm'), String(process.pid)); process.exit(0); });
-writeFileSync(join(home, 'fixture-env.json'), JSON.stringify({ port: process.env.FOREMAN_PORT, home, claude: process.env.CLAUDE_CONFIG_DIR, codex: process.env.CODEX_HOME, relay: process.env.FOREMAN_RELAY_URL }));
+writeFileSync(join(home, 'fixture-env.json'), JSON.stringify({ port: process.env.FOREMAN_PORT, home, hookHome: process.env.FOREMAN_HOOK_HOME ?? null, claude: process.env.CLAUDE_CONFIG_DIR ?? null, codex: process.env.CODEX_HOME ?? null, relay: process.env.FOREMAN_RELAY_URL }));
 writeFileSync(join(home, 'fixture-pid'), String(process.pid));
 ${serve ? `createServer((request, response) => {
   if (request.url !== '/api/health') { response.statusCode = 404; response.end(); return; }
@@ -150,14 +150,21 @@ function authMock() {
 
 // 1. Actual startup ------------------------------------------------------------
 
-test('actual startup: a real deploy then start runs a real daemon to health and relay readiness, status reflects it, and stop proves exit', async (t) => {
+for (const isolatedLogins of [false, true]) test(`actual startup (${isolatedLogins ? 'isolated logins' : 'host logins, the default'}): a real deploy then start runs a real daemon to health and relay readiness, status reflects it, and stop proves exit`, async (t) => {
   const f = fixture(t), commit = f.commit(), port = await injectedPort();
   const deployment = await deployed(f, commit);
   assert.equal(deployment.commit, commit);
   const pair = json(f.pairFile);
   // Relay offline at preflight and on the first healthy poll; online from the third call.
   const relay = relayMock(commit, 3), auth = authMock();
-  const { output } = await captureLog(() => start(f.home, { relayStatus: relay.fn, execute: auth.fn, port }));
+  // Stray provider directories inherited by start never reach the checks or the
+  // daemon: the host default (unset) or the dev home's own directories apply.
+  const saved = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, CODEX_HOME: process.env.CODEX_HOME };
+  Object.assign(process.env, { CLAUDE_CONFIG_DIR: join(f.dir, 'stray-claude'), CODEX_HOME: join(f.dir, 'stray-codex') });
+  let output;
+  try { ({ output } = await captureLog(() => start(f.home, { relayStatus: relay.fn, execute: auth.fn, port, ...(isolatedLogins ? { isolatedLogins } : {}) }))); }
+  finally { for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+  const claude = isolatedLogins ? join(f.home, 'claude') : null, codex = isolatedLogins ? join(f.home, 'codex') : null;
 
   // start resolved only after the daemon answered health and the relay reported
   // online: calls 2 and 3 happen only once health matched the child PID, and the
@@ -166,8 +173,12 @@ test('actual startup: a real deploy then start runs a real daemon to health and 
   assert.deepEqual(relay.tokens, Array(4).fill(pair.token));
   // Claude (required) is checked before Codex (optional, notice only; #69).
   assert.deepEqual(auth.calls.map((c) => c.args), [['auth', 'status', '--json'], ['login', 'status']]);
-  assert.equal(auth.calls[0].env.CLAUDE_CONFIG_DIR, join(f.home, 'claude'));
-  assert.equal(auth.calls[1].env.CODEX_HOME, join(f.home, 'codex'));
+  assert.equal(auth.calls[0].env.CLAUDE_CONFIG_DIR ?? null, claude);
+  assert.equal(auth.calls[1].env.CODEX_HOME ?? null, codex);
+  assert.equal(Object.hasOwn(auth.calls[0].env, 'CLAUDE_CONFIG_DIR'), isolatedLogins);
+  assert.equal(Object.hasOwn(auth.calls[1].env, 'CODEX_HOME'), isolatedLogins);
+  // Private provider directories exist only for isolated logins.
+  assert.equal(existsSync(join(f.home, 'claude')), isolatedLogins); assert.equal(existsSync(join(f.home, 'codex')), isolatedLogins);
 
   const pid = Number(readFileSync(join(f.home, 'fixture-pid'), 'utf8'));
   assert.equal(alive(pid), true);
@@ -175,9 +186,13 @@ test('actual startup: a real deploy then start runs a real daemon to health and 
   assert.equal(record.state, 'running'); assert.equal(record.pid, pid);
   assert.ok(record.identity.endsWith(` ${join(f.home, 'run.mjs')} ${record.id}`), record.identity);
   assert.equal(record.identity, processIdentity(pid));
-  assert.deepEqual(json(join(f.home, 'fixture-env.json')), { port: String(port), home: f.home, claude: join(f.home, 'claude'), codex: join(f.home, 'codex'), relay: TARGET.url });
+  assert.equal(record.logins, isolatedLogins ? 'isolated' : 'host');
+  // Hook routing: sessions the daemon launches inherit FOREMAN_HOME (Claude hook)
+  // and FOREMAN_HOOK_HOME (Codex hook), both the dev home, never production.
+  assert.deepEqual(json(join(f.home, 'fixture-env.json')), { port: String(port), home: f.home, hookHome: f.home, claude, codex, relay: TARGET.url });
   const reported = JSON.parse(output.slice(output.indexOf('{')));
   assert.equal(reported.pid, pid); assert.equal(reported.commit, commit); assert.equal(reported.error, undefined);
+  assert.equal(reported.logins, isolatedLogins ? 'isolated' : 'host');
 
   // The daemon really answers health on the injected port.
   assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/api/health`)).json(), { pid });
@@ -539,4 +554,37 @@ test('destroy retains local state and names the login step when the auth token c
   assert.equal(deletes, 0);
   assert.equal(processIdentity(daemon.pid), ''); assert.equal(existsSync(f.daemonFile), false);
   assert.ok(existsSync(f.deploymentFile)); assert.ok(existsSync(f.pairFile)); assert.ok(existsSync(f.home));
+});
+
+// Dev uses the host's provider logins by default, so teardown must never reach
+// the host's own ~/.claude or ~/.codex (here: siblings of the dev home in the
+// temporary HOME), even when the dev home links to them.
+function hostProviders(f) {
+  const dirs = { claude: join(f.dir, '.claude'), codex: join(f.dir, '.codex') };
+  for (const dir of Object.values(dirs)) { mkdirSync(dir); writeFileSync(join(dir, 'sentinel'), 'host login'); }
+  return dirs;
+}
+test('destroy removes the dev home but never the host provider directories, even through links in the dev home', async (t) => {
+  const f = fixture(t); devState(f);
+  const host = hostProviders(f);
+  symlinkSync(host.claude, join(f.home, 'claude')); symlinkSync(host.codex, join(f.home, 'codex'));
+  mkdirSync(join(f.home, 'legacy'), { mode: 0o700 }); symlinkSync(host.claude, join(f.home, 'legacy', 'nested-claude'));
+  const api = cloudflare(() => Response.json({ success: true }));
+  await captureLog(() => destroy(f.home, { readAuth: () => ({ type: 'oauth', token: 'fake-oauth' }), deleter: api.deleter }));
+  assert.equal(api.requests.length, 1);
+  assert.equal(existsSync(f.home), false, 'dev home removed');
+  for (const dir of Object.values(host)) assert.equal(readFileSync(join(dir, 'sentinel'), 'utf8'), 'host login');
+});
+test('destroy refuses any path that is not the dev home, before stopping, authenticating or deleting anything', async (t) => {
+  const f = fixture(t); devState(f);
+  const host = hostProviders(f);
+  for (const target of [host.claude, host.codex, f.dir, join(f.dir, 'missing')]) {
+    let reads = 0;
+    const api = cloudflare(() => Response.json({ success: true }));
+    await assert.rejects(captureLog(() => destroy(target, { readAuth: () => { reads++; return { type: 'oauth', token: 'fake-oauth' }; }, deleter: api.deleter })),
+      /Refusing to destroy .*: not the dev home/);
+    assert.equal(reads, 0); assert.equal(api.requests.length, 0);
+  }
+  for (const dir of Object.values(host)) assert.equal(readFileSync(join(dir, 'sentinel'), 'utf8'), 'host login');
+  assert.ok(existsSync(f.deploymentFile)); assert.ok(existsSync(f.pairFile));
 });
