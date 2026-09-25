@@ -1,5 +1,23 @@
 # Working in this repo
 
+## Development cadence
+
+Foreman is built in a loop between the developer and an orchestrating agent. The developer acts as a **customer**: they use the shipped app and file issues. The **orchestrator** owns delivery: it works through the backlog, ships to production, and reports what changed.
+
+1. **The developer files issues.** Bug reports, feature requests and design direction go in GitHub issues or comments on them. A decision the developer states in a comment is settled. Agents build on it and don't reopen it.
+2. **Triage.** The orchestrator reads every open issue and its comments, then proposes an order. The proposal says which issues become sprints, which are single tasks, which fold together because they change the same surface, and which are parked. A parked issue gets the `deferred` label and a comment saying why. Each open decision comes with a recommended default.
+3. **Decisions.** The developer answers the questions they care about. Everything else takes the recommended default, and the orchestrator says which defaults it took. For a large design question, a subagent first writes the design as a comment on the issue.
+4. **Execute.** The orchestrator gives each sprint to a **sprint lead**, a subagent that runs it as described in [Sprint and task workflow](#sprint-and-task-workflow). Sprints that change separate parts of the code run in parallel. A single task gets one implementer and one non-author reviewer.
+5. **Land and ship.** The orchestrator, not the lead, lands each epic PR. It checks the PR on GitHub. If `main` has moved, it merges `main` in and reruns the five checks. It runs the live suites when the change calls for them. Then it merges and deploys, following [Deploying and restarting](#deploying-and-restarting). The orchestrator is the only deployer.
+6. **Report, then loop.** After each ship, tell the developer what changed *for them* (not the diff), anything they need to do, and which follow-up issues were filed. Findings from reviews that don't block become new issues and return to step 2.
+
+Rules of the loop:
+
+- Escalate only what an agent can't do: OAuth sign-ins, checks on a real phone, and product decisions with no sensible default. Batch them into one list instead of asking one at a time.
+- Don't take a lead's report on trust. Confirm the PR's state and the exact commit the checks ran on.
+- Sprint leads launch their own agents in the foreground (`run_in_background: false`). A background child does not wake a subagent lead, and the sprint stalls.
+- Clean up after agents. Prune finished worktrees. Before deploying, check that no agent wrote to real state (`~/.foreman`, PM memory).
+
 ## Sprint and task workflow
 
 Work here is either a **sprint** or a **single task**, and they land differently.
@@ -19,7 +37,7 @@ main
 ```
 
 - Story branches target the **epic branch**, never `main`. Each story gets its own PR there.
-- **Only the integrated epic PR targets `main`.** That PR is the unit of human review: the developer reviews the sprint whole, once, and does not review individual story PRs.
+- **Only the integrated epic PR targets `main`.** That PR is the unit of review. The sprint is reviewed whole, once: by the orchestrator in the [development cadence](#development-cadence), otherwise by the developer. Nobody outside the sprint reviews individual story PRs.
 - Story PRs are reviewed by an agent that is **not their author**, before merging into the epic branch.
 - The integrator resolves conflicts and changes integration-owned files only. A behavioral defect goes back to the story that owns it; do not fix it in the integration commit.
 - After a story has merged, further repairs to it are new PRs into the epic branch. Never merge a broken epic PR and fix it on `main`.
@@ -44,7 +62,7 @@ A single task goes straight to `main` as one `<type>/<short-name>` branch and PR
 
 ### Merging
 
-Leave the merge decision to the developer unless they tell you otherwise. When told to merge: story PRs merge into the epic branch preserving their merge commits; the epic PR squash-merges into `main` with `gh pr merge --squash --delete-branch`.
+In the [development cadence](#development-cadence), the orchestrator merges once the definition of done is met. Outside it, leave the merge decision to the developer unless they tell you otherwise. When merging: story PRs merge into the epic branch preserving their merge commits; the epic PR squash-merges into `main` with `gh pr merge --squash --delete-branch`.
 
 ## Verification before you claim anything
 
