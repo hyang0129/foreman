@@ -134,7 +134,9 @@ async function disconnect(stub: Stub, host: Host) {
 // ---- DO access -----------------------------------------------------------------------------
 const pmHost = async (stub: Stub) => (await (await stub.fetch(`${ORIGIN}/api/pm/host`)).json()) as PmHostResponse;
 const move = (stub: Stub, body: unknown) => stub.fetch(`${ORIGIN}/api/pm/host`, { method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body) });
-const hostStatus = async (stub: Stub) => (await (await stub.fetch(`${ORIGIN}/api/host`)).json()) as any;
+// /api/host also carries the push counters (#127), covered in push-routes.test.ts; the PM fields are compared here.
+const withoutPush = ({ push, ...status }: any) => { expect(push).toBeTypeOf('object'); return status; };
+const hostStatus = async (stub: Stub) => withoutPush(await (await stub.fetch(`${ORIGIN}/api/host`)).json());
 const sql = <T extends Record<string, SqlStorageValue>>(stub: Stub, query: string, ...bindings: unknown[]) =>
   runInDurableObject(stub, (_instance: HostRelay, ctx) => ctx.storage.sql.exec<T>(query, ...bindings).toArray());
 const turns = (stub: Stub) => sql<{ turn_id: string; machine_id: string; epoch: number; state: string; reason: string | null }>(stub, 'SELECT turn_id, machine_id, epoch, state, reason FROM pm_turns ORDER BY accepted_at, turn_id');
@@ -641,7 +643,7 @@ describe('/api/pm/host through the Worker', () => {
     expect(moved.status).toBe(200);
     expect(await moved.json()).toMatchObject({ active: { machine_id: b.machine_id, name: 'machine-b', epoch: 2, assigned_by: 'developer' }, epoch: 2 });
     // /api/host (still relayed contract-wise, answered by the DO) reports the new PM host.
-    expect(await (await api('GET', '/api/host')).json()).toEqual({ online: true, host: 'machine-b', machine_id: b.machine_id, standby_online: true });
+    expect(withoutPush(await (await api('GET', '/api/host')).json())).toEqual({ online: true, host: 'machine-b', machine_id: b.machine_id, standby_online: true });
     await flush(a); await flush(b);
     expect(requests(a)).toEqual([]);
     expect(requests(b)).toEqual([]);

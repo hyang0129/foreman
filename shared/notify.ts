@@ -110,8 +110,15 @@ export function parseNotifyFrame(raw: unknown): NotifyFrame | null {
   }
 }
 
-// C0/C1 controls, bidi embeddings/overrides/isolates and marks, zero-width and BOM characters.
-const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+// Characters that render as nothing (or reorder what follows) and so can hide or disguise text:
+// C0/C1 controls; soft hyphen; combining grapheme joiner; Arabic letter mark; Hangul and
+// halfwidth Hangul fillers; Khmer inherent vowels; Mongolian free variation selectors and vowel
+// separator; zero-width space/joiners and LRM/RLM; bidi embeddings/overrides (U+202A-202E); word
+// joiner, invisible operators, bidi isolates and deprecated format characters (U+2060-206F); BOM;
+// interlinear annotation controls; shorthand format controls; musical formatting controls; and
+// Unicode tag characters (invisible ASCII look-alikes). Variation selectors are kept: they only
+// select a glyph form of the preceding character (emoji presentation).
+const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\uffa0\ufff9-\ufffb\u{1bca0}-\u{1bca3}\u{1d173}-\u{1d17a}\u{e0000}-\u{e007f}]/gu;
 const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
 
 // Single-line, display-safe name: whitespace (including newlines and line/paragraph separators)
@@ -177,6 +184,7 @@ export function sessionUrl(key: string): string {
 
 export const PM_URL = '/?view=pm';
 
+// Every PushKind has a case; buildPushPayload never passes anything else.
 function render(kind: PushKind, host: string, key: string | undefined, name: string | undefined, at: string): PushPayload {
   const who = name || 'A session';
   const session = key === undefined ? {} : { session_key: key };
@@ -194,7 +202,6 @@ function render(kind: PushKind, host: string, key: string | undefined, name: str
     case 'host_offline':
       return { v: 1, kind, host, at, tag: 'host', url: '/', title: 'Mac offline', body: `${host || 'Your Mac'} has been disconnected for over 5 minutes.` };
     case 'test':
-    default:
       return { v: 1, kind: 'test', host, at, tag: 'test', url: '/', title: 'Foreman notifications are on', body: 'You will be notified when a session needs you.' };
   }
 }
@@ -206,9 +213,15 @@ export function pushPayloadSize(payload: PushPayload): number {
 // The single push renderer. Reads only kind, host, session_key, session_name and at from the
 // event, cleans each, and builds every other field from fixed templates. The serialized result
 // is guaranteed to be at most MAX_PUSH_PAYLOAD bytes.
+//
+// An event whose kind is not a PushKind throws a TypeError (naming nothing from the input) rather
+// than rendering a fallback: callers validate first (the relay renders only parsed frames and its
+// own host_offline/test events), so an unknown kind is a bug, and any fallback would have to
+// claim some real kind - the old one claimed 'test' and told the user "notifications are on".
 export function buildPushPayload(event: PushEvent): PushPayload {
   const input = (isPlainObject(event) ? event : {}) as Record<string, unknown>;
-  const kind: PushKind = isNotifyKind(input.kind) || input.kind === 'host_offline' ? input.kind : 'test';
+  const kind = input.kind;
+  if (!isNotifyKind(kind) && kind !== 'host_offline' && kind !== 'test') throw new TypeError('buildPushPayload: unknown notification kind');
   const at = isIsoTimestamp(input.at) ? input.at : new Date().toISOString();
   let host = typeof input.host === 'string' ? cleanDisplayName(input.host, MAX_HOST) : '';
   const sessionKind = kind === 'approval_requested' || kind === 'question_asked' || kind === 'session_failed';

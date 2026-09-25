@@ -8,6 +8,8 @@ import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 import { CodexControl } from '../server/codex-control.ts';
 
+// How the fixture answers account/read; set per test and reset after it.
+let accountRead: 'ok' | 'hang' | 'error' | 'signed-out' = 'ok';
 async function fixture(t: test.TestContext, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'foreman-rpc-test-'));
   const socket = join(dir, 'rpc.sock');
@@ -24,6 +26,11 @@ async function fixture(t: test.TestContext, options = {}) {
       if (msg.method === 'initialize') { initialized = true; reply({}); return; }
       assert.equal(initialized, true);
       if (msg.method === 'initialized' || msg.method === 'fixture/hang') return;
+      if (msg.method === 'account/read' && accountRead !== 'ok') {
+        if (accountRead === 'error') peer.send(JSON.stringify({ id:msg.id, error:{ code:-32603, message:'account store unavailable' } }));
+        else if (accountRead === 'signed-out') reply({ account:null, requiresOpenaiAuth:true });
+        return;
+      }
       const thread = { id: msg.params.threadId ?? 'live', cwd:dir, createdAt:1, updatedAt:1,
         status:{ type:msg.params.threadId === 'stored' ? 'notLoaded' : 'idle' }, canAcceptDirectInput:true, turns:[] };
       if (msg.method === 'thread/start') reply({ thread, approvalPolicy: msg.params.approvalPolicy, sandbox: {
@@ -95,6 +102,34 @@ test('timeouts expose uncertain delivery without retrying mutations', async (t) 
   const { client, sent } = await fixture(t, { timeoutMs:100 });
   await assert.rejects(client.request('fixture/hang'), /delivery is unknown/);
   assert.equal(sent.filter((m) => m.method === 'fixture/hang').length, 1);
+});
+
+// #106: a timeout or error from account/read keeps its old behavior (the
+// check passes and the launch continues) but leaves a diagnostic on stderr.
+test('requireSignedIn logs a diagnostic when account/read times out or errors, and still continues', async (t) => {
+  t.after(() => { accountRead = 'ok'; });
+  const errors = t.mock.method(console, 'error', () => {});
+  for (const [mode, detail] of [['hang', /Codex account\/read timed out/], ['error', /Codex: account store unavailable/]] as const) {
+    accountRead = mode; errors.mock.resetCalls();
+    const { client, sent } = await fixture(t, { timeoutMs:100 });
+    await client.requireSignedIn();
+    assert.equal(sent.filter((m) => m.method === 'account/read').length, 1);
+    assert.equal(errors.mock.callCount(), 1);
+    const [prefix, message] = errors.mock.calls[0].arguments;
+    assert.equal(prefix, 'foreman: Codex account/read failed; continuing without the sign-in check:');
+    assert.match(message, detail);
+    client.close();
+  }
+});
+
+test('requireSignedIn logs nothing when account/read answers', async (t) => {
+  t.after(() => { accountRead = 'ok'; });
+  const errors = t.mock.method(console, 'error', () => {});
+  accountRead = 'ok';
+  await (await fixture(t)).client.requireSignedIn();
+  accountRead = 'signed-out';
+  await assert.rejects((await fixture(t)).client.requireSignedIn(), /Codex is not signed in/);
+  assert.equal(errors.mock.callCount(), 0);
 });
 
 test('delayed turn completion preserves a newer turn approval', async (t) => {

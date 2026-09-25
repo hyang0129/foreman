@@ -255,7 +255,7 @@ test('notify on an open relay sends the validated frame after hello', (t) => {
   assert.deepEqual(notifies(socket), [frame(1, { at: notifies(socket)[0].at })]);
 });
 
-test('notify while disconnected queues and flushes once on the next open, without replay', (t) => {
+test('notify while disconnected queues and flushes on the next open; later opens re-send only recent frames', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
   t.mock.method(Math, 'random', () => 0);
   const f = bridge(t), first = f.sockets[0]!;
@@ -267,11 +267,51 @@ test('notify while disconnected queues and flushes once on the next open, withou
   f.instance.notify(frame(2)); f.instance.notify(frame(3));
   t.mock.timers.tick(1000);
   const second = f.sockets[1]!; second.open();
-  assert.deepEqual(second.sent.map((entry) => entry.type), ['hello', 'notify', 'notify']);
-  assert.deepEqual(notifies(second).map((entry) => entry.session_name), ['session 2', 'session 3']);
+  // #126: frame 1 (sent on the first socket) is re-sent first, then the queue flushes.
+  assert.deepEqual(second.sent.map((entry) => entry.type), ['hello', 'notify', 'notify', 'notify']);
+  assert.deepEqual(notifies(second).map((entry) => entry.session_name), ['session 1', 'session 2', 'session 3']);
   second.close(); t.mock.timers.tick(2000);
   const third = f.sockets[2]!; third.open();
-  assert.equal(notifies(third).length, 0, 'flushed frames are not re-sent on later connections');
+  // #126: every recently sent frame goes out again (same ids; the relay de-duplicates), once each.
+  assert.deepEqual(notifies(third).map((entry) => entry.session_name), ['session 1', 'session 2', 'session 3']);
+  assert.deepEqual(notifies(third).map((entry) => entry.id), notifies(second).map((entry) => entry.id));
+});
+
+test('#126: a frame sent into an open-but-dead socket is re-sent on the next connection, before queued ones', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  t.mock.method(Math, 'random', () => 0);
+  const f = bridge(t), first = f.sockets[0]!; first.open();
+  f.instance.notify(frame(1));
+  assert.equal(notifies(first).length, 1, 'written into the socket, which reported open');
+  // The socket was dead all along: the heartbeat finds no pong and terminates it.
+  t.mock.timers.tick(80_000);
+  assert.equal(first.terminated, true);
+  f.instance.notify(frame(2));
+  t.mock.timers.tick(1000);
+  const second = f.sockets[1]!; second.open();
+  assert.deepEqual(second.sent.map((entry) => entry.type), ['hello', 'notify', 'notify']);
+  assert.deepEqual(notifies(second).map((entry) => entry.session_name), ['session 1', 'session 2']);
+  assert.equal(notifies(second)[0].id, notifies(first)[0].id, 'the same id, so the relay drops it if it did arrive');
+  f.instance.notify(frame(3));
+  assert.deepEqual(notifies(second).map((entry) => entry.session_name), ['session 1', 'session 2', 'session 3'], 'nothing is sent twice on one connection');
+});
+
+test('#126: re-sent frames are bounded to the newest 20 and to five minutes', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  t.mock.method(Math, 'random', () => 0);
+  const f = bridge(t), first = f.sockets[0]!; first.open();
+  for (let n = 1; n <= 25; n++) f.instance.notify(frame(n));
+  assert.equal(notifies(first).length, 25);
+  first.close(); t.mock.timers.tick(1000);
+  const second = f.sockets[1]!; second.open();
+  assert.deepEqual(notifies(second).map((entry) => entry.session_name), Array.from({ length: 20 }, (_, i) => `session ${i + 6}`));
+  // Sockets are left unopened while time passes, so no heartbeat runs.
+  second.close(); t.mock.timers.tick(4 * 60_000);
+  const third = f.sockets.at(-1)!; assert.notEqual(third, second); third.open();
+  assert.equal(notifies(third).length, 20, 'still under five minutes old');
+  third.close(); t.mock.timers.tick(60_000);
+  const fourth = f.sockets.at(-1)!; assert.notEqual(fourth, third); fourth.open();
+  assert.equal(notifies(fourth).length, 0, 'frames older than five minutes are not re-sent');
 });
 
 test('the notify queue keeps only the newest 20 frames', (t) => {
@@ -336,12 +376,13 @@ test('startHostBridge keeps its shape and exposes notify only when a relay is co
   const home = mkdtempSync(join(tmpdir(), 'foreman-bridge-start-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const moduleUrl = new URL('../server/host-bridge.ts', import.meta.url).href;
-  const code = `import {startHostBridge} from ${JSON.stringify(moduleUrl)}; const b = startHostBridge(1, 'local'); console.log(typeof b.close, typeof b.notify); b.close(); process.exit(0);`;
+  // #126: a fake socket factory, so the relay case never opens a real WebSocket to foreman.invalid.
+  const code = `import {startHostBridge} from ${JSON.stringify(moduleUrl)}; import {EventEmitter} from 'node:events'; const opened = []; const fake = (url) => { opened.push(url.href); const s = new EventEmitter(); s.readyState = 0; s.close = () => { s.readyState = 3; }; s.terminate = s.close; return s; }; const b = startHostBridge(1, 'local', { socketFactory: fake }); console.log(typeof b.close, typeof b.notify, JSON.stringify(opened)); b.close(); process.exit(0);`;
   const env: NodeJS.ProcessEnv = { ...process.env, FOREMAN_HOME: home };
   delete env.FOREMAN_RELAY_URL; delete env.FOREMAN_HOST_TOKEN;
   const run = (overrides = {}) => execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', code], { env: { ...env, ...overrides }, encoding: 'utf8' }).trim().split('\n').at(-1);
-  assert.equal(run(), 'function undefined', 'local-only mode: no notify, so no notifier is wired');
-  assert.equal(run({ FOREMAN_RELAY_URL: 'https://foreman.invalid', FOREMAN_HOST_TOKEN: TOKEN }), 'function function');
+  assert.equal(run(), 'function undefined []', 'local-only mode: no notify, so no notifier is wired');
+  assert.equal(run({ FOREMAN_RELAY_URL: 'https://foreman.invalid', FOREMAN_HOST_TOKEN: TOKEN }), 'function function ["wss://foreman.invalid/api/host/connect"]', 'the only socket is the injected fake');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -490,14 +531,25 @@ test('#43 notify sending is intact on a v2 bridge', (t) => {
   assert.deepEqual(notifies(socket).map((entry) => entry.session_name), ['session 1', 'session 2']);
 });
 
+test('#126: notify re-sending also works on a v2 bridge', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  t.mock.method(Math, 'random', () => 0);
+  const f = v2(t), first = f.sockets[0]!; first.open();
+  f.instance.notify(frame(1));
+  first.close(); t.mock.timers.tick(1000);
+  const second = f.sockets[1]!; second.open();
+  assert.equal(second.sent[0].type, 'hello');
+  assert.deepEqual(notifies(second).map((entry) => entry.session_name), ['session 1']);
+});
+
 test('startHostBridge with an identity starts a v2 bridge and exposes it', (t) => {
   const home = mkdtempSync(join(tmpdir(), 'foreman-bridge-v2-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const moduleUrl = new URL('../server/host-bridge.ts', import.meta.url).href;
-  const code = `import {startHostBridge, HostBridge} from ${JSON.stringify(moduleUrl)}; const b = startHostBridge(1, 'local', { identity: ${JSON.stringify(MACHINE)}, pmOpenTurns: () => [] }); console.log(b.bridge instanceof HostBridge, b.bridge?.protocol); b.close(); process.exit(0);`;
+  const code = `import {startHostBridge, HostBridge} from ${JSON.stringify(moduleUrl)}; import {EventEmitter} from 'node:events'; const opened = []; const fake = (url) => { opened.push(url.href); const s = new EventEmitter(); s.readyState = 0; s.close = () => { s.readyState = 3; }; s.terminate = s.close; return s; }; const b = startHostBridge(1, 'local', { identity: ${JSON.stringify(MACHINE)}, pmOpenTurns: () => [], socketFactory: fake }); console.log(b.bridge instanceof HostBridge, b.bridge?.protocol, JSON.stringify(opened)); b.close(); process.exit(0);`;
   const env: NodeJS.ProcessEnv = { ...process.env, FOREMAN_HOME: home, FOREMAN_RELAY_URL: 'https://foreman.invalid', FOREMAN_HOST_TOKEN: TOKEN };
   const out = execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', code], { env, encoding: 'utf8' }).trim().split('\n').at(-1);
-  assert.equal(out, 'true 2');
+  assert.equal(out, 'true 2 ["wss://foreman.invalid/api/host/connect"]', 'the only socket is the injected fake');
 });
 
 // #122: a policy close (1008, e.g. "Too many machines") is logged with its reason, exposed by

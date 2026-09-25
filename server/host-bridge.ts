@@ -15,6 +15,9 @@ import { redactSecrets } from '../shared/redact.ts';
 // de-duplicates by frame id, so flushing a frame that also went out before a drop is harmless.
 export const NOTIFY_QUEUE_LIMIT = 20;
 export const NOTIFY_QUEUE_MAX_AGE_MS = 5 * 60_000;
+// A frame written into a socket that still reports open but is dead is lost without an error, so
+// frames sent recently (same bounds as the queue) are sent again on the next connection. Safe
+// because the relay drops any id it has logged in the last hour (cloud/worker.ts DEDUPE_WINDOW).
 
 /** Default per-call timeout for `rpc` (epic #26). */
 export const PM_RPC_TIMEOUT_MS = 10_000;
@@ -94,6 +97,7 @@ export class HostBridge {
   private lastPong = 0;
   private inFlight = 0;
   private notifyQueue: { raw: string; kind: string; queuedAt: number }[] = [];
+  private notifySent: { raw: string; kind: string; queuedAt: number }[] = [];
   private port: number;
   private config: BridgeConfig;
   private localToken?: string;
@@ -238,7 +242,7 @@ export class HostBridge {
       if (!valid) { console.error('foreman: dropped invalid notify frame'); return; }
       const entry = { raw: JSON.stringify(valid), kind: valid.kind, queuedAt: Date.now() };
       const socket = this.socket;
-      if (socket && socket.readyState === WebSocket.OPEN && this.sendNotify(socket, entry)) return;
+      if (socket && socket.readyState === WebSocket.OPEN && this.sendNotify(socket, entry)) { this.rememberSent(entry); return; }
       this.pruneNotify();
       this.notifyQueue.push(entry);
       if (this.notifyQueue.length > NOTIFY_QUEUE_LIMIT) this.notifyQueue.splice(0, this.notifyQueue.length - NOTIFY_QUEUE_LIMIT);
@@ -250,15 +254,25 @@ export class HostBridge {
     try { socket.send(entry.raw); return true; }
     catch { console.error('foreman: notify send failed', JSON.stringify({ kind: entry.kind })); return false; }
   }
+  private rememberSent(entry: { raw: string; kind: string; queuedAt: number }) {
+    this.notifySent.push(entry);
+    if (this.notifySent.length > NOTIFY_QUEUE_LIMIT) this.notifySent.splice(0, this.notifySent.length - NOTIFY_QUEUE_LIMIT);
+  }
   private pruneNotify() {
     const cutoff = Date.now() - NOTIFY_QUEUE_MAX_AGE_MS;
     this.notifyQueue = this.notifyQueue.filter((entry) => entry.queuedAt >= cutoff);
+    this.notifySent = this.notifySent.filter((entry) => entry.queuedAt >= cutoff);
   }
+  // On each open: first re-send recently sent frames (oldest first; an earlier socket may have
+  // swallowed them), then the queue.
   private flushNotify(socket: WebSocket) {
     this.pruneNotify();
+    for (const entry of this.notifySent) {
+      if (socket.readyState !== WebSocket.OPEN || !this.sendNotify(socket, entry)) return;
+    }
     while (this.notifyQueue.length && socket.readyState === WebSocket.OPEN) {
       if (!this.sendNotify(socket, this.notifyQueue[0]!)) return;
-      this.notifyQueue.shift();
+      this.rememberSent(this.notifyQueue.shift()!);
     }
   }
 
@@ -351,7 +365,7 @@ export class HostBridge {
     });
   }
   close() {
-    this.stopped = true; this.notifyQueue = []; clearTimeout(this.reconnect); clearInterval(this.heartbeat);
+    this.stopped = true; this.notifyQueue = []; this.notifySent = []; clearTimeout(this.reconnect); clearInterval(this.heartbeat);
     const socket = this.socket;
     socket?.close(1000, 'Host stopping');
     if (socket) this.dropSocket(socket);
@@ -363,7 +377,7 @@ export class HostBridge {
 // `identity` (PMM-05) makes the bridge speak protocol v2; `bridge` is then the HostBridge a
 // RelayPmStore is built on. Without options the behavior is exactly the pre-#26 one.
 // #122: `error` is the (redacted) reason a configured relay could not be started, so the caller can name it.
-export function startHostBridge(port: number, localToken?: string, options: Omit<HostBridgeOptions, 'localToken' | 'socketFactory'> = {}): { close(): void; notify?: (frame: NotifyFrame) => void; bridge?: HostBridge; error?: string } {
+export function startHostBridge(port: number, localToken?: string, options: Omit<HostBridgeOptions, 'localToken'> = {}): { close(): void; notify?: (frame: NotifyFrame) => void; bridge?: HostBridge; error?: string } {
   try {
     const config = readBridgeConfig();
     if (!config) return { close() {} };

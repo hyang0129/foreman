@@ -27,11 +27,18 @@ class FakeSessions extends EventEmitter {
   rows = new Map<string, FakeRow>();
   pending = new Map<string, FakeApproval[]>();
   detailCalls = 0;
+  approvalCalls = 0;
   add(key: string, managed = true, overrides: Partial<FakeRow> = {}) {
     this.rows.set(key, { session_key: key, name: 'fix login', state: 'idle', managed, cwd: '/Users/hong/secret-project', last_error: null, last_message: 'transcript text SECRET', transcript_path: '/Users/hong/secret-project/t.jsonl', ...overrides });
     this.pending.set(key, []);
   }
   list() { return [...this.rows.values()].map((row) => ({ ...row })); }
+  approvals(id: string) {
+    this.approvalCalls++;
+    const session = this.rows.get(id);
+    return session?.managed ? structuredClone(this.pending.get(id) ?? []) : [];
+  }
+  // Present so a regression back to detail() is visible: the notifier must never call it.
   detail(id: string) {
     this.detailCalls++;
     const session = this.rows.get(id); if (!session) throw new Error('No such session');
@@ -113,6 +120,60 @@ test('approvals already pending at start-up never fire, but later ones do', (t) 
   sessions.request('fm:managed', permission('after'));
   assert.equal(frames.length, 1);
   assert.equal(frames[0]!.kind, 'approval_requested');
+});
+
+test('#126: session events read approvals() and the emitted row list, never detail()', (t) => {
+  const { sessions, frames } = setup(t);
+  sessions.request('fm:managed', permission('a'));
+  sessions.set('fm:managed', { state: 'unknown' });
+  assert.deepEqual(frames.map((f) => f.kind), ['approval_requested', 'session_failed']);
+  assert.equal(sessions.detailCalls, 0, 'detail() copies history and receipts; the notifier must not call it');
+  assert.ok(sessions.approvalCalls >= 2);
+});
+
+test('#126: only the session named by the event is read, not every session on each change', (t) => {
+  const { sessions } = setup(t, (sessions) => { for (let i = 0; i < 5; i++) sessions.add(`fm:other-${i}`); });
+  const before = sessions.approvalCalls;
+  sessions.request('fm:managed', permission('a'));
+  assert.equal(sessions.approvalCalls - before, 1);
+});
+
+test('#126: approval memory never evicts a still-pending id, however many are pending', (t) => {
+  const { sessions, frames } = setup(t);
+  const ids = Array.from({ length: 1005 }, (_, i) => `tool-${i}`);
+  sessions.pending.get('fm:managed')!.push(...ids.map(permission));
+  sessions.changed('fm:managed');
+  assert.equal(frames.length, 1005);
+  sessions.changed('fm:managed');
+  sessions.set('fm:managed', { state: 'working' });
+  assert.equal(frames.length, 1005, 'no still-pending approval fires twice, even past 1,000');
+});
+
+test('#126: approval memory forgets exactly the ids no longer pending', (t) => {
+  const { sessions, frames, notifier } = setup(t);
+  sessions.request('fm:managed', permission('a'));
+  sessions.request('fm:managed', permission('b'));
+  const memory = () => [...((notifier as any).seen.get('fm:managed') as Set<string>)].sort();
+  assert.deepEqual(memory(), ['a', 'b']);
+  sessions.resolve('fm:managed', 'a');
+  assert.deepEqual(memory(), ['b'], 'a resolved id is dropped; the pending one stays');
+  sessions.changed('fm:managed');
+  assert.equal(frames.length, 2, 'b is still remembered, so it never re-fires');
+});
+
+test('#126: a failing approvals() read still lets the failure edge fire and keeps the memory', (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { sessions, frames } = setup(t);
+  sessions.request('fm:managed', permission('a'));
+  const original = sessions.approvals.bind(sessions);
+  sessions.approvals = () => { throw new Error('approvals exploded'); };
+  sessions.set('fm:managed', { state: 'working' });
+  sessions.approvals = original;
+  sessions.changed('fm:managed');
+  assert.equal(frames.length, 1, 'a is still remembered after the failed read');
+  sessions.approvals = () => { throw new Error('approvals exploded'); };
+  sessions.set('fm:managed', { state: 'unknown' });
+  assert.deepEqual(frames.map((f) => f.kind), ['approval_requested', 'session_failed']);
 });
 
 test('observed (unmanaged) sessions never notify', (t) => {
@@ -212,10 +273,10 @@ test('a throwing sender or service never throws into the emitter, and later edge
   t.after(() => notifier.close());
   assert.doesNotThrow(() => sessions.request('fm:managed', permission('a')));
   assert.doesNotThrow(() => pm.fail());
-  const original = sessions.detail.bind(sessions);
-  sessions.detail = () => { throw new Error('detail exploded'); };
+  const original = sessions.approvals.bind(sessions);
+  sessions.approvals = () => { throw new Error('approvals exploded'); };
   assert.doesNotThrow(() => sessions.changed('fm:managed'));
-  sessions.detail = original;
+  sessions.approvals = original;
   assert.doesNotThrow(() => sessions.request('fm:managed', permission('b')));
   assert.equal(calls, 3);
 });
@@ -233,9 +294,11 @@ test('an invalid frame (host outside the contract) is dropped instead of sent', 
 test('close removes every listener and stops notifying', (t) => {
   const { sessions, pm, frames, notifier } = setup(t);
   assert.equal(sessions.listenerCount('session'), 1);
+  assert.equal(sessions.listenerCount('change'), 1);
   assert.equal(pm.listenerCount('event'), 1);
   notifier.close();
   assert.equal(sessions.listenerCount('session'), 0);
+  assert.equal(sessions.listenerCount('change'), 0);
   assert.equal(pm.listenerCount('event'), 0);
   sessions.request('fm:managed', permission('late'));
   sessions.set('fm:managed', { state: 'unknown' });
@@ -244,7 +307,7 @@ test('close removes every listener and stops notifying', (t) => {
 });
 
 // The same edges through the real SessionService (fake provider), so the notifier is proven
-// against the events and detail() shape SessionService actually exposes.
+// against the events and approvals() shape SessionService actually exposes.
 class FakeClaude extends EventEmitter {
   sent: any[] = []; pending: any[] = [];
   send(text: string, id: string) { this.sent.push({ text, id }); return { id, status: 'running' }; }
@@ -340,7 +403,7 @@ test('with the real ProjectManager: failed turn -> one pm_failed; success re-arm
     };
   };
   const frames: NotifyFrame[] = [];
-  const sessions = new EventEmitter() as any; sessions.list = () => []; sessions.detail = () => { throw new Error('none'); };
+  const sessions = new EventEmitter() as any; sessions.list = () => []; sessions.approvals = () => { throw new Error('none'); };
   const notifier = new Notifier({ sessions, pm, host: 'test-mac', send: (frame) => frames.push(frame) }).start();
   const running = pm.start();
   t.after(async () => { notifier.close(); pm.close(); await running; });

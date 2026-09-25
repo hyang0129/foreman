@@ -154,9 +154,19 @@ export interface SendOptions {
   salt?: Bytes; sender?: SenderKeys;
 }
 
+export interface PushResult {
+  /** The push service's HTTP status. */
+  status: number;
+  /** True when this push went out payload-less: asked for (`payload === null`) or because encryption failed. */
+  payloadless: boolean;
+}
+
 // Sends one push. `payload === null` is the payload-less fallback: VAPID only, empty body, which
-// the service worker shows as generic text. Returns the push service's HTTP status.
-export async function sendPush(target: PushTarget, payload: Uint8Array | null, options: SendOptions): Promise<number> {
+// the service worker shows as generic text. Push services answer a bodiless POST without a length
+// with 411 Length Required, so the fallback sends a zero-length *body* (a known length, for which
+// the runtime emits `Content-Length: 0` itself) alongside the explicit header, rather than relying
+// on a hand-set header next to a null body.
+export async function sendPush(target: PushTarget, payload: Uint8Array | null, options: SendOptions): Promise<PushResult> {
   if (!pushEndpointAllowed(target.endpoint)) throw new Error('Push endpoint not allowed');
   const headers: Record<string, string> = {
     authorization: await vapidAuthorization(target.endpoint, options.subject, options.vapid),
@@ -169,11 +179,15 @@ export async function sendPush(target: PushTarget, payload: Uint8Array | null, o
     // the payload-less push rather than dropping the notification.
     try { body = await encryptPayload(payload, target.p256dh, target.auth, { salt: options.salt, sender: options.sender }); } catch { body = null; }
   }
+  const payloadless = !body;
   if (body) {
     headers['content-encoding'] = 'aes128gcm';
     headers['content-type'] = 'application/octet-stream';
-  } else headers['content-length'] = '0';
+  } else {
+    headers['content-length'] = '0';
+    body = new Uint8Array(0);
+  }
   const response = await (options.fetcher ?? fetch)(target.endpoint, { method: 'POST', headers, body, redirect: 'manual', signal: AbortSignal.timeout(10_000) });
   await response.body?.cancel();
-  return response.status;
+  return { status: response.status, payloadless };
 }

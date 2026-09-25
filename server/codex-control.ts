@@ -186,7 +186,13 @@ export class CodexControl extends EventEmitter {
   // app-server that cannot answer keeps the previous behavior.
   async requireSignedIn() {
     let result: { account?: unknown; requiresOpenaiAuth?: unknown } | undefined;
-    try { result = await this.request('account/read', { refreshToken: false }); } catch { return; }
+    try { result = await this.request('account/read', { refreshToken: false }); }
+    catch (error) {
+      // Behavior is unchanged (the launch continues), but leave a trace so a
+      // slow or failing Codex app-server is visible in the service log (#106).
+      console.error('foreman: Codex account/read failed; continuing without the sign-in check:', String((error as Error)?.message ?? error).slice(0, 300));
+      return;
+    }
     if (result?.account === null && result?.requiresOpenaiAuth === true) {
       throw new Error('Codex is not signed in on this host, so Codex sessions are unavailable. Sign in with `codex login` using the CODEX_HOME this Foreman uses, then try again.');
     }

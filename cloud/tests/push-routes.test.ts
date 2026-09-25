@@ -9,7 +9,7 @@ import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import worker, { HostRelay, MAX_SUBSCRIPTIONS, OFFLINE_AFTER, RATE_LIMIT } from '../worker.ts';
 import { buildPushPayload, type NotifyFrame } from '../../shared/notify.ts';
 import { loadVapidKeys } from '../push.ts';
-import { decryptPush, newReceiver, verifyVapid, type Receiver } from './push-helpers.ts';
+import { CHROME_FCM_PRIVATE_KEY, CHROME_FCM_SUBSCRIPTION, decryptPush, ecdhPrivateKey, newReceiver, verifyVapid, type Receiver } from './push-helpers.ts';
 
 const ORIGIN = 'https://foreman.test';
 const JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
@@ -33,18 +33,22 @@ type Push = { endpoint: string; headers: Headers; body: Uint8Array; payload: any
 let pushes: Push[] = [];
 let receivers = new Map<string, Receiver>();
 let pushStatus = 201;
+// Per-endpoint overrides: a status to answer with, or 'network' to fail without any response.
+let endpointOutcome = new Map<string, number | 'network'>();
 let otherFetches: string[] = [];
 beforeEach(() => {
-  pushes = []; receivers = new Map(); pushStatus = 201; otherFetches = [];
+  pushes = []; receivers = new Map(); pushStatus = 201; endpointOutcome = new Map(); otherFetches = [];
   const realFetch = globalThis.fetch;
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
     const request = new Request(input, init);
     if (request.url === JWKS_URL) return Response.json(jwks);
     const receiver = receivers.get(request.url);
     if (receiver) {
+      const outcome = endpointOutcome.get(request.url);
+      if (outcome === 'network') throw new TypeError('Network connection lost');
       const body = new Uint8Array(await request.arrayBuffer());
       pushes.push({ endpoint: request.url, headers: request.headers, body, payload: body.length ? JSON.parse(await decryptPush(body, receiver)) : null });
-      return new Response(null, { status: pushStatus });
+      return new Response(null, { status: outcome ?? pushStatus });
     }
     otherFetches.push(new URL(request.url).hostname);
     return realFetch(input, init);
@@ -244,6 +248,24 @@ describe('push route boundary', () => {
     expect(await storedEndpoints(ownerRelay())).toEqual([]);
     expect(pushes).toHaveLength(2);
   });
+  it('accepts a subscription shaped exactly like Chrome/FCM PushSubscription.toJSON(), sent the way the web app sends it', async () => {
+    const { endpoint, keys } = CHROME_FCM_SUBSCRIPTION;
+    receivers.set(endpoint, { privateKey: await ecdhPrivateKey(CHROME_FCM_PRIVATE_KEY, keys.p256dh), ...keys });
+    // web/app.js: post("/api/push/subscribe", { subscription: subscription.toJSON(), device_label, kinds })
+    const body = JSON.stringify({ subscription: CHROME_FCM_SUBSCRIPTION, device_label: 'Pixel 9 · Chrome', kinds: ['approval_requested', 'question_asked', 'session_failed', 'pm_failed', 'host_offline'] });
+    expect(body).toContain('"expirationTime":null');
+    const response = await api('/api/push/subscribe', body);
+    expect(response.status).toBe(200);
+    expect(await storedEndpoints(ownerRelay())).toEqual([endpoint]);
+    const stored = await runInDurableObject(ownerRelay(), (_i: HostRelay, ctx) => ctx.storage.sql.exec<{ p256dh: string; auth: string }>('SELECT p256dh, auth FROM push_subscriptions').one());
+    expect(stored).toEqual({ p256dh: keys.p256dh, auth: keys.auth });
+    // And a push to it is encrypted (not the payload-less fallback) and decrypts with the device key.
+    expect(await (await api('/api/push/test', { endpoint })).json()).toEqual({ ok: true, sent: 1, failed: 0 });
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]!.headers.get('content-encoding')).toBe('aes128gcm');
+    expect(pushes[0]!.payload).toMatchObject({ v: 1, kind: 'test' });
+    expect((await verifyVapid(pushes[0]!.headers.get('authorization')!)).claims.aud).toBe('https://fcm.googleapis.com');
+  });
   it('rate-limits test pushes and keeps at most 20 subscriptions, evicting the oldest', async () => {
     const endpoints: string[] = [];
     for (let i = 0; i < MAX_SUBSCRIPTIONS + 2; i++) {
@@ -365,6 +387,63 @@ describe('notify frames from the host', () => {
   });
 });
 
+describe('push counters on GET /api/host', () => {
+  const hostStatus = async () => {
+    const response = await api('/api/host', undefined, { method: 'GET' });
+    expect(response.status).toBe(200);
+    return response.text();
+  };
+  it('are behind sign-in, like the rest of /api/host', async () => {
+    expect((await api('/api/host', undefined, { method: 'GET', token: null })).status).toBe(401);
+    expect((await api('/api/host', undefined, { method: 'GET', token: await idToken('intruder@example.com') })).status).toBe(403);
+  });
+  it('count sends, failures, expired removals, payload-less fallbacks and invalid frames, without endpoints or keys', async () => {
+    expect(JSON.parse(await hostStatus()).push).toEqual({ sent: 0, failed: 0, expired_removed: 0, payloadless: 0, invalid_notify: 0, last_failure: null });
+    const ok = await newSubscription(), gone = await newSubscription(), down = await newSubscription(), broken = await newSubscription();
+    for (const subscription of [ok, gone, down, broken]) expect((await api('/api/push/subscribe', { subscription: subscription.json })).status).toBe(200);
+    endpointOutcome.set(gone.endpoint, 410);
+    endpointOutcome.set(down.endpoint, 'network');
+    // Keys are validated on subscribe, so only a stored row that can no longer encrypt reaches the
+    // payload-less fallback; corrupt one directly.
+    await runInDurableObject(ownerRelay(), (_i: HostRelay, ctx) => { ctx.storage.sql.exec('UPDATE push_subscriptions SET p256dh = ? WHERE endpoint = ?', 'corrupted', broken.endpoint); });
+    const before = Date.now();
+    expect(await (await api('/api/push/test', {})).json()).toEqual({ ok: true, sent: 2, failed: 2 });
+    // The fallback went out as an empty, unencrypted POST with an explicit zero length.
+    const fallback = pushes.find((push) => push.endpoint === broken.endpoint)!;
+    expect(fallback.body.byteLength).toBe(0);
+    expect(fallback.payload).toBeNull();
+    expect(fallback.headers.get('content-length')).toBe('0');
+    expect(fallback.headers.get('content-encoding')).toBeNull();
+    // Invalid notify frames from the host are counted too.
+    const host = await connect(ownerRelay());
+    host.socket.send(JSON.stringify({ ...frame(), kind: 'turn_finished' }));
+    host.socket.send(JSON.stringify({ ...frame(), extra: 'transcript text' }));
+    await flush(host);
+    const text = await hostStatus();
+    const { push } = JSON.parse(text);
+    expect(push).toMatchObject({ sent: 2, failed: 2, expired_removed: 1, payloadless: 1, invalid_notify: 2 });
+    expect(Object.keys(push).sort()).toEqual(['expired_removed', 'failed', 'invalid_notify', 'last_failure', 'payloadless', 'sent']);
+    expect(Object.keys(push.last_failure).sort()).toEqual(['at', 'status']);
+    expect([410, null]).toContain(push.last_failure.status);
+    expect(Date.parse(push.last_failure.at)).toBeGreaterThanOrEqual(before - 1000);
+    // Nothing that identifies or unlocks a subscription is reported.
+    for (const subscription of [ok, gone, down, broken]) {
+      for (const secret of [subscription.endpoint, subscription.receiver.p256dh, subscription.receiver.auth]) expect(text).not.toContain(secret);
+    }
+    expect(text).not.toContain('googleapis');
+    expect(text).not.toContain('transcript');
+  });
+  it('record a network failure (no response) with a null status', async () => {
+    const down = await newSubscription();
+    await api('/api/push/subscribe', { subscription: down.json });
+    endpointOutcome.set(down.endpoint, 'network');
+    expect(await (await api('/api/push/test', {})).json()).toEqual({ ok: true, sent: 0, failed: 1 });
+    const { push } = JSON.parse(await hostStatus());
+    expect(push).toMatchObject({ sent: 0, failed: 1, expired_removed: 0, payloadless: 0, last_failure: { status: null } });
+    expect(await storedEndpoints(ownerRelay())).toEqual([down.endpoint]);
+  });
+});
+
 describe('Mac offline alarm', () => {
   async function disconnect(stub: Stub, host: Awaited<ReturnType<typeof connect>>) {
     host.socket.close(1000, 'Network lost');
@@ -437,6 +516,35 @@ describe('Mac offline alarm', () => {
     expect(pushes).toHaveLength(1);
     expect(pushes[0]!.payload.kind).toBe('host_offline');
     expect(host.socket.readyState).toBe(1);
+  });
+  it('subscribing while the host socket is stale-but-open dates the outage from its last heartbeat, not from now', async () => {
+    const stub = relay(), host = await connect(stub);
+    // Nobody wanted host_offline yet, so no check ran while the socket went silent without closing.
+    expect(await runInDurableObject(stub, (_i: HostRelay, ctx) => ctx.storage.getAlarm())).toBeNull();
+    const lastSeen = Date.now() - OFFLINE_AFTER - 10_000;
+    await runInDurableObject(stub, (_instance: HostRelay, ctx) => {
+      for (const socket of ctx.getWebSockets('host')) socket.serializeAttachment({ host: 'Test Mac', lastSeen });
+    });
+    await subscribe(stub);
+    expect(await state(stub, 'outage_since')).toBe(String(lastSeen));
+    // The host has been silent for more than 5 minutes already, so the alarm was set in the past
+    // and alerts at once (the runtime may already have run it; if not, run it now).
+    if (await runInDurableObject(stub, (_i: HostRelay, ctx) => ctx.storage.getAlarm()) !== null) await runDurableObjectAlarm(stub);
+    await until(() => pushes.length > 0, 'host_offline push');
+    expect(pushes.map((push) => push.payload.kind)).toEqual(['host_offline']);
+    expect(await state(stub, 'offline_notified')).toBe('1');
+    expect(host.socket.readyState).toBe(1);
+  });
+  it('a stale-but-open socket silent for under 5 minutes schedules the alert from its last heartbeat', async () => {
+    const stub = relay(); await connect(stub);
+    const lastSeen = Date.now() - 2 * 60_000;
+    await runInDurableObject(stub, (_instance: HostRelay, ctx) => {
+      for (const socket of ctx.getWebSockets('host')) socket.serializeAttachment({ host: 'Test Mac', lastSeen });
+    });
+    await subscribe(stub);
+    expect(await runInDurableObject(stub, (_i: HostRelay, ctx) => ctx.storage.getAlarm())).toBe(lastSeen + OFFLINE_AFTER);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(pushes).toEqual([]);
   });
   it('does not arm the alarm for nobody, or for subscriptions that opted out of host_offline', async () => {
     const stub = relay(), host = await connect(stub);

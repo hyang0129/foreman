@@ -64,6 +64,29 @@
       }
       window.addEventListener("online", () => { probes = 0; probe(); });
       if (navigator.onLine) probeTimer = setTimeout(probe, 2000);
+      // A notification tapped while this screen is the open window: the service worker posts the
+      // notification's URL here, as it does to the app. This screen has no app to route in place,
+      // so it loads that URL (the app, or this screen again if Foreman is still unreachable).
+      // Only a relative, same-origin app URL is followed (the checks mirror safeAppUrl in sw.js
+      // and the app's own routing of this message).
+      function appUrl(url) {
+        if (typeof url !== "string" || url.length === 0 || url.length > 2048) return null;
+        if (url[0] !== "/" || url[1] === "/" || url.includes("\\") || /[\s\u0000-\u001f\u007f-\u009f]/.test(url)) return null;
+        let target;
+        try { target = new URL(url, location.origin); } catch { return null; }
+        if (target.origin !== location.origin || !["/", "/index.html"].includes(target.pathname)) return null;
+        return target.href;
+      }
+      if ("serviceWorker" in navigator)
+        navigator.serviceWorker.addEventListener("message", (event) => {
+          if (!(event.source instanceof ServiceWorker) || event.data?.type !== "foreman:open") return;
+          const target = appUrl(event.data.url);
+          if (!target) return;
+          clearTimeout(probeTimer);
+          button.disabled = true;
+          button.textContent = "Opening…";
+          location.assign(target);
+        });
       const dark = document.documentElement.dataset.theme === "dark";
       document.querySelector('meta[name="theme-color"]').content = dark ? "#111b16" : "#f8faf8";
     </script>

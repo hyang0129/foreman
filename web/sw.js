@@ -90,10 +90,10 @@ function safeAppUrl(url) {
 // An empty payload (the relay's payload-less fallback), unreadable JSON, another version, a
 // malformed field or an unsafe url shows the generic notification, which opens "/".
 const GENERIC_NOTIFICATION = { title: "Foreman needs your attention", body: "Open Foreman to see what needs you.", tag: "foreman", url: "/", renotify: true };
-// No `badge`: Android draws a badge from its alpha channel only, and every shipped icon is an
-// opaque square, which would show as a blank white square in the status bar. Chrome's default
-// badge is used until a monochrome badge icon exists.
+// Android draws the status-bar badge from its alpha channel only, so the badge is a separate
+// monochrome icon: the white "f." glyph on transparent, 96x96 (the size Android asks for).
 const ICON = "/icons/icon-192.png";
+const BADGE = "/icons/badge-96.png";
 const isText = (value, max, allowEmpty = false) => typeof value === "string" && value.length <= max && (allowEmpty || value.length > 0);
 
 function notificationFor(data) {
@@ -113,6 +113,7 @@ self.addEventListener("push", (event) => {
     tag: note.tag,
     renotify: note.renotify,
     icon: ICON,
+    badge: BADGE,
     data: { url: note.url },
   }));
 });
@@ -125,7 +126,8 @@ self.addEventListener("notificationclick", (event) => {
 
 // Route an open app window in place (the app handles the message with its deep-link routing,
 // so drafts and history are kept), preferring a focused, then a visible window; otherwise
-// open a new one.
+// open a new one. A window showing the offline screen (served at the app's URL) gets the same
+// message and loads the URL itself.
 async function openApp(url) {
   const windows = (await self.clients.matchAll({ type: "window", includeUncontrolled: true }))
     .filter((client) => ["/", "/index.html"].includes(new URL(client.url).pathname));

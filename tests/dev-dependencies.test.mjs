@@ -204,10 +204,51 @@ test('start refuses before spawning with an actionable message when a file is re
   p.neverSpawned();
 });
 
-test('verifyDependencies rethrows an error without code or path using its message', async (t) => {
+test('verifyDependencies rethrows a programming error unchanged, without the reinstall instruction (#106)', async (t) => {
   const f = await deployed(t);
-  await assert.rejects(verifyDependencies(f.snapshot, f.deployment, async () => { throw new Error('boom'); }),
-    /^Error: Could not read installed dependencies at .* \(boom\); reinstall matching dependencies and run npm run dev:deploy again$/);
+  for (const bug of [new TypeError('boom'), Object.assign(new TypeError('bad arg'), { code: 'ERR_INVALID_ARG_TYPE' })]) {
+    const error = await verifyDependencies(f.snapshot, f.deployment, async () => { throw bug; }).then(() => assert.fail('resolved'), (e) => e);
+    assert.equal(error, bug);
+    assert.doesNotMatch(error.message, /reinstall/);
+  }
+});
+
+test('verifyDependencies does not add undefined code or path properties when the cause has none (#106)', async (t) => {
+  const f = await deployed(t);
+  const error = await verifyDependencies(f.snapshot, f.deployment, async () => { throw Object.assign(new Error('too many open files'), { code: 'EMFILE' }); })
+    .then(() => assert.fail('resolved'), (e) => e);
+  assert.match(error.message, /Could not read installed dependencies at .* \(EMFILE\); reinstall matching dependencies and run npm run dev:deploy again$/);
+  assert.equal(error.code, 'EMFILE');
+  assert.equal(Object.hasOwn(error, 'path'), false);
+  assert.equal(error.cause.message, 'too many open files');
+});
+
+// Deploy's own identity read (#106): the same actionable refusal as start,
+// and no deployment is recorded or uploaded.
+async function deployRefused(t, f, pattern) {
+  let uploads = 0;
+  const error = await deploy(f.home, { source: f.source, ref: f.commit }, async () => { uploads++; }).then(() => assert.fail('deploy resolved'), (e) => e);
+  assert.match(error.message, pattern);
+  assert.equal(uploads, 0);
+  assert.equal(existsSync(join(f.home, 'deployment.json')), false);
+  return error;
+}
+
+test('deploy refuses with an actionable message when an installed file is unreadable (#106)', { skip: process.getuid?.() === 0 && 'root ignores file permissions' }, async (t) => {
+  const f = fixture(t), file = join(f.modules, 'pkg/lib/index.js');
+  chmodSync(file, 0o000);
+  let error;
+  try { error = await deployRefused(t, f, unreadable('EACCES', file)); }
+  finally { chmodSync(file, 0o644); }
+  assert.equal(error.code, 'EACCES'); assert.equal(error.path, file);
+  assert.equal(error.cause?.code, 'EACCES');
+});
+
+test('deploy refuses with an actionable message when node_modules resolves to a regular file (#106)', async (t) => {
+  const f = fixture(t);
+  rmSync(f.modules, { recursive: true }); writeFileSync(f.modules, 'not a directory');
+  const error = await deployRefused(t, f, unreadable('ENOTDIR', f.modules));
+  assert.equal(error.cause?.code, 'ENOTDIR');
 });
 
 test('a failed read aborts the other in-flight reads and reports the first error', async (t) => {

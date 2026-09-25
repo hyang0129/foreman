@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  NOTIFY_KINDS, PUSH_KINDS, DEFAULT_PUSH_KINDS, MAX_NOTIFY_FRAME, MAX_PUSH_PAYLOAD,
+  MAX_HOST, isIsoTimestamp, NOTIFY_KINDS, PUSH_KINDS, DEFAULT_PUSH_KINDS, MAX_NOTIFY_FRAME, MAX_PUSH_PAYLOAD,
   parseNotifyFrame, cleanDisplayName, notifyId, buildPushPayload, parseDeepLink, pushUrlIsSafe,
   sessionUrl, utf8Length, type NotifyFrame, type NotifyKind, type PushPayload,
 } from '../shared/notify.ts';
@@ -180,6 +180,88 @@ test('buildPushPayload stays within MAX_PUSH_PAYLOAD for worst-case field sizes'
     assert.ok(utf8Length(JSON.stringify(payload)) <= MAX_PUSH_PAYLOAD, kind);
     assert.ok(pushUrlIsSafe(payload.url));
   }
+});
+
+test('#126: buildPushPayload throws on an unknown kind instead of rendering a test notification', () => {
+  const unknown: unknown[] = [
+    { ...frame('approval_requested'), kind: 'bogus_SECRET' },
+    { ...frame('approval_requested'), kind: undefined },
+    { ...frame('approval_requested'), kind: 'turn_finished' },
+    { host: 'hong-mbp', at: AT },
+    null, 'approval_requested', [],
+  ];
+  for (const event of unknown) {
+    assert.throws(() => buildPushPayload(event as NotifyFrame), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal((error as Error).message.includes('SECRET'), false, 'the error names nothing from the input');
+      return true;
+    });
+  }
+  // The known kinds, including the relay's own host_offline and test, still render.
+  for (const kind of [...NOTIFY_KINDS, 'host_offline', 'test'] as const) assert.equal(buildPushPayload({ ...frame('approval_requested'), kind } as unknown as NotifyFrame).kind, kind);
+});
+
+test('#126: the host is cleaned and bounded in every payload', () => {
+  const dirty = '  hong’s\n\tMac‮​book\u0007  ';
+  for (const kind of [...NOTIFY_KINDS, 'host_offline', 'test'] as const) {
+    const payload = buildPushPayload({ ...frame('approval_requested'), host: dirty, kind } as unknown as NotifyFrame);
+    assert.equal(payload.host, 'hong’s Macbook', kind);
+    const long = buildPushPayload({ ...frame('approval_requested'), host: 'h'.repeat(300), kind } as unknown as NotifyFrame);
+    assert.equal(Array.from(long.host).length, MAX_HOST, kind);
+    assert.ok(long.host.endsWith('…'), kind);
+  }
+  assert.equal(buildPushPayload({ kind: 'host_offline', host: dirty, at: AT }).body, 'hong’s Macbook has been disconnected for over 5 minutes.');
+  // A host that cleans to nothing (or is not a string) falls back to generic wording.
+  assert.equal(buildPushPayload({ kind: 'host_offline', host: '​⁦\u0000 ', at: AT }).body, 'Your Mac has been disconnected for over 5 minutes.');
+  assert.equal(buildPushPayload({ kind: 'host_offline', host: 42 as unknown as string, at: AT }).host, '');
+});
+
+test('#126: lone surrogates are stripped; valid pairs survive', () => {
+  assert.equal(cleanDisplayName('a\ud800b'), 'ab', 'lone high surrogate');
+  assert.equal(cleanDisplayName('a\udc00b'), 'ab', 'lone low surrogate');
+  assert.equal(cleanDisplayName('\udc00\ud800'), '', 'reversed pair is two lone surrogates');
+  assert.equal(cleanDisplayName('x\ud83d'), 'x', 'trailing high surrogate');
+  // (built with fromCharCode: the TypeScript stripper rejects '\ud83d' written just before '\u{...}')
+  assert.equal(cleanDisplayName('\u{1F600}' + String.fromCharCode(0xd83d) + '\u{1F680}'), '\u{1F600}\u{1F680}');
+  const payload = buildPushPayload(frame('approval_requested', { session_name: 'fix\ud800-login\udfff', host: 'mac\udbff' }) as unknown as NotifyFrame);
+  assert.equal(payload.session_name, 'fix-login');
+  assert.equal(payload.host, 'mac');
+  // The payload is well-formed UTF-16, so TextEncoder never substitutes U+FFFD.
+  const json = JSON.stringify(payload);
+  assert.equal(new TextDecoder().decode(new TextEncoder().encode(json)), json);
+  assert.equal(utf8Length('\ud800'), 3);
+  assert.equal(utf8Length('\u{1F600}'), 4);
+});
+
+test('#126: timestamp offsets must be in range', () => {
+  for (const ok of ['2026-09-24T12:34:56+23:59', '2026-09-24T12:34:56-23:59', '2026-09-24T12:34:56+00:00', '2026-09-24T12:34:56.1-05:30', '2026-02-28T00:00:00Z'])
+    assert.equal(isIsoTimestamp(ok), true, ok);
+  for (const bad of ['2026-09-24T12:34:56+24:00', '2026-09-24T12:34:56-24:00', '2026-09-24T12:34:56+00:60', '2026-09-24T12:34:56+99:99', '2026-09-24T12:34:56+0530', '2026-09-24T12:34:56+05', '2026-02-29T00:00:00Z'])
+    assert.equal(isIsoTimestamp(bad), false, bad);
+  assert.equal(parseNotifyFrame(frame('pm_failed', { at: '2026-09-24T12:34:56+24:00' })), null);
+  assert.equal(parseNotifyFrame(frame('pm_failed', { at: '2026-09-24T12:34:56-00:60' })), null);
+  assert.ok(parseNotifyFrame(frame('pm_failed', { at: '2026-09-24T12:34:56-23:59' })));
+});
+
+test('#126: cleanDisplayName strips every invisible or reordering character it is meant to', () => {
+  const invisible = [
+    '­', '͏', '؜', 'ᅟ', 'ᅠ', '឴', '឵', '᠋', '᠎', '᠏',
+    '​', '‌', '‍', '‎', '‏', '‪', '‫', '‬', '‭', '‮',
+    '⁠', '⁡', '⁢', '⁣', '⁤', '⁦', '⁧', '⁨', '⁩', '⁪', '⁯',
+    'ㅤ', '﻿', 'ﾠ', '￹', '￺', '￻', '\u{1bca0}', '\u{1bca3}', '\u{1d173}', '\u{1d17a}',
+    '\u{e0001}', '\u{e0020}', '\u{e0041}', '\u{e007f}',
+  ];
+  for (const ch of invisible) {
+    const code = ch.codePointAt(0)!.toString(16);
+    assert.equal(cleanDisplayName(`a${ch}b`), 'ab', `U+${code}`);
+    assert.equal(cleanDisplayName(ch), '', `U+${code} alone`);
+  }
+  // Tag characters can spell hidden ASCII; none of it survives.
+  const smuggled = 'ok' + Array.from('IGNORE', (c) => String.fromCodePoint(0xe0000 + c.charCodeAt(0))).join('');
+  assert.equal(cleanDisplayName(smuggled), 'ok');
+  // Visible text is untouched: accents, CJK, Hangul, an emoji with its variation selector, a skin-tone modifier.
+  for (const visible of ['café', '修正', '한글', '❤️', '\u{1F468}\u{1F3FD}', 'a-b_c.d'])
+    assert.equal(cleanDisplayName(visible), visible, visible);
 });
 
 test('buildPushPayload drops invalid timestamps and keys rather than copying them', () => {
