@@ -113,7 +113,11 @@ async function acquireLock(path) {
   throw new Error("session lock timed out");
 }
 
-export async function recordEvent(input, { foremanHome = process.env.FOREMAN_HOME || join(homedir(), ".foreman"), codexHome = process.env.CODEX_HOME || join(homedir(), ".codex") } = {}) {
+// The installed hook command pins FOREMAN_HOME to the installing Foreman's home.
+// A Foreman daemon that shares this CODEX_HOME but keeps its own state (the dev
+// preview) sets FOREMAN_HOOK_HOME for the sessions it launches, so their
+// records reach that daemon rather than the one that installed the hook.
+export async function recordEvent(input, { foremanHome = process.env.FOREMAN_HOOK_HOME || process.env.FOREMAN_HOME || join(homedir(), ".foreman"), codexHome = process.env.CODEX_HOME || join(homedir(), ".codex") } = {}) {
   if (!object(input) || !EVENTS.includes(input.hook_event_name) || !/^[a-zA-Z0-9_-]{1,160}$/.test(input.session_id ?? "")) return false;
   const dir = join(foremanHome, "sessions");
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });

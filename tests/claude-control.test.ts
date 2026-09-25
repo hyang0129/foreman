@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ClaudeControl } from "../server/claude-control.ts";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 function harness(policy?: "native" | "bypass") {
   let opts: any;
@@ -164,4 +169,28 @@ test('Bypass task questions still require an answer and completed turns cancel p
   assert.equal((await pending).behavior,'deny');
   assert.equal(h.control.pendingApprovals().length,0);
   assert.equal(h.control.respondApproval('question','allow',{answers:{'Which project?':'A'}}),false);
+});
+
+// Hook routing for the dev preview: a daemon run with FOREMAN_HOME (the dev
+// home) must have its sessions' Claude hooks record there, never in production.
+// The SDK passes `{ ...process.env }` to Claude when no `env` option is given,
+// and Claude passes its environment to hooks, so the launch must not override env.
+test("launch leaves the SDK environment unset so sessions and their hooks inherit the daemon's FOREMAN_HOME", async () => {
+  const h = harness(); await tick();
+  assert.ok(h.options(), "the provider was launched");
+  assert.equal(Object.hasOwn(h.options(), "env"), false);
+  h.control.close(); await h.control.finished;
+  // The SDK's own default is the full process environment.
+  const sdk = readFileSync(fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk")), "utf8");
+  assert.match(sdk, /env:[A-Za-z_$][\w$]*=\{\.\.\.process\.env\}/);
+});
+test("the installed Claude hook records into the FOREMAN_HOME it inherits", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "foreman-hook-routing-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dev = join(root, "dev"), production = join(root, "production");
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: production, FOREMAN_HOME: dev, CLAUDE_CONFIG_DIR: join(root, "claude") };
+  const hook = spawnSync(resolve("hooks/foreman-hook"), ["session-start"], { input: JSON.stringify({ session_id: "sid-dev", cwd: "/tmp", source: "startup" }), env, encoding: "utf8" });
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.equal(JSON.parse(readFileSync(join(dev, "sessions", "sid-dev.json"), "utf8")).state, "idle");
+  assert.equal(existsSync(join(production, ".foreman")), false, "nothing reached the default (production) home");
 });

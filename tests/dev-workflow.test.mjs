@@ -36,12 +36,25 @@ test('startup never copies a production Codex rotating credential; a missing iso
   const saveRecord=()=>{throw Error('injected stop before spawn');};
   const warnings=[],warn=console.warn;console.warn=(...a)=>warnings.push(a.join(' '));
   let rejected;
-  try { await start(f.home,{relayStatus:async()=>({commit,relay:{online:false}}),checkPort:async()=>{},execute,saveRecord}); } catch(error) { rejected=error; } finally { console.warn=warn; }
+  try { await start(f.home,{relayStatus:async()=>({commit,relay:{online:false}}),checkPort:async()=>{},execute,saveRecord,isolatedLogins:true}); } catch(error) { rejected=error; } finally { console.warn=warn; }
   assert.equal(readdirSync(join(f.home,'codex')).includes('auth.json'),false);
   assert.equal(readFileSync(join(prod,'auth.json'),'utf8'),credential);
   assert.match(rejected?.message ?? '', /injected stop before spawn/);
   assert.equal(warnings.length,1);
   assert.match(warnings[0], /Codex sessions are unavailable in DEV.*CODEX_HOME=".*\/codex" codex login/);
+});
+test('host-login startup copies no provider credential into the dev home and leaves the host login untouched', async t => {
+  const f=fixture(t), release='release-fixture', commit='a'.repeat(40);
+  mkdirSync(join(f.home,release),{mode:0o700});
+  symlinkSync(join(f.source,'node_modules'),join(f.home,release,'node_modules'));
+  save(join(f.home,'deployment.json'),{release,commit,dependencies:{realpath:join(f.source,'node_modules'),identity:await dependencyIdentity(join(f.source,'node_modules'))}});
+  save(join(f.home,'dev-pairing.json'),{environment:'foreman-dev-v1',url:TARGET.url,token:'a'.repeat(64)});
+  const before=readdirSync(f.home).sort();
+  const execute=(bin,args,options)=>{assert.equal(Object.hasOwn(options.env,bin==='codex'?'CODEX_HOME':'CLAUDE_CONFIG_DIR'),false);return bin==='codex'?'Logged in':'{"loggedIn":true}';};
+  const saveRecord=()=>{throw Error('injected stop before spawn');};
+  await assert.rejects(start(f.home,{relayStatus:async()=>({commit,relay:{online:false}}),checkPort:async()=>{},execute,saveRecord}),/injected stop before spawn/);
+  // Only the daemon entry point was written: no provider directory or credential.
+  assert.deepEqual(readdirSync(f.home).sort(),[...before,'run.mjs'].sort());
 });
 test('CODEX_HOME cannot retarget dev credential discovery',()=>assert.throws(()=>guardEnvironment({CODEX_HOME:'/production'}),/Unset CODEX_HOME/));
 for(const failure of ['lockfile','html','dry-run','upload']) test(`failed deploy cleans snapshot and preserves previous deployment: ${failure}`, async t=>{

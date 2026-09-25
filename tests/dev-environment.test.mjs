@@ -8,13 +8,29 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { argumentsFor, guardEnvironment, owned, openHome, validatePairing, workerConfig, devEntry, freePort, deleteDevWorker, processIdentity, running, stop, TARGET, requireClaudeAuth, SUPPORTED_WORKER_CONTRACT } from '../scripts/dev-environment.mjs';
+import { argumentsFor, guardEnvironment, owned, openHome, validatePairing, workerConfig, devEntry, freePort, deleteDevWorker, processIdentity, running, stop, TARGET, requireClaudeAuth, daemonEnvironment, SUPPORTED_WORKER_CONTRACT } from '../scripts/dev-environment.mjs';
 const conforming = structuredClone(SUPPORTED_WORKER_CONTRACT);
 
 function temporary(t) { const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-dev-test-'))); t.after(() => rmSync(dir, { recursive: true, force: true })); return dir; }
 test('dev CLI rejects target and lifecycle overrides before side effects', () => {
   for (const args of [['deploy','--name','foreman'],['deploy','--config','wrangler.jsonc'],['deploy','--env','production'],['start','--source','somewhere'],['destroy','foreman'],['deploy','--ref'],['deploy','--ref','--all'],['restart']]) assert.throws(() => argumentsFor(args));
   assert.deepEqual(argumentsFor(['deploy','--source','/tmp/sprint','--ref','epic/1-ux-polish']), {command:'deploy',source:'/tmp/sprint',ref:'epic/1-ux-polish'});
+});
+test('only dev:start accepts --isolated-logins, once; host logins are the default', () => {
+  assert.equal(argumentsFor(['start']).isolatedLogins, undefined);
+  assert.equal(argumentsFor(['start','--isolated-logins']).isolatedLogins, true);
+  for (const args of [['deploy','--isolated-logins'],['stop','--isolated-logins'],['status','--isolated-logins'],['destroy','--isolated-logins'],['start','--isolated-logins','--isolated-logins'],['start','--isolated-logins=1'],['start','--isolated']]) assert.throws(() => argumentsFor(args), /Refusing unsupported argument/);
+});
+test('the dev daemon environment routes hooks to the dev home and uses host logins unless isolated', () => {
+  const inherited = { PATH: '/bin', FOREMAN_HOME: '/production/.foreman', CLAUDE_CONFIG_DIR: '/stray/claude', CODEX_HOME: '/stray/codex' };
+  const host = daemonEnvironment('/h/.foreman-dev', { port: 4178, token: 't'.repeat(64), env: inherited });
+  assert.equal(host.FOREMAN_HOME, '/h/.foreman-dev'); assert.equal(host.FOREMAN_HOOK_HOME, '/h/.foreman-dev');
+  assert.equal(host.FOREMAN_PORT, '4178'); assert.equal(host.FOREMAN_RELAY_URL, TARGET.url); assert.equal(host.FOREMAN_HOST_TOKEN, 't'.repeat(64)); assert.equal(host.PATH, '/bin');
+  assert.equal(Object.hasOwn(host, 'CLAUDE_CONFIG_DIR'), false); assert.equal(Object.hasOwn(host, 'CODEX_HOME'), false);
+  const isolated = daemonEnvironment('/h/.foreman-dev', { port: 4178, token: 't'.repeat(64), env: inherited, isolatedLogins: true });
+  assert.equal(isolated.CLAUDE_CONFIG_DIR, '/h/.foreman-dev/claude'); assert.equal(isolated.CODEX_HOME, '/h/.foreman-dev/codex');
+  assert.equal(isolated.FOREMAN_HOME, '/h/.foreman-dev'); assert.equal(isolated.FOREMAN_HOOK_HOME, '/h/.foreman-dev');
+  assert.equal(inherited.CLAUDE_CONFIG_DIR, '/stray/claude', 'the caller environment is not mutated');
 });
 test('inherited production pairing, port, config and account overrides are refused', () => {
   for (const key of ['FOREMAN_HOME','FOREMAN_PORT','FOREMAN_HOST_TOKEN','FOREMAN_RELAY_URL','CLOUDFLARE_ENV','CLOUDFLARE_ACCOUNT_ID','CF_ACCOUNT_ID','WRANGLER_CONFIG','NODE_OPTIONS','CLAUDE_CONFIG_DIR']) assert.throws(() => guardEnvironment({[key]:'production'}), new RegExp(key));
@@ -131,8 +147,26 @@ test('Claude dev authentication checks isolated login and never clones productio
   assert.throws(() => requireClaudeAuth('/sdk/claude', '/owned/dev/claude', {}, () => { throw new Error('secret-output'); }), (error) => !error.message.includes('secret-output'));
 });
 test('explicit Claude API key or token bypasses credential discovery', () => {
-  for (const env of [{ ANTHROPIC_API_KEY: 'test' }, { CLAUDE_CODE_OAUTH_TOKEN: 'test' }])
-    requireClaudeAuth('/sdk/claude', '/owned/dev/claude', env, () => { assert.fail('Must not consult stored credentials'); });
+  for (const configDir of ['/owned/dev/claude', null])
+    for (const env of [{ ANTHROPIC_API_KEY: 'test' }, { CLAUDE_CODE_OAUTH_TOKEN: 'test' }])
+      requireClaudeAuth('/sdk/claude', configDir, env, () => { assert.fail('Must not consult stored credentials'); });
+});
+test('Claude host-login check uses the normal login (no config directory) and redacts provider output', () => {
+  let calls = 0;
+  requireClaudeAuth('/sdk/claude', null, { PATH: '/bin', CLAUDE_CONFIG_DIR: '/stray/claude' }, (binary, args, options) => {
+    calls++; assert.equal(binary, '/sdk/claude'); assert.deepEqual(args, ['auth', 'status', '--json']);
+    assert.equal(Object.hasOwn(options.env, 'CLAUDE_CONFIG_DIR'), false); assert.equal(options.env.PATH, '/bin');
+    return JSON.stringify({ loggedIn: true });
+  });
+  assert.equal(calls, 1);
+  for (const result of ['{}', '{"loggedIn":false}', 'bad-json-secret']) {
+    assert.throws(() => requireClaudeAuth('/sdk/claude', null, {}, () => result), (error) => {
+      assert.match(error.message, /DEV Claude is not signed in: this Mac has no normal Claude CLI login\. Run claude auth login/);
+      assert.doesNotMatch(error.message, /CLAUDE_CONFIG_DIR|isolated/);
+      assert.ok(!error.message.includes('bad-json-secret')); return true;
+    });
+  }
+  assert.throws(() => requireClaudeAuth('/sdk/claude', null, {}, () => { throw new Error('secret-output'); }), (error) => !error.message.includes('secret-output'));
 });
 
 test('Codex status uses isolated CODEX_HOME and redacts failed provider output', async () => {
@@ -140,4 +174,10 @@ test('Codex status uses isolated CODEX_HOME and redacts failed provider output',
   requireCodexAuth('codex','/dev/codex',{PATH:'/bin'},(binary,args,options)=>{calls++;assert.equal(binary,'codex');assert.deepEqual(args,['login','status']);assert.equal(options.env.CODEX_HOME,'/dev/codex');});
   assert.equal(calls,1);
   assert.throws(()=>requireCodexAuth('codex','/dev/codex',{},()=>{throw Error('secret provider output');}),error=>{assert.match(error.message,/CODEX_HOME="\/dev\/codex" "codex" login/);assert.ok(!error.message.includes('secret provider output'));return true;});
+});
+test('Codex host-login status uses the default CODEX_HOME and redacts failed provider output', async () => {
+  const {requireCodexAuth}=await import('../scripts/dev-environment.mjs');let calls=0;
+  requireCodexAuth('codex',null,{PATH:'/bin',CODEX_HOME:'/stray/codex'},(binary,args,options)=>{calls++;assert.equal(binary,'codex');assert.deepEqual(args,['login','status']);assert.equal(Object.hasOwn(options.env,'CODEX_HOME'),false);});
+  assert.equal(calls,1);
+  assert.throws(()=>requireCodexAuth('codex',null,{},()=>{throw Error('secret provider output');}),error=>{assert.match(error.message,/no normal Codex login\. Run "codex" login/);assert.doesNotMatch(error.message,/CODEX_HOME/);assert.ok(!error.message.includes('secret provider output'));return true;});
 });
