@@ -50,12 +50,29 @@ const GROUPS = [
   ["ended", "Ended"],
   ["dead", "Stopped"],
 ];
-let selected = null;
-try {
-  selected = sessionStorage.getItem("foreman:selected");
-} catch {
-  /* Storage may be unavailable in private browsing. */
+// Deep links (epic #43 contract D): /?session=<key> and /?view=pm. Plain-JS mirror of
+// parseDeepLink in shared/notify.ts; web/ is static and cannot import it.
+const SESSION_KEY_PATTERN = /^[\x21-\x7e]{1,300}$/;
+function parseDeepLink(search) {
+  if (typeof search !== "string" || search.length > 4096) return null;
+  let params;
+  try { params = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search); } catch { return null; }
+  const session = params.get("session");
+  if (session !== null && SESSION_KEY_PATTERN.test(session)) return { session };
+  if (params.get("view") === "pm") return { view: "pm" };
+  return null;
 }
+// The URL is the only record of the open conversation, so reload keeps the view.
+function viewUrl(key) {
+  return key === "pm" ? "/?view=pm" : key ? `/?session=${encodeURIComponent(key)}` : "/";
+}
+const initialLink = parseDeepLink(location.search);
+// "pm" is the PM sentinel, never a session key; a session link naming it is unknown.
+const unknownInitialLink = initialLink?.session === "pm" || (!initialLink && new URLSearchParams(location.search).has("session"));
+let selected = initialLink?.view === "pm" ? "pm" : initialLink?.session && initialLink.session !== "pm" ? initialLink.session : null;
+// A deep-linked session opens optimistically and is checked against the host's list once.
+let deepLinkPending = selected && selected !== "pm" ? selected : null, initialNoticeShown = false;
+const UNKNOWN_LINK_NOTICE = "That conversation isn’t available on your Mac. Showing your inbox.";
 let sessions = [],
   detail = null,
   host = { online: false },
@@ -81,6 +98,49 @@ let projectRows = [], projectResolution = null, projectSelection = null, project
 const projectName = (s) => s.project_name || (s.cwd || "").split("/").filter(Boolean).at(-1) || "Project unavailable";
 const drafts = new Map(),
   sendAttempts = new Map();
+// Unsent composer text per conversation, kept on this device across reloads and offline
+// round trips. Bounded, best effort, and erased on sign-out.
+const DRAFT_STORAGE = "foreman:drafts", DRAFT_LIMIT = 20, DRAFT_MAX = 60000;
+let draftTimer;
+function loadDrafts() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(DRAFT_STORAGE) || "[]");
+    if (!Array.isArray(saved)) return;
+    for (const entry of saved.slice(-DRAFT_LIMIT))
+      if (Array.isArray(entry) && typeof entry[0] === "string" && entry[0].length <= 300 && typeof entry[1] === "string" && entry[1])
+        drafts.set(entry[0], entry[1].slice(0, DRAFT_MAX));
+  } catch { /* Unreadable or unavailable storage starts with no drafts. */ }
+}
+function saveDrafts() {
+  clearTimeout(draftTimer);
+  draftTimer = undefined;
+  try {
+    const entries = [...drafts].filter(([, text]) => text.trim()).slice(-DRAFT_LIMIT)
+      .map(([key, text]) => [key, text.slice(0, DRAFT_MAX)]);
+    if (entries.length) localStorage.setItem(DRAFT_STORAGE, JSON.stringify(entries));
+    else localStorage.removeItem(DRAFT_STORAGE);
+  } catch { /* Drafts stay in memory when storage is full or unavailable. */ }
+}
+// Most recently edited last, so the oldest drafts are the ones dropped at the limit.
+function setDraft(key, text) {
+  if (!key) return;
+  drafts.delete(key);
+  if (text) drafts.set(key, text);
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(saveDrafts, 300);
+}
+function flushDrafts() {
+  if (draftTimer !== undefined) saveDrafts();
+}
+function clearDrafts() {
+  drafts.clear();
+  clearTimeout(draftTimer);
+  draftTimer = undefined;
+  try { localStorage.removeItem(DRAFT_STORAGE); } catch { /* optional */ }
+}
+loadDrafts();
+window.addEventListener("pagehide", flushDrafts);
+document.addEventListener("visibilitychange", () => { if (document.hidden) flushDrafts(); });
 const actionFeedback = new Map(), approvalFeedback = new Map();
 let conversationLoading = false, hostChecked = false, sessionsLoaded = false;
 let timelineEntries = [], nextEntryKey = 0, newMessages = false;
@@ -260,7 +320,11 @@ function revokeAccess(message) {
   sessionsLoaded = false;
   detail = null;
   host = { online: false };
-  drafts.clear();
+  clearDrafts();
+  // A PM failure seen by the previous identity is not shown to the next one.
+  polledPmError = null;
+  setPmRailError(null);
+  hideNotice();
   sendAttempts.clear();
   actionFeedback.clear();
   approvalFeedback.clear();
@@ -293,6 +357,114 @@ function setNav(open) {
   $("#rail").inert = mobile && !open;
   $(".conversation").inert = mobile && open;
   if (open) $("#close-nav").focus();
+}
+// History model (Android Back). The stack is at most [inbox, conversation, drawer, dialog]:
+// opening a conversation from the inbox pushes an entry, switching conversations replaces it,
+// and the drawer and the new-session dialog each push an overlay entry. Back therefore closes
+// the dialog, then the drawer, then returns to the inbox, then leaves the app. Every entry
+// carries { foreman: 1, view, overlay? } so popstate can restore the matching screen.
+let ownBack = null, ownBackDone = null;
+function historyState(view, overlay) {
+  return overlay ? { foreman: 1, view: view || null, overlay } : { foreman: 1, view: view || null };
+}
+// history.back() is asynchronous; later history changes wait for its popstate so they never
+// race it. The popstate of our own back is not treated as a user navigation.
+function historyBack() {
+  if (ownBack) return;
+  let release;
+  const done = new Promise((resolve) => { release = resolve; });
+  const timer = setTimeout(() => ownBack?.(), 1000);
+  ownBack = () => { clearTimeout(timer); ownBack = null; ownBackDone = null; release(); };
+  ownBackDone = done;
+  history.back();
+}
+function afterHistory(run) {
+  if (ownBackDone) ownBackDone.then(run);
+  else run();
+}
+function recordView(key) {
+  afterHistory(() => {
+    const state = history.state;
+    if (state?.foreman && state.overlay) {
+      // A conversation opened from the drawer or dialog replaces neither; pop them first.
+      historyBack();
+      afterHistory(() => recordView(key));
+      return;
+    }
+    if (state?.foreman && state.view === (key || null)) return;
+    if (!key) {
+      // Our conversation entries always sit directly above an inbox entry.
+      if (state?.foreman && state.view) historyBack();
+      else history.replaceState(historyState(null), "", "/");
+    } else if (state?.foreman && state.view) history.replaceState(historyState(key), "", viewUrl(key));
+    else history.pushState(historyState(key), "", viewUrl(key));
+  });
+}
+function pushOverlay(kind, isOpen) {
+  afterHistory(() => {
+    if (!isOpen() || history.state?.overlay === kind) return;
+    history.pushState(historyState(selected, kind), "", location.href);
+  });
+}
+function popOverlay(kind) {
+  afterHistory(() => {
+    if (history.state?.foreman && history.state.overlay === kind) historyBack();
+  });
+}
+const navOpen = () => ui.app.classList.contains("nav-open");
+function openNav() {
+  setNav(true);
+  pushOverlay("nav", navOpen);
+}
+function closeNav() {
+  setNav(false);
+  popOverlay("nav");
+}
+function initHistory() {
+  const url = viewUrl(selected);
+  const state = history.state;
+  if (state?.foreman && (state.view || null) === selected) {
+    // A reload or restore of an entry this app created keeps its stack; an overlay that
+    // no longer exists after the reload is dropped from the entry.
+    if (state.overlay || location.pathname + location.search !== url) history.replaceState(historyState(selected), "", url);
+  } else if (selected) {
+    // A fresh deep link: put the inbox beneath it, so Back returns to the inbox, not out.
+    history.replaceState(historyState(null), "", "/");
+    history.pushState(historyState(selected), "", url);
+  } else history.replaceState(historyState(null), "", "/");
+}
+window.addEventListener("popstate", (event) => {
+  if (ownBack) { ownBack(); return; }
+  const state = event.state?.foreman ? event.state : historyState(parseDeepLinkKey(location.search));
+  // Back closes the top-most layer first: the dialog, then the drawer, then the conversation.
+  if (ui.dialog.open && state.overlay !== "dialog") ui.dialog.close();
+  if (navOpen() && !state.overlay) {
+    setNav(false);
+    $("#open-nav").focus({ preventScroll: true });
+  }
+  // Forward into an overlay entry whose layer is gone: keep the entry as a plain view.
+  if ((state.overlay === "nav" && !navOpen()) || (state.overlay === "dialog" && !ui.dialog.open))
+    history.replaceState(historyState(state.view), "", location.href);
+  const view = state.view || null;
+  if (view === selected) return;
+  if (view) void selectSession(view, false);
+  else showInbox();
+});
+function parseDeepLinkKey(search) {
+  const link = parseDeepLink(search);
+  return link?.view === "pm" ? "pm" : link?.session && link.session !== "pm" ? link.session : null;
+}
+let noticeTimer;
+function showNotice(text) {
+  const notice = $("#app-notice");
+  notice.textContent = text;
+  notice.hidden = false;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(hideNotice, 10000);
+}
+function hideNotice() {
+  clearTimeout(noticeTimer);
+  $("#app-notice").hidden = true;
 }
 function renderHost() {
   $("#host-dot").className = `dot ${host.online ? "online" : "offline"}`;
@@ -709,7 +881,7 @@ function renderMessages(history = [], receipts = []) {
     const previous = item.previous;
     if (!firstRender && !wasNearBottom && (!previous || textOf(previous.entry) !== textOf(item.entry))) newMessages = true;
     item.key = previous?.key || ++nextEntryKey;
-    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source]);
+    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source, item.entry.error === true]);
     const receiptSignature = JSON.stringify(item.receipt);
     item.element = previous?.contentSignature === contentSignature ? previous.element : messageNode(item.entry, item.receipt, item.key);
     if (item.element === previous?.element && previous.receiptSignature !== receiptSignature) renderMessageReceipt(item.element, item.receipt);
@@ -941,9 +1113,13 @@ function renderApprovals(approvals = []) {
     ui.timeline.scrollTop = ui.timeline.scrollHeight;
   updateLatest();
 }
-async function selectSession(key) {
-  if (selected) drafts.set(selected, ui.input.value);
+// `record` is false when the history entry already exists (Back/Forward).
+async function selectSession(key, record = true) {
+  if (selected) setDraft(selected, ui.input.value);
   selected = key;
+  deepLinkPending = null;
+  hideNotice();
+  if (record) recordView(key);
   selectionEpoch++;
   const epoch = selectionEpoch;
   detail = null;
@@ -952,11 +1128,6 @@ async function selectSession(key) {
   messageSignature = "";
   resetLatest();
   approvalSignature = "";
-  try {
-    sessionStorage.setItem("foreman:selected", key);
-  } catch {
-    /* optional */
-  }
   ui.input.value = drafts.get(key) || "";
   autosize();
   clearError();
@@ -976,6 +1147,34 @@ async function selectSession(key) {
   } catch (error) {
     if (epoch === selectionEpoch) showRefreshError(error);
   }
+}
+// Return to the inbox (Back from a conversation, or an unknown deep link). The history
+// entry is already correct, or the caller records it.
+function showInbox() {
+  if (selected) setDraft(selected, ui.input.value);
+  selected = null;
+  deepLinkPending = null;
+  selectionEpoch++;
+  detail = null;
+  pmBusy = false;
+  pmModelReady = false;
+  messageSignature = "";
+  resetLatest();
+  approvalSignature = "";
+  conversationLoading = false;
+  ui.input.value = "";
+  autosize();
+  clearError();
+  ui.approvals.replaceChildren();
+  renderRail();
+  renderMessages();
+  renderHeading();
+}
+// The deep-linked session is not on this host: fall back to the inbox with a neutral notice.
+function rejectDeepLink() {
+  showInbox();
+  recordView(null);
+  showNotice(UNKNOWN_LINK_NOTICE);
 }
 let polledPmError = null;
 async function refreshSelected() {
@@ -1034,7 +1233,10 @@ function setPmRailError(error) {
     const dot = node("span", "pm-alert-dot", "!");
     dot.setAttribute("aria-hidden", "true");
     alert.append(dot, node("span", "sr-only", "Project manager has an error"));
-    row.querySelector(".pinned").before(alert);
+    // Sit before the PINNED tag when the row has one; otherwise stay visible at the end.
+    const pinned = row.querySelector(".pinned");
+    if (pinned) pinned.before(alert);
+    else row.append(alert);
   } else if (!pmRailError) alert?.remove();
   row.classList.toggle("has-error", !!pmRailError);
   if (pmRailError) {
@@ -1072,6 +1274,11 @@ async function poll() {
       if (!authorized || epoch !== authEpoch) return;
       sessions = Array.isArray(rows) ? rows : [];
       sessionsLoaded = true;
+      if (deepLinkPending) {
+        const key = deepLinkPending;
+        deepLinkPending = null;
+        if (selected === key && !sessions.some((s) => s.session_key === key)) rejectDeepLink();
+      }
       renderRail();
       await refreshSelected().catch(showRefreshError);
       if (!selected) {
@@ -1106,7 +1313,7 @@ function autosize() {
   ui.input.style.height = `${Math.min(200, ui.input.scrollHeight)}px`;
 }
 ui.input.addEventListener("input", () => {
-  if (selected) drafts.set(selected, ui.input.value);
+  if (selected) setDraft(selected, ui.input.value);
   for (const action of ["send", "interrupt"]) {
     const feedback = actionFeedback.get(selected)?.[action];
     if (feedback?.text && !feedback.error) setActionFeedback(selected, action, "");
@@ -1145,7 +1352,7 @@ $("#composer").addEventListener("submit", async (event) => {
       });
     accepted = true;
     sendAttempts.delete(key);
-    drafts.delete(key);
+    setDraft(key, "");
     if (selected === key) {
       ui.input.value = "";
       autosize();
@@ -1431,6 +1638,7 @@ function openNew(event) {
   $("#new-policy").value = "native";
   updateNewPolicy();
   ui.dialog.showModal();
+  pushOverlay("dialog", () => ui.dialog.open);
   setLaunchMode("brief"); launchStatus("");
   void loadLauncherModels();
   void loadNewModels();
@@ -1439,6 +1647,7 @@ function openNew(event) {
 }
 ui.newButton.addEventListener("click", openNew);
 ui.dialog.addEventListener("close", () => {
+  popOverlay("dialog");
   cancelLauncher(); launcherModelRequest++;
   projectRevision++; projectPending = false; projectResolution = null; projectSelection = null;
   if (!authorized || creating) return;
@@ -1496,15 +1705,15 @@ ui.newForm.addEventListener("submit", async (event) => {
 $("#select-pm").addEventListener("click", () => { if (!pmModelLoading) pmModelLoaded = false; return selectSession("pm"); });
 ui.search.addEventListener("input", renderRail);
 $("#dismiss-error").addEventListener("click", clearError);
-$("#open-nav").addEventListener("click", () => setNav(true));
+$("#open-nav").addEventListener("click", () => openNav());
 for (const selector of ["#close-nav", "#nav-backdrop"])
   $(selector).addEventListener("click", () => {
-    setNav(false);
+    closeNav();
     $("#open-nav").focus();
   });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !ui.dialog.open && ui.app.classList.contains("nav-open")) {
-    setNav(false);
+    closeNav();
     $("#open-nav").focus();
   }
 });
@@ -1552,8 +1761,14 @@ function enterApp(user) {
   renderHost();
   renderRail();
   renderHeading();
+  if (selected && !ui.input.value) {
+    ui.input.value = drafts.get(selected) || "";
+    autosize();
+  }
   if (selected) showConversationLoading();
   else renderMessages();
+  if (unknownInitialLink && !initialNoticeShown) showNotice(UNKNOWN_LINK_NOTICE);
+  initialNoticeShown = true;
   poll();
 }
 async function boot() {
@@ -1613,7 +1828,7 @@ async function boot() {
 }
 window
   .matchMedia("(max-width: 760px)")
-  .addEventListener("change", () => setNav(false));
+  .addEventListener("change", () => closeNav());
 // Android keyboards can resize only the visual viewport. Keep the composer and
 // dialog scroll area inside it without changing browser pinch-zoom behavior.
 function fitViewport() {
@@ -1624,4 +1839,12 @@ function fitViewport() {
 window.visualViewport?.addEventListener("resize", fitViewport);
 fitViewport();
 setNav(false);
+initHistory();
 boot();
+// Installability and the offline screen. Registered after load so it never competes with
+// startup; failures (no support, insecure origin, blocked) leave the app unchanged.
+if ("serviceWorker" in navigator && window.isSecureContext) {
+  const register = () => navigator.serviceWorker.register("/sw.js", { scope: "/", updateViaCache: "none" }).catch(() => {});
+  if (document.readyState === "complete") register();
+  else window.addEventListener("load", register, { once: true });
+}

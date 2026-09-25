@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#f8faf8" />
     <title>Foreman · Session inbox</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
     <script src="/appearance.js"></script>
     <link rel="stylesheet" href="/style.css" />
   </head>
@@ -114,6 +117,7 @@
           role="status"
           hidden
         ></div>
+        <p id="app-notice" class="banner notice" role="status" hidden></p>
         <div id="error-banner" class="banner error" role="alert" hidden>
           <span id="error-text"></span
           ><button
