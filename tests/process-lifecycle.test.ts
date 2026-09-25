@@ -4,9 +4,16 @@ import { once } from 'node:events';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawnOwnedProcess } from '../server/owned-process.ts';
 import { ProcessTree, processTable, type ProcessEntry } from '../server/process-tree.ts';
 
+// Supervisors inherit this env: keep their compiled helper cache (#104) in a temp dir.
+const helperCache = mkdtempSync(join(tmpdir(), 'foreman-lifecycle-helper-'));
+process.env.FOREMAN_PROCESS_HELPER_DIR = helperCache;
+test.after(() => rmSync(helperCache, { recursive: true, force: true }));
 const fixture = fileURLToPath(new URL('./fixtures/process-provider.mjs', import.meta.url));
 async function until<T>(check: () => T | false) {
   for (let i = 0; i < 100; i++) { const value = check(); if (value) return value; await delay(50); }
