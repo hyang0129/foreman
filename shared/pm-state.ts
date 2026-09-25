@@ -134,10 +134,20 @@ function isTurnIdList(value: unknown, min: number): value is string[] {
     && value.every(isPmId) && new Set(value).size === value.length;
 }
 
-/** Redact then bound a reason/error string before it is sent to or stored by the relay. */
+/**
+ * Redact then bound a reason/error string before it is sent to or stored by the relay. The bound
+ * is in UTF-16 code units (`.length`, what `parsePmRpcResult` checks), and a surrogate pair is
+ * never split.
+ */
 export function boundedReason(text: string): string {
   const redacted = redactSecrets(typeof text === 'string' ? text : '');
-  return Array.from(redacted).length <= MAX_REASON ? redacted : Array.from(redacted).slice(0, MAX_REASON - 1).join('') + '…';
+  if (redacted.length <= MAX_REASON) return redacted;
+  let out = '';
+  for (const ch of redacted) {
+    if (out.length + ch.length > MAX_REASON - 1) break;
+    out += ch;
+  }
+  return out + '…';
 }
 
 // ---------------------------------------------------------------------------------------------

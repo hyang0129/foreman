@@ -330,6 +330,14 @@ test('pmRpcError redacts and bounds the message; pmRpcOk builds a result', () =>
   assert.ok(parsePmRpcResult(e).ok);
   assert.deepEqual(pmRpcOk('rpc-2', 'memory.log', { seq: 1 }), { type: 'pm_rpc_result', id: 'rpc-2', ok: true, result: { seq: 1 } });
   assert.equal(boundedReason('Authorization: required'), 'Authorization: required');
+  // Astral characters (emoji) count as two UTF-16 units: the bound holds in `.length`, the unit
+  // parsePmRpcResult checks, and a surrogate pair is never split.
+  for (const text of ['😀'.repeat(200), 'a' + '😀'.repeat(400), 'x'.repeat(299) + '😀']) {
+    const reason = boundedReason(text);
+    assert.ok(reason.length <= MAX_PM_ERROR_MESSAGE, String(reason.length));
+    assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(reason), 'no lone surrogate');
+    assert.ok(parsePmRpcResult(pmRpcError('rpc-3', 'unavailable', text)).ok);
+  }
 });
 
 // ----- B. pm_assignment -----
