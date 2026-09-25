@@ -50,6 +50,13 @@ type Logger = (line: string) => void;
 const defaultLog: Logger = (line) => console.log(line);
 
 export const ALREADY_INITIALIZED_MESSAGE = 'relay memory already initialized; local memory not imported';
+/**
+ * #122: logged instead of ALREADY_INITIALIZED_MESSAGE when this store's own earlier memory.import
+ * may have been applied without its reply arriving (timeout, lost connection): the relay's memory
+ * may be this machine's import, so "not imported" would mislead. Nothing more is sent (a
+ * pm/state.json preferences doc included): the relay's memory is not known to be this machine's.
+ */
+export const IMPORT_REPLY_LOST_MESSAGE = "relay memory already initialized, possibly by this machine's earlier import attempt whose reply was lost; nothing more is imported (a pm/state.json preferences doc, if any, was not sent)";
 export const IMPORT_MARKER_FILE = '.imported.json';
 /** #117: `<home>/memory/.pm-mode.json`, `{ version: 1, mode: 'relay', machine_id, at }`: this machine has used relay PM memory. */
 export const PM_MODE_FILE = '.pm-mode.json';
@@ -308,6 +315,8 @@ export class RelayPmStore implements HostPmStore {
   private flushing = false;
   private importRun: Promise<PmImportOutcome> | null = null;
   private importOutcome: PmImportOutcome | null = null;
+  // #122: a memory.import this store sent may have been applied (no reply: timeout, lost connection).
+  private importUnconfirmed = false;
   private listeners = new Set<PmAssignmentListener>();
   private unsubscribe: (() => void)[] = [];
   private closed = false;
@@ -470,12 +479,14 @@ export class RelayPmStore implements HostPmStore {
   // pm/state.json is imported when valid, else the pre-#26 files.
   private async runImport(): Promise<PmImportOutcome> {
     const memory = await this.request('memory.get', {});
-    if (memory.initialized) { this.logger(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
+    if (memory.initialized) { this.logger(`foreman: ${this.importUnconfirmed ? IMPORT_REPLY_LOST_MESSAGE : ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
     const { payload, preferences, source } = readRelayImportSource(this.home, this.identity.machine_id, this.logger);
     try {
       await this.request('memory.import', payload);
     } catch (error) {
-      if ((error as PmStoreError).code === 'already_initialized') { this.logger(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
+      const code = (error as PmStoreError).code;
+      if (code === 'already_initialized') { this.logger(`foreman: ${this.importUnconfirmed ? IMPORT_REPLY_LOST_MESSAGE : ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
+      if (code === 'timeout' || code === 'disconnected' || code === 'invalid_result') this.importUnconfirmed = true;
       throw error;
     }
     // memory.import carries no preferences doc: a non-empty one from pm/state.json follows as the

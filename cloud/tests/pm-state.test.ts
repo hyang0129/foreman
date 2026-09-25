@@ -732,3 +732,50 @@ describe('#43 host-offline alarm follows the active PM host', () => {
     expect(pushes[1]!.payload).toMatchObject({ kind: 'host_offline', host: 'machine-b' });
   });
 });
+
+describe('#122 heartbeat and offline diagnostics', () => {
+  const lastSeen = async (stub: Stub, machineId: string) => (await sql<{ last_seen: number }>(stub, 'SELECT last_seen FROM machines WHERE machine_id = ?', machineId))[0]!.last_seen;
+  const setLastSeen = (stub: Stub, machineId: string, value: number) => sql(stub, 'UPDATE machines SET last_seen = ? WHERE machine_id = ?', value, machineId);
+
+  it('a pm_rpc frame refreshes its socket\'s heartbeat, so an active host that only sends rpcs stays online', async () => {
+    const stub = relay();
+    const a = await machine(stub, 'machine-a');
+    await runInDurableObject(stub, (_instance: HostRelay, ctx) => {
+      for (const socket of ctx.getWebSockets('host')) socket.serializeAttachment({ ...socket.deserializeAttachment(), lastSeen: Date.now() - 120_000 });
+    });
+    expect((await hostStatus(stub)).online).toBe(false);
+    await ok(a, 'memory.get', {}, 1);
+    expect((await hostStatus(stub)).online).toBe(true);
+    expect((await pmHost(stub)).machines.find((m) => m.machine_id === a.machine_id)?.online).toBe(true);
+  });
+
+  it('machines.last_seen is written at most once a minute per machine by heartbeats (pings and pm_rpc)', async () => {
+    const stub = relay();
+    const a = await machine(stub, 'machine-a');
+    // Seen 30 s ago: a ping and an rpc within the interval write nothing.
+    const recent = Date.now() - 30_000;
+    await setLastSeen(stub, a.machine_id, recent);
+    await flush(a);
+    await ok(a, 'memory.get', {}, 1);
+    expect(await lastSeen(stub, a.machine_id)).toBe(recent);
+    // Seen over a minute ago: the next heartbeat writes it.
+    const old = Date.now() - 61_000;
+    await setLastSeen(stub, a.machine_id, old);
+    await flush(a);
+    expect(await lastSeen(stub, a.machine_id)).toBeGreaterThan(old + 60_000);
+    // Online is the socket's own freshness, never the stored value.
+    await setLastSeen(stub, a.machine_id, Date.now() - 30 * 60_000);
+    expect((await pmHost(stub)).machines[0]).toMatchObject({ online: true });
+    // A hello always writes it.
+    await hello(a);
+    expect(await lastSeen(stub, a.machine_id)).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it('with no host at all, the offline answer is platform-neutral', async () => {
+    const stub = relay();
+    const response = await stub.fetch(`${ORIGIN}/api/session/message`, { method: 'POST', body: '{}' });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'The execution host is offline. Open Foreman on it and reconnect.' });
+    expect(await hostStatus(stub)).toEqual({ online: false, host: null, machine_id: null, standby_online: false });
+  });
+});

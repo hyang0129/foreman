@@ -5,7 +5,7 @@ import { FOREMAN_HOME, HOST } from './paths.ts';
 import { allowedRequest, MAX_BODY, MAX_RESPONSE, MAX_REQUEST_FRAME, type RelayRequest } from '../shared/relay.ts';
 import { parseNotifyFrame, utf8Length, type NotifyFrame } from '../shared/notify.ts';
 import {
-  MAX_OPEN_TURNS, MAX_PM_FRAME, MAX_PM_IMPORT_FRAME, MAX_PM_RESULT_FRAME,
+  MAX_MACHINES, MAX_OPEN_TURNS, MAX_PM_FRAME, MAX_PM_IMPORT_FRAME, MAX_PM_RESULT_FRAME,
   isPmId, parseHello, parsePmAssignment, parsePmOpArgs, parsePmOpResult, parsePmRpcResult,
   type HelloV2, type MachineIdentity, type PmAssignment, type PmErrorCode, type PmOp, type PmOpArgs, type PmOpResults,
 } from '../shared/pm-state.ts';
@@ -39,6 +39,17 @@ export class PmRpcError extends Error {
 }
 
 export interface PmRpcOptions { epoch?: number; timeoutMs?: number }
+
+/**
+ * #122: a relay close with this code is a policy refusal (e.g. "Too many machines", "Invalid hello"):
+ * reconnecting at once would be refused again, so the bridge backs off from POLICY_BACKOFF_BASE_MS,
+ * doubling per consecutive refusal up to POLICY_BACKOFF_MAX_MS, until a connection is accepted.
+ */
+export const POLICY_CLOSE_CODE = 1008;
+export const POLICY_BACKOFF_BASE_MS = 60_000;
+export const POLICY_BACKOFF_MAX_MS = 30 * 60_000;
+/** The relay's latest policy refusal of this machine, until a connection is accepted again. */
+export interface RelayRefusal { code: number; reason: string; at: number; retry_at: number }
 
 /** Bridge options. All optional: without `identity` the bridge sends today's legacy hello and has no PM rpc. */
 export interface HostBridgeOptions {
@@ -97,6 +108,8 @@ export class HostBridge {
   private assignment: PmAssignment | null = null;
   private assignmentListeners = new Set<(assignment: PmAssignment) => void>();
   private connectionListeners = new Set<(connected: boolean) => void>();
+  private refused: RelayRefusal | null = null;
+  private refusals = 0;
   constructor(port: number, config: BridgeConfig, options: HostBridgeOptions = {}) {
     this.port = port; this.config = config; this.localToken = options.localToken;
     this.socketFactory = options.socketFactory ?? ((url, options) => new WebSocket(url, options));
@@ -111,6 +124,8 @@ export class HostBridge {
   get protocol(): 1 | 2 { return this.identity ? 2 : 1; }
   /** The relay socket is open and this bridge's hello went out on it. */
   get connected(): boolean { return this.helloSocket !== undefined && this.helloSocket === this.socket && this.socket.readyState === WebSocket.OPEN; }
+  /** #122: why the relay last refused this machine (a policy close), or null once a connection is accepted. */
+  refusal(): RelayRefusal | null { return this.refused ? { ...this.refused } : null; }
   /** The latest valid `pm_assignment` on the current connection, or null (disconnected, or none received yet). */
   currentAssignment(): PmAssignment | null { return this.assignment; }
   /** Every valid `pm_assignment` frame (the DO sends one after each v2 hello and on reassignment). Returns an unsubscribe. */
@@ -147,23 +162,44 @@ export class HostBridge {
       let message: any;
       try { message = JSON.parse(text); } catch { socket.close(1003, 'Invalid JSON'); return; }
       if (!message || typeof message !== 'object' || Array.isArray(message)) { socket.close(1003, 'Invalid message'); return; }
-      if (message.type === 'pong') { this.lastPong = Date.now(); return; }
+      if (message.type === 'pong') { this.lastPong = Date.now(); this.accepted(socket); return; }
       if (message.type === 'request') {
         if (Buffer.byteLength(text) > MAX_REQUEST_FRAME) { socket.close(1009, 'Frame too large'); return; }
         void this.handle(message, socket).catch(() => socket.close(1011, 'Relay failed'));
         return;
       }
       if (message.type === 'pm_rpc_result') { this.handleRpcResult(message); return; }
-      if (message.type === 'pm_assignment' && socket === this.helloSocket) this.handleAssignment(message);
+      if (message.type === 'pm_assignment' && socket === this.helloSocket) { this.accepted(socket); this.handleAssignment(message); }
     });
     socket.on('error', () => { /* close schedules reconnect; never log credentials/handshake headers */ });
-    socket.on('close', () => {
+    socket.on('close', (code?: number, reason?: Buffer | string) => {
       clearInterval(this.heartbeat);
       this.dropSocket(socket);
       if (this.stopped) return;
-      const delay = Math.min(30_000, 1000 * 2 ** Math.min(this.attempts++, 5)) + Math.random() * 1000;
+      const delay = code === POLICY_CLOSE_CODE
+        ? this.policyRefused(String(reason ?? ''))
+        : Math.min(30_000, 1000 * 2 ** Math.min(this.attempts++, 5)) + Math.random() * 1000;
       this.reconnect = setTimeout(() => this.connect(), delay);
     });
+  }
+  // #122: the relay refused this machine by policy. Logged with the relay's reason (redacted,
+  // bounded) and retried only after a strong backoff; returns the delay.
+  private policyRefused(rawReason: string): number {
+    const reason = redactSecrets(rawReason).replace(/\s+/g, ' ').trim().slice(0, 123) || 'policy violation';
+    const delay = Math.min(POLICY_BACKOFF_MAX_MS, POLICY_BACKOFF_BASE_MS * 2 ** Math.min(this.refusals++, 10)) + Math.random() * 1000;
+    const now = Date.now();
+    this.refused = { code: POLICY_CLOSE_CODE, reason, at: now, retry_at: now + delay };
+    const hint = reason === 'Too many machines'
+      ? ` The relay keeps at most ${MAX_MACHINES} machines and every slot is held by an online machine or the PM host; disconnect one of them to free a slot.`
+      : '';
+    console.error(`foreman: the cloud relay refused this machine (${POLICY_CLOSE_CODE} ${reason}).${hint} Retrying in ${Math.round(delay / 60_000)} min.`);
+    return delay;
+  }
+  // The relay answered this socket's hello: any earlier refusal is over.
+  private accepted(socket: WebSocket) {
+    if (socket !== this.helloSocket || (!this.refused && !this.refusals)) return;
+    this.refused = null; this.refusals = 0;
+    console.log('foreman: the cloud relay accepted this machine again');
   }
   private async handle(message: RelayRequest, socket: WebSocket) {
     const reply = (status: number, body: string) => {
@@ -326,12 +362,17 @@ export class HostBridge {
 // presence is how callers tell cloud mode from local-only mode. Passing `options` with an
 // `identity` (PMM-05) makes the bridge speak protocol v2; `bridge` is then the HostBridge a
 // RelayPmStore is built on. Without options the behavior is exactly the pre-#26 one.
-export function startHostBridge(port: number, localToken?: string, options: Omit<HostBridgeOptions, 'localToken' | 'socketFactory'> = {}): { close(): void; notify?: (frame: NotifyFrame) => void; bridge?: HostBridge } {
+// #122: `error` is the (redacted) reason a configured relay could not be started, so the caller can name it.
+export function startHostBridge(port: number, localToken?: string, options: Omit<HostBridgeOptions, 'localToken' | 'socketFactory'> = {}): { close(): void; notify?: (frame: NotifyFrame) => void; bridge?: HostBridge; error?: string } {
   try {
     const config = readBridgeConfig();
     if (!config) return { close() {} };
     const bridge = new HostBridge(port, config, { ...options, localToken }).start();
     return { close: () => bridge.close(), notify: (frame: NotifyFrame) => bridge.notify(frame), bridge };
   }
-  catch (error) { console.error('foreman: cloud bridge configuration error:', (error as Error).message); return { close() {} }; }
+  catch (error) {
+    const message = redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300);
+    console.error('foreman: cloud bridge configuration error:', message);
+    return { close() {}, error: message };
+  }
 }

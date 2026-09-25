@@ -499,3 +499,55 @@ test('startHostBridge with an identity starts a v2 bridge and exposes it', (t) =
   const out = execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', code], { env, encoding: 'utf8' }).trim().split('\n').at(-1);
   assert.equal(out, 'true 2');
 });
+
+// #122: a policy close (1008, e.g. "Too many machines") is logged with its reason, exposed by
+// refusal(), and retried only after a strong, growing backoff; an accepted hello clears it.
+test('a 1008 policy refusal is surfaced and retried with a strong backoff, never in a tight loop', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  t.mock.method(Math, 'random', () => 0);
+  const errors: string[] = [], logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.join(' ')); });
+  const f = v2(t);
+  t.mock.method(console, 'log', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  const refuse = (socket: FakeSocket, reason: string) => { socket.readyState = 3; socket.emit('close', 1008, Buffer.from(reason)); };
+  const first = f.sockets[0]!; first.open();
+  assert.equal(f.instance.refusal(), null);
+  refuse(first, 'Too many machines');
+  assert.deepEqual(f.instance.refusal(), { code: 1008, reason: 'Too many machines', at: 100_000, retry_at: 160_000 });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0]!, /cloud relay refused this machine \(1008 Too many machines\)\. The relay keeps at most 16 machines.*Retrying in 1 min/);
+  // Not the ordinary 1 s reconnect.
+  t.mock.timers.tick(59_000); assert.equal(f.sockets.length, 1);
+  t.mock.timers.tick(1_000); assert.equal(f.sockets.length, 2);
+  // Refused again: the wait doubles.
+  const second = f.sockets[1]!; second.open(); refuse(second, 'Too many machines');
+  assert.equal(f.instance.refusal()?.retry_at, 160_000 + 120_000);
+  t.mock.timers.tick(119_000); assert.equal(f.sockets.length, 2);
+  t.mock.timers.tick(1_000); assert.equal(f.sockets.length, 3);
+  // Accepted: the refusal clears, and a later ordinary drop reconnects on the ordinary schedule.
+  const third = f.sockets[2]!; third.open();
+  third.receive(assignmentFrame());
+  assert.equal(f.instance.refusal(), null);
+  assert.ok(logs.some((line) => line.includes('accepted this machine again')));
+  third.close();
+  t.mock.timers.tick(1_000); assert.equal(f.sockets.length, 4);
+  // The reason is redacted and bounded; the credential never reaches the log.
+  const fourth = f.sockets[3]!; fourth.open(); refuse(fourth, `Invalid hello token=${TOKEN}`);
+  assert.equal(f.instance.refusal()?.reason, 'Invalid hello token=[REDACTED]');
+  assert.ok(!errors.join('\n').includes(TOKEN));
+  assert.doesNotMatch(errors.at(-1)!, /16 machines/);
+});
+
+test('startHostBridge names why a configured relay could not start, without the credential', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'foreman-bridge-error-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const moduleUrl = new URL('../server/host-bridge.ts', import.meta.url).href;
+  const code = `import {startHostBridge} from ${JSON.stringify(moduleUrl)}; const b = startHostBridge(1, 'local'); console.log(JSON.stringify({ error: b.error ?? null, bridge: Boolean(b.bridge) })); b.close(); process.exit(0);`;
+  const env: NodeJS.ProcessEnv = { ...process.env, FOREMAN_HOME: home };
+  delete env.FOREMAN_RELAY_URL; delete env.FOREMAN_HOST_TOKEN;
+  const run = (overrides = {}) => JSON.parse(execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', code], { env: { ...env, ...overrides }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n').at(-1)!);
+  assert.deepEqual(run(), { error: null, bridge: false });
+  assert.deepEqual(run({ FOREMAN_RELAY_URL: 'http://foreman.invalid', FOREMAN_HOST_TOKEN: TOKEN }), { error: 'Relay URL must be an HTTPS origin', bridge: false });
+  assert.deepEqual(run({ FOREMAN_RELAY_URL: 'https://foreman.invalid', FOREMAN_HOST_TOKEN: 'short' }), { error: 'Invalid host token', bridge: false });
+  assert.deepEqual(run({ FOREMAN_RELAY_URL: 'https://foreman.invalid' }), { error: 'Set both FOREMAN_RELAY_URL and FOREMAN_HOST_TOKEN', bridge: false });
+});

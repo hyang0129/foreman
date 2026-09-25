@@ -30,6 +30,8 @@ const UNKNOWN_MACHINE_NAME = 'unknown machine';
  * (by accepted_at, then turn_id) are dropped, so a host that never acknowledges cannot grow the table.
  */
 export const MAX_UNCERTAIN_TURNS = 256;
+/** #122: heartbeats refresh a machine's stored `last_seen` at most this often. */
+export const LAST_SEEN_WRITE_INTERVAL_MS = 60_000;
 
 export class PmState {
   private readonly storage: DurableObjectStorage;
@@ -81,8 +83,15 @@ export class PmState {
       return true;
     });
   }
-  touch(machineId: string, now: number) {
-    this.sql.exec('UPDATE machines SET last_seen = ? WHERE machine_id = ?', now, machineId);
+  /**
+   * A heartbeat (ping or pm_rpc) from an identified machine. #122: `last_seen` is written at most
+   * once per LAST_SEEN_WRITE_INTERVAL_MS per machine, not on every frame. Online/offline never reads
+   * it (that is the socket's own freshness), so the stored value only feeds the machine list's "last
+   * seen" and the eviction order, where being up to one interval old is harmless. A hello always
+   * writes it (upsertMachine). Returns whether a row was written.
+   */
+  touch(machineId: string, now: number): boolean {
+    return this.sql.exec('UPDATE machines SET last_seen = ? WHERE machine_id = ? AND last_seen <= ?', now, machineId, now - LAST_SEEN_WRITE_INTERVAL_MS).rowsWritten > 0;
   }
 
   /** No assignment yet: the first protocol-v2 machine becomes the PM host at epoch 1. */

@@ -41,6 +41,9 @@ try { identity = loadMachineIdentity(); }
 catch (error) { identityError = redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300); console.error('foreman: machine identity error:', identityError); }
 const pm = new ProjectManager(fleet, { sessions, projects, machineName: identity?.name ?? HOST });
 let store: HostPmStore | null = null;
+// #122: why this machine runs no PM (no store), so POST /api/pm/host can name the cause.
+let pmUnavailable: string | null = null;
+function failUnavailable(reason: string) { pmUnavailable = reason; pm.failUnavailable(reason); }
 const startedAt = Date.now();
 let bridge: ReturnType<typeof startHostBridge> | undefined;
 let notifier: Notifier | undefined;
@@ -125,7 +128,8 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/api/models' && req.method === 'GET') return json(res, 200, { models: await modelCatalog.list(url.searchParams.get('provider') ?? '') });
     if (url.pathname === '/api/pm/model' && req.method === 'POST') { const { model } = await body(req); await pm.setModel(model); return json(res, 200, { model: pm.model ?? null }); }
     if (url.pathname === "/api/pm/history" && url.searchParams.get("summary") === "1") return json(res, 200, { error: pm.lastError, busy: pm.modelBusy });
-    if (url.pathname === "/api/pm/history") return json(res, 200, { history: pm.history(), error: pm.lastError, busy: pm.modelBusy, session_id: pm.sessionId, model: pm.model ?? null });
+    // #122: the model is known before the first PM start (from the store, else the configured default).
+    if (url.pathname === "/api/pm/history") return json(res, 200, { history: pm.history(), error: pm.lastError, busy: pm.modelBusy, session_id: pm.sessionId, model: await pm.displayModel() });
     if (url.pathname === "/api/pm/message" && req.method === "POST") {
       const { text } = await body(req);
       if (!text || typeof text !== "string") return json(res, 400, { error: "text required" });
@@ -138,7 +142,10 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/api/pm/host' && req.method === 'GET') return pmHost(res);
     if (url.pathname === '/api/pm/host' && req.method === 'POST') {
       // Only the relay reassigns the PM; the Worker answers this route for the hosted app.
-      return json(res, 400, { error: store?.mode === 'relay' ? 'Move the PM from the hosted app; the cloud relay makes that change.' : PM_HOST_LOCAL_ONLY_ERROR });
+      // #122: with no PM store (e.g. an invalid relay configuration), name the cause.
+      const error = store?.mode === 'relay' ? 'Move the PM from the hosted app; the cloud relay makes that change.'
+        : !store && pmUnavailable ? `${PM_HOST_LOCAL_ONLY_ERROR}, which this machine cannot use: ${pmUnavailable}` : PM_HOST_LOCAL_ONLY_ERROR;
+      return json(res, 400, { error });
     }
     if (url.pathname === "/api/memory" && req.method === 'GET') {
       if (!store) return json(res, 503, { error: pm.lastError ?? 'PM memory is unavailable on this machine' });
@@ -197,18 +204,18 @@ server.listen(PORT, "127.0.0.1", () => {
   // before the PM is attached, so an uncertain turn reported at activation is a pm_failed edge.
   const notify = bridge.notify?.bind(bridge);
   if (notify) notifier = new Notifier({ sessions, pm, send: notify }).start();
-  if (!identity) { pm.failUnavailable(`machine.json is invalid (${identityError})`); return; }
+  if (!identity) { failUnavailable(`machine.json is invalid (${identityError})`); return; }
   // Never two PMs: LocalPmStore only when no relay is configured at all (no cloud.json, no relay
   // env). A configured relay that is invalid or did not start means no PM on this machine.
-  const choice = choosePmStore(readBridgeConfig, Boolean(bridge.bridge));
-  if (choice.mode === 'unavailable') { pm.failUnavailable(choice.reason); return; }
+  const choice = choosePmStore(readBridgeConfig, Boolean(bridge.bridge), process.env, bridge.error);
+  if (choice.mode === 'unavailable') { failUnavailable(choice.reason); return; }
   try {
     // RelayPmStore when the relay is configured (a v2 bridge), else LocalPmStore (pm/state.json).
     store = createPmStore({ identity, bridge: choice.mode === 'relay' ? bridge.bridge! : null });
   } catch (error) {
     const reason = redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300);
     console.error('foreman: PM state store error:', reason);
-    pm.failUnavailable(`the PM state store could not be opened (${reason})`);
+    failUnavailable(`the PM state store could not be opened (${reason})`);
     return;
   }
   // The PM runs only while this machine is the active PM host. FOREMAN_PM_DISABLED=1 only defers
