@@ -11,6 +11,37 @@ export const LABEL = 'com.foreman.daemon';
 const OWNER = 'foreman/scripts/service.mjs/v1';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
+// Mirrors isMachineName/MAX_MACHINE_NAME in shared/pm-state.ts and the trimming in
+// server/machine.ts configuredMachineName(). Not imported: `npm run service:*` runs plain `node`,
+// which cannot load .ts on every supported Node version. tests/service.test.mjs checks the two agree.
+export const MAX_MACHINE_NAME = 80;
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+
+/**
+ * Settings the daemon reads at startup that the service carries over from the install-time
+ * environment when set. Invalid values refuse the install instead of installing a service that
+ * would start without a PM (bad name) or silently ignore the setting (bad threshold).
+ */
+export function passThroughSettings(env) {
+  const out = {};
+  const name = env.FOREMAN_MACHINE_NAME;
+  if (name !== undefined && name !== '') {
+    const trimmed = name.trim();
+    if (trimmed.length < 1 || trimmed.length > MAX_MACHINE_NAME || CONTROL.test(trimmed)) {
+      throw new Error(`FOREMAN_MACHINE_NAME must be 1-${MAX_MACHINE_NAME} printable characters`);
+    }
+    out.FOREMAN_MACHINE_NAME = trimmed;
+  }
+  const hung = env.FOREMAN_PM_HUNG_MS;
+  if (hung !== undefined && hung !== '') {
+    if (!/^[0-9]+$/.test(hung) || !Number.isSafeInteger(Number(hung)) || Number(hung) < 1) {
+      throw new Error('FOREMAN_PM_HUNG_MS must be a positive integer number of milliseconds');
+    }
+    out.FOREMAN_PM_HUNG_MS = String(Number(hung));
+  }
+  return out;
+}
+
 export function config({ repo = ROOT, home = homedir(), node = process.execPath,
   env = process.env, keepAwake = false } = {}) {
   const port = Number(env.FOREMAN_PORT || 4177);
@@ -32,6 +63,9 @@ export function config({ repo = ROOT, home = homedir(), node = process.execPath,
       environment[key] = env[key];
     }
   }
+  // FOREMAN_MACHINE_NAME is persisted to <FOREMAN_HOME>/machine.json by the daemon, so passing it
+  // renames this machine on the service's next start; omitting it later keeps the stored name.
+  Object.assign(environment, passThroughSettings(env));
   const args = [node, '--experimental-strip-types', join(repo, 'server/main.ts')];
   return {
     repo, home, port, state,
