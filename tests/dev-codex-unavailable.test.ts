@@ -56,17 +56,19 @@ function provider(mode: string) {
 // Each test spawns real stub processes (via the process supervisor), which can
 // take seconds on a loaded machine. Budgets derive from the test's own timeout
 // instead of fixed ones: every wait still fails, but only once the test's
-// deadline has passed. Codex requests get the remaining budget minus a margin so
-// a stuck request reports its own error before the test itself times out.
+// deadline has passed. Codex requests get a smaller share than the polling wait
+// (the remaining budget minus twice the margin, #106), so a stuck request fails
+// with its own Codex error while a wait is still polling, and the wait's failure
+// reports that error instead of only "Timed out waiting for ...".
 const TEST_TIMEOUT = 30_000;
 const MARGIN = 3_000;
 function budget(t: { signal: AbortSignal }) {
   const deadline = Date.now() + TEST_TIMEOUT;
   return {
-    codexTimeoutMs: () => Math.max(1, deadline - Date.now() - MARGIN),
-    async until(check: () => boolean, what: string) {
+    codexTimeoutMs: () => Math.max(1, deadline - Date.now() - 2 * MARGIN),
+    async until(check: () => boolean, what: string, detail?: () => string | null | undefined) {
       while (!check()) {
-        if (t.signal.aborted || Date.now() > deadline - MARGIN) assert.fail(`Timed out waiting for ${what}`);
+        if (t.signal.aborted || Date.now() > deadline - MARGIN) assert.fail(`Timed out waiting for ${what}${detail?.() ? ` (${detail!()})` : ''}`);
         await new Promise((r) => setTimeout(r, 10));
       }
     },
@@ -94,7 +96,7 @@ test('launching a Codex session on a signed-out host fails clearly before any th
   const service = new SessionService({ home, codexFactory: (options) => new CodexControl({ ...options, bin: fakeBin, env: p.env, timeoutMs: b.codexTimeoutMs() }) });
   t.after(() => service.close());
   const row = await service.create({ id: 'codex-1', provider: 'codex', cwd: home, name: 'Codex', text: 'Hello' });
-  await b.until(() => service.detail(row.session_key).session.state === 'unknown', 'launch failure');
+  await b.until(() => service.detail(row.session_key).session.state === 'unknown', 'launch failure', () => service.detail(row.session_key).session.last_error);
   const { session, receipts } = service.detail(row.session_key);
   assert.equal(session.alive, false);
   assert.match(session.last_error ?? '', /^Could not start provider: Error: Codex is not signed in on this host, so Codex sessions are unavailable/);
@@ -114,7 +116,7 @@ test('launching a Codex session on a signed-in host is unchanged', { timeout: TE
   const service = new SessionService({ home, codexFactory: (options) => new CodexControl({ ...options, bin: fakeBin, env: p.env, timeoutMs: b.codexTimeoutMs() }) });
   t.after(() => service.close());
   const row = await service.create({ id: 'codex-2', provider: 'codex', cwd: home, name: 'Codex', text: 'Hello' });
-  await b.until(() => p.calls().includes('turn/start'), 'first turn dispatch');
+  await b.until(() => p.calls().includes('turn/start'), 'first turn dispatch', () => service.detail(row.session_key).session.last_error);
   const { session } = service.detail(row.session_key);
   assert.equal(session.session_id, 'thread-1'); assert.equal(session.last_error, null);
   assert.deepEqual(p.calls(), ['initialize', 'account/read', 'thread/start', 'turn/start']);

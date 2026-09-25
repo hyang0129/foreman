@@ -228,7 +228,7 @@ try {
     exitGrace: { term: 50, kill: 50 },
     spawnChild: (...args) => { const child = spawn(...args); child.kill = (signal) => { signals.push(signal); return true; }; return child; },
     saveRecord: (path, value) => {
-      if (value.state === 'running') { writeFileSync(pidFile, String(value.pid)); throw new Error('injected promotion failure'); }
+      if (value.state === 'running') { writeFileSync(pidFile, JSON.stringify({ pid: value.pid, id: value.id })); throw new Error('injected promotion failure'); }
       writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
     },
   });
@@ -240,9 +240,12 @@ try {
   let timer;
   const exited = await Promise.race([once(starter, 'exit').then(() => true), new Promise((resolve) => { timer = setTimeout(resolve, 8000, false); })]);
   clearTimeout(timer);
-  const pid = Number(readFileSync(pidFile, 'utf8'));
+  // Register cleanup as soon as the PID is known, before reading daemon.json,
+  // so a regression that deletes the record cannot leak the stuck child (#106).
+  const { pid, id } = JSON.parse(readFileSync(pidFile, 'utf8'));
+  reap(t, pid, ` ${f.entry} ${id}`);
   const record = JSON.parse(readFileSync(f.daemonFile, 'utf8'));
-  reap(t, pid, ` ${f.entry} ${record.id}`);
+  assert.equal(record.id, id);
   // The mechanism ran: both signals were attempted and the child really outlived them.
   assert.match(stderr, new RegExp(`START FAILED: DEV daemon PID ${pid} did not exit after a failed start; .* signals=SIGTERM,SIGKILL`));
   assert.equal(alive(pid), true);

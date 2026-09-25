@@ -383,7 +383,7 @@ export async function deploy(home, options, deployWorker = wrangler) {
     // installed: record the installed tree's identity so start can re-verify it.
     if (!readFileSync(join(snapshot, 'package-lock.json')).equals(readFileSync(join(source, 'package-lock.json')))) throw new Error('Install matching dependencies in a worktree for that ref first');
     const modules = realpathSync(join(source, 'node_modules'));
-    const dependencies = { realpath: modules, identity: await dependencyIdentity(modules) };
+    const dependencies = { realpath: modules, identity: await readDependencies(modules, dependencyIdentity) };
     symlinkSync(modules, join(snapshot, 'node_modules'));
     const index = join(snapshot, 'web/index.html');
     const html = readFileSync(index, 'utf8');
@@ -503,20 +503,30 @@ async function terminateChild(child, { term = 10000, kill = 5000 } = {}) {
   throw new Error(`DEV daemon PID ${child.pid} did not exit after a failed start; its startup record is kept for npm run dev:stop`);
 }
 const redeploy = 'reinstall matching dependencies and run npm run dev:deploy again';
+// Filesystem failures reading the installed tree (unreadable entries, a
+// node_modules link resolving to a regular file, an entry removed mid-walk):
+// refuse with the recovery step, keeping the cause and its code/path. Anything
+// else is a programming error, not something a reinstall fixes, so it is
+// rethrown unchanged.
+const unreadableCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'ENOTDIR', 'EISDIR', 'ELOOP', 'ENAMETOOLONG', 'EMFILE', 'ENFILE', 'EIO', 'EBUSY', 'ESTALE']);
+async function readDependencies(dir, identify) {
+  try { return await identify(dir); }
+  catch (error) {
+    if (!unreadableCodes.has(error?.code)) throw error;
+    const detail = [error.code, error.path].filter(Boolean).join(' ');
+    const wrapped = new Error(`Could not read installed dependencies at ${dir} (${detail}); ${redeploy}`, { cause: error });
+    wrapped.code = error.code;
+    if (error.path !== undefined) wrapped.path = error.path;
+    throw wrapped;
+  }
+}
 export async function verifyDependencies(snapshot, deployment, identify = dependencyIdentity) {
   const recorded = deployment.dependencies;
   if (typeof recorded?.realpath !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(recorded?.identity ?? '')) throw new Error('Dev deployment has no installed-dependency record (deployed by an older workflow); run npm run dev:deploy again');
   let linked;
   try { linked = realpathSync(join(snapshot, 'node_modules')); } catch { linked = null; }
   if (linked !== recorded.realpath) throw new Error(`Snapshot node_modules resolves to ${linked ?? 'nothing'}, not the deployed ${recorded.realpath}; ${redeploy}`);
-  let identity;
-  // Unreadable entries, a node_modules link resolving to a regular file, or an
-  // entry removed mid-walk: refuse with the recovery step, keeping the cause.
-  try { identity = await identify(linked); }
-  catch (error) {
-    const detail = [error?.code, error?.path].filter(Boolean).join(' ') || error?.message || String(error);
-    throw Object.assign(new Error(`Could not read installed dependencies at ${linked} (${detail}); ${redeploy}`, { cause: error }), { code: error?.code, path: error?.path });
-  }
+  const identity = await readDependencies(linked, identify);
   if (identity !== recorded.identity) throw new Error(`Installed dependencies changed since deploy (${linked}: ${identity} != deployed ${recorded.identity}); ${redeploy}`);
 }
 export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500, spawnChild = spawn, exitGrace, identify, isolatedLogins = false } = {}) {
