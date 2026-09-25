@@ -161,8 +161,10 @@ const server = createServer(async (req, res) => {
 
 // GET /api/pm/host. Local-only mode answers for its single machine. In relay mode the Worker/DO
 // answers this route for the hosted app (it is never relayed); a request that reaches this host
-// directly (the local UI) gets 404 with this host's own view of the assignment, which the PM view
-// treats as "no machine line": this host cannot see the other machines or whether they are online.
+// directly (the local UI) gets 404 with this host's own view of the assignment: this host cannot
+// see the other machines, whether they are online, or when and by whom the PM was assigned, so it
+// never answers a PmHostResponse. The PM view shows this view as one line (whether this machine
+// runs the PM, the active machine's name) and points to the hosted app for the rest.
 function pmHost(res: ServerResponse) {
   if (store?.mode === 'local' && identity) {
     const response: PmHostResponse = {
@@ -176,7 +178,10 @@ function pmHost(res: ServerResponse) {
     const a = store.assignment(), frame = bridge?.bridge?.currentAssignment() ?? null;
     return json(res, 404, {
       error: 'The cloud relay answers /api/pm/host; open the hosted app to see every machine or move the PM.',
-      view: { mode: 'relay', connected: a.connected, this_machine_active: a.active, epoch: frame?.epoch ?? null, active_machine: frame?.active_machine ?? null },
+      view: {
+        mode: 'relay', connected: a.connected, this_machine_active: a.active, epoch: frame?.epoch ?? null, active_machine: frame?.active_machine ?? null,
+        this_machine: identity ? { machine_id: identity.machine_id, name: identity.name } : null,
+      },
     });
   }
   return json(res, 404, { error: pm.lastError ?? 'The PM is unavailable on this machine.' });

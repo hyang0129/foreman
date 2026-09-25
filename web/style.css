@@ -351,6 +351,11 @@ select:focus-visible,
   background: transparent;
   border: 1px solid var(--muted);
 }
+/* Not known (yet): no PM host, an untracked session. A dashed ring, in both themes via tokens. */
+.dot.unknown {
+  background: transparent;
+  border: 1.5px dashed var(--control-line);
+}
 .rail-footer {
   border-top: 1px solid var(--line);
   padding: 15px 21px;
@@ -528,6 +533,19 @@ select:focus-visible,
 }
 .message.system.error .message-label {
   color: var(--error);
+}
+/* The PM moved to another machine: why messages sent here are refused. */
+.message.system.pm-moved {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  padding: 8px 12px;
+  border-radius: 0 8px 8px 0;
+  color: var(--ink);
+  font-size: 0.8125rem;
+}
+.message.system.pm-moved .message-label {
+  color: var(--accent);
+  font-weight: 600;
 }
 .message.system.error .message-label::before,
 .pm-alert-dot {
@@ -1119,6 +1137,7 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 .pm-host-offline { flex-basis: 100%; font-weight: 600; }
 .pm-host-offline[hidden] { display: none; }
 .pm-host.is-offline { background: var(--warning-soft); color: var(--warning); }
+.pm-host[aria-busy="true"] { font-style: italic; }
 .pm-host .btn { margin-left: auto; }
 .machine-choices { border: 0; padding: 0; margin: 0; min-width: 0; }
 .machine-choices legend { font-size: .75rem; font-weight: 600; margin-bottom: 8px; padding: 0; }
