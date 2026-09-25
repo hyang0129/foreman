@@ -44,11 +44,48 @@ On September 13, 2026, the idle manual server was verified and handed off to thi
 
 ## Always-on execution path
 
-For work that continues when the laptop is off, use a dedicated powered Mac with this checkout, repositories, provider CLIs and separately authenticated provider accounts; install the same LaunchAgent under its logged-in user. This is the lowest-change path for the current macOS-oriented app. A Linux VM is another option after replacing Mac-specific terminal launching and providing a systemd unit; it also needs repository access and fresh provider authentication.
+For work that continues when the laptop is off, use a dedicated powered Mac with this checkout, repositories, provider CLIs and separately authenticated provider accounts; install the same LaunchAgent under its logged-in user. This is the lowest-change path for the current macOS-oriented app. A Linux machine also works as a host, but without the service (see [Linux host](#linux-host)); it needs repository access and fresh provider authentication.
 
 An always-on host runs sessions started on that host. It cannot keep the laptop's existing processes alive; a handoff needs synchronized repository changes, required files, and a resumable provider session or a new session with supplied context. Do not blindly copy account credential stores between hosts.
 
 The authenticated outbound Cloudflare relay, host identity, heartbeat/offline state, and reconnect handling are implemented and paired on this Mac. The daemon loads its private pairing from `~/.foreman/cloud.json`; the service installer itself does not provision cloud resources. Hosted Firebase Google login is configured; see [Cloud setup](CLOUD_SETUP.md). Keep the local HTTP server bound to loopback. Managed histories/receipts survive daemon restart, but recovered sessions are read-only and unfinished delivery is marked uncertain without replay.
+
+## More than one machine
+
+Several machines can be paired with the same relay at once, for example this Mac and the Linux box `homen`. Each `FOREMAN_HOME` is one machine, identified by `<FOREMAN_HOME>/machine.json` (a random `machine_id` and a display name, created on first start). The display name defaults to the short hostname. Set `FOREMAN_MACHINE_NAME` in the daemon's environment to choose another name (1–80 printable characters); it is saved to `machine.json`, so later starts keep it. An invalid value means no PM on that machine until it is fixed. The macOS service installer does not pass `FOREMAN_MACHINE_NAME` to the installed service, so a variable set in your shell does not reach it.
+
+To pair another machine, copy `cloud.json` to it; see [Add a second machine](CLOUD_SETUP.md#add-a-second-machine). Never copy `machine.json` or a whole `~/.foreman`: two daemons with the same `machine_id` count as one machine and replace each other's relay connection.
+
+- **One PM at a time.** The relay records one active PM host. The first machine that connects with this version becomes the PM host, and it stays the PM host until you move it. Every other connected machine is a standby.
+- **The hosted app talks to the PM host only.** Sessions, projects, launches and the PM are all relayed to that one machine. A standby receives nothing through the relay. The hosted app shows standbys only in the Move PM dialog. A standby's own sessions are still available from its local UI (`http://localhost:4177`).
+- **PM memory is shared; everything else is per machine.** The PM's memory (projects, preferences, log, model) lives in the relay, so it is the same on every machine. Worker sessions, their transcripts and receipts, worktrees, and the project registry (`projects.json`, with its paths) stay on the machine that owns them. Register a project under the same name on each machine where the PM should find it: PM memory refers to projects by name, and each machine resolves the name to its own path.
+- **A machine that is not the PM host runs no PM.** Its local UI refuses PM messages with "The PM runs on <name>.". A PM host that loses the relay also refuses PM messages ("The cloud relay is unreachable; the PM is unavailable on this machine.") until it reconnects, because it cannot confirm it is still the PM host.
+
+See [PM memory and the PM host](DESIGN.md#pm-memory-and-the-pm-host) for the full model.
+
+## Moving the PM
+
+Moving the PM is always a developer action; there is no automatic failover.
+
+1. Open the hosted app and the PM view. The header shows "PM on <name> · online" (or offline).
+2. Choose **Move PM…**. It appears only when another machine is online.
+3. Pick an online machine and confirm.
+
+The move needs an online target. The current PM host may be offline, which is how you recover from losing a machine. If the PM host changed since the page loaded, the move is refused (409); the dialog reloads the machine list.
+
+After the move:
+
+- The new PM host starts with an empty conversation and a fresh provider session built from the shared memory. Past conversations are not kept anywhere.
+- A message that was still in progress on the old machine appears once on the new one as an uncertain entry: "…could not be confirmed (the PM was moved)", or "(machine went offline)" if the old machine was offline. It is never replayed. Send it again if you still need it.
+- The old machine stops its PM and refuses PM messages from its local UI ("The PM runs on <name>."). If its daemon kept running, its PM view also shows "The PM now runs on <name>.": at once if it was online during the move, otherwise when it reconnects. A machine whose daemon restarted shows no entry. When a lost machine comes back, it is a standby; it never takes the PM back.
+
+In relay mode the PM can be moved only from the hosted app. The local UI at `localhost` cannot see the other machines. A machine without `cloud.json` (local-only mode) is always its own PM host and has nothing to move to.
+
+Restarting the PM host's daemon keeps the PM there. A message in progress during the restart is reported once as uncertain ("Foreman restarted") and not replayed. A brief network drop is not reported: a turn that finishes across it completes normally.
+
+## Linux host
+
+A Linux machine runs the daemon in the foreground with `npm start` (after `npm install`, `npm run hooks:install` and the provider logins). Service management (`npm run service:*`, `scripts/service.mjs`) is macOS-only and refuses to run elsewhere, so keep `npm start` running yourself and restart it by hand. Visible-tab launches (`spawn_session` mode `tab`) need `warp-spawn` at `FOREMAN_WARP_SPAWN` (default `~/.claude/warp-playbook/bin/warp-spawn`); without it they fail. Managed launches (the default) do not use it.
 
 ## Validation
 

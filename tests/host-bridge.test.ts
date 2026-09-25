@@ -6,9 +6,10 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, chmodSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { HostBridge } from '../server/host-bridge.ts';
+import { HostBridge, PmRpcError } from '../server/host-bridge.ts';
 import { MAX_BODY, MAX_RESPONSE, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME } from '../shared/relay.ts';
 import { notifyId, type NotifyFrame } from '../shared/notify.ts';
+import { MAX_PM_RESULT_FRAME, isHelloV2, parseHello, type PmAssignment } from '../shared/pm-state.ts';
 
 const TOKEN = 'synthetic-test-host-credential'.repeat(2);
 class FakeSocket extends EventEmitter {
@@ -339,4 +340,160 @@ test('startHostBridge keeps its shape and exposes notify only when a relay is co
   const run = (overrides = {}) => execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', code], { env: { ...env, ...overrides }, encoding: 'utf8' }).trim().split('\n').at(-1);
   assert.equal(run(), 'function undefined', 'local-only mode: no notify, so no notifier is wired');
   assert.equal(run({ FOREMAN_RELAY_URL: 'https://foreman.invalid', FOREMAN_HOST_TOKEN: TOKEN }), 'function function');
+});
+
+// ---------------------------------------------------------------------------------------------
+// Epic #26 (PMM-03): hello v2, pm_rpc correlation/timeout, pm_assignment, disconnect.
+// ---------------------------------------------------------------------------------------------
+
+const MACHINE = { machine_id: '3f1c2b1e-8e0a-4f3c-9b2a-0d6f5c4e3a21', name: 'machine-a' };
+const OTHER = { machine_id: 'a9b8c7d6-1234-4abc-8def-0123456789ab', name: 'machine-b' };
+const assignmentFrame = (overrides: Record<string, unknown> = {}) => ({ type: 'pm_assignment', active: true, epoch: 3, active_machine: { machine_id: MACHINE.machine_id, host: MACHINE.name }, uncertain_turns: [], ...overrides });
+const rpcs = (socket: FakeSocket) => socket.sent.filter((entry) => entry.type === 'pm_rpc');
+
+function v2(t: test.TestContext, settings: { openTurns?: () => readonly string[]; rpcTimeoutMs?: number } = {}) {
+  t.mock.method(console, 'log', () => {});
+  const sockets: FakeSocket[] = [];
+  const options: any[] = [];
+  const instance = new HostBridge(4177, { url: 'https://foreman.example', token: TOKEN }, {
+    identity: MACHINE, platform: 'darwin', pmOpenTurns: settings.openTurns, rpcTimeoutMs: settings.rpcTimeoutMs,
+    socketFactory: (_url, opts) => { const socket = new FakeSocket(); options.push(opts); sockets.push(socket); return socket as any; },
+  });
+  t.after(() => instance.close());
+  instance.start();
+  return { instance, sockets, options };
+}
+
+test('v2 hello carries machine_id, name, platform, protocol 2 and pm_open_turns from the provider on every connect', (t) => {
+  let turns: string[] = ['turn-1', 'turn-2'];
+  const f = v2(t, { openTurns: () => turns });
+  const first = f.sockets[0]!; first.open();
+  const hello = first.sent[0];
+  assert.deepEqual(hello, { type: 'hello', protocol: 2, machine_id: MACHINE.machine_id, host: 'machine-a', platform: 'darwin', pm_open_turns: ['turn-1', 'turn-2'] });
+  const parsed = parseHello(hello); assert.ok(parsed.ok && isHelloV2(parsed.value));
+  assert.ok(!JSON.stringify(hello).includes(TOKEN));
+  assert.equal(f.instance.protocol, 2);
+  first.close(); clearTimeout((f.instance as any).reconnect);
+  turns = ['turn-2', 'bad id with spaces', 'turn-2', 'turn-3'];
+  t.mock.method(console, 'error', () => {});
+  (f.instance as any).connect();
+  const second = f.sockets[1]!; second.open();
+  assert.deepEqual(second.sent[0].pm_open_turns, ['turn-2', 'turn-3'], 'called again on reconnect; invalid and duplicate ids dropped');
+  assert.equal(f.options[0].maxPayload, MAX_PM_RESULT_FRAME, 'a v2 socket accepts DO result frames up to 1 MiB');
+});
+
+test('the legacy bridge (no identity) still sends the pre-#26 hello and has no PM rpc', async (t) => {
+  const f = bridge(t), socket = f.sockets[0]!; socket.open();
+  assert.deepEqual(Object.keys(socket.sent[0]).sort(), ['host', 'type']);
+  assert.equal(f.instance.protocol, 1);
+  assert.equal(f.options[0].maxPayload, MAX_REQUEST_FRAME);
+  await assert.rejects(f.instance.rpc('memory.get', {}), (error: any) => error instanceof PmRpcError && error.code === 'unavailable');
+  assert.equal(socket.sent.filter((entry) => entry.type === 'pm_rpc').length, 0);
+});
+
+test('on a v2 socket a relayed request frame over MAX_REQUEST_FRAME still closes the socket', (t) => {
+  const f = v2(t), socket = f.sockets[0]!; socket.open();
+  socket.receive({ type: 'request', id: 'huge', method: 'POST', path: '/api/session/message', body: 'x'.repeat(MAX_REQUEST_FRAME) });
+  assert.equal(socket.closed?.code, 1009);
+});
+
+test('rpc correlates replies by id, carries the assignment epoch, and validates results per op', async (t) => {
+  const f = v2(t), socket = f.sockets[0]!; socket.open();
+  socket.receive(assignmentFrame());
+  const a = f.instance.rpc('memory.log', { text: 'first note' });
+  const b = f.instance.rpc('memory.put', { doc: 'projects', content: '# P', expected_version: 0 });
+  const [ra, rb] = rpcs(socket);
+  assert.equal(ra.epoch, 3); assert.equal(rb.epoch, 3);
+  assert.notEqual(ra.id, rb.id);
+  assert.deepEqual(ra.args, { text: 'first note' });
+  socket.receive({ type: 'pm_rpc_result', id: rb.id, ok: true, result: { version: 1 } });
+  socket.receive({ type: 'pm_rpc_result', id: ra.id, ok: true, result: { seq: 7 } });
+  assert.deepEqual(await a, { seq: 7 });
+  assert.deepEqual(await b, { version: 1 });
+  const c = f.instance.rpc('memory.put', { doc: 'projects', content: 'x', expected_version: 1 }, { epoch: 9 });
+  const rc = rpcs(socket)[2]; assert.equal(rc.epoch, 9, 'an explicit epoch wins');
+  socket.receive({ type: 'pm_rpc_result', id: rc.id, ok: false, code: 'stale_epoch', message: 'epoch 9 is not current' });
+  await assert.rejects(c, (error: any) => error instanceof PmRpcError && error.code === 'stale_epoch' && error.epoch === 9);
+  const d = f.instance.rpc('memory.log', { text: 'bad result' });
+  socket.receive({ type: 'pm_rpc_result', id: rpcs(socket)[3].id, ok: true, result: { version: 1 } });
+  await assert.rejects(d, (error: any) => error.code === 'invalid_result');
+  // A DO error message is redacted again on the host before it can reach the user.
+  const e = f.instance.rpc('memory.log', { text: 'leaky error' });
+  socket.receive({ type: 'pm_rpc_result', id: rpcs(socket)[4].id, ok: false, code: 'unavailable', message: `upstream said Authorization: Bearer ${TOKEN}` });
+  await assert.rejects(e, (error: any) => error.code === 'unavailable' && !error.message.includes(TOKEN) && error.message.includes('[REDACTED]'));
+});
+
+test('invalid args fail locally with the contract code and nothing is sent', async (t) => {
+  const f = v2(t), socket = f.sockets[0]!; socket.open(); socket.receive(assignmentFrame());
+  await assert.rejects(f.instance.rpc('memory.log', { text: 'x'.repeat(501) }), (error: any) => error.code === 'too_large');
+  await assert.rejects(f.instance.rpc('turn.begin', { turn_id: 'has space', accepted_at: new Date().toISOString() }), (error: any) => error.code === 'invalid');
+  assert.equal(rpcs(socket).length, 0);
+});
+
+test('rpc times out after the per-call timeout (default 10 s) and a stale reply afterwards is ignored', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  const f = v2(t), socket = f.sockets[0]!; socket.open(); socket.receive(assignmentFrame());
+  const call = f.instance.rpc('turn.begin', { turn_id: 'turn-1', accepted_at: '2026-09-24T00:00:00.000Z' });
+  let settled = false; call.then(() => { settled = true; }, () => { settled = true; });
+  t.mock.timers.tick(9_999); await Promise.resolve();
+  assert.equal(settled, false);
+  t.mock.timers.tick(1);
+  await assert.rejects(call, (error: any) => error instanceof PmRpcError && error.code === 'timeout' && error.op === 'turn.begin');
+  const stale = rpcs(socket)[0];
+  assert.doesNotThrow(() => socket.receive({ type: 'pm_rpc_result', id: stale.id, ok: true, result: {} }));
+  assert.equal(socket.closed, undefined, 'a stale reply does not close the socket');
+  const next = f.instance.rpc('memory.log', { text: 'after stale' }, { timeoutMs: 50 });
+  socket.receive({ type: 'pm_rpc_result', id: rpcs(socket)[1].id, ok: true, result: { seq: 1 } });
+  assert.deepEqual(await next, { seq: 1 });
+});
+
+test('disconnected: rpc rejects without sending, a close fails pending calls, and the bridge reports disconnected', async (t) => {
+  const f = v2(t), socket = f.sockets[0]!;
+  const events: boolean[] = []; f.instance.onConnection((connected) => events.push(connected));
+  await assert.rejects(f.instance.rpc('memory.get', {}), (error: any) => error.code === 'disconnected');
+  socket.open(); socket.receive(assignmentFrame());
+  assert.equal(f.instance.connected, true);
+  assert.equal(f.instance.currentAssignment()?.epoch, 3);
+  const pending = f.instance.rpc('turn.begin', { turn_id: 'turn-1', accepted_at: '2026-09-24T00:00:00.000Z' });
+  socket.close(1006, 'gone');
+  await assert.rejects(pending, (error: any) => error.code === 'disconnected');
+  assert.equal(f.instance.connected, false);
+  assert.equal(f.instance.currentAssignment(), null, 'a host that cannot see the DO holds no assignment');
+  assert.deepEqual(events, [true, false]);
+  await assert.rejects(f.instance.rpc('memory.get', {}), (error: any) => error.code === 'disconnected');
+  assert.equal(rpcs(socket).length, 1);
+});
+
+test('pm_assignment frames are validated and emitted; invalid ones are dropped', (t) => {
+  t.mock.method(console, 'error', () => {});
+  const f = v2(t), socket = f.sockets[0]!; socket.open();
+  const seen: PmAssignment[] = []; const off = f.instance.onAssignment((a) => seen.push(a));
+  socket.receive(assignmentFrame({ uncertain_turns: [{ turn_id: 'turn-9', accepted_at: '2026-09-24T00:00:00.000Z', host: 'machine-a', reason: 'restarted' }] }));
+  socket.receive(assignmentFrame({ active: false, epoch: 4, active_machine: { machine_id: OTHER.machine_id, host: OTHER.name } }));
+  socket.receive(assignmentFrame({ active: false, uncertain_turns: [{ turn_id: 'x', accepted_at: '2026-09-24T00:00:00.000Z', host: 'a', reason: 'restarted' }] }));
+  socket.receive({ type: 'pm_assignment', active: true });
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0]!.uncertain_turns[0]!.turn_id, 'turn-9');
+  assert.deepEqual(seen[1]!.active_machine, { machine_id: OTHER.machine_id, host: 'machine-b' });
+  assert.equal(f.instance.currentAssignment()?.epoch, 4);
+  off(); socket.receive(assignmentFrame({ epoch: 5 }));
+  assert.equal(seen.length, 2);
+});
+
+test('#43 notify sending is intact on a v2 bridge', (t) => {
+  const f = v2(t), socket = f.sockets[0]!;
+  f.instance.notify(frame(1)); socket.open();
+  assert.deepEqual(socket.sent.map((entry) => entry.type), ['hello', 'notify']);
+  f.instance.notify(frame(2));
+  assert.deepEqual(notifies(socket).map((entry) => entry.session_name), ['session 1', 'session 2']);
+});
+
+test('startHostBridge with an identity starts a v2 bridge and exposes it', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'foreman-bridge-v2-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const moduleUrl = new URL('../server/host-bridge.ts', import.meta.url).href;
+  const code = `import {startHostBridge, HostBridge} from ${JSON.stringify(moduleUrl)}; const b = startHostBridge(1, 'local', { identity: ${JSON.stringify(MACHINE)}, pmOpenTurns: () => [] }); console.log(b.bridge instanceof HostBridge, b.bridge?.protocol); b.close(); process.exit(0);`;
+  const env: NodeJS.ProcessEnv = { ...process.env, FOREMAN_HOME: home, FOREMAN_RELAY_URL: 'https://foreman.invalid', FOREMAN_HOST_TOKEN: TOKEN };
+  const out = execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', code], { env, encoding: 'utf8' }).trim().split('\n').at(-1);
+  assert.equal(out, 'true 2');
 });

@@ -3,6 +3,8 @@ import { verifyUser, validHostToken } from './auth.ts';
 import { allowedRequest, MAX_BODY, MAX_RESPONSE, MAX_RESPONSE_FRAME, type RelayResponse } from '../shared/relay.ts';
 import { buildPushPayload, cleanDisplayName, DEFAULT_PUSH_KINDS, isPushPreferenceKind, parseNotifyFrame, PUSH_KINDS, type PushEvent, type PushKind } from '../shared/notify.ts';
 import { fromB64u, loadVapidKeys, pushEndpointAllowed, sendPush, topicFor, validReceiverKeys, type PushTarget } from './push.ts';
+import { isHelloV2, parseHello, parsePmHostMoveRequest, parsePmRpc, pmHostOfflineMessage, pmRpcError, type HelloV2, type HostStatusResponse, type PmAssignment, type PmHostMoveResponse, type PmRpcResult } from '../shared/pm-state.ts';
+import { PmState } from './pm-state.ts';
 
 export function json(data: unknown, status = 200) {
   return Response.json(data, { status, headers: { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } });
@@ -22,6 +24,13 @@ const HOST_FRESH = 65_000;
 
 function pushRoute(method: string, url: URL) {
   return method === 'POST' && !url.search && PUSH_ROUTES.includes(url.pathname);
+}
+
+/** Worker/DO-terminated (#26): never part of the host relay allowlist, never relayed to a host. */
+export const PM_HOST_ROUTE = '/api/pm/host';
+export const MAX_PM_HOST_BODY = 1024;
+function pmHostRoute(method: string, url: URL) {
+  return (method === 'GET' || method === 'POST') && !url.search && url.pathname === PM_HOST_ROUTE;
 }
 
 export default {
@@ -54,6 +63,9 @@ export default {
       if (url.pathname.startsWith('/api/push/')) {
         if (!pushRoute(request.method, url)) return json({ error: 'Unknown API route' }, 404);
         if (!await loadVapidKeys(env.VAPID_PRIVATE_KEY)) return json({ error: 'Push notifications are not configured' }, 503);
+      } else if (url.pathname === PM_HOST_ROUTE) {
+        // The PM host record terminates in the Durable Object too, after the same identity and origin checks.
+        if (!pmHostRoute(request.method, url)) return json({ error: 'Unknown API route' }, 404);
       } else if (!allowedRequest(request.method, url.pathname + url.search)) return json({ error: 'Unknown API route' }, 404);
     }
     // This MVP has one explicitly allowlisted owner and one Mac.
@@ -62,7 +74,9 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 type Pending = { socket: WebSocket; resolve: (response: Response) => void; timer: ReturnType<typeof setTimeout> };
-type Attachment = { host: string; lastSeen: number };
+// `machine_id` is set by a protocol-2 hello. A socket without it is legacy (or has not said hello
+// yet): it is relayed to only while no PM host is assigned and is never recorded as the PM host.
+type Attachment = { host: string; lastSeen: number; machine_id?: string };
 
 type Subscription = PushTarget & { id: string; kinds: string[] };
 type SubscriptionRow = { id: string; endpoint: string; p256dh: string; auth: string; kinds: string };
@@ -104,8 +118,10 @@ async function readJsonBody(request: Request, limit: number): Promise<Record<str
 
 export class HostRelay extends DurableObject<Env> {
   private pending = new Map<string, Pending>();
+  private pm: PmState;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.pm = new PmState(ctx.storage);
     // HostRelay is already a SQLite-backed class (migration v1), so these tables need no migration.
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS push_subscriptions (
         id TEXT PRIMARY KEY, endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL,
@@ -113,11 +129,38 @@ export class HostRelay extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS push_log (source TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, sent INTEGER NOT NULL, PRIMARY KEY (source, id));
       CREATE TABLE IF NOT EXISTS push_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
   }
-  private hostSocket(except?: WebSocket) {
-    return this.ctx.getWebSockets('host').find((socket) => {
-      const state = socket.deserializeAttachment() as Attachment;
-      return socket !== except && socket.readyState === 1 && state && Date.now() - state.lastSeen < HOST_FRESH;
+  // ---- Host sockets ------------------------------------------------------------------------------
+  // Every host socket carries the 'host' tag. Machines are told apart by the attachment's
+  // `machine_id`: different machines coexist, and a machine's new hello replaces only its own
+  // older socket. Relayed traffic and the offline alarm follow the *target* socket: the active PM
+  // host's socket when an assignment exists, else the newest legacy socket.
+
+  private static attachment(socket: WebSocket): Attachment | null {
+    return (socket.deserializeAttachment() as Attachment | null) ?? null;
+  }
+  private liveSockets(except?: WebSocket, match: (state: Attachment) => boolean = () => true) {
+    return this.ctx.getWebSockets('host').filter((socket) => {
+      const state = HostRelay.attachment(socket);
+      return socket !== except && socket.readyState === 1 && state !== null && Date.now() - state.lastSeen < HOST_FRESH && match(state);
     });
+  }
+  private machineSocket(machineId: string, except?: WebSocket) {
+    return this.liveSockets(except, (state) => state.machine_id === machineId).at(-1);
+  }
+  private legacySocket(except?: WebSocket) {
+    return this.liveSockets(except, (state) => !state.machine_id).at(-1);
+  }
+  private online(machineId: string) { return Boolean(this.machineSocket(machineId)); }
+  /** The one socket relayed requests go to. */
+  private hostSocket(except?: WebSocket) {
+    const assignment = this.pm.assignment();
+    return assignment ? this.machineSocket(assignment.machine_id, except) : this.legacySocket(except);
+  }
+  /** Whether `socket` belongs to the relay target (active PM host, or legacy while unassigned), regardless of freshness. */
+  private isTarget(socket: WebSocket) {
+    const machineId = HostRelay.attachment(socket)?.machine_id;
+    const assignment = this.pm.assignment();
+    return assignment ? machineId === assignment.machine_id : !machineId;
   }
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -125,20 +168,27 @@ export class HostRelay extends DurableObject<Env> {
       // Defense in depth: bindings are private, but authentication is checked here too.
       const token = request.headers.get('authorization')?.replace(/^Bearer /, '') ?? '';
       if (!await validHostToken(token, this.env.HOST_TOKEN)) return json({ error: 'Unauthorized host' }, 401);
-      for (const previous of this.ctx.getWebSockets('host')) { this.failPending(previous); previous.close(1000, 'Host reconnected'); }
+      // Nothing is replaced yet: the machine is unknown until its hello. A protocol-2 hello replaces
+      // only that machine's older socket; a legacy hello keeps the old replace-all behavior.
       const [client, server] = Object.values(new WebSocketPair());
       this.ctx.acceptWebSocket(server!, ['host']);
       server!.serializeAttachment({ host: 'Mac', lastSeen: Date.now() } satisfies Attachment);
-      // A (re)connected host ends any outage; the next outage may notify again.
-      this.setState('outage_since', null); this.setState('offline_notified', null);
+      // With no PM host assigned, a (re)connected host ends any outage; the next outage may notify
+      // again. Once a PM host is assigned, only that machine's hello ends its outage.
+      if (!this.pm.assignment()) { this.setState('outage_since', null); this.setState('offline_notified', null); }
       await this.armOfflineCheck();
       return new Response(null, { status: 101, webSocket: client });
     }
     // Push routes are answered here, never relayed to the Mac, and work while it is offline.
     if (url.pathname.startsWith('/api/push/')) return this.pushRequest(request, url);
+    // The PM host record is answered here, never relayed, and works while every host is offline.
+    if (url.pathname === PM_HOST_ROUTE) return this.pmHostRequest(request, url);
     const socket = this.hostSocket();
-    if (url.pathname === '/api/host') return json({ online: Boolean(socket), host: socket?.deserializeAttachment()?.host ?? 'Mac' });
-    if (!socket) return json({ error: 'Your Mac is offline. Open Foreman on the Mac and reconnect.' }, 503);
+    if (url.pathname === '/api/host') return json(this.hostStatus(socket));
+    if (!socket) {
+      const assignment = this.pm.assignment();
+      return json({ error: assignment ? pmHostOfflineMessage(this.pm.machineName(assignment.machine_id)) : 'Your Mac is offline. Open Foreman on the Mac and reconnect.' }, 503);
+    }
     if (this.pending.size >= 64) return json({ error: 'Host is busy; try again shortly' }, 429);
     if (!allowedRequest(request.method, url.pathname + url.search)) return json({ error: 'Unknown API route' }, 404);
     if (Number(request.headers.get('content-length') ?? 0) > MAX_BODY) return json({ error: 'Request too large' }, 413);
@@ -172,19 +222,37 @@ export class HostRelay extends DurableObject<Env> {
     try { message = JSON.parse(raw); } catch { socket.close(1003, 'Invalid JSON'); this.failPending(socket); return; }
     if (!message || typeof message !== 'object' || Array.isArray(message)) { socket.close(1003, 'Invalid message'); this.failPending(socket); return; }
     if (message.type === 'ping' || message.type === 'hello') {
-      const previous = socket.deserializeAttachment() as Attachment;
-      const host = typeof message.host === 'string' ? message.host.slice(0, 100) : previous.host;
-      socket.serializeAttachment({ host, lastSeen: Date.now() });
-      if (message.type === 'hello') this.setState('host_name', host);
-      // A heartbeat on a socket that had gone stale ends that outage just like a reconnect does,
-      // so the next outage notifies again and the periodic check resumes.
-      if (this.getState('outage_since') !== null || this.getState('offline_notified') !== null) {
+      const previous = HostRelay.attachment(socket) ?? { host: 'Mac', lastSeen: 0 };
+      const hello = message.type === 'hello' ? parseHello(message) : null;
+      if (hello && !hello.ok) { socket.close(1008, 'Invalid hello'); this.failPending(socket); return; }
+      if (hello?.ok && isHelloV2(hello.value)) {
+        if (!this.acceptHelloV2(socket, hello.value)) return;
+      } else if (previous.machine_id) {
+        // A heartbeat from an identified machine. It cannot rename or un-identify the socket.
+        socket.serializeAttachment({ ...previous, lastSeen: Date.now() } satisfies Attachment);
+        this.pm.touch(previous.machine_id, Date.now());
+      } else {
+        const host = typeof message.host === 'string' ? message.host.slice(0, 100) : previous.host;
+        socket.serializeAttachment({ host, lastSeen: Date.now() } satisfies Attachment);
+        if (hello) {
+          this.setState('host_name', host);
+          // Legacy hello: today's replace-all among legacy sockets. Identified machines stay.
+          for (const other of this.ctx.getWebSockets('host')) {
+            if (other === socket || HostRelay.attachment(other)?.machine_id) continue;
+            this.failPending(other); other.close(1000, 'Host reconnected');
+          }
+        }
+      }
+      // A heartbeat on the relay target's socket that had gone stale ends that outage just like a
+      // reconnect does, so the next outage notifies again and the periodic check resumes.
+      if (this.hostSocket() === socket && (this.getState('outage_since') !== null || this.getState('offline_notified') !== null)) {
         this.setState('outage_since', null); this.setState('offline_notified', null);
         await this.armOfflineCheck();
       }
       socket.send(JSON.stringify({ type: 'pong' })); return;
     }
     if (message.type === 'notify') { try { this.acceptNotify(message); } catch {} return; }
+    if (message.type === 'pm_rpc') { this.acceptPmRpc(socket, message); return; }
     if (message.type !== 'response') return;
     const reply = message as RelayResponse;
     const pending = this.pending.get(reply.id);
@@ -203,6 +271,89 @@ export class HostRelay extends DurableObject<Env> {
   }
   async webSocketClose(socket: WebSocket) { this.failPending(socket); socket.close(); await this.hostLost(socket); }
   async webSocketError(socket: WebSocket) { this.failPending(socket); socket.close(1011, 'Connection failed'); await this.hostLost(socket); }
+
+  // ---- Portable PM state (#26) -------------------------------------------------------------------
+
+  private hostStatus(socket: WebSocket | undefined): HostStatusResponse {
+    const assignment = this.pm.assignment();
+    if (!assignment) return { online: Boolean(socket), host: (socket && HostRelay.attachment(socket)?.host) ?? 'Mac', machine_id: null, standby_online: false };
+    return {
+      online: Boolean(socket), host: this.pm.machineName(assignment.machine_id), machine_id: assignment.machine_id,
+      standby_online: this.pm.machines().some((m) => m.machine_id !== assignment.machine_id && this.online(m.machine_id)),
+    };
+  }
+
+  // A protocol-2 hello: record the machine, replace only its own older socket, bootstrap the first
+  // PM host, reconcile the active host's open turns, then answer with its `pm_assignment` (sent
+  // before the hello's pong). False when the socket was refused and closed.
+  private acceptHelloV2(socket: WebSocket, hello: HelloV2): boolean {
+    const now = Date.now(), id = hello.machine_id;
+    if (!this.pm.upsertMachine(id, hello.host, hello.platform, now, (machineId) => this.online(machineId))) {
+      socket.close(1008, 'Too many machines'); this.failPending(socket); return false;
+    }
+    socket.serializeAttachment({ host: hello.host, lastSeen: now, machine_id: id } satisfies Attachment);
+    for (const other of this.ctx.getWebSockets('host')) {
+      if (other === socket || HostRelay.attachment(other)?.machine_id !== id) continue;
+      this.failPending(other); other.close(1000, 'Host reconnected');
+    }
+    this.pm.bootstrapIfUnassigned(id, now);
+    if (this.pm.assignment()!.machine_id === id) this.pm.reconcileRestart(id, hello.pm_open_turns);
+    this.sendAssignment(socket, id);
+    return true;
+  }
+
+  private assignmentFrame(machineId: string): PmAssignment {
+    const assignment = this.pm.assignment();
+    const active = assignment?.machine_id === machineId;
+    return {
+      type: 'pm_assignment', active, epoch: assignment?.epoch ?? 0,
+      active_machine: assignment ? { machine_id: assignment.machine_id, host: this.pm.machineName(assignment.machine_id) } : null,
+      uncertain_turns: active ? this.pm.uncertainTurns() : [],
+    };
+  }
+  private sendAssignment(socket: WebSocket, machineId: string) {
+    try { socket.send(JSON.stringify(this.assignmentFrame(machineId))); } catch {}
+  }
+
+  private acceptPmRpc(socket: WebSocket, message: unknown) {
+    const parsed = parsePmRpc(message);
+    let result: PmRpcResult | null;
+    if (!parsed.ok) result = parsed.id === null ? null : pmRpcError(parsed.id, parsed.code, parsed.error);
+    else {
+      const machineId = HostRelay.attachment(socket)?.machine_id;
+      try {
+        result = machineId ? this.pm.execute(machineId, parsed.value, Date.now()) : pmRpcError(parsed.value.id, 'not_active', 'Send a protocol 2 hello before PM state requests');
+      } catch { result = pmRpcError(parsed.value.id, 'unavailable', 'PM state storage failed'); }
+    }
+    if (result) try { socket.send(JSON.stringify(result)); } catch {}
+  }
+
+  private async pmHostRequest(request: Request, url: URL): Promise<Response> {
+    if (!pmHostRoute(request.method, url)) return json({ error: 'Unknown API route' }, 404);
+    const isOnline = (machineId: string) => this.online(machineId);
+    if (request.method === 'GET') return json(this.pm.hostResponse(isOnline));
+    const body = await readJsonBody(request, MAX_PM_HOST_BODY);
+    if (body instanceof Response) return body;
+    const parsed = parsePmHostMoveRequest(body);
+    if (!parsed.ok) return badRequest(`Invalid request: ${parsed.error}`);
+    const { machine_id: target, expected_epoch } = parsed.value;
+    if (!this.pm.machine(target)) return json({ error: 'Unknown machine' }, 404);
+    const current = this.pm.assignment();
+    const name = this.pm.machineName(target);
+    if ((current?.epoch ?? 0) !== expected_epoch) return json({ error: 'The PM host changed since this page loaded. Refresh and try again.' }, 409);
+    if (current?.machine_id === target) return badRequest(`The PM already runs on ${name}.`);
+    if (!isOnline(target)) return json({ error: `${name} is offline. The PM can move only to an online machine.` }, 409);
+    const assignment = this.pm.reassign(target, Date.now(), isOnline);
+    // Every connected machine learns the new assignment; only the new host gets the uncertain turns.
+    for (const socket of this.ctx.getWebSockets('host')) {
+      const machineId = HostRelay.attachment(socket)?.machine_id;
+      if (machineId && socket.readyState === 1) this.sendAssignment(socket, machineId);
+    }
+    // The new PM host is online: any outage of the old one no longer concerns the developer.
+    this.setState('outage_since', null); this.setState('offline_notified', null);
+    await this.armOfflineCheck();
+    return json({ active: this.pm.hostActive(isOnline)!, epoch: assignment.epoch } satisfies PmHostMoveResponse);
+  }
 
   // ---- Web Push ------------------------------------------------------------------------------
 
@@ -298,6 +449,8 @@ export class HostRelay extends DurableObject<Env> {
   }
 
   private hostName() {
+    const assignment = this.pm.assignment();
+    if (assignment) return this.pm.machineName(assignment.machine_id);
     return (this.hostSocket()?.deserializeAttachment() as Attachment | undefined)?.host ?? this.getState('host_name') ?? 'Mac';
   }
 
@@ -338,6 +491,8 @@ export class HostRelay extends DurableObject<Env> {
   }
 
   // ---- Mac offline -----------------------------------------------------------------------------
+  // Keyed on the relay target (#26): the active PM host's socket, or the legacy socket while no PM
+  // host is assigned. Standby machines never start or end an outage.
   // State: `outage_since` (ms) while no live host socket exists, `offline_notified` once the one
   // notification for that outage went out. The alarm only runs while someone wants host_offline:
   // every CHECK_INTERVAL while a host is connected (catching a silently stale socket), then once
@@ -359,8 +514,9 @@ export class HostRelay extends DurableObject<Env> {
     return this.scheduleAt(since + OFFLINE_AFTER);
   }
 
+  // Only the relay target's socket matters: a standby machine going away is not an outage.
   private async hostLost(socket: WebSocket) {
-    if (this.hostSocket(socket)) return;
+    if (!this.isTarget(socket) || this.hostSocket(socket)) return;
     if (!this.getState('outage_since')) this.setState('outage_since', String(Date.now()));
     await this.armOfflineCheck();
   }
@@ -377,7 +533,7 @@ export class HostRelay extends DurableObject<Env> {
     let since = Number(this.getState('outage_since') ?? NaN);
     if (!Number.isFinite(since)) {
       // A socket that went silent without closing: the outage began at its last heartbeat.
-      const seen = this.ctx.getWebSockets('host').map((socket) => (socket.deserializeAttachment() as Attachment | null)?.lastSeen ?? 0);
+      const seen = this.ctx.getWebSockets('host').filter((socket) => this.isTarget(socket)).map((socket) => HostRelay.attachment(socket)?.lastSeen ?? 0);
       since = Math.min(now, Math.max(0, ...seen) || now);
       this.setState('outage_since', String(since));
     }

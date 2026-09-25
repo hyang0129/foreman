@@ -4,10 +4,11 @@ import { PERMISSION_MODES, type PermissionMode } from './permission-policy.ts';
 import { tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { execFile, spawn } from "node:child_process";
-import { existsSync, appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { Fleet, transcriptTail } from "./fleet.ts";
-import { CLAUDE_BIN, WARP_SPAWN, MEMORY_DIR } from "./paths.ts";
+import { CLAUDE_BIN, WARP_SPAWN } from "./paths.ts";
+import { makeMemoryTools } from "./memory-tools.ts";
+import type { PmMemory } from "../shared/pm-state.ts";
 import { bindPeerTools, type PeerService } from "./peer-tools.ts";
 import { modelCatalog } from "./models.ts";
 import { randomUUID } from "node:crypto";
@@ -28,7 +29,9 @@ export function runClaude(args: string[], cwd?: string): Promise<{ code: number;
   });
 }
 
-export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService, projects?: ProjectRegistry) {
+// `memory` (epic #26): when given, the portable memory tools (memory_read, memory_write,
+// memory_edit, log_note; see PM_MEMORY_TOOLS) are added. Without it there are no memory tools.
+export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService, projects?: ProjectRegistry, memory?: PmMemory) {
   const peers = sessions ? bindPeerTools(sessions, 'foreman-pm') : undefined;
   const list_sessions = tool(
     "list_sessions",
@@ -135,16 +138,5 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService, pr
     },
   );
 
-  const log_note = tool(
-    "log_note",
-    "Append one dated line to ~/.foreman/memory/LOG.md (decisions, outcomes). Use Write/Edit on PROJECTS.md for the project overview.",
-    { note: z.string().min(3).max(500) },
-    async ({ note }) => {
-      const line = `- ${new Date().toISOString().slice(0, 16).replace("T", " ")} — ${note.replace(/\s+/g, " ").trim()}\n`;
-      appendFileSync(join(MEMORY_DIR, "LOG.md"), line);
-      return fmt("Logged.");
-    },
-  );
-
-  return createSdkMcpServer({ name: "fleet", version: "0.1.0", tools: [list_sessions, list_models, list_projects, resolve_project, register_project, spawn_session, session_tail, stop_session, log_note] });
+  return createSdkMcpServer({ name: "fleet", version: "0.1.0", tools: [list_sessions, list_models, list_projects, resolve_project, register_project, spawn_session, session_tail, stop_session, ...(memory ? makeMemoryTools(memory) : [])] });
 }
