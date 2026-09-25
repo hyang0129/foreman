@@ -324,6 +324,8 @@ function revokeAccess(message) {
   // A PM failure seen by the previous identity is not shown to the next one.
   polledPmError = null;
   setPmRailError(null);
+  // Push feedback belongs to the previous identity; the state is re-read on the next sign-in.
+  pushFeedback();
   hideNotice();
   sendAttempts.clear();
   actionFeedback.clear();
@@ -1722,12 +1724,304 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("online", poll);
 ui.signOut.addEventListener("click", async () => {
+  // Capture the push subscription and token while still signed in; the server unsubscribe
+  // must be sent with the token before Firebase sign-out. It never blocks signing out.
+  const leaving = unsubscribeOnSignOut();
   revokeAccess("Sign in to open your session inbox.");
+  await leaving;
   try {
     await authSDK.signOut(firebaseAuth);
   } catch (error) {
     ui.authStatus.textContent = errorMessage(error);
   }
+});
+
+// Push notifications (epic #43 AND-05). Shown only in hosted mode when the relay has push
+// configured (/api/config `push`) and the browser supports it. Permission is requested only
+// from the "Turn on notifications" tap, never on load.
+const PUSH_KINDS = ["approval_requested", "question_asked", "session_failed", "pm_failed", "host_offline"];
+const PUSH_KINDS_STORAGE = "foreman:push-kinds";
+const PUSH_STATUS = {
+  off: "Get a notification when a session needs your approval or an answer, even with Foreman closed.",
+  blocked: "Notifications are blocked for Foreman. To allow them on Android, open Settings → Apps → Foreman → Notifications (in a browser tab: Chrome → Site settings → Notifications), then return here.",
+  on: "This device gets Foreman notifications. They name the session and what it needs, never its conversation.",
+};
+const PUSH_SUMMARY = { off: "Off", blocked: "Blocked", on: "On" };
+const pushUi = {
+  root: $("#notify-settings"),
+  summary: $("#notify-summary"),
+  status: $("#notify-status"),
+  enable: $("#notify-enable"),
+  kinds: $("#notify-kinds"),
+  actions: $("#notify-actions"),
+  test: $("#notify-test"),
+  disable: $("#notify-disable"),
+  feedback: $("#notify-feedback"),
+  toggles: [...document.querySelectorAll("#notify-kinds input[data-kinds]")],
+};
+let pushKey = null, pushBusy = false, pushState = "unsupported";
+
+function pushSupported() {
+  return window.isSecureContext && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+function base64UrlBytes(value) {
+  const text = atob(value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "="));
+  return Uint8Array.from(text, (c) => c.charCodeAt(0));
+}
+// Whether a subscription was made with the relay's current VAPID key.
+function subscriptionMatchesKey(subscription) {
+  const current = subscription?.options?.applicationServerKey;
+  if (!current || !pushKey) return false;
+  const a = new Uint8Array(current), b = base64UrlBytes(pushKey);
+  return a.length === b.length && a.every((byte, i) => byte === b[i]);
+}
+// A short, human label for the device list ("Android · Chrome"); never the user agent string.
+function deviceLabel() {
+  const ua = navigator.userAgent;
+  const platform = /Android/i.test(ua) ? "Android" : /iPhone|iPad|iPod/i.test(ua) ? "iOS" : /Macintosh|Mac OS X/i.test(ua) ? "Mac"
+    : /Windows/i.test(ua) ? "Windows" : /CrOS/i.test(ua) ? "ChromeOS" : /Linux/i.test(ua) ? "Linux" : "Device";
+  const browser = /EdgA?\//.test(ua) ? "Edge" : /SamsungBrowser\//.test(ua) ? "Samsung Internet" : /Firefox\/|FxiOS/.test(ua) ? "Firefox"
+    : /Chrome\/|CriOS/.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
+  return `${platform} · ${browser}`;
+}
+function storedPushKinds() {
+  try {
+    const kinds = JSON.parse(localStorage.getItem(PUSH_KINDS_STORAGE));
+    if (Array.isArray(kinds) && kinds.every((kind) => PUSH_KINDS.includes(kind))) return kinds;
+  } catch { /* Fall back to the defaults. */ }
+  return [...PUSH_KINDS];
+}
+function savePushKinds(kinds) {
+  try { localStorage.setItem(PUSH_KINDS_STORAGE, JSON.stringify(kinds)); } catch { /* Display only. */ }
+}
+function toggleKinds(toggle) {
+  return toggle.dataset.kinds.split(" ");
+}
+function kindsFromToggles() {
+  return PUSH_KINDS.filter((kind) => pushUi.toggles.some((toggle) => toggle.checked && toggleKinds(toggle).includes(kind)));
+}
+function showPushKinds(kinds) {
+  for (const toggle of pushUi.toggles) toggle.checked = toggleKinds(toggle).every((kind) => kinds.includes(kind));
+}
+function pushFeedback(text = "", error = false) {
+  pushUi.feedback.textContent = text;
+  pushUi.feedback.classList.toggle("error", error);
+}
+function renderPush(state) {
+  pushState = state;
+  pushUi.root.dataset.state = state;
+  // Unsupported (no push on the relay, local mode, or a browser without Push) hides the section.
+  pushUi.root.hidden = state === "unsupported";
+  if (state === "unsupported") return;
+  pushUi.summary.textContent = PUSH_SUMMARY[state];
+  pushUi.status.textContent = PUSH_STATUS[state];
+  pushUi.enable.hidden = state !== "off";
+  pushUi.kinds.hidden = pushUi.actions.hidden = state !== "on";
+}
+function setPushBusy(busy) {
+  pushBusy = busy;
+  for (const control of [pushUi.enable, pushUi.test, pushUi.disable, ...pushUi.toggles]) control.disabled = busy;
+}
+async function withTimeout(promise, ms, message) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function currentPushSubscription() {
+  const registration = await navigator.serviceWorker.getRegistration("/");
+  return registration ? registration.pushManager.getSubscription() : null;
+}
+// This device's subscription for the current VAPID key; one made with another key can never
+// be delivered to, so it is replaced.
+async function subscribeDevice() {
+  const registration = await withTimeout(navigator.serviceWorker.ready, 10000, "Foreman is still starting up. Reload and try again.");
+  let subscription = await registration.pushManager.getSubscription();
+  if (subscription && !subscriptionMatchesKey(subscription)) {
+    const stale = subscription.endpoint;
+    await subscription.unsubscribe().catch(() => {});
+    subscription = null;
+    post("/api/push/unsubscribe", { endpoint: stale }).catch(() => {});
+  }
+  return subscription || registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlBytes(pushKey) });
+}
+function postPushSubscription(subscription, kinds) {
+  return post("/api/push/subscribe", { subscription: subscription.toJSON(), device_label: deviceLabel(), kinds });
+}
+async function refreshPush() {
+  if (!pushKey || !authorized || !pushSupported()) { renderPush("unsupported"); return; }
+  if (pushBusy) return;
+  if (Notification.permission === "denied") { renderPush("blocked"); return; }
+  const epoch = authEpoch;
+  let subscription = null;
+  try { subscription = await currentPushSubscription(); } catch { /* Treated as off. */ }
+  if (epoch !== authEpoch || pushBusy) return;
+  if (!subscription || Notification.permission !== "granted") { renderPush("off"); return; }
+  if (!subscriptionMatchesKey(subscription)) {
+    // The relay's key changed since this device subscribed: resubscribe with the saved kinds.
+    setPushBusy(true);
+    try {
+      const kinds = storedPushKinds();
+      await postPushSubscription(await subscribeDevice(), kinds);
+      if (epoch !== authEpoch) return;
+    } catch (error) {
+      if (epoch === authEpoch) { renderPush("off"); pushFeedback(`Notifications need to be turned on again. ${errorMessage(error)}`, true); }
+      return;
+    } finally {
+      setPushBusy(false);
+    }
+  }
+  showPushKinds(storedPushKinds());
+  renderPush("on");
+}
+pushUi.enable.addEventListener("click", async () => {
+  if (pushBusy) return;
+  const epoch = authEpoch;
+  setPushBusy(true);
+  pushFeedback();
+  try {
+    // The only place Foreman asks for notification permission: this tap.
+    const permission = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
+    if (epoch !== authEpoch) return;
+    if (permission !== "granted") {
+      renderPush(permission === "denied" ? "blocked" : "off");
+      if (permission !== "denied") pushFeedback("Notifications were not allowed.");
+      return;
+    }
+    // Every kind is on when notifications are turned on.
+    const kinds = [...PUSH_KINDS];
+    const subscription = await subscribeDevice();
+    try {
+      await postPushSubscription(subscription, kinds);
+    } catch (error) {
+      await subscription.unsubscribe().catch(() => {});
+      throw error;
+    }
+    if (epoch !== authEpoch) return;
+    savePushKinds(kinds);
+    showPushKinds(kinds);
+    renderPush("on");
+    pushFeedback("Notifications are on for this device.");
+  } catch (error) {
+    if (epoch === authEpoch) { renderPush(Notification.permission === "denied" ? "blocked" : "off"); pushFeedback(`Could not turn on notifications. ${errorMessage(error)}`, true); }
+  } finally {
+    setPushBusy(false);
+  }
+});
+for (const toggle of pushUi.toggles)
+  toggle.addEventListener("change", async () => {
+    const previous = storedPushKinds(), kinds = kindsFromToggles(), epoch = authEpoch;
+    setPushBusy(true);
+    pushFeedback();
+    try {
+      const subscription = await currentPushSubscription();
+      if (!subscription) {
+        renderPush("off");
+        pushFeedback("This device is no longer subscribed. Turn notifications on again.", true);
+        return;
+      }
+      await postPushSubscription(subscription, kinds);
+      if (epoch !== authEpoch) return;
+      savePushKinds(kinds);
+      pushFeedback("Saved.");
+    } catch (error) {
+      if (epoch !== authEpoch) return;
+      showPushKinds(previous);
+      pushFeedback(`Could not save. ${errorMessage(error)}`, true);
+    } finally {
+      setPushBusy(false);
+    }
+  });
+pushUi.test.addEventListener("click", async () => {
+  const epoch = authEpoch;
+  setPushBusy(true);
+  pushFeedback();
+  try {
+    const subscription = await currentPushSubscription();
+    const result = await post("/api/push/test", subscription ? { endpoint: subscription.endpoint } : {});
+    if (epoch !== authEpoch) return;
+    if (result?.failed && !result?.sent) pushFeedback("The push service did not accept the test notification. Turn notifications off and on again.", true);
+    else pushFeedback("Test notification sent. It should arrive in a few seconds.");
+  } catch (error) {
+    if (epoch === authEpoch) pushFeedback(errorMessage(error), true);
+  } finally {
+    setPushBusy(false);
+  }
+});
+pushUi.disable.addEventListener("click", async () => {
+  const epoch = authEpoch;
+  setPushBusy(true);
+  pushFeedback();
+  try {
+    const subscription = await currentPushSubscription();
+    let confirmed = true;
+    if (subscription) {
+      try { await post("/api/push/unsubscribe", { endpoint: subscription.endpoint }); } catch { confirmed = false; }
+      // Even unconfirmed, the browser subscription is removed: the relay then gets "gone" from
+      // the push service on its next send and deletes it.
+      await subscription.unsubscribe().catch(() => {});
+    }
+    if (epoch !== authEpoch) return;
+    renderPush("off");
+    pushFeedback(confirmed ? "Notifications are off for this device." : "Notifications are off for this device. Foreman could not confirm with the relay; it stops sending after its next attempt.");
+  } catch (error) {
+    if (epoch === authEpoch) pushFeedback(errorMessage(error), true);
+  } finally {
+    setPushBusy(false);
+  }
+});
+// Removes this device's subscription on sign-out: the relay first (with the still-valid token),
+// then the browser. Bounded, and failures are ignored, so sign-out always proceeds.
+async function unsubscribeOnSignOut() {
+  if (!pushKey || !pushSupported() || !firebaseAuth?.currentUser) return;
+  const user = firebaseAuth.currentUser;
+  const work = (async () => {
+    const subscription = await currentPushSubscription();
+    if (!subscription) return;
+    try {
+      const token = await user.getIdToken();
+      await fetch("/api/push/unsubscribe", {
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+        cache: "no-store",
+        signal: AbortSignal.timeout(4000),
+      });
+    } catch { /* The browser unsubscribe below still stops delivery. */ }
+    await subscription.unsubscribe().catch(() => {});
+  })();
+  await withTimeout(work, 5000, "timeout").catch(() => {});
+}
+// A notification tapped while the app is open: the service worker posts the notification's
+// URL here, and it is routed like a deep link, without a reload (drafts and history kept).
+function openFromNotification(url) {
+  let target;
+  try { target = new URL(url, location.origin); } catch { return; }
+  if (target.origin !== location.origin || !["/", "/index.html"].includes(target.pathname)) return;
+  const key = parseDeepLinkKey(target.search);
+  if (ui.dialog.open) ui.dialog.close();
+  if (!key) {
+    if (navOpen()) closeNav();
+    if (selected) { showInbox(); recordView(null); }
+    return;
+  }
+  if (key === selected) {
+    if (navOpen()) closeNav();
+    void refreshSelected().catch(showRefreshError);
+  } else void selectSession(key);
+  // Checked against the host's next session list, like a deep link at load.
+  if (key !== "pm") deepLinkPending = key;
+}
+if ("serviceWorker" in navigator)
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (!(event.source instanceof ServiceWorker) || event.data?.type !== "foreman:open" || typeof event.data.url !== "string") return;
+    openFromNotification(event.data.url);
+  });
+document.addEventListener("visibilitychange", () => {
+  // Permission may have been changed in Android settings while Foreman was in the background.
+  if (!document.hidden && pushState !== "unsupported") void refreshPush();
 });
 ui.signIn.addEventListener("click", async () => {
   if (!firebaseAuth || !authSDK) {
@@ -1770,6 +2064,7 @@ function enterApp(user) {
   if (unknownInitialLink && !initialNoticeShown) showNotice(UNKNOWN_LINK_NOTICE);
   initialNoticeShown = true;
   poll();
+  void refreshPush();
 }
 async function boot() {
   try {
@@ -1783,6 +2078,9 @@ async function boot() {
       );
     const config = await response.json();
     authRequired = config.auth?.required !== false;
+    // Push exists only on the hosted relay (Google sign-in), never in local or open mode.
+    const vapidKey = config.push?.vapid_public_key;
+    pushKey = authRequired && config.auth?.kind !== "local" && typeof vapidKey === "string" && /^[A-Za-z0-9_-]{80,100}$/.test(vapidKey) ? vapidKey : null;
     if (!authRequired) {
       enterApp(null);
       return;

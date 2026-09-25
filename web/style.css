@@ -1094,3 +1094,19 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 
 .rail-empty p { margin: 0 0 12px; }
 .rail-empty .btn { max-width: 100%; }
+
+/* Notifications settings (rail footer). Scrolls within itself so the session list keeps room. */
+.notify-settings { margin: 0 0 .5rem; }
+.notify-settings > summary { display: flex; align-items: center; justify-content: space-between; gap: .75rem; font-weight: 600; color: var(--ink); }
+.notify-summary { font-weight: 400; color: var(--muted); }
+.notify-settings[data-state="on"] .notify-summary { color: var(--accent); }
+.notify-settings[data-state="blocked"] .notify-summary { color: var(--warning); }
+.notify-panel { max-height: min(22rem, 45dvh); overflow-y: auto; padding-bottom: .25rem; }
+.notify-panel .btn { font-size: .75rem; padding: 7px 12px; }
+.notify-kinds { border: 0; padding: 0; margin: .5rem 0; min-width: 0; }
+.notify-kinds legend { font-size: .75rem; font-weight: 600; margin-bottom: .25rem; padding: 0; }
+.notify-kinds label { display: flex; align-items: center; gap: .625rem; min-height: 44px; font-weight: 400; }
+.notify-kinds input[type="checkbox"] { display: inline-block; width: 20px; height: 20px; margin: 0; padding: 0; flex-shrink: 0; accent-color: var(--accent); }
+.notify-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .5rem; }
+#notify-feedback:empty { display: none; }
+#notify-feedback.error { color: var(--error); }
