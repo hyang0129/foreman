@@ -63,17 +63,19 @@ function parseDeepLink(search) {
   if (params.get("view") === "pm") return { view: "pm" };
   return null;
 }
-// The URL is the only record of the open conversation, so reload keeps the view.
+// The URL is the only record of the open conversation, so reload keeps the view. The PM is
+// the home view: it lives at "/" ("/?view=pm" still opens it), and every other conversation
+// sits one Back step above it.
 function viewUrl(key) {
-  return key === "pm" ? "/?view=pm" : key ? `/?session=${encodeURIComponent(key)}` : "/";
+  return key && key !== "pm" ? `/?session=${encodeURIComponent(key)}` : "/";
 }
 const initialLink = parseDeepLink(location.search);
 // "pm" is the PM sentinel, never a session key; a session link naming it is unknown.
 const unknownInitialLink = initialLink?.session === "pm" || (!initialLink && new URLSearchParams(location.search).has("session"));
-let selected = initialLink?.view === "pm" ? "pm" : initialLink?.session && initialLink.session !== "pm" ? initialLink.session : null;
+let selected = initialLink?.session && initialLink.session !== "pm" ? initialLink.session : "pm";
 // A deep-linked session opens optimistically and is checked against the host's list once.
 let deepLinkPending = selected && selected !== "pm" ? selected : null, initialNoticeShown = false;
-const UNKNOWN_LINK_NOTICE = "That conversation isn’t available on the execution host. Showing your inbox.";
+const UNKNOWN_LINK_NOTICE = "That conversation isn’t available on the execution host. Showing the project manager.";
 let sessions = [],
   detail = null,
   host = { online: false },
@@ -373,14 +375,16 @@ function setNav(open) {
   $(".conversation").inert = mobile && open;
   if (open) $("#close-nav").focus();
 }
-// History model (Android Back). The stack is at most [inbox, conversation, drawer, dialog]:
-// opening a conversation from the inbox pushes an entry, switching conversations replaces it,
+// History model (Android Back). The stack is at most [PM, conversation, drawer, dialog]:
+// opening a conversation from the PM pushes an entry, switching conversations replaces it,
 // and the drawer and the new-session dialog each push an overlay entry. Back therefore closes
-// the dialog, then the drawer, then returns to the inbox, then leaves the app. Every entry
-// carries { foreman: 1, view, overlay? } so popstate can restore the matching screen.
+// the dialog, then the drawer, then returns to the PM, then leaves the app. Every entry
+// carries { foreman: 1, view, overlay? } so popstate can restore the matching screen; the PM
+// home entry records view null.
 let ownBack = null, ownBackDone = null;
 function historyState(view, overlay) {
-  return overlay ? { foreman: 1, view: view || null, overlay } : { foreman: 1, view: view || null };
+  const home = !view || view === "pm";
+  return overlay ? { foreman: 1, view: home ? null : view, overlay } : { foreman: 1, view: home ? null : view };
 }
 // history.back() is asynchronous; later history changes wait for its popstate so they never
 // race it. The popstate of our own back is not treated as a user navigation.
@@ -398,6 +402,7 @@ function afterHistory(run) {
   else run();
 }
 function recordView(key) {
+  if (key === "pm") key = null;
   afterHistory(() => {
     const state = history.state;
     if (state?.foreman && state.overlay) {
@@ -408,7 +413,7 @@ function recordView(key) {
     }
     if (state?.foreman && state.view === (key || null)) return;
     if (!key) {
-      // Our conversation entries always sit directly above an inbox entry.
+      // Our conversation entries always sit directly above the PM home entry.
       if (state?.foreman && state.view) historyBack();
       else history.replaceState(historyState(null), "", "/");
     } else if (state?.foreman && state.view) history.replaceState(historyState(key), "", viewUrl(key));
@@ -458,13 +463,13 @@ function dropDeadOverlay(budget = 3) {
 function initHistory() {
   const url = viewUrl(selected);
   const state = history.state;
-  if (state?.foreman && (state.view || null) === selected) {
+  if (state?.foreman && (state.view || "pm") === selected) {
     // A reload or restore of an entry this app created keeps its stack; an overlay that
     // no longer exists after the reload is stepped off (see dropDeadOverlay).
     if (state.overlay) dropDeadOverlay();
     else if (location.pathname + location.search !== url) history.replaceState(historyState(selected), "", url);
-  } else if (selected) {
-    // A fresh deep link: put the inbox beneath it, so Back returns to the inbox, not out.
+  } else if (selected !== "pm") {
+    // A fresh deep link: put the PM beneath it, so Back returns to the PM, not out.
     history.replaceState(historyState(null), "", "/");
     history.pushState(historyState(selected), "", url);
   } else history.replaceState(historyState(null), "", "/");
@@ -481,18 +486,17 @@ window.addEventListener("popstate", (event) => {
   }
   // Forward into an overlay entry whose layer is gone: step back off it (same view beneath).
   if (event.state?.foreman && deadOverlay(state)) dropDeadOverlay();
-  const view = state.view || null;
+  const view = state.view || "pm";
   if (view === selected) return;
-  // Forward onto a deep link that was rejected: the same neutral inbox fallback, not the
+  // Forward onto a deep link that was rejected: the same neutral PM fallback, not the
   // conversation's error, unless the host has since listed that session.
-  if (view && state.rejected && !sessions.some((s) => s.session_key === view)) {
+  if (view !== "pm" && state.rejected && !sessions.some((s) => s.session_key === view)) {
     showInbox();
     showNotice(UNKNOWN_LINK_NOTICE);
     historyBack();
     return;
   }
-  if (view) void selectSession(view, false);
-  else showInbox();
+  void selectSession(view, false);
 });
 function parseDeepLinkKey(search) {
   const link = parseDeepLink(search);
@@ -1195,6 +1199,8 @@ async function selectSession(key, record = true) {
   ui.input.value = drafts.get(key) || "";
   autosize();
   clearError();
+  // The banner was just cleared, so the next PM read must raise a still-present error again.
+  polledPmError = null;
   showConversationLoading();
   ui.approvals.replaceChildren();
   renderRail();
@@ -1213,30 +1219,12 @@ async function selectSession(key, record = true) {
     if (epoch === selectionEpoch) showRefreshError(error);
   }
 }
-// Return to the inbox (Back from a conversation, or an unknown deep link). The history
+// Return to the PM home view (Back from a conversation, or an unknown deep link). The history
 // entry is already correct, or the caller records it.
 function showInbox() {
-  if (selected) setDraft(selected, ui.input.value);
-  selected = null;
-  deepLinkPending = null;
-  selectionEpoch++;
-  detail = null;
-  pmBusy = false;
-  pmModelReady = false;
-  messageSignature = "";
-  resetLatest();
-  approvalSignature = "";
-  conversationLoading = false;
-  ui.input.value = "";
-  autosize();
-  clearError();
-  ui.approvals.replaceChildren();
-  renderRail();
-  renderPmHost();
-  renderMessages();
-  renderHeading();
+  void selectSession("pm", false);
 }
-// The deep-linked session is not on this host: fall back to the inbox with a neutral notice.
+// The deep-linked session is not on this host: fall back to the PM with a neutral notice.
 // Its entry is marked rejected before Back leaves it, so Forward repeats this fallback.
 function rejectDeepLink() {
   const key = selected;
@@ -2339,7 +2327,7 @@ function openFromNotification(url) {
   if (ui.moveDialog.open) ui.moveDialog.close();
   if (!key) {
     if (navOpen()) closeNav();
-    if (selected) { showInbox(); recordView(null); }
+    if (selected !== "pm") { showInbox(); recordView(null); }
     return;
   }
   if (key === selected) {

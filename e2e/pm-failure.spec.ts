@@ -1,4 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
+// The app opens on the PM; tests about the rail summary start on a session instead.
+const SESSION_URL = "/?session=managed%3Aalpha";
 
 // Self-contained route mock for the PM failure UI (#37). It records every API
 // call so tests can prove which PM reads were actually made.
@@ -175,9 +177,10 @@ test("rail flags a PM failure from the summary read and clears it", async ({
   const state = await fixture(page);
   const pmRow = page.locator("#select-pm");
   const indicator = pmRow.locator(".pm-alert");
-  await page.goto("/");
+  await page.goto(SESSION_URL);
 
-  // Nothing selected: the summary is polled, and without an error there is no flag.
+  // A session is open (the PM is not selected): the summary is polled, and without an error
+  // there is no flag.
   await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(0);
   await expect(indicator).toHaveCount(0);
   await expect(pmRow).not.toHaveClass(/has-error/);
@@ -237,7 +240,7 @@ test("summary is not requested while the PM is selected", async ({ page }) => {
 // /api/host requests are one complete poll.
 test("each poll requests the PM summary exactly once", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto(SESSION_URL);
   const hosts = () => state.calls.filter((c) => c.path === "/api/host").length;
   // Start extra polls instead of waiting for the timer; a poll already in flight ignores them.
   for (let polls = 1; polls <= 4; polls++) {
@@ -262,7 +265,7 @@ for (const failure of [500, "network"] as const) {
   test(`a failed PM summary read (${failure}) leaves the UI usable and the indicator unset`, async ({ page }) => {
     const state = await fixture(page);
     state.summaryFailure = failure;
-    await page.goto("/");
+    await page.goto(SESSION_URL);
     // The failing read was really made, and more than once: polling continues after it.
     await expect.poll(() => summaryCalls(state).length).toBeGreaterThanOrEqual(1);
     const failedAt = summaryCalls(state).length;
@@ -291,7 +294,7 @@ for (const failure of [500, "network"] as const) {
 test("a known indicator survives a failed summary read", async ({ page }) => {
   const state = await fixture(page);
   state.pmError = "Project manager failed: provider outage";
-  await page.goto("/");
+  await page.goto(SESSION_URL);
   await expect(page.locator("#select-pm .pm-alert")).toHaveCount(1);
   state.summaryFailure = 500;
   const before = summaryCalls(state).length;
@@ -303,7 +306,7 @@ test("a known indicator survives a failed summary read", async ({ page }) => {
 
 test("the rail indicator appears even when the PM row has no PINNED tag", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto(SESSION_URL);
   await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(0);
   await page.locator("#select-pm .pinned").evaluate((el) => el.remove());
   state.pmError = "Project manager failed: provider outage";
