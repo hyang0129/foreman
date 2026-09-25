@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { HostBridge } from '../server/host-bridge.ts';
 import { loadMachineIdentity } from '../server/machine.ts';
 import {
-  ALREADY_INITIALIZED_MESSAGE, LocalPmStore, PmStoreError, RELAY_MEMORY_NOT_MERGED_NOTICE, RelayPmStore, createPmStore, fitImportFrame, importFrameBytes,
+  ALREADY_INITIALIZED_MESSAGE, IMPORT_REPLY_LOST_MESSAGE, LocalPmStore, PmStoreError, RELAY_MEMORY_NOT_MERGED_NOTICE, RelayPmStore, createPmStore, fitImportFrame, importFrameBytes,
   parseLogLines, readImportPayload, truncateAtLine,
 } from '../server/pm-store.ts';
 import { utf8Length } from '../shared/notify.ts';
@@ -878,4 +878,40 @@ test('#117 a machine that never used relay memory logs no relay notice in local-
   new LocalPmStore({ identity: IDENTITY, home: dir, log: (l) => logs.push(l) }).close();
   new LocalPmStore({ identity: IDENTITY, home: dir, log: (l) => logs.push(l) }).close();
   assert.ok(!logs.some((l) => l.includes('cloud relay')), logs.join('\n'));
+});
+
+test('#122: an import whose reply was lost is not later logged as "local memory not imported"', async (t) => {
+  const dir = tempHome(t);
+  seed(dir, { projects: '# Mine\n' });
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, dir, 'machine-a', { rpcTimeoutMs: 30 });
+  // The relay applies the import, but its reply is lost in transit.
+  relay.swallow = (frame) => {
+    if (frame.op !== 'memory.import') return false;
+    relay.swallow = null;
+    relay.imports.push(frame.args); relay.memory.initialized = true;
+    relay.memory.projects = { content: frame.args.projects, version: 1, updated_at: AT };
+    return true;
+  };
+  await h.connect();
+  await assert.rejects(h.store.ensureImported(), code('timeout'));
+  // The retry finds the relay initialized (by that very import).
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  const line = h.logs.find((l) => l.includes('already initialized'));
+  assert.equal(line, `foreman: ${IMPORT_REPLY_LOST_MESSAGE}`, h.logs.join('\n'));
+  assert.ok(!h.logs.some((l) => l.includes(ALREADY_INITIALIZED_MESSAGE)), 'never "local memory not imported"');
+  assert.equal(relay.imports.length, 1, 'not imported twice');
+  assert.equal(relay.memory.projects.content, '# Mine\n');
+});
+
+test('#122: a relay initialized by another machine is still logged as "local memory not imported"', async (t) => {
+  const dir = tempHome(t);
+  seed(dir, { projects: '# Mine\n' });
+  const relay = new FakeRelay();
+  relay.memory.initialized = true;
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  assert.ok(h.logs.includes(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`), h.logs.join('\n'));
+  assert.ok(!h.logs.some((l) => l.includes(IMPORT_REPLY_LOST_MESSAGE)));
 });

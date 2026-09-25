@@ -146,8 +146,14 @@ test('store too_large and other codes come back as clear tool errors with next s
   mem.failNext = new PmStoreError('unavailable', 'relay offline');
   const down = await invoke('memory_write', { doc: 'projects', content: 'x', expected_version: 0 });
   assert.equal(down.isError, true); assert.match(text(down), /unavailable/); assert.match(text(down), /Nothing was saved/);
+  // #122: not_active claims no move (this machine may never have been the PM host); stale_epoch does.
   mem.failNext = new PmStoreError('not_active', 'not the PM host');
-  assert.match(text(await invoke('log_note', { note: 'abc' })), /no longer the active PM host/);
+  const inactive = text(await invoke('log_note', { note: 'abc' }));
+  assert.match(inactive, /^not_active: .*is not the active PM host right now\. Nothing was saved/);
+  assert.doesNotMatch(inactive, /no longer|moved/);
+  mem.failNext = new PmStoreError('stale_epoch', 'stale epoch');
+  const moved = text(await invoke('log_note', { note: 'abc' }));
+  assert.match(moved, /^stale_epoch: .*no longer the active PM host \(the PM was moved\)\. Nothing was saved/);
   mem.failNext = new Error('disk exploded');
   const plain = await invoke('memory_read', {});
   assert.equal(plain.isError, true); assert.match(text(plain), /disk exploded/);

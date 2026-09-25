@@ -570,3 +570,109 @@ test('store selection: absent relay config is local; configured-but-invalid is n
   assert.match(pm.lastError!, /cloud\.json is invalid/);
   assert.equal(pm.history().filter((e) => e.role === 'user').length, 0, 'nothing was accepted');
 });
+
+// ---------------------------------------------------------------------------------------------
+// #122 diagnostics
+// ---------------------------------------------------------------------------------------------
+
+test('#122: a failed one-time import is reported as an import failure, not as "memory could not be read"', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const A = daemon(t, relay, home('machine-a', '## p\nx\n'), 'machine-a');
+  // The relay refuses the import (as the DO does for an oversized frame).
+  relay.swallow = (frame) => {
+    if (frame.op !== 'memory.import') return false;
+    queueMicrotask(() => A.sockets.at(-1)!.receive(pmRpcError(frame.id, 'too_large', 'memory.import frame is too large')));
+    return true;
+  };
+  await A.connect();
+  await until(() => A.pm.lastError !== null, 'the launch failure is reported');
+  assert.match(A.pm.lastError!, /the one-time import of this machine's PM memory into the cloud relay failed, so the PM did not start \(it is retried at the next start\): memory\.import frame is too large/);
+  assert.doesNotMatch(A.pm.lastError!, /could not be read/);
+  assert.equal(A.launches.length, 0, 'no provider started');
+  // A send retries the import and rejects with the same specific cause; nothing is dispatched.
+  await assert.rejects(A.pm.send('hello'), /one-time import of this machine's PM memory into the cloud relay failed/);
+  assert.equal(A.launches.length, 0);
+  // Once the relay accepts it, the next send imports and starts the PM.
+  relay.swallow = null;
+  await A.pm.send('hello again');
+  await until(() => A.answers().length === 1);
+  assert.equal(relay.imports.length, 1);
+});
+
+test('#122: a memory read failure after a good import keeps its own wording', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  relay.memory.initialized = true;
+  const A = daemon(t, relay, home('machine-a'), 'machine-a');
+  let gets = 0;
+  // The import's memory.get succeeds; the read that follows it is refused.
+  relay.swallow = (frame) => {
+    if (frame.op !== 'memory.get' || ++gets < 2) return false;
+    queueMicrotask(() => A.sockets.at(-1)!.receive(pmRpcError(frame.id, 'unavailable', 'PM state storage failed')));
+    return true;
+  };
+  await A.connect();
+  await until(() => A.pm.lastError !== null, 'the launch failure is reported');
+  assert.match(A.pm.lastError!, /PM memory could not be read, so the PM did not start: PM state storage failed/);
+  assert.doesNotMatch(A.pm.lastError!, /import/);
+});
+
+test('#122: the model is known before the first PM start, read from the store without starting a provider', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const previous = process.env.FOREMAN_PM_MODEL;
+  t.after(() => { if (previous === undefined) delete process.env.FOREMAN_PM_MODEL; else process.env.FOREMAN_PM_MODEL = previous; });
+  process.env.FOREMAN_PM_MODEL = 'claude-default-from-env';
+  const relay = new FakeRelay();
+  relay.memory.initialized = true; relay.memory.model = 'claude-sonnet-4-5';
+  const A = daemon(t, relay, home('machine-a'), 'machine-a', { autoStart: false });
+  // Not the PM host yet (never connected): the configured default.
+  assert.equal(await A.pm.displayModel(), 'claude-default-from-env');
+  await A.connect();
+  assert.equal(A.pm.model, undefined, 'no provider start has set it');
+  assert.equal(await A.pm.displayModel(), 'claude-sonnet-4-5');
+  assert.equal(A.launches.length, 0, 'reading the model starts no provider');
+  // Cached: a second read sends no second memory.get.
+  const gets = () => relay.frames.filter((f) => f.frame.op === 'memory.get').length;
+  const before = gets();
+  assert.equal(await A.pm.displayModel(), 'claude-sonnet-4-5');
+  assert.equal(gets(), before);
+  // With no saved model, the configured default (as the next start would pick it).
+  relay.memory.model = null;
+  const B = daemon(t, relay, home('machine-b'), 'machine-b', { autoStart: false });
+  relay.assignment = null; // B bootstraps as the PM host of a fresh relay record
+  await B.connect();
+  assert.equal(await B.pm.displayModel(), 'claude-default-from-env');
+  // After a start, the live selection.
+  await B.pm.send('hello');
+  await until(() => B.answers().length === 1);
+  assert.equal(await B.pm.displayModel(), 'claude-default-from-env');
+  assert.equal(B.launches[0]!.options.model, 'claude-default-from-env');
+});
+
+test('#122: while the relay refuses this machine by policy, sends name the refusal and when it retries', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const A = daemon(t, relay, home('machine-a'), 'machine-a');
+  const socket = A.sockets.at(-1)!;
+  socket.readyState = 3; socket.emit('close', 1008, Buffer.from('Too many machines'));
+  const retryAt = A.bridge.refusal()!.retry_at;
+  clearTimeout((A.bridge as any).reconnect);
+  const expected = new Date(retryAt).toISOString().slice(0, 16).replace('T', ' ');
+  await assert.rejects(A.pm.send('hello'), (error: Error) => {
+    assert.equal(error.message, `The cloud relay is unreachable; the PM is unavailable on this machine. The relay refused this machine: Too many machines. It retries at ${expected} UTC.`);
+    return true;
+  });
+  // An ordinary outage keeps the ordinary message.
+  const B = daemon(t, relay, home('machine-b'), 'machine-b');
+  await assert.rejects(B.pm.send('hello'), /^Error: The cloud relay is unreachable; the PM is unavailable on this machine\.$/);
+});
+
+test('#122: store selection names the bridge\'s own reason for a configured relay that did not start', () => {
+  const config = () => ({ url: 'http://relay', token: TOKEN });
+  assert.deepEqual(choosePmStore(config, false, {}, 'Relay URL must be an HTTPS origin'),
+    { mode: 'unavailable', reason: 'cloud.json is invalid (Relay URL must be an HTTPS origin); the PM is unavailable on this machine' });
+  assert.deepEqual(choosePmStore(config, false, { FOREMAN_RELAY_URL: 'http://relay', FOREMAN_HOST_TOKEN: 'short' }, 'Invalid host token'),
+    { mode: 'unavailable', reason: 'the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN) is invalid (Invalid host token); the PM is unavailable on this machine' });
+  assert.equal(choosePmStore(config, true, {}, 'ignored').mode, 'relay');
+});
