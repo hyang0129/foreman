@@ -71,13 +71,22 @@ export const SUPPORTED_WORKER_CONTRACT = deepFreeze({
 // emits these, so a snapshot declaring any of them would lose them silently.
 // `exports` declares Durable Objects without migrations; `containers` and
 // `cloudchamber` attach to Durable Object classes. Non-binding keys (name,
-// account_id, main, routes, route, triggers, build, env, vars, secrets, ...)
-// stay ignored by construction.
+// account_id, main, routes, route, triggers, build, env, ...) stay ignored by
+// construction; vars and secrets are checked against the lists below.
+// Bindings declared only under `env.<name>` are ignored with the rest of
+// `env`: neither dev nor production (deploy-cloud.mjs) deploys with --env.
 export const UNSUPPORTED_BINDING_KEYS = Object.freeze(['kv_namespaces', 'r2_buckets', 'd1_databases', 'services', 'queues', 'workflows',
   'vectorize', 'hyperdrive', 'analytics_engine_datasets', 'ai', 'ai_search', 'ai_search_namespaces', 'agent_memory', 'websearch', 'browser',
   'images', 'media', 'stream', 'version_metadata', 'send_email', 'mtls_certificates', 'dispatch_namespaces', 'pipelines', 'secrets_store_secrets',
   'artifacts', 'flagship', 'ratelimits', 'worker_loaders', 'vpc_services', 'vpc_networks', 'connect', 'tail_consumers', 'streaming_tail_consumers',
   'logfwdr', 'unsafe', 'unsafe_hello_world', 'wasm_modules', 'text_blobs', 'data_blobs', 'containers', 'cloudchamber', 'exports']);
+// The vars the dev Worker emits. Pinned vars are fixed to these values, so a
+// snapshot may omit them but may not declare a different value; FIREBASE_CONFIG
+// is taken from the snapshot. Any other var would be silently dropped.
+export const SUPPORTED_DEV_VARS = deepFreeze({ pinned: { FIREBASE_PROJECT_ID: 'foreman-hong-2026', ALLOWED_EMAIL: 'hooong.yang@gmail.com' }, fromSnapshot: ['FIREBASE_CONFIG'] });
+// The only secrets the dev Worker is given; any other required secret would be
+// missing from the preview.
+export const SUPPORTED_DEV_SECRETS = deepFreeze(['HOST_TOKEN']);
 function deepFreeze(value) {
   if (value && typeof value === 'object') { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value); }
   return value;
@@ -123,26 +132,48 @@ export function contractDivergences(base) {
       const count = migrations.filter(migration => migration?.tag === expected.tag).length;
       if (count !== 1) problems.push(`migration ${expected.tag} ${show(expected)} is ${count ? 'duplicated' : 'missing'}`);
     }
+    // Unreachable while the contract has one migration, and gated on a
+    // substring check; revisit when a second migration exists (#70).
     if (!problems.some(problem => problem.includes('migration'))) problems.push(`migrations are ordered ${show(migrations.map(entry => entry.tag))}, not ${show(contract.migrations.map(entry => entry.tag))}`);
   }
   if (base?.assets?.binding !== contract.assets.binding) problems.push(`assets binding is ${show(base?.assets?.binding)}, not ${show(contract.assets.binding)}`);
   for (const key of UNSUPPORTED_BINDING_KEYS) if (base?.[key] !== undefined) problems.push(`unsupported binding kind ${key} ${show(base[key])}`);
+  const vars = base?.vars, pinned = SUPPORTED_DEV_VARS.pinned;
+  if (!vars || typeof vars !== 'object' || Array.isArray(vars)) problems.push(`vars is ${show(vars)}, not an object`);
+  else {
+    const unknown = Object.keys(vars).filter(key => !Object.hasOwn(pinned, key) && !SUPPORTED_DEV_VARS.fromSnapshot.includes(key));
+    if (unknown.length) problems.push(`unsupported vars ${show(unknown)} (the dev Worker would not define them)`);
+    for (const [key, value] of Object.entries(pinned)) if (Object.hasOwn(vars, key) && vars[key] !== value) problems.push(`var ${key} is ${show(vars[key])}, not ${show(value)}`);
+    for (const key of SUPPORTED_DEV_VARS.fromSnapshot) if (typeof vars[key] !== 'string') problems.push(`var ${key} is ${show(vars[key])}, not a string`);
+  }
+  const secrets = base?.secrets;
+  if (secrets !== undefined) {
+    const extraKeys = Object.keys(secrets ?? {}).filter(key => key !== 'required');
+    if (!secrets || typeof secrets !== 'object' || Array.isArray(secrets)) problems.push(`secrets is ${show(secrets)}, not an object`);
+    else if (extraKeys.length) problems.push(`unsupported secrets keys ${show(extraKeys)}`);
+    const required = secrets?.required;
+    if (required !== undefined && !Array.isArray(required)) problems.push(`secrets.required is ${show(required)}, not a list`);
+    else {
+      const unknown = (required ?? []).filter(name => !SUPPORTED_DEV_SECRETS.includes(name));
+      if (unknown.length) problems.push(`unsupported required secrets ${show(unknown)} (the dev Worker would not be given them)`);
+    }
+  }
   return problems;
 }
 export function workerConfig(base) {
   const problems = contractDivergences(base);
-  if (problems.length) throw new Error(`Refusing preview: the snapshot's wrangler.jsonc diverges from the bindings the dev Worker supports, so they would be silently dropped or changed. Divergence: ${problems.join('; ')}. Dev supports exactly durable_objects.bindings ${show(SUPPORTED_WORKER_CONTRACT.durable_objects.bindings)}, migrations ${show(SUPPORTED_WORKER_CONTRACT.migrations)} and assets binding ${show(SUPPORTED_WORKER_CONTRACT.assets.binding)}, and no other binding kinds. Preview a ref that matches, or extend SUPPORTED_WORKER_CONTRACT in scripts/dev-environment.mjs first.`);
+  if (problems.length) throw new Error(`Refusing preview: the snapshot's wrangler.jsonc diverges from the bindings, vars and secrets the dev Worker supports, so they would be silently dropped or changed. Divergence: ${problems.join('; ')}. Dev supports exactly durable_objects.bindings ${show(SUPPORTED_WORKER_CONTRACT.durable_objects.bindings)}, migrations ${show(SUPPORTED_WORKER_CONTRACT.migrations)} and assets binding ${show(SUPPORTED_WORKER_CONTRACT.assets.binding)}, and no other binding kinds; vars ${show([...Object.keys(SUPPORTED_DEV_VARS.pinned), ...SUPPORTED_DEV_VARS.fromSnapshot])} with ${Object.entries(SUPPORTED_DEV_VARS.pinned).map(([key, value]) => `${key} ${show(value)}`).join(' and ')} fixed; and required secrets ${show(SUPPORTED_DEV_SECRETS)}. Preview a ref that matches, or extend SUPPORTED_WORKER_CONTRACT, SUPPORTED_DEV_VARS or SUPPORTED_DEV_SECRETS (and workerConfig) in scripts/dev-environment.mjs first.`);
   // Deliberately construct, never spread a branch's Wrangler config: no routes,
   // external DO namespaces, build hooks, environments, or production secrets.
   // Bindings and migrations come only from the supported contract.
   const contract = structuredClone(SUPPORTED_WORKER_CONTRACT);
   return {
     name: TARGET.worker, account_id: TARGET.account, main: './dev-worker.ts', compatibility_date: '2026-09-21',
-    workers_dev: true, preview_urls: false, secrets: { required: ['HOST_TOKEN'] },
+    workers_dev: true, preview_urls: false, secrets: { required: [...SUPPORTED_DEV_SECRETS] },
     assets: { directory: './web', binding: contract.assets.binding, run_worker_first: ['/api/*'] },
     durable_objects: contract.durable_objects,
     migrations: contract.migrations,
-    vars: { FIREBASE_PROJECT_ID: 'foreman-hong-2026', ALLOWED_EMAIL: 'hooong.yang@gmail.com', FIREBASE_CONFIG: base.vars.FIREBASE_CONFIG },
+    vars: { ...SUPPORTED_DEV_VARS.pinned, FIREBASE_CONFIG: base.vars.FIREBASE_CONFIG },
     observability: { enabled: true, logs: { enabled: true, invocation_logs: true }, traces: { enabled: true } },
   };
 }

@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { experimental_readRawConfig } from 'wrangler';
-import { deploy, openHome, workerConfig, contractDivergences, SUPPORTED_WORKER_CONTRACT, UNSUPPORTED_BINDING_KEYS, TARGET } from '../scripts/dev-environment.mjs';
+import { deploy, openHome, workerConfig, contractDivergences, SUPPORTED_WORKER_CONTRACT, SUPPORTED_DEV_VARS, SUPPORTED_DEV_SECRETS, UNSUPPORTED_BINDING_KEYS, TARGET } from '../scripts/dev-environment.mjs';
 // Resolve repository files against this test, not the working directory (#53).
 const repo = fileURLToPath(new URL('..', import.meta.url));
 
@@ -34,8 +34,8 @@ test('a conforming snapshot yields exactly the contract bindings and migrations'
 
 test('non-binding fields remain ignored by construction, not refused', () => {
   const base = { ...conforming(), name: 'foreman', account_id: 'production', main: 'other.ts', routes: ['production/*'], route: 'x/*', triggers: { crons: ['* * * * *'] },
-    build: { command: 'production-deploy' }, env: { production: { name: 'foreman', kv_namespaces: [{ binding: 'KV', id: 'x' }] } }, secrets: { required: ['HOST_TOKEN', 'OTHER'] },
-    compatibility_flags: ['nodejs_compat'], vars: { FIREBASE_CONFIG: 'public', ALLOWED_EMAIL: 'attacker' } };
+    build: { command: 'production-deploy' }, env: { production: { name: 'foreman', kv_namespaces: [{ binding: 'KV', id: 'x' }] } }, secrets: { required: ['HOST_TOKEN'] },
+    compatibility_flags: ['nodejs_compat'], vars: { FIREBASE_CONFIG: 'public' } };
   assert.deepEqual(contractDivergences(base), []);
   const config = workerConfig(base);
   assert.equal(config.name, TARGET.worker); assert.equal(config.account_id, TARGET.account); assert.equal(config.main, './dev-worker.ts');
@@ -63,6 +63,13 @@ const divergences = {
   'duplicated migration': [b => { b.migrations.push({ ...v1 }); }, /migration v1 .* is duplicated/],
   'renamed assets binding': [b => { b.assets.binding = 'STATIC'; }, /assets binding is "STATIC", not "ASSETS"/],
   'missing assets binding': [b => { delete b.assets; }, /assets binding is nothing, not "ASSETS"/],
+  'extra var': [b => { b.vars.FEATURE_FLAG = 'on'; }, /unsupported vars \["FEATURE_FLAG"\] \(the dev Worker would not define them\)/],
+  'retargeted pinned var': [b => { b.vars.ALLOWED_EMAIL = 'attacker'; }, /var ALLOWED_EMAIL is "attacker", not "hooong\.yang@gmail\.com"/],
+  'missing FIREBASE_CONFIG': [b => { delete b.vars.FIREBASE_CONFIG; }, /var FIREBASE_CONFIG is nothing, not a string/],
+  'missing vars': [b => { delete b.vars; }, /vars is nothing, not an object/],
+  'extra required secret': [b => { b.secrets = { required: ['HOST_TOKEN', 'STRIPE_KEY'] }; }, /unsupported required secrets \["STRIPE_KEY"\] \(the dev Worker would not be given them\)/],
+  'required secrets not a list': [b => { b.secrets = { required: 'HOST_TOKEN' }; }, /secrets\.required is "HOST_TOKEN", not a list/],
+  'extra secrets keys': [b => { b.secrets = { required: ['HOST_TOKEN'], optional: ['X'] }; }, /unsupported secrets keys \["optional"\]/],
 };
 for (const [name, [mutate, message]] of Object.entries(divergences)) test(`refuses a snapshot with a divergent contract: ${name}`, () => {
   const base = conforming(); mutate(base);
@@ -70,6 +77,7 @@ for (const [name, [mutate, message]] of Object.entries(divergences)) test(`refus
     assert.match(error.message, /^Refusing preview: the snapshot's wrangler\.jsonc diverges/);
     assert.match(error.message, message);
     assert.match(error.message, /Dev supports exactly durable_objects\.bindings \[\{"name":"RELAY","class_name":"HostRelay"\}\], migrations \[\{"tag":"v1","new_sqlite_classes":\["HostRelay"\]\}\]/);
+    assert.match(error.message, /vars \["FIREBASE_PROJECT_ID","ALLOWED_EMAIL","FIREBASE_CONFIG"\] with FIREBASE_PROJECT_ID "foreman-hong-2026" and ALLOWED_EMAIL "hooong\.yang@gmail\.com" fixed; and required secrets \["HOST_TOKEN"\]\. Preview a ref that matches, or extend .*SUPPORTED_DEV_VARS or SUPPORTED_DEV_SECRETS/);
     return true;
   });
 });
@@ -91,9 +99,9 @@ test('every Wrangler top-level config key is classified', () => {
   const ignored = ['$schema', 'env', 'name', 'account_id', 'compatibility_date', 'compatibility_flags', 'main', 'find_additional_modules', 'preserve_file_names',
     'base_dir', 'workers_dev', 'preview_urls', 'routes', 'route', 'tsconfig', 'jsx_factory', 'jsx_fragment', 'triggers', 'limits', 'rules', 'build', 'no_bundle',
     'minify', 'keep_names', 'first_party_worker', 'logpush', 'upload_source_maps', 'placement', 'observability', 'access', 'cache', 'compliance_region',
-    'python_modules', 'previews', 'define', 'vars', 'secrets', 'pages_build_output_dir', 'send_metrics', 'dependencies_instrumentation', 'dev', 'site', 'alias',
+    'python_modules', 'previews', 'define', 'pages_build_output_dir', 'send_metrics', 'dependencies_instrumentation', 'dev', 'site', 'alias',
     'keep_vars', 'addresses'];
-  const contract = Object.keys(SUPPORTED_WORKER_CONTRACT);
+  const contract = [...Object.keys(SUPPORTED_WORKER_CONTRACT), 'vars', 'secrets'];
   const unclassified = keys.filter(key => !contract.includes(key) && !UNSUPPORTED_BINDING_KEYS.includes(key) && !ignored.includes(key));
   assert.deepEqual(unclassified, []);
   for (const key of UNSUPPORTED_BINDING_KEYS) assert.ok(keys.includes(key), `${key} is a real Wrangler key`);
@@ -107,6 +115,23 @@ test('the real repository wrangler.jsonc conforms and yields the same bindings a
   assert.deepEqual(config.migrations, rawConfig.migrations);
   assert.equal(config.assets.binding, rawConfig.assets.binding);
   assert.equal(config.vars.FIREBASE_CONFIG, rawConfig.vars.FIREBASE_CONFIG);
+  // Every var and required secret the repository declares reaches the dev config.
+  assert.deepEqual(config.vars, rawConfig.vars);
+  assert.deepEqual(config.secrets, rawConfig.secrets);
+});
+
+test('the supported dev vars and secrets are immutable', () => {
+  assert.throws(() => { SUPPORTED_DEV_VARS.pinned.ALLOWED_EMAIL = 'attacker'; }, TypeError);
+  assert.throws(() => { SUPPORTED_DEV_VARS.fromSnapshot.push('OTHER'); }, TypeError);
+  assert.throws(() => { SUPPORTED_DEV_SECRETS.push('OTHER'); }, TypeError);
+});
+
+test('a snapshot may omit the pinned vars and required secrets; dev supplies them', () => {
+  const base = conforming(); delete base.secrets;
+  assert.deepEqual(contractDivergences(base), []);
+  const config = workerConfig(base);
+  assert.deepEqual(config.vars, { FIREBASE_PROJECT_ID: 'foreman-hong-2026', ALLOWED_EMAIL: 'hooong.yang@gmail.com', FIREBASE_CONFIG: 'public' });
+  assert.deepEqual(config.secrets, { required: ['HOST_TOKEN'] });
 });
 
 function fixture(t, wrangler) {
@@ -131,6 +156,14 @@ const deployCases = {
   'conforming (positive control)': base => base,
   'extra Durable Object binding': base => { base.durable_objects.bindings.push({ name: 'CACHE', class_name: 'Cache' }); return base; },
   'v2 migration': base => { base.migrations.push({ tag: 'v2', new_sqlite_classes: ['Cache'] }); return base; },
+  'extra var': base => { base.vars.FEATURE_FLAG = 'on'; return base; },
+  'extra required secret': base => { base.secrets = { required: ['HOST_TOKEN', 'STRIPE_KEY'] }; return base; },
+};
+const deployRefusals = {
+  'extra Durable Object binding': /Refusing preview.*extra or renamed Durable Object binding \{"name":"CACHE"/,
+  'v2 migration': /Refusing preview.*extra or different migration \{"tag":"v2"/,
+  'extra var': /Refusing preview.*unsupported vars \["FEATURE_FLAG"\]/,
+  'extra required secret': /Refusing preview.*unsupported required secrets \["STRIPE_KEY"\]/,
 };
 for (const [name, build] of Object.entries(deployCases)) test(`deploy checks the snapshot contract before any deployer call: ${name}`, async t => {
   const f = fixture(t, build(conforming()));
@@ -142,8 +175,7 @@ for (const [name, build] of Object.entries(deployCases)) test(`deploy checks the
     assert.equal(JSON.parse(readFileSync(join(f.home, 'deployment.json'))).commit, f.commit);
     return;
   }
-  await assert.rejects(deploy(f.home, { source: f.source, ref: f.commit }, deployer), name === 'v2 migration'
-    ? /Refusing preview.*extra or different migration \{"tag":"v2"/ : /Refusing preview.*extra or renamed Durable Object binding \{"name":"CACHE"/);
+  await assert.rejects(deploy(f.home, { source: f.source, ref: f.commit }, deployer), deployRefusals[name]);
   assert.equal(calls, 0);
   assert.deepEqual(JSON.parse(readFileSync(join(f.home, 'deployment.json'))), f.previous);
   assert.deepEqual(readdirSync(f.home).filter(n => n.startsWith('release-')), [f.old]);
