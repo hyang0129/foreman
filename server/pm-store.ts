@@ -9,14 +9,14 @@
 // pm/session.quarantine.jsonl.
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { FOREMAN_HOME } from './paths.ts';
 import { PmRpcError, type HostBridge, type PmRpcFailure } from './host-bridge.ts';
 import { utf8Length } from '../shared/notify.ts';
 import {
   MAX_LOG_ENTRY, MAX_LOG_KEPT, MAX_LOG_READ, MAX_OPEN_TURNS, MAX_PM_IMPORT_FRAME, MAX_PROJECTS_DOC, MAX_RPC_ID, MIN_LOG_ENTRY,
-  PM_DOC_NAMES, isLogText, isPmId, isPmModel, parsePmOpArgs,
+  PM_DOC_NAMES, TURN_OUTCOMES, isLogText, isPmId, isPmModel, parsePmOpArgs,
   type Doc, type LogEntry, type MachineIdentity, type PmAssignment, type PmDocName, type PmOp, type PmOpArgs, type PmOpResults,
   type PmStateStore, type TurnOutcome, type UncertainTurn,
 } from '../shared/pm-state.ts';
@@ -151,12 +151,38 @@ export type PmBridge = Pick<HostBridge, 'rpc' | 'onAssignment' | 'onConnection' 
 
 export interface RelayPmStoreOptions {
   identity: MachineIdentity;
-  /** FOREMAN_HOME to import from (default the process's). */
+  /** FOREMAN_HOME to import from, and home of `pm/turn-outbox.json` (default the process's). */
   home?: string;
   log?: Logger;
   now?: () => Date;
   /** Import automatically on activation (default true). */
   autoImport?: boolean;
+  /** #116: first retry delay after a turn.end/ack times out while connected (default 1 s), doubling up to `retryMaxMs` (default 30 s). */
+  retryBaseMs?: number;
+  retryMaxMs?: number;
+}
+
+/** #116: the host's durable record of turn updates the relay has not yet confirmed. */
+export const TURN_OUTBOX_FILE = 'turn-outbox.json';
+// Bounds of the outbox: the DO holds at most MAX_OPEN_TURNS open rows (so at most that many ends
+// matter) and caps its uncertain rows at 256 (cloud/pm-state.ts MAX_UNCERTAIN_TURNS).
+const MAX_OUTBOX_ENDS = MAX_OPEN_TURNS;
+const MAX_OUTBOX_ACKS = 256;
+
+interface TurnOutbox { ends: Map<string, TurnOutcome>; acks: Set<string> }
+
+function readTurnOutbox(file: string, log: Logger): TurnOutbox {
+  const outbox: TurnOutbox = { ends: new Map(), acks: new Set() };
+  if (!existsSync(file)) return outbox;
+  try {
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    if (!isObject(raw) || raw.version !== 1 || !Array.isArray(raw.ends) || !Array.isArray(raw.acks)) throw new Error('shape');
+    for (const end of raw.ends) if (isObject(end) && isPmId(end.turn_id) && (TURN_OUTCOMES as readonly unknown[]).includes(end.outcome)) outbox.ends.set(end.turn_id, end.outcome);
+    for (const id of raw.acks) if (isPmId(id)) outbox.acks.add(id);
+  } catch {
+    log('foreman: pm/turn-outbox.json is invalid; ignoring it (queued PM turn updates from a previous run are lost)');
+  }
+  return outbox;
 }
 
 type QueueItem =
@@ -169,6 +195,14 @@ type QueueItem =
  * `ackUncertain` queue while disconnected and flush in order once this machine is active again; a
  * `stale_epoch`/`not_active` reply, or an inactive assignment, drops the queue and the store reports
  * not active.
+ *
+ * #116: every queued end and every acknowledged uncertain turn is also written to
+ * `<home>/pm/turn-outbox.json` until the relay confirms it, so a daemon restart neither reports a
+ * turn it already reported, nor turns a pending end (e.g. the `failed` end of a begin that never
+ * dispatched) into a `restarted` uncertain entry: pending ends are listed as still open in the next
+ * hello and flushed on activation, and an uncertain turn this host already knows the outcome of, or
+ * already reported, is acknowledged without being reported again. A turn.end/ack that times out
+ * while connected is retried with capped exponential backoff.
  */
 export class RelayPmStore implements HostPmStore {
   readonly mode = 'relay' as const;
@@ -193,11 +227,23 @@ export class RelayPmStore implements HostPmStore {
   private listeners = new Set<PmAssignmentListener>();
   private unsubscribe: (() => void)[] = [];
   private closed = false;
+  private outboxFile: string;
+  private outbox: TurnOutbox;
+  private retryBaseMs: number;
+  private retryMaxMs: number;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryAttempts = 0;
 
   constructor(bridge: PmBridge, options: RelayPmStoreOptions) {
     this.bridge = bridge; this.identity = options.identity;
     this.home = options.home ?? FOREMAN_HOME; this.logger = options.log ?? defaultLog;
     this.now = options.now ?? (() => new Date()); this.autoImport = options.autoImport ?? true;
+    this.retryBaseMs = options.retryBaseMs ?? 1000; this.retryMaxMs = Math.max(this.retryBaseMs, options.retryMaxMs ?? 30_000);
+    this.outboxFile = join(this.home, 'pm', TURN_OUTBOX_FILE);
+    this.outbox = readTurnOutbox(this.outboxFile, this.logger);
+    // Ends a previous run could not deliver: still open as far as this host knows, so the next
+    // hello lists them (the DO does not mark them restarted) and activation flushes them.
+    for (const turnId of this.outbox.ends.keys()) this.open.add(turnId);
     this.connected = bridge.connected;
     this.unsubscribe.push(bridge.onConnection((connected) => this.connectionChanged(connected)));
     this.unsubscribe.push(bridge.onAssignment((assignment) => this.assignmentChanged(assignment)));
@@ -216,7 +262,7 @@ export class RelayPmStore implements HostPmStore {
   }
   openTurnIds(): string[] { return [...this.open]; }
   uncertainTurns(): UncertainTurn[] { return this.uncertain.map((turn) => ({ ...turn })); }
-  close(): void { this.closed = true; for (const off of this.unsubscribe.splice(0)) off(); this.listeners.clear(); }
+  close(): void { this.closed = true; this.clearRetry(); for (const off of this.unsubscribe.splice(0)) off(); this.listeners.clear(); }
 
   async read() {
     await this.importSettled();
@@ -251,21 +297,78 @@ export class RelayPmStore implements HostPmStore {
       if (code === 'disconnected' || code === 'timeout' || code === 'invalid_result') {
         // The DO may have recorded it: keep it listed as open and end it as failed when possible,
         // so the record is removed without ever surfacing as uncertain.
-        void this.enqueue({ kind: 'end', epoch: this.epoch, turnId, outcome: 'failed', settled: false, resolve: () => {} });
+        void this.queueEnd(turnId, 'failed');
       } else this.open.delete(turnId);
       throw error;
     }
   }
   /** Sends the outcome now, or queues it while disconnected (resolving once queued). Never rejects. */
   endTurn(turnId: string, outcome: TurnOutcome): Promise<void> {
-    return this.enqueue({ kind: 'end', epoch: this.epoch, turnId, outcome, settled: false, resolve: () => {} });
+    return this.queueEnd(turnId, outcome);
   }
+  /** Records the acknowledgement durably (synchronously, before it is sent), so a reported turn is never reported again. */
   ackUncertain(turnIds: string[]): Promise<void> {
     const ids = [...new Set(turnIds)];
     if (ids.length === 0) return Promise.resolve();
+    for (const id of ids) this.outbox.acks.add(id);
+    this.saveOutbox();
+    return this.queueAcks(ids);
+  }
+  private queueEnd(turnId: string, outcome: TurnOutcome): Promise<void> {
+    this.outbox.ends.set(turnId, outcome);
+    this.saveOutbox();
+    return this.enqueue({ kind: 'end', epoch: this.epoch, turnId, outcome, settled: false, resolve: () => {} });
+  }
+  private queueAcks(ids: string[]): Promise<void> {
     const batches: Promise<void>[] = [];
     for (let i = 0; i < ids.length; i += MAX_OPEN_TURNS) batches.push(this.enqueue({ kind: 'ack', epoch: this.epoch, turnIds: ids.slice(i, i + MAX_OPEN_TURNS), settled: false, resolve: () => {} }));
     return Promise.all(batches).then(() => {});
+  }
+  // The relay confirmed (or finally refused) this update: forget it.
+  private confirmed(item: QueueItem) {
+    const changed = item.kind === 'end' ? this.outbox.ends.delete(item.turnId) : item.turnIds.map((id) => this.outbox.acks.delete(id)).some(Boolean);
+    if (changed) this.saveOutbox();
+  }
+  // Best effort: a failed write keeps the in-memory outbox (per-process dedup still holds).
+  private saveOutbox() {
+    const ends = [...this.outbox.ends].slice(-MAX_OUTBOX_ENDS);
+    const acks = [...this.outbox.acks].slice(-MAX_OUTBOX_ACKS);
+    if (ends.length < this.outbox.ends.size) this.outbox.ends = new Map(ends);
+    if (acks.length < this.outbox.acks.size) this.outbox.acks = new Set(acks);
+    try {
+      // Nothing pending: no file (so an idle host's pm/ holds nothing new).
+      if (!ends.length && !acks.length) { rmSync(this.outboxFile, { force: true }); return; }
+      atomicWrite(this.outboxFile, JSON.stringify({ version: 1, ends: ends.map(([turn_id, outcome]) => ({ turn_id, outcome })), acks }) + '\n');
+    } catch {
+      this.logger('foreman: could not save pm/turn-outbox.json; pending PM turn updates are kept in memory only');
+    }
+  }
+  // Activation: queue every recorded update not yet queued for the current epoch (after a restart,
+  // after a move dropped the queue, or when an item queued at an older epoch will be refused).
+  private requeueOutbox() {
+    const queuedEnds = new Set<string>(), queuedAcks = new Set<string>();
+    for (const item of this.queue) {
+      if (item.epoch !== this.epoch) continue;
+      if (item.kind === 'end') queuedEnds.add(item.turnId); else for (const id of item.turnIds) queuedAcks.add(id);
+    }
+    for (const [turnId, outcome] of this.outbox.ends) {
+      if (queuedEnds.has(turnId)) continue;
+      this.open.add(turnId);
+      void this.enqueue({ kind: 'end', epoch: this.epoch, turnId, outcome, settled: false, resolve: () => {} });
+    }
+    const acks = [...this.outbox.acks].filter((id) => !queuedAcks.has(id));
+    if (acks.length) void this.queueAcks(acks);
+  }
+  private clearRetry() {
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+  }
+  // A timed-out update while still connected: retry with capped exponential backoff (one timer).
+  private scheduleRetry() {
+    if (this.closed || this.retryTimer || !this.usable()) return;
+    const delay = Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** Math.min(this.retryAttempts, 16));
+    this.retryAttempts++;
+    this.retryTimer = setTimeout(() => { this.retryTimer = null; void this.flush(); }, delay);
+    this.retryTimer.unref?.();
   }
 
   /** Imports this machine's file memory if the DO's memory is uninitialized. Once per store. */
@@ -360,29 +463,36 @@ export class RelayPmStore implements HostPmStore {
         } catch (error) {
           const code = error instanceof PmRpcError ? error.code : 'unavailable';
           if (code === 'disconnected' || code === 'timeout') {
-            // Held at the head for the next connection (turn.end/ack are idempotent in the DO).
+            // Held at the head (turn.end/ack are idempotent in the DO): retried with backoff while
+            // still connected, else on the next connection.
             for (const held of this.queue) this.settle(held);
+            this.scheduleRetry();
             return;
           }
           if (code === 'stale_epoch' || code === 'not_active') {
             if (item.epoch === this.epoch) { this.fence(); return; }
-            // Older than the current assignment: that turn was already reconciled by the DO.
+            // Older than the current assignment: that turn was already reconciled by the DO. The
+            // outbox keeps it, so the next activation resends it with the current epoch.
             this.queue.shift(); if (item.kind === 'end') this.open.delete(item.turnId); this.settle(item);
             continue;
           }
           this.queue.shift(); if (item.kind === 'end') this.open.delete(item.turnId); this.settle(item);
+          this.confirmed(item);
           this.logger(`foreman: PM turn update rejected by the relay (${code})`);
           continue;
         }
+        this.retryAttempts = 0;
         this.queue.shift();
         if (item.kind === 'end') this.open.delete(item.turnId);
         else this.uncertain = this.uncertain.filter((turn) => !item.turnIds.includes(turn.turn_id));
+        this.confirmed(item);
         this.settle(item);
       }
     } finally { this.flushing = false; }
   }
   private connectionChanged(connected: boolean) {
     if (this.closed) return;
+    this.clearRetry(); this.retryAttempts = 0; // the next connection flushes the queue
     this.connected = connected;
     this.assigned = false; this.active = false;
     if (!connected) this.uncertain = [];
@@ -394,7 +504,7 @@ export class RelayPmStore implements HostPmStore {
     this.connected = true; this.assigned = true;
     this.epoch = assignment.epoch; this.active = assignment.active; this.fenced = false;
     this.activeHost = assignment.active_machine?.host ?? null;
-    this.uncertain = assignment.active ? assignment.uncertain_turns.map((turn) => ({ ...turn })) : [];
+    this.uncertain = assignment.active ? this.unreported(assignment.uncertain_turns) : [];
     if (!assignment.active) {
       this.dropQueue(`the PM runs on ${this.activeHost ?? 'no machine'}`);
       // Turns this machine held were reconciled by the DO on reassignment.
@@ -402,11 +512,31 @@ export class RelayPmStore implements HostPmStore {
     }
     this.emit();
     if (this.usable()) {
+      this.requeueOutbox();
       void this.flush();
       if (this.autoImport && !wasActive && !this.importOutcome) {
         this.ensureImported().catch((error) => this.logger(`foreman: memory import did not complete (${(error as PmStoreError).code ?? 'error'}); it will be retried on the next activation`));
       }
     }
+  }
+  // #116: an uncertain turn this host already reported (ack recorded) or already knows the outcome
+  // of (end recorded, e.g. a begin that failed so nothing was dispatched) is not reported again: it
+  // is only acknowledged, on activation.
+  private unreported(turns: readonly UncertainTurn[]): UncertainTurn[] {
+    let changed = false;
+    const fresh: UncertainTurn[] = [];
+    for (const turn of turns) {
+      if (this.outbox.ends.has(turn.turn_id)) {
+        // turn.end removes only open rows: this one needs the ack instead.
+        this.outbox.ends.delete(turn.turn_id); this.outbox.acks.add(turn.turn_id); changed = true;
+        // A queued end for it is left in place: it removes nothing now and is harmless.
+        this.open.delete(turn.turn_id);
+      }
+      if (this.outbox.acks.has(turn.turn_id)) continue;
+      fresh.push({ ...turn });
+    }
+    if (changed) this.saveOutbox();
+    return fresh;
   }
   private call(listener: PmAssignmentListener) {
     try { listener(this.assignment(), this.uncertainTurns()); } catch { console.error('foreman: PM assignment listener failed'); }

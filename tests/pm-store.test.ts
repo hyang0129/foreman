@@ -158,7 +158,7 @@ function snapshot(dir: string) {
   });
 }
 
-function relayHost(t: test.TestContext, relay: FakeRelay, dir: string, name: string, options: { rpcTimeoutMs?: number } = {}) {
+function relayHost(t: test.TestContext, relay: FakeRelay, dir: string, name: string, options: { rpcTimeoutMs?: number; retryBaseMs?: number } = {}) {
   t.mock.method(console, 'log', () => {});
   const identity = loadMachineIdentity({ home: dir, env: { FOREMAN_MACHINE_NAME: name } });
   const logs: string[] = [];
@@ -169,7 +169,7 @@ function relayHost(t: test.TestContext, relay: FakeRelay, dir: string, name: str
     pmOpenTurns: () => store?.openTurnIds() ?? [],
     socketFactory: () => { const socket = new FakeSocket(); relay.attach(socket); sockets.push(socket); return socket as any; },
   });
-  store = new RelayPmStore(bridge, { identity, home: dir, log: (line) => logs.push(line) });
+  store = new RelayPmStore(bridge, { identity, home: dir, log: (line) => logs.push(line), retryBaseMs: options.retryBaseMs });
   bridge.start();
   t.after(() => { store!.close(); bridge.close(); });
   return {
@@ -386,6 +386,127 @@ test('a timed-out beginTurn stays in pm_open_turns until its failed end is acked
   assert.equal(relay.turns.size, 0, 'removed by the flushed end, never surfaced as uncertain');
   assert.deepEqual(h.store.openTurnIds(), []);
   assert.deepEqual(h.store.uncertainTurns(), []);
+});
+
+// ---- #116: uncertain reporting across restarts ------------------------------------------------
+
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** The daemon process dies: nothing more is flushed. */
+const kill = (h: { store: RelayPmStore; bridge: HostBridge }) => { h.store.close(); h.bridge.close(); };
+
+test('#116: an uncertain turn whose ack was lost is not reported again after a restart, and is acked then', async (t) => {
+  const relay = new FakeRelay();
+  const dir = tempHome(t);
+  const first = relayHost(t, relay, dir, 'machine-a', { rpcTimeoutMs: 30 });
+  relay.assignment = { machine_id: first.identity.machine_id, epoch: 1 };
+  relay.machines.set(first.identity.machine_id, { name: 'machine-a', socket: null });
+  relay.turns.set('turn-u', { machine_id: first.identity.machine_id, epoch: 1, accepted_at: AT, state: 'uncertain', reason: 'restarted' });
+  await first.connect();
+  assert.deepEqual(first.store.uncertainTurns().map((u) => u.turn_id), ['turn-u'], 'reported to this process');
+  relay.swallow = (frame) => frame.op === 'turn.ack_uncertain'; // the ack is lost in transit
+  await first.store.ackUncertain(['turn-u']);
+  await settle();
+  assert.equal(relay.turns.get('turn-u')?.state, 'uncertain', 'the DO never got the ack');
+  kill(first); // restart before the ack is retried
+  relay.swallow = null;
+  const before = relay.rpcs().length;
+  const second = relayHost(t, relay, dir, 'machine-a');
+  const heard: UncertainTurn[][] = [];
+  second.store.onAssignment((a, uncertain) => { if (a.active) heard.push(uncertain); });
+  await second.connect();
+  assert.equal(second.identity.machine_id, first.identity.machine_id);
+  assert.deepEqual(second.store.uncertainTurns(), [], 'not reported again after the restart');
+  assert.ok(heard.length > 0 && heard.every((list) => list.length === 0), 'no listener hears it');
+  assert.equal(relay.turns.has('turn-u'), false, 'acknowledged on activation');
+  assert.deepEqual(relay.rpcs().slice(before).filter((f) => f.op === 'turn.ack_uncertain').map((f) => f.args.turn_ids), [['turn-u']]);
+  // Once confirmed, the record is forgotten: a third run neither lists nor acks it.
+  kill(second);
+  const third = relayHost(t, relay, dir, 'machine-a');
+  await third.connect();
+  assert.equal(relay.rpcs().filter((f) => f.op === 'turn.ack_uncertain').length, 2);
+});
+
+test('#116: a begin that failed (never dispatched) and a restart before its failed end flushes yields no uncertain entry', async (t) => {
+  const relay = new FakeRelay();
+  const dir = tempHome(t);
+  const first = relayHost(t, relay, dir, 'machine-a', { rpcTimeoutMs: 30 });
+  await first.connect();
+  // The DO records the turn but its ack never arrives; the failed end is lost in transit too.
+  relay.hold = (frame) => frame.op === 'turn.begin';
+  relay.swallow = (frame) => frame.op === 'turn.end';
+  await assert.rejects(first.store.beginTurn('turn-t', AT), code('timeout'));
+  assert.equal(relay.turns.get('turn-t')?.state, 'open', 'the DO did record it');
+  kill(first); // restart before the failed end is confirmed
+  relay.hold = null; relay.held = []; relay.swallow = null;
+  const before = relay.rpcs().length;
+  const second = relayHost(t, relay, dir, 'machine-a');
+  await second.connect();
+  assert.deepEqual(relay.hellos().at(-1).pm_open_turns, ['turn-t'], 'the restarted host still lists it, so the DO does not mark it restarted');
+  assert.deepEqual(second.store.uncertainTurns(), []);
+  assert.equal(relay.turns.size, 0, 'removed by the failed end flushed on activation');
+  assert.deepEqual(relay.rpcs().slice(before).filter((f) => f.op === 'turn.end').map((f) => f.args), [{ turn_id: 'turn-t', outcome: 'failed' }]);
+  assert.deepEqual(second.store.openTurnIds(), []);
+});
+
+test('#116: a turn with a recorded outcome that the DO already marked uncertain is acknowledged, not reported', async (t) => {
+  const relay = new FakeRelay();
+  const dir = tempHome(t);
+  const first = relayHost(t, relay, dir, 'machine-a', { rpcTimeoutMs: 30 });
+  await first.connect();
+  relay.hold = (frame) => frame.op === 'turn.begin';
+  relay.swallow = (frame) => frame.op === 'turn.end';
+  await assert.rejects(first.store.beginTurn('turn-t', AT), code('timeout'));
+  kill(first);
+  relay.hold = null; relay.held = []; relay.swallow = null;
+  // Meanwhile the DO reconciled it (e.g. a hello from an older build of this daemon): uncertain.
+  const turn = relay.turns.get('turn-t')!; turn.state = 'uncertain'; turn.reason = 'restarted';
+  const before = relay.rpcs().length;
+  const second = relayHost(t, relay, dir, 'machine-a');
+  await second.connect();
+  assert.deepEqual(second.store.uncertainTurns(), [], 'never dispatched, so never reported');
+  assert.equal(relay.turns.size, 0, 'acknowledged instead');
+  assert.deepEqual(relay.rpcs().slice(before).filter((f) => f.op === 'turn.ack_uncertain').map((f) => f.args.turn_ids), [['turn-t']]);
+});
+
+test('#116: a turn.end that times out while still connected is retried with backoff, not left until the next item', async (t) => {
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, tempHome(t), 'machine-a', { rpcTimeoutMs: 30, retryBaseMs: 20 });
+  await h.connect();
+  await h.store.beginTurn('turn-1', AT);
+  let lost = 1;
+  relay.swallow = (frame) => frame.op === 'turn.end' && lost-- > 0; // only the first end is lost
+  await h.store.endTurn('turn-1', 'completed');
+  for (let i = 0; i < 100 && relay.turns.size; i++) await wait(10);
+  assert.equal(relay.turns.size, 0, 'the DO row was closed by the retry, while still connected');
+  assert.equal(h.store.assignment().connected, true);
+  assert.deepEqual(relay.rpcs().filter((f) => f.op === 'turn.end').map((f) => f.args.turn_id), ['turn-1', 'turn-1']);
+  assert.deepEqual(h.store.openTurnIds(), []);
+  await wait(100);
+  assert.equal(relay.rpcs().filter((f) => f.op === 'turn.end').length, 2, 'nothing more once confirmed');
+});
+
+test('#116: retries back off (no hot loop) and stop on disconnect and on close', async (t) => {
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, tempHome(t), 'machine-a', { rpcTimeoutMs: 20, retryBaseMs: 20 });
+  await h.connect();
+  await h.store.beginTurn('turn-1', AT);
+  relay.swallow = (frame) => frame.op === 'turn.ack_uncertain' || frame.op === 'turn.end'; // every update is lost
+  await h.store.endTurn('turn-1', 'completed');
+  await wait(400);
+  const ends = () => relay.rpcs().filter((f) => f.op === 'turn.end').length;
+  // Sends at ~0, 40, 100, 200, 380 ms (20 ms timeout + 20/40/80/160 ms backoff); a hot loop would be ~20.
+  assert.ok(ends() >= 2 && ends() <= 6, `retried with backoff (${ends()} sends)`);
+  h.drop();
+  const atDrop = ends();
+  await wait(200);
+  assert.equal(ends(), atDrop, 'no retries while disconnected');
+  await h.reconnect();
+  assert.equal(ends(), atDrop + 1, 'the reconnect flushes it once');
+  await wait(30);
+  h.store.close();
+  const atClose = ends();
+  await wait(300);
+  assert.equal(ends(), atClose, 'no retries after close');
 });
 
 test('turn.begin: a repeated begin of an open turn is acked again; a 65th open turn is unavailable (as the DO)', async (t) => {
