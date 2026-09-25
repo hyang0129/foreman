@@ -66,9 +66,17 @@ export function memoryToolError(action: string, error: unknown): ToolResult {
       return fail(`${code}: ${action} was not saved because this machine is no longer the active PM host. Nothing was saved — tell the developer the memory update did not happen.${said}`);
     case "unavailable":
       return fail(`unavailable: ${action} failed because PM memory is unreachable right now. Nothing was saved — tell the developer the memory update did not happen; try again later.${said}`);
+    case "already_initialized":
+      return fail(`already_initialized: ${action} was refused by the memory store. Nothing was saved — call memory_read and retry against the current memory.${said}`);
     case null:
-    default:
-      return fail(`${code ? `${code}: ` : ""}${action} failed in the memory store. Nothing was saved — tell the developer the memory update did not happen.${said}`);
+    default: {
+      // Host transport failures (PMM-03's `disconnected`/`timeout`/`invalid_result`) and unrecognized
+      // rejections: the request may have been applied before the answer was lost, so the outcome is
+      // unknown. Do not claim nothing was saved.
+      const raw = error !== null && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+      const label = typeof raw === "string" && /^[a-z_]{1,40}$/.test(raw) ? `${raw}: ` : "";
+      return fail(`${label}${action} failed in the memory store and may or may not have been saved. Call memory_read to check whether your change is there before retrying; if memory stays unreachable, tell the developer the update may not have happened.${said}`);
+    }
   }
 }
 
@@ -87,7 +95,8 @@ function tooLarge(doc: PmDocName, what: string, text: string): string | null {
 }
 function occurrences(haystack: string, needle: string): number {
   let n = 0;
-  for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + needle.length)) n++;
+  // Overlapping matches count, as in the stores' exactly-once check (`indexOf(old_text, at + 1)`).
+  for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + 1)) n++;
   return n;
 }
 
@@ -152,9 +161,11 @@ export function makeMemoryTools(memory: PmMemory): SdkMcpToolDefinition<any>[] {
         return ok({ saved: doc, version });
       } catch (error) {
         const code = pmErrorCode(error);
-        if (code === "invalid" || code === null) {
+        if (code === "invalid") {
           // Say plainly whether old_text was missing or not unique. Diagnose against the current doc
           // only after the store refused; the store stays the authority and nothing is retried.
+          // Only for `invalid` (a definite refusal): after an ambiguous failure (timeout, lost
+          // connection) the edit may have landed, so a changed version is not a conflict.
           try {
             const current = (await memory.read())[doc];
             if (current.version !== expected_version) return memoryToolError(`Editing ${doc}`, new PmStoreError("version_conflict", `expected version ${expected_version}, current version ${current.version}`));

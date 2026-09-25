@@ -46,8 +46,8 @@ class FakeMemory implements PmMemory {
     this.calls.push({ op: 'edit', args: [doc, oldText, newText, expectedVersion] }); this.take();
     const d = this.docs[doc];
     if (d.version !== expectedVersion) throw new PmStoreError('version_conflict', 'stale');
-    const n = d.content.split(oldText).length - 1;
-    if (n !== 1) throw new PmStoreError('invalid', 'old_text must occur exactly once');
+    const at = d.content.indexOf(oldText);
+    if (at < 0 || d.content.indexOf(oldText, at + 1) >= 0) throw new PmStoreError('invalid', 'old_text must occur exactly once');
     return this.put(doc, d.content.replace(oldText, () => newText), expectedVersion);
   }
   async log(text: string) {
@@ -151,6 +151,44 @@ test('store too_large and other codes come back as clear tool errors with next s
   mem.failNext = new Error('disk exploded');
   const plain = await invoke('memory_read', {});
   assert.equal(plain.isError, true); assert.match(text(plain), /disk exploded/);
+});
+
+test('host transport failures (PMM-03 disconnected/timeout/invalid_result) are reported as unknown outcomes, never as "nothing saved" or a conflict', async () => {
+  const mem = new FakeMemory();
+  mem.docs.projects = { content: '## a\nState: building', version: 1, updated_at: 'x' };
+  const { invoke } = fixture(mem);
+  // The relay applied the edit but the answer was lost: the store rejects with `timeout` while the version moved on.
+  const origEdit = mem.edit.bind(mem);
+  mem.edit = async (...args: Parameters<FakeMemory['edit']>) => {
+    await origEdit(...args);
+    throw Object.assign(new Error('The PM state store did not answer memory.edit within 10 s.'), { code: 'timeout' });
+  };
+  const e = await invoke('memory_edit', { doc: 'projects', old_text: 'building', new_text: 'merged', expected_version: 1 });
+  assert.equal(e.isError, true);
+  assert.match(text(e), /^timeout: /);
+  assert.match(text(e), /may or may not have been saved/);
+  assert.match(text(e), /memory_read/);
+  assert.doesNotMatch(text(e), /version_conflict|Nothing was saved/);
+  assert.equal(mem.storeCalls('edit').length, 1, 'no automatic retry');
+  for (const code of ['disconnected', 'invalid_result']) {
+    mem.failNext = Object.assign(new Error('The cloud relay connection closed.'), { code });
+    const r = await invoke('memory_write', { doc: 'preferences', content: 'x', expected_version: 0 });
+    assert.equal(r.isError, true);
+    assert.match(text(r), new RegExp(`^${code}: .*may or may not have been saved`));
+    assert.doesNotMatch(text(r), /Nothing was saved/);
+  }
+  mem.failNext = Object.assign(new Error('lost'), { code: 'timeout' });
+  assert.match(text(await invoke('log_note', { note: 'shipped it' })), /may or may not have been saved/);
+});
+
+test('memory_edit counts overlapping matches as not unique, like the stores', async () => {
+  const mem = new FakeMemory();
+  mem.docs.projects = { content: 'State: aaa', version: 1, updated_at: 'x' };
+  const { invoke } = fixture(mem);
+  const r = await invoke('memory_edit', { doc: 'projects', old_text: 'aa', new_text: 'b', expected_version: 1 });
+  assert.equal(r.isError, true);
+  assert.match(text(r), /not_unique: old_text occurs 2 times/);
+  assert.equal(mem.docs.projects.content, 'State: aaa');
 });
 
 test('memory_edit reports missing and non-unique old_text clearly and saves nothing', async () => {
