@@ -2,9 +2,10 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, writeFileSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
+import { LOCAL_API_TOKEN_NAME } from './paths.ts';
 
 export function localAuth(home: string) {
-  const path = join(home, 'local-api-token');
+  const path = join(home, LOCAL_API_TOKEN_NAME);
   let token: string;
   try {
     const stat = lstatSync(path);

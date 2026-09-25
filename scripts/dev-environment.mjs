@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Only this file chooses deployment targets. Preview source/config cannot retarget them.
-import { randomBytes, randomUUID, createHash } from 'node:crypto';
+import { randomBytes, randomUUID, createHash, webcrypto } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, lstatSync, realpathSync, renameSync, symlinkSync, openSync, closeSync, createReadStream } from 'node:fs';
 import { lstat, readdir, readlink } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
@@ -54,6 +54,21 @@ function save(path, value) {
   renameSync(temp, path);
 }
 function read(path) { owned(path); return JSON.parse(readFileSync(path, 'utf8')); }
+// The dev Worker's own Web Push VAPID key (P-256 private JWK), separate from production's:
+// generated once into the dev home, reused after, uploaded only through the secrets file.
+export async function devVapidKey(home) {
+  const path = join(home, 'vapid.json');
+  const valid = (jwk) => jwk?.kty === 'EC' && jwk.crv === 'P-256' && ['x', 'y', 'd'].every((key) => /^[A-Za-z0-9_-]{43}$/.test(jwk[key] ?? ''));
+  if (existsSync(path)) {
+    const jwk = read(path);
+    if (!valid(jwk)) throw new Error('Refusing invalid dev vapid.json');
+    return { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y, d: jwk.d };
+  }
+  const { privateKey } = await webcrypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const { kty, crv, x, y, d } = await webcrypto.subtle.exportKey('jwk', privateKey);
+  save(path, { kty, crv, x, y, d });
+  return { kty, crv, x, y, d };
+}
 export function validatePairing(pair) {
   if (pair?.environment !== marker || pair.url !== TARGET.url || !/^[a-f0-9]{64}$/.test(pair.token)) throw new Error('Refusing non-dev pairing');
   return pair;
@@ -380,7 +395,8 @@ export async function deploy(home, options, deployWorker = wrangler) {
     // Persist before upload so a partial/failed deployment can reuse its credential.
     save(pairFile, pair);
     const secret = join(home, `secrets-${randomUUID()}.json`);
-    writeFileSync(secret, JSON.stringify({ HOST_TOKEN: pair.token }), { mode: 0o600, flag: 'wx' });
+    const vapid = await devVapidKey(home);
+    writeFileSync(secret, JSON.stringify({ HOST_TOKEN: pair.token, VAPID_PRIVATE_KEY: JSON.stringify(vapid) }), { mode: 0o600, flag: 'wx' });
     try {
       await deployWorker(home, config, ['deploy', '--dry-run', '--secrets-file', secret]);
       await deployWorker(home, config, ['deploy', '--secrets-file', secret]);

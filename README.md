@@ -30,6 +30,25 @@ npm run status
 
 Restart interrupts managed sessions and active PM work. The LaunchAgent restarts automatically and holds an AC-only sleep assertion. Keep the Mac awake, network-connected, and logged in. [Execution host details](docs/EXECUTION_HOST.md).
 
+## Install on Android
+
+Foreman installs from Chrome as an app. There is no APK or Play Store listing; the installed app is the hosted web app, so every cloud deploy reaches it the next time you open it.
+
+1. Open https://foreman.hooong-yang.workers.dev in **Chrome** on the phone. Open the ⋮ menu and choose **Install app** (on some phones it's **Add to Home screen** → **Install**). Foreman appears in the launcher and opens full screen.
+2. Open Foreman and choose **Continue with Google** with the authorized account. You stay signed in until you sign out.
+3. To get notifications, open the menu (☰), tap **Notifications** at the bottom of the panel, then **Turn on notifications**, then allow them when Android asks. All kinds start on: approvals and questions, a session failed, project manager errors, and Mac offline (after it has been disconnected for over 5 minutes). Untick a kind to stop it. **Send test notification** checks delivery to this phone.
+4. Tapping an approval, question, or failed-session notification opens that conversation; a project manager error opens the project manager; Mac offline and test notifications open Foreman's home screen.
+
+Notifications carry only the kind of event, the session name, and the Mac's name (for example "Approval needed: fix-login is waiting for your approval"). Transcript text, tool input, file paths, and error details never leave the Mac in a notification; you see them after the app opens and loads them through your signed-in session.
+
+To stop notifications on this phone, open the menu (☰) → **Notifications** → **Turn off**. **Sign out** also removes this phone's subscription. You can block them from Android instead (Settings → Apps → Foreman → Notifications). If you blocked them and want them back, allow them there first; Foreman then offers **Turn on notifications** again.
+
+Everything still runs on the Mac; the phone is a remote control. When the Mac is asleep or disconnected, the app still opens but shows that your Mac is offline with the last known state: sending messages, answering approvals, and starting sessions are disabled until it reconnects, and your unsent text is kept. No session notifications arrive while the Mac is down; if the **Mac offline** kind is on, you get one "Mac offline" notification per outage, once it has been disconnected for over 5 minutes. Foreman's separate "You're offline" screen appears only when the phone itself can't reach the hosted app (no network); it keeps anything you typed and retries automatically.
+
+For QA, https://foreman-dev.hooong-yang.workers.dev (see [Cloud setup](docs/CLOUD_SETUP.md)) installs and notifies the same way as a separate app. Use it only to test a branch; it's torn down and redeployed often.
+
+Known contingency: sign-in uses a Google popup. If the popup ever fails in the installed app, the fallback is redirect sign-in through the Worker (tracked as AND-C in #43, not built).
+
 ## Developer workflow
 
 1. Open Foreman and choose **New session**. Pick Claude or Codex, a model (or provider default), a name, an existing absolute project directory, a permission mode (Native by default), and the first task. Bypass is visibly marked and requires confirmation. See [Session permissions](docs/SESSION_PERMISSIONS.md) for the native provider mappings and their limits.
@@ -44,7 +63,7 @@ The responsive inbox groups work needing your attention and shows provider, proj
 
 State lives under `~/.foreman` (override `FOREMAN_HOME`): managed snapshots/receipts, hook observations, PM history/memory, and the private cloud pairing. An exclusive service lock prevents simultaneous writers. Browser refresh restores history. Reusing a managed creation/message ID with identical input returns the existing result; different input is rejected.
 
-After daemon restart, unfinished receipts become uncertain and recovered sessions become read-only. Nothing is automatically replayed or resumed. Start a new session to continue. The legacy PM conversation has separate history and does not yet share managed message deduplication. Arbitrary takeover of a live terminal/desktop, multiple users/hosts, and background push notifications are deferred.
+After daemon restart, unfinished receipts become uncertain and recovered sessions become read-only. Nothing is automatically replayed or resumed. Start a new session to continue. The legacy PM conversation has separate history and does not yet share managed message deduplication. Arbitrary takeover of a live terminal/desktop and multiple users/hosts are deferred. Push notifications exist only on the hosted app (see [Install on Android](#install-on-android)), not at `localhost:4177`.
 
 The PM is a coordinator: specific existing document reads and memory reads only; no Bash, Glob, Grep, code, or subagent tools. Memory writes resolve parent symlinks and stay in its memory directory. It cannot directly read Foreman configuration. Managed sessions perform implementation work under their immutable launch preset and the mandatory protected-path guard.
 

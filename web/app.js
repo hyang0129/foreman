@@ -50,12 +50,29 @@ const GROUPS = [
   ["ended", "Ended"],
   ["dead", "Stopped"],
 ];
-let selected = null;
-try {
-  selected = sessionStorage.getItem("foreman:selected");
-} catch {
-  /* Storage may be unavailable in private browsing. */
+// Deep links (epic #43 contract D): /?session=<key> and /?view=pm. Plain-JS mirror of
+// parseDeepLink in shared/notify.ts; web/ is static and cannot import it.
+const SESSION_KEY_PATTERN = /^[\x21-\x7e]{1,300}$/;
+function parseDeepLink(search) {
+  if (typeof search !== "string" || search.length > 4096) return null;
+  let params;
+  try { params = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search); } catch { return null; }
+  const session = params.get("session");
+  if (session !== null && SESSION_KEY_PATTERN.test(session)) return { session };
+  if (params.get("view") === "pm") return { view: "pm" };
+  return null;
 }
+// The URL is the only record of the open conversation, so reload keeps the view.
+function viewUrl(key) {
+  return key === "pm" ? "/?view=pm" : key ? `/?session=${encodeURIComponent(key)}` : "/";
+}
+const initialLink = parseDeepLink(location.search);
+// "pm" is the PM sentinel, never a session key; a session link naming it is unknown.
+const unknownInitialLink = initialLink?.session === "pm" || (!initialLink && new URLSearchParams(location.search).has("session"));
+let selected = initialLink?.view === "pm" ? "pm" : initialLink?.session && initialLink.session !== "pm" ? initialLink.session : null;
+// A deep-linked session opens optimistically and is checked against the host's list once.
+let deepLinkPending = selected && selected !== "pm" ? selected : null, initialNoticeShown = false;
+const UNKNOWN_LINK_NOTICE = "That conversation isn’t available on your Mac. Showing your inbox.";
 let sessions = [],
   detail = null,
   host = { online: false },
@@ -81,6 +98,49 @@ let projectRows = [], projectResolution = null, projectSelection = null, project
 const projectName = (s) => s.project_name || (s.cwd || "").split("/").filter(Boolean).at(-1) || "Project unavailable";
 const drafts = new Map(),
   sendAttempts = new Map();
+// Unsent composer text per conversation, kept on this device across reloads and offline
+// round trips. Bounded, best effort, and erased on sign-out.
+const DRAFT_STORAGE = "foreman:drafts", DRAFT_LIMIT = 20, DRAFT_MAX = 60000;
+let draftTimer;
+function loadDrafts() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(DRAFT_STORAGE) || "[]");
+    if (!Array.isArray(saved)) return;
+    for (const entry of saved.slice(-DRAFT_LIMIT))
+      if (Array.isArray(entry) && typeof entry[0] === "string" && entry[0].length <= 300 && typeof entry[1] === "string" && entry[1])
+        drafts.set(entry[0], entry[1].slice(0, DRAFT_MAX));
+  } catch { /* Unreadable or unavailable storage starts with no drafts. */ }
+}
+function saveDrafts() {
+  clearTimeout(draftTimer);
+  draftTimer = undefined;
+  try {
+    const entries = [...drafts].filter(([, text]) => text.trim()).slice(-DRAFT_LIMIT)
+      .map(([key, text]) => [key, text.slice(0, DRAFT_MAX)]);
+    if (entries.length) localStorage.setItem(DRAFT_STORAGE, JSON.stringify(entries));
+    else localStorage.removeItem(DRAFT_STORAGE);
+  } catch { /* Drafts stay in memory when storage is full or unavailable. */ }
+}
+// Most recently edited last, so the oldest drafts are the ones dropped at the limit.
+function setDraft(key, text) {
+  if (!key) return;
+  drafts.delete(key);
+  if (text) drafts.set(key, text);
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(saveDrafts, 300);
+}
+function flushDrafts() {
+  if (draftTimer !== undefined) saveDrafts();
+}
+function clearDrafts() {
+  drafts.clear();
+  clearTimeout(draftTimer);
+  draftTimer = undefined;
+  try { localStorage.removeItem(DRAFT_STORAGE); } catch { /* optional */ }
+}
+loadDrafts();
+window.addEventListener("pagehide", flushDrafts);
+document.addEventListener("visibilitychange", () => { if (document.hidden) flushDrafts(); });
 const actionFeedback = new Map(), approvalFeedback = new Map();
 let conversationLoading = false, hostChecked = false, sessionsLoaded = false;
 let timelineEntries = [], nextEntryKey = 0, newMessages = false;
@@ -260,7 +320,13 @@ function revokeAccess(message) {
   sessionsLoaded = false;
   detail = null;
   host = { online: false };
-  drafts.clear();
+  clearDrafts();
+  // A PM failure seen by the previous identity is not shown to the next one.
+  polledPmError = null;
+  setPmRailError(null);
+  // Push feedback belongs to the previous identity; the state is re-read on the next sign-in.
+  pushFeedback();
+  hideNotice();
   sendAttempts.clear();
   actionFeedback.clear();
   approvalFeedback.clear();
@@ -293,6 +359,114 @@ function setNav(open) {
   $("#rail").inert = mobile && !open;
   $(".conversation").inert = mobile && open;
   if (open) $("#close-nav").focus();
+}
+// History model (Android Back). The stack is at most [inbox, conversation, drawer, dialog]:
+// opening a conversation from the inbox pushes an entry, switching conversations replaces it,
+// and the drawer and the new-session dialog each push an overlay entry. Back therefore closes
+// the dialog, then the drawer, then returns to the inbox, then leaves the app. Every entry
+// carries { foreman: 1, view, overlay? } so popstate can restore the matching screen.
+let ownBack = null, ownBackDone = null;
+function historyState(view, overlay) {
+  return overlay ? { foreman: 1, view: view || null, overlay } : { foreman: 1, view: view || null };
+}
+// history.back() is asynchronous; later history changes wait for its popstate so they never
+// race it. The popstate of our own back is not treated as a user navigation.
+function historyBack() {
+  if (ownBack) return;
+  let release;
+  const done = new Promise((resolve) => { release = resolve; });
+  const timer = setTimeout(() => ownBack?.(), 1000);
+  ownBack = () => { clearTimeout(timer); ownBack = null; ownBackDone = null; release(); };
+  ownBackDone = done;
+  history.back();
+}
+function afterHistory(run) {
+  if (ownBackDone) ownBackDone.then(run);
+  else run();
+}
+function recordView(key) {
+  afterHistory(() => {
+    const state = history.state;
+    if (state?.foreman && state.overlay) {
+      // A conversation opened from the drawer or dialog replaces neither; pop them first.
+      historyBack();
+      afterHistory(() => recordView(key));
+      return;
+    }
+    if (state?.foreman && state.view === (key || null)) return;
+    if (!key) {
+      // Our conversation entries always sit directly above an inbox entry.
+      if (state?.foreman && state.view) historyBack();
+      else history.replaceState(historyState(null), "", "/");
+    } else if (state?.foreman && state.view) history.replaceState(historyState(key), "", viewUrl(key));
+    else history.pushState(historyState(key), "", viewUrl(key));
+  });
+}
+function pushOverlay(kind, isOpen) {
+  afterHistory(() => {
+    if (!isOpen() || history.state?.overlay === kind) return;
+    history.pushState(historyState(selected, kind), "", location.href);
+  });
+}
+function popOverlay(kind) {
+  afterHistory(() => {
+    if (history.state?.foreman && history.state.overlay === kind) historyBack();
+  });
+}
+const navOpen = () => ui.app.classList.contains("nav-open");
+function openNav() {
+  setNav(true);
+  pushOverlay("nav", navOpen);
+}
+function closeNav() {
+  setNav(false);
+  popOverlay("nav");
+}
+function initHistory() {
+  const url = viewUrl(selected);
+  const state = history.state;
+  if (state?.foreman && (state.view || null) === selected) {
+    // A reload or restore of an entry this app created keeps its stack; an overlay that
+    // no longer exists after the reload is dropped from the entry.
+    if (state.overlay || location.pathname + location.search !== url) history.replaceState(historyState(selected), "", url);
+  } else if (selected) {
+    // A fresh deep link: put the inbox beneath it, so Back returns to the inbox, not out.
+    history.replaceState(historyState(null), "", "/");
+    history.pushState(historyState(selected), "", url);
+  } else history.replaceState(historyState(null), "", "/");
+}
+window.addEventListener("popstate", (event) => {
+  if (ownBack) { ownBack(); return; }
+  const state = event.state?.foreman ? event.state : historyState(parseDeepLinkKey(location.search));
+  // Back closes the top-most layer first: the dialog, then the drawer, then the conversation.
+  if (ui.dialog.open && state.overlay !== "dialog") ui.dialog.close();
+  if (navOpen() && !state.overlay) {
+    setNav(false);
+    $("#open-nav").focus({ preventScroll: true });
+  }
+  // Forward into an overlay entry whose layer is gone: keep the entry as a plain view.
+  if ((state.overlay === "nav" && !navOpen()) || (state.overlay === "dialog" && !ui.dialog.open))
+    history.replaceState(historyState(state.view), "", location.href);
+  const view = state.view || null;
+  if (view === selected) return;
+  if (view) void selectSession(view, false);
+  else showInbox();
+});
+function parseDeepLinkKey(search) {
+  const link = parseDeepLink(search);
+  return link?.view === "pm" ? "pm" : link?.session && link.session !== "pm" ? link.session : null;
+}
+let noticeTimer;
+function showNotice(text) {
+  const notice = $("#app-notice");
+  notice.textContent = text;
+  notice.hidden = false;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(hideNotice, 10000);
+}
+function hideNotice() {
+  clearTimeout(noticeTimer);
+  $("#app-notice").hidden = true;
 }
 function renderHost() {
   $("#host-dot").className = `dot ${host.online ? "online" : "offline"}`;
@@ -709,7 +883,7 @@ function renderMessages(history = [], receipts = []) {
     const previous = item.previous;
     if (!firstRender && !wasNearBottom && (!previous || textOf(previous.entry) !== textOf(item.entry))) newMessages = true;
     item.key = previous?.key || ++nextEntryKey;
-    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source]);
+    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source, item.entry.error === true]);
     const receiptSignature = JSON.stringify(item.receipt);
     item.element = previous?.contentSignature === contentSignature ? previous.element : messageNode(item.entry, item.receipt, item.key);
     if (item.element === previous?.element && previous.receiptSignature !== receiptSignature) renderMessageReceipt(item.element, item.receipt);
@@ -941,9 +1115,13 @@ function renderApprovals(approvals = []) {
     ui.timeline.scrollTop = ui.timeline.scrollHeight;
   updateLatest();
 }
-async function selectSession(key) {
-  if (selected) drafts.set(selected, ui.input.value);
+// `record` is false when the history entry already exists (Back/Forward).
+async function selectSession(key, record = true) {
+  if (selected) setDraft(selected, ui.input.value);
   selected = key;
+  deepLinkPending = null;
+  hideNotice();
+  if (record) recordView(key);
   selectionEpoch++;
   const epoch = selectionEpoch;
   detail = null;
@@ -952,11 +1130,6 @@ async function selectSession(key) {
   messageSignature = "";
   resetLatest();
   approvalSignature = "";
-  try {
-    sessionStorage.setItem("foreman:selected", key);
-  } catch {
-    /* optional */
-  }
   ui.input.value = drafts.get(key) || "";
   autosize();
   clearError();
@@ -976,6 +1149,34 @@ async function selectSession(key) {
   } catch (error) {
     if (epoch === selectionEpoch) showRefreshError(error);
   }
+}
+// Return to the inbox (Back from a conversation, or an unknown deep link). The history
+// entry is already correct, or the caller records it.
+function showInbox() {
+  if (selected) setDraft(selected, ui.input.value);
+  selected = null;
+  deepLinkPending = null;
+  selectionEpoch++;
+  detail = null;
+  pmBusy = false;
+  pmModelReady = false;
+  messageSignature = "";
+  resetLatest();
+  approvalSignature = "";
+  conversationLoading = false;
+  ui.input.value = "";
+  autosize();
+  clearError();
+  ui.approvals.replaceChildren();
+  renderRail();
+  renderMessages();
+  renderHeading();
+}
+// The deep-linked session is not on this host: fall back to the inbox with a neutral notice.
+function rejectDeepLink() {
+  showInbox();
+  recordView(null);
+  showNotice(UNKNOWN_LINK_NOTICE);
 }
 let polledPmError = null;
 async function refreshSelected() {
@@ -1034,7 +1235,10 @@ function setPmRailError(error) {
     const dot = node("span", "pm-alert-dot", "!");
     dot.setAttribute("aria-hidden", "true");
     alert.append(dot, node("span", "sr-only", "Project manager has an error"));
-    row.querySelector(".pinned").before(alert);
+    // Sit before the PINNED tag when the row has one; otherwise stay visible at the end.
+    const pinned = row.querySelector(".pinned");
+    if (pinned) pinned.before(alert);
+    else row.append(alert);
   } else if (!pmRailError) alert?.remove();
   row.classList.toggle("has-error", !!pmRailError);
   if (pmRailError) {
@@ -1072,6 +1276,11 @@ async function poll() {
       if (!authorized || epoch !== authEpoch) return;
       sessions = Array.isArray(rows) ? rows : [];
       sessionsLoaded = true;
+      if (deepLinkPending) {
+        const key = deepLinkPending;
+        deepLinkPending = null;
+        if (selected === key && !sessions.some((s) => s.session_key === key)) rejectDeepLink();
+      }
       renderRail();
       await refreshSelected().catch(showRefreshError);
       if (!selected) {
@@ -1106,7 +1315,7 @@ function autosize() {
   ui.input.style.height = `${Math.min(200, ui.input.scrollHeight)}px`;
 }
 ui.input.addEventListener("input", () => {
-  if (selected) drafts.set(selected, ui.input.value);
+  if (selected) setDraft(selected, ui.input.value);
   for (const action of ["send", "interrupt"]) {
     const feedback = actionFeedback.get(selected)?.[action];
     if (feedback?.text && !feedback.error) setActionFeedback(selected, action, "");
@@ -1145,7 +1354,7 @@ $("#composer").addEventListener("submit", async (event) => {
       });
     accepted = true;
     sendAttempts.delete(key);
-    drafts.delete(key);
+    setDraft(key, "");
     if (selected === key) {
       ui.input.value = "";
       autosize();
@@ -1431,6 +1640,7 @@ function openNew(event) {
   $("#new-policy").value = "native";
   updateNewPolicy();
   ui.dialog.showModal();
+  pushOverlay("dialog", () => ui.dialog.open);
   setLaunchMode("brief"); launchStatus("");
   void loadLauncherModels();
   void loadNewModels();
@@ -1439,6 +1649,7 @@ function openNew(event) {
 }
 ui.newButton.addEventListener("click", openNew);
 ui.dialog.addEventListener("close", () => {
+  popOverlay("dialog");
   cancelLauncher(); launcherModelRequest++;
   projectRevision++; projectPending = false; projectResolution = null; projectSelection = null;
   if (!authorized || creating) return;
@@ -1496,15 +1707,15 @@ ui.newForm.addEventListener("submit", async (event) => {
 $("#select-pm").addEventListener("click", () => { if (!pmModelLoading) pmModelLoaded = false; return selectSession("pm"); });
 ui.search.addEventListener("input", renderRail);
 $("#dismiss-error").addEventListener("click", clearError);
-$("#open-nav").addEventListener("click", () => setNav(true));
+$("#open-nav").addEventListener("click", () => openNav());
 for (const selector of ["#close-nav", "#nav-backdrop"])
   $(selector).addEventListener("click", () => {
-    setNav(false);
+    closeNav();
     $("#open-nav").focus();
   });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !ui.dialog.open && ui.app.classList.contains("nav-open")) {
-    setNav(false);
+    closeNav();
     $("#open-nav").focus();
   }
 });
@@ -1513,12 +1724,304 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("online", poll);
 ui.signOut.addEventListener("click", async () => {
+  // Capture the push subscription and token while still signed in; the server unsubscribe
+  // must be sent with the token before Firebase sign-out. It never blocks signing out.
+  const leaving = unsubscribeOnSignOut();
   revokeAccess("Sign in to open your session inbox.");
+  await leaving;
   try {
     await authSDK.signOut(firebaseAuth);
   } catch (error) {
     ui.authStatus.textContent = errorMessage(error);
   }
+});
+
+// Push notifications (epic #43 AND-05). Shown only in hosted mode when the relay has push
+// configured (/api/config `push`) and the browser supports it. Permission is requested only
+// from the "Turn on notifications" tap, never on load.
+const PUSH_KINDS = ["approval_requested", "question_asked", "session_failed", "pm_failed", "host_offline"];
+const PUSH_KINDS_STORAGE = "foreman:push-kinds";
+const PUSH_STATUS = {
+  off: "Get a notification when a session needs your approval or an answer, even with Foreman closed.",
+  blocked: "Notifications are blocked for Foreman. To allow them on Android, open Settings → Apps → Foreman → Notifications (in a browser tab: Chrome → Site settings → Notifications), then return here.",
+  on: "This device gets Foreman notifications. They name the session and what it needs, never its conversation.",
+};
+const PUSH_SUMMARY = { off: "Off", blocked: "Blocked", on: "On" };
+const pushUi = {
+  root: $("#notify-settings"),
+  summary: $("#notify-summary"),
+  status: $("#notify-status"),
+  enable: $("#notify-enable"),
+  kinds: $("#notify-kinds"),
+  actions: $("#notify-actions"),
+  test: $("#notify-test"),
+  disable: $("#notify-disable"),
+  feedback: $("#notify-feedback"),
+  toggles: [...document.querySelectorAll("#notify-kinds input[data-kinds]")],
+};
+let pushKey = null, pushBusy = false, pushState = "unsupported";
+
+function pushSupported() {
+  return window.isSecureContext && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+function base64UrlBytes(value) {
+  const text = atob(value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "="));
+  return Uint8Array.from(text, (c) => c.charCodeAt(0));
+}
+// Whether a subscription was made with the relay's current VAPID key.
+function subscriptionMatchesKey(subscription) {
+  const current = subscription?.options?.applicationServerKey;
+  if (!current || !pushKey) return false;
+  const a = new Uint8Array(current), b = base64UrlBytes(pushKey);
+  return a.length === b.length && a.every((byte, i) => byte === b[i]);
+}
+// A short, human label for the device list ("Android · Chrome"); never the user agent string.
+function deviceLabel() {
+  const ua = navigator.userAgent;
+  const platform = /Android/i.test(ua) ? "Android" : /iPhone|iPad|iPod/i.test(ua) ? "iOS" : /Macintosh|Mac OS X/i.test(ua) ? "Mac"
+    : /Windows/i.test(ua) ? "Windows" : /CrOS/i.test(ua) ? "ChromeOS" : /Linux/i.test(ua) ? "Linux" : "Device";
+  const browser = /EdgA?\//.test(ua) ? "Edge" : /SamsungBrowser\//.test(ua) ? "Samsung Internet" : /Firefox\/|FxiOS/.test(ua) ? "Firefox"
+    : /Chrome\/|CriOS/.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
+  return `${platform} · ${browser}`;
+}
+function storedPushKinds() {
+  try {
+    const kinds = JSON.parse(localStorage.getItem(PUSH_KINDS_STORAGE));
+    if (Array.isArray(kinds) && kinds.every((kind) => PUSH_KINDS.includes(kind))) return kinds;
+  } catch { /* Fall back to the defaults. */ }
+  return [...PUSH_KINDS];
+}
+function savePushKinds(kinds) {
+  try { localStorage.setItem(PUSH_KINDS_STORAGE, JSON.stringify(kinds)); } catch { /* Display only. */ }
+}
+function toggleKinds(toggle) {
+  return toggle.dataset.kinds.split(" ");
+}
+function kindsFromToggles() {
+  return PUSH_KINDS.filter((kind) => pushUi.toggles.some((toggle) => toggle.checked && toggleKinds(toggle).includes(kind)));
+}
+function showPushKinds(kinds) {
+  for (const toggle of pushUi.toggles) toggle.checked = toggleKinds(toggle).every((kind) => kinds.includes(kind));
+}
+function pushFeedback(text = "", error = false) {
+  pushUi.feedback.textContent = text;
+  pushUi.feedback.classList.toggle("error", error);
+}
+function renderPush(state) {
+  pushState = state;
+  pushUi.root.dataset.state = state;
+  // Unsupported (no push on the relay, local mode, or a browser without Push) hides the section.
+  pushUi.root.hidden = state === "unsupported";
+  if (state === "unsupported") return;
+  pushUi.summary.textContent = PUSH_SUMMARY[state];
+  pushUi.status.textContent = PUSH_STATUS[state];
+  pushUi.enable.hidden = state !== "off";
+  pushUi.kinds.hidden = pushUi.actions.hidden = state !== "on";
+}
+function setPushBusy(busy) {
+  pushBusy = busy;
+  for (const control of [pushUi.enable, pushUi.test, pushUi.disable, ...pushUi.toggles]) control.disabled = busy;
+}
+async function withTimeout(promise, ms, message) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function currentPushSubscription() {
+  const registration = await navigator.serviceWorker.getRegistration("/");
+  return registration ? registration.pushManager.getSubscription() : null;
+}
+// This device's subscription for the current VAPID key; one made with another key can never
+// be delivered to, so it is replaced.
+async function subscribeDevice() {
+  const registration = await withTimeout(navigator.serviceWorker.ready, 10000, "Foreman is still starting up. Reload and try again.");
+  let subscription = await registration.pushManager.getSubscription();
+  if (subscription && !subscriptionMatchesKey(subscription)) {
+    const stale = subscription.endpoint;
+    await subscription.unsubscribe().catch(() => {});
+    subscription = null;
+    post("/api/push/unsubscribe", { endpoint: stale }).catch(() => {});
+  }
+  return subscription || registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlBytes(pushKey) });
+}
+function postPushSubscription(subscription, kinds) {
+  return post("/api/push/subscribe", { subscription: subscription.toJSON(), device_label: deviceLabel(), kinds });
+}
+async function refreshPush() {
+  if (!pushKey || !authorized || !pushSupported()) { renderPush("unsupported"); return; }
+  if (pushBusy) return;
+  if (Notification.permission === "denied") { renderPush("blocked"); return; }
+  const epoch = authEpoch;
+  let subscription = null;
+  try { subscription = await currentPushSubscription(); } catch { /* Treated as off. */ }
+  if (epoch !== authEpoch || pushBusy) return;
+  if (!subscription || Notification.permission !== "granted") { renderPush("off"); return; }
+  if (!subscriptionMatchesKey(subscription)) {
+    // The relay's key changed since this device subscribed: resubscribe with the saved kinds.
+    setPushBusy(true);
+    try {
+      const kinds = storedPushKinds();
+      await postPushSubscription(await subscribeDevice(), kinds);
+      if (epoch !== authEpoch) return;
+    } catch (error) {
+      if (epoch === authEpoch) { renderPush("off"); pushFeedback(`Notifications need to be turned on again. ${errorMessage(error)}`, true); }
+      return;
+    } finally {
+      setPushBusy(false);
+    }
+  }
+  showPushKinds(storedPushKinds());
+  renderPush("on");
+}
+pushUi.enable.addEventListener("click", async () => {
+  if (pushBusy) return;
+  const epoch = authEpoch;
+  setPushBusy(true);
+  pushFeedback();
+  try {
+    // The only place Foreman asks for notification permission: this tap.
+    const permission = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
+    if (epoch !== authEpoch) return;
+    if (permission !== "granted") {
+      renderPush(permission === "denied" ? "blocked" : "off");
+      if (permission !== "denied") pushFeedback("Notifications were not allowed.");
+      return;
+    }
+    // Every kind is on when notifications are turned on.
+    const kinds = [...PUSH_KINDS];
+    const subscription = await subscribeDevice();
+    try {
+      await postPushSubscription(subscription, kinds);
+    } catch (error) {
+      await subscription.unsubscribe().catch(() => {});
+      throw error;
+    }
+    if (epoch !== authEpoch) return;
+    savePushKinds(kinds);
+    showPushKinds(kinds);
+    renderPush("on");
+    pushFeedback("Notifications are on for this device.");
+  } catch (error) {
+    if (epoch === authEpoch) { renderPush(Notification.permission === "denied" ? "blocked" : "off"); pushFeedback(`Could not turn on notifications. ${errorMessage(error)}`, true); }
+  } finally {
+    setPushBusy(false);
+  }
+});
+for (const toggle of pushUi.toggles)
+  toggle.addEventListener("change", async () => {
+    const previous = storedPushKinds(), kinds = kindsFromToggles(), epoch = authEpoch;
+    setPushBusy(true);
+    pushFeedback();
+    try {
+      const subscription = await currentPushSubscription();
+      if (!subscription) {
+        renderPush("off");
+        pushFeedback("This device is no longer subscribed. Turn notifications on again.", true);
+        return;
+      }
+      await postPushSubscription(subscription, kinds);
+      if (epoch !== authEpoch) return;
+      savePushKinds(kinds);
+      pushFeedback("Saved.");
+    } catch (error) {
+      if (epoch !== authEpoch) return;
+      showPushKinds(previous);
+      pushFeedback(`Could not save. ${errorMessage(error)}`, true);
+    } finally {
+      setPushBusy(false);
+    }
+  });
+pushUi.test.addEventListener("click", async () => {
+  const epoch = authEpoch;
+  setPushBusy(true);
+  pushFeedback();
+  try {
+    const subscription = await currentPushSubscription();
+    const result = await post("/api/push/test", subscription ? { endpoint: subscription.endpoint } : {});
+    if (epoch !== authEpoch) return;
+    if (result?.failed && !result?.sent) pushFeedback("The push service did not accept the test notification. Turn notifications off and on again.", true);
+    else pushFeedback("Test notification sent. It should arrive in a few seconds.");
+  } catch (error) {
+    if (epoch === authEpoch) pushFeedback(errorMessage(error), true);
+  } finally {
+    setPushBusy(false);
+  }
+});
+pushUi.disable.addEventListener("click", async () => {
+  const epoch = authEpoch;
+  setPushBusy(true);
+  pushFeedback();
+  try {
+    const subscription = await currentPushSubscription();
+    let confirmed = true;
+    if (subscription) {
+      try { await post("/api/push/unsubscribe", { endpoint: subscription.endpoint }); } catch { confirmed = false; }
+      // Even unconfirmed, the browser subscription is removed: the relay then gets "gone" from
+      // the push service on its next send and deletes it.
+      await subscription.unsubscribe().catch(() => {});
+    }
+    if (epoch !== authEpoch) return;
+    renderPush("off");
+    pushFeedback(confirmed ? "Notifications are off for this device." : "Notifications are off for this device. Foreman could not confirm with the relay; it stops sending after its next attempt.");
+  } catch (error) {
+    if (epoch === authEpoch) pushFeedback(errorMessage(error), true);
+  } finally {
+    setPushBusy(false);
+  }
+});
+// Removes this device's subscription on sign-out: the relay first (with the still-valid token),
+// then the browser. Bounded, and failures are ignored, so sign-out always proceeds.
+async function unsubscribeOnSignOut() {
+  if (!pushKey || !pushSupported() || !firebaseAuth?.currentUser) return;
+  const user = firebaseAuth.currentUser;
+  const work = (async () => {
+    const subscription = await currentPushSubscription();
+    if (!subscription) return;
+    try {
+      const token = await user.getIdToken();
+      await fetch("/api/push/unsubscribe", {
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+        cache: "no-store",
+        signal: AbortSignal.timeout(4000),
+      });
+    } catch { /* The browser unsubscribe below still stops delivery. */ }
+    await subscription.unsubscribe().catch(() => {});
+  })();
+  await withTimeout(work, 5000, "timeout").catch(() => {});
+}
+// A notification tapped while the app is open: the service worker posts the notification's
+// URL here, and it is routed like a deep link, without a reload (drafts and history kept).
+function openFromNotification(url) {
+  let target;
+  try { target = new URL(url, location.origin); } catch { return; }
+  if (target.origin !== location.origin || !["/", "/index.html"].includes(target.pathname)) return;
+  const key = parseDeepLinkKey(target.search);
+  if (ui.dialog.open) ui.dialog.close();
+  if (!key) {
+    if (navOpen()) closeNav();
+    if (selected) { showInbox(); recordView(null); }
+    return;
+  }
+  if (key === selected) {
+    if (navOpen()) closeNav();
+    void refreshSelected().catch(showRefreshError);
+  } else void selectSession(key);
+  // Checked against the host's next session list, like a deep link at load.
+  if (key !== "pm") deepLinkPending = key;
+}
+if ("serviceWorker" in navigator)
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (!(event.source instanceof ServiceWorker) || event.data?.type !== "foreman:open" || typeof event.data.url !== "string") return;
+    openFromNotification(event.data.url);
+  });
+document.addEventListener("visibilitychange", () => {
+  // Permission may have been changed in Android settings while Foreman was in the background.
+  if (!document.hidden && pushState !== "unsupported") void refreshPush();
 });
 ui.signIn.addEventListener("click", async () => {
   if (!firebaseAuth || !authSDK) {
@@ -1552,9 +2055,16 @@ function enterApp(user) {
   renderHost();
   renderRail();
   renderHeading();
+  if (selected && !ui.input.value) {
+    ui.input.value = drafts.get(selected) || "";
+    autosize();
+  }
   if (selected) showConversationLoading();
   else renderMessages();
+  if (unknownInitialLink && !initialNoticeShown) showNotice(UNKNOWN_LINK_NOTICE);
+  initialNoticeShown = true;
   poll();
+  void refreshPush();
 }
 async function boot() {
   try {
@@ -1568,6 +2078,9 @@ async function boot() {
       );
     const config = await response.json();
     authRequired = config.auth?.required !== false;
+    // Push exists only on the hosted relay (Google sign-in), never in local or open mode.
+    const vapidKey = config.push?.vapid_public_key;
+    pushKey = authRequired && config.auth?.kind !== "local" && typeof vapidKey === "string" && /^[A-Za-z0-9_-]{80,100}$/.test(vapidKey) ? vapidKey : null;
     if (!authRequired) {
       enterApp(null);
       return;
@@ -1613,7 +2126,7 @@ async function boot() {
 }
 window
   .matchMedia("(max-width: 760px)")
-  .addEventListener("change", () => setNav(false));
+  .addEventListener("change", () => closeNav());
 // Android keyboards can resize only the visual viewport. Keep the composer and
 // dialog scroll area inside it without changing browser pinch-zoom behavior.
 function fitViewport() {
@@ -1624,4 +2137,12 @@ function fitViewport() {
 window.visualViewport?.addEventListener("resize", fitViewport);
 fitViewport();
 setNav(false);
+initHistory();
 boot();
+// Installability and the offline screen. Registered after load so it never competes with
+// startup; failures (no support, insecure origin, blocked) leave the app unchanged.
+if ("serviceWorker" in navigator && window.isSecureContext) {
+  const register = () => navigator.serviceWorker.register("/sw.js", { scope: "/", updateViaCache: "none" }).catch(() => {});
+  if (document.readyState === "complete") register();
+  else window.addEventListener("load", register, { once: true });
+}

@@ -7,6 +7,8 @@ interface __BaseEnv_Env {
 	ALLOWED_EMAIL: "hooong.yang@gmail.com";
 	FIREBASE_CONFIG: "{\"projectId\":\"foreman-hong-2026\",\"appId\":\"1:1070263755050:web:3eeab9e86d9a1200c57e53\",\"storageBucket\":\"foreman-hong-2026.firebasestorage.app\",\"apiKey\":\"AIzaSyAHjakBQEEPy6GzgwUtXGwFVQ6zlxxOYEw\",\"authDomain\":\"foreman-hong-2026.firebaseapp.com\",\"messagingSenderId\":\"1070263755050\",\"measurementId\":\"G-TY5VTF8F7T\",\"projectNumber\":\"1070263755050\",\"version\":\"2\"}";
 	HOST_TOKEN: string;
+	// Optional secret (hand-added): P-256 private JWK for Web Push VAPID. Absent disables push.
+	VAPID_PRIVATE_KEY?: string;
 	RELAY: DurableObjectNamespace<import("./worker").HostRelay>;
 }
 declare namespace Cloudflare {
