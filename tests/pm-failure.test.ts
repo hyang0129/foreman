@@ -41,6 +41,18 @@ async function settle(check: () => boolean) {
   }
   assert.fail('Expected provider evidence did not arrive');
 }
+// settle's ~500ms budget is sized for in-process fakes, which answer within a few event-loop
+// turns. The real-SDK tests spawn one or two real CLI processes (a node stub) before the
+// evidence can exist, and process startup has no such bound on a loaded host: under CPU stress
+// with concurrent suites, these flows took well over a second and settle failed (#48). Wait for
+// the same evidence, bounded by the test's own declared timeout (t.signal aborts when it
+// expires) rather than by a second, much shorter budget.
+async function settleProcess(t: any, check: () => boolean) {
+  while (!check()) {
+    if (t.signal.aborted) assert.fail('Expected provider evidence did not arrive before the test timeout');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 test('authentication failure without deltas survives history, emits a diagnostic and settles the dispatched turn', async (t) => {
   const f = fixture(t, [
@@ -556,7 +568,7 @@ test('real SDK: a send-triggered resume rejected before any frame is answered on
   const cli = stubCli('reject');
   const f = realSdkPm(t, cli.path);
   f.pm.send('new input');
-  await settle(() => f.pm.history().some((e) => e.role === 'assistant'));
+  await settleProcess(t, () => f.pm.history().some((e) => e.role === 'assistant'));
   await quiet();
   assert.deepEqual(f.resumes, ['stale-session', undefined]);
   assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }, { resume: null }, { input: 'new input' }]);
@@ -570,7 +582,7 @@ test('real SDK: a resume rejected after a provider frame fails loudly without a 
   const cli = stubCli('init-then-reject');
   const f = realSdkPm(t, cli.path);
   f.pm.send('new input');
-  await settle(() => !(f.pm as any).running);
+  await settleProcess(t, () => !(f.pm as any).running);
   await quiet();
   assert.deepEqual(f.resumes, ['stale-session']);
   assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }]);
@@ -720,7 +732,7 @@ test('real SDK: an invalid resume handle before any frame quarantines, fails lou
   const cli = stubCli('invalid-handle');
   const f = realSdkPm(t, cli.path);
   f.pm.send('failed input');
-  await settle(() => !(f.pm as any).running);
+  await settleProcess(t, () => !(f.pm as any).running);
   await quiet();
   assert.deepEqual(f.resumes, ['stale-session']);
   assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }]); // the rejected CLI never read stdin
@@ -729,7 +741,7 @@ test('real SDK: an invalid resume handle before any frame quarantines, fails lou
   assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
   assert.match(quarantined()[0].reason, /Invalid resume handle: stale-session/);
   f.pm.send('explicit retry');
-  await settle(() => f.pm.history().some((e) => e.role === 'assistant'));
+  await settleProcess(t, () => f.pm.history().some((e) => e.role === 'assistant'));
   await quiet();
   assert.deepEqual(f.resumes, ['stale-session', undefined]);
   assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }, { resume: null }, { input: 'explicit retry' }]);
@@ -746,7 +758,7 @@ test('real SDK: a send-triggered restart whose resume the CLI rejects with a pre
   const cli = stubCli('reject-result');
   const f = realSdkPm(t, cli.path);
   f.pm.send('new input');
-  await settle(() => f.pm.history().some((e) => e.role === 'assistant'));
+  await settleProcess(t, () => f.pm.history().some((e) => e.role === 'assistant'));
   await quiet();
   assert.deepEqual(f.resumes, ['stale-session', undefined]);
   // Only the fresh process read the input; the rejected one never read stdin.
@@ -765,7 +777,7 @@ test('real SDK: an invalid resume handle reported as a pre-init error result qua
   const cli = stubCli('invalid-handle-result');
   const f = realSdkPm(t, cli.path);
   f.pm.send('failed input');
-  await settle(() => !(f.pm as any).running);
+  await settleProcess(t, () => !(f.pm as any).running);
   await quiet();
   assert.deepEqual(f.resumes, ['stale-session']); // no automatic fresh run
   assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }]);
@@ -775,7 +787,7 @@ test('real SDK: an invalid resume handle reported as a pre-init error result qua
   assert.equal(readFileSync(PM_SESSION_FILE, 'utf8'), '');
   assert.deepEqual(quarantined().map((r) => r.session_id), ['stale-session']);
   f.pm.send('explicit retry');
-  await settle(() => f.pm.history().some((e) => e.role === 'assistant'));
+  await settleProcess(t, () => f.pm.history().some((e) => e.role === 'assistant'));
   await quiet();
   assert.deepEqual(f.resumes, ['stale-session', undefined]);
   assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }, { resume: null }, { input: 'explicit retry' }]);
@@ -788,7 +800,7 @@ test('real SDK: a missing-conversation error result after system/init fails loud
   const cli = stubCli('init-then-reject-result');
   const f = realSdkPm(t, cli.path);
   f.pm.send('new input');
-  await settle(() => !(f.pm as any).running);
+  await settleProcess(t, () => !(f.pm as any).running);
   await quiet();
   assert.deepEqual(f.resumes, ['stale-session']);
   assert.deepEqual(cli.entries(), [{ resume: 'stale-session' }]);
