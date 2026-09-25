@@ -300,6 +300,8 @@ export async function stop(home) {
   }
   throw new Error('DEV daemon did not stop in 10 seconds; refusing forced termination or teardown');
 }
+// POSIX single-quoted shell word: fully literal, including $, ` and \.
+export function shellQuote(value) { return `'${String(value).replaceAll("'", `'\\''`)}'`; }
 export async function deploy(home, options, deployWorker = wrangler) {
   if (running(home)) throw new Error('Run npm run dev:stop before deploying; UI and daemon must use the same snapshot');
   const source = realpathSync(resolve(options.source));
@@ -310,6 +312,8 @@ export async function deploy(home, options, deployWorker = wrangler) {
   if (/^120000 /m.test(tree)) throw new Error('Preview commits containing symlinks are not supported');
   const snapshot = mkdtempSync(join(home, 'release-'));
   let committed = false;
+  const unpruned = [];
+  let listingError = null;
   try {
     const archive = join(home, `archive-${randomUUID()}.tar`);
     try {
@@ -345,13 +349,23 @@ export async function deploy(home, options, deployWorker = wrangler) {
     save(join(home, 'deployment.json'), { release: snapshot.slice(home.length + 1), commit, source, dependencies });
     committed = true;
     // Only prune after the replacement record has been atomically published.
-    for (const name of readdirSync(home)) {
+    // From here the deploy has committed, so pruning is best-effort: a refused
+    // or failed directory is reported and skipped, never a deploy failure.
+    let names = [];
+    try { names = readdirSync(home); } catch (error) { listingError = error.message; }
+    for (const name of names) {
       if (!/^release-[a-zA-Z0-9]+$/.test(name) || join(home, name) === snapshot) continue;
-      const path = join(home, name); owned(path, true);
-      rmSync(path, { recursive: true });
+      const path = join(home, name);
+      try { owned(path, true); rmSync(path, { recursive: true }); } catch (error) { unpruned.push({ path, reason: error.message }); }
     }
   } finally { if (!committed) rmSync(snapshot, { recursive: true, force: true }); }
   console.log(`DEV deployed ${commit}\n${TARGET.url}\nNext: npm run dev:start`);
+  const current = snapshot.slice(home.length + 1);
+  if (listingError) console.warn(`Warning: DEV deployed, but superseded releases were not pruned: could not list ${home} (${listingError}). Remove every release-* directory there except ${current} by hand.`);
+  if (unpruned.length) {
+    console.warn(`Warning: DEV deployed, but ${unpruned.length} superseded release director${unpruned.length === 1 ? 'y was' : 'ies were'} not pruned; the deployment no longer uses ${unpruned.length === 1 ? 'it' : 'them'}. Remove by hand:`);
+    for (const { path, reason } of unpruned) console.warn(`  ${path} (${reason})\n    rm -rf ${shellQuote(path)}`);
+  }
 }
 // A copied rotating OAuth refresh token is not an independent login: one
 // installation can invalidate the other's copy. Authenticate dev separately.

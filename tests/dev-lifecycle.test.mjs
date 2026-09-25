@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { deploy, start, stop, status, destroy, deleteDevWorker, acquireLock, running, openHome, processIdentity, TARGET } from '../scripts/dev-environment.mjs';
+import { deploy, shellQuote, start, stop, status, destroy, deleteDevWorker, acquireLock, running, openHome, processIdentity, TARGET } from '../scripts/dev-environment.mjs';
 
 const scriptPath = realpathSync('scripts/dev-environment.mjs');
 const scriptUrl = pathToFileURL(scriptPath).href;
@@ -84,9 +84,10 @@ async function injectedPort() {
   assert.notEqual(port, TARGET.port); return port;
 }
 async function captureLog(fn) {
-  const lines = [], original = console.log;
+  const lines = [], warnings = [], original = console.log, originalWarn = console.warn;
   console.log = (...args) => lines.push(args.join(' '));
-  try { const result = await fn(); return { result, output: lines.join('\n') }; } finally { console.log = original; }
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try { const result = await fn(); return { result, output: lines.join('\n'), warnings: warnings.join('\n') }; } finally { console.log = original; console.warn = originalWarn; }
 }
 const json = (path) => JSON.parse(readFileSync(path, 'utf8'));
 const writeJson = (path, value) => writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
@@ -363,9 +364,10 @@ test('upload succeeds but deployment record publication fails: no new record, sn
 
 // 4. Cleanup publication failure -----------------------------------------------
 
-// Pins KNOWN DEFECT #56 (https://github.com/hyang0129/foreman/issues/56): deploy
-// rejects after it has committed. The fix for #56 must update this test deliberately.
-test('pruning failure after the new record is published (pins known defect #56): the new record and release stand, the unsafe old release remains, and deploy rejects', async (t) => {
+// #56: once the new deployment record is published the deploy has committed, so
+// pruning superseded releases is best-effort. A refused release is reported with
+// how to remove it, pruning continues past it, and deploy resolves (CLI exit 0).
+test('pruning failure after the new record is published (#56): deploy still succeeds, reports DEV deployed, and warns naming the unsafe old release, which remains', async (t) => {
   const f = fixture(t);
   const first = await deployed(f, f.commit('first'));
   const second = f.commit('second');
@@ -373,20 +375,89 @@ test('pruning failure after the new record is published (pins known defect #56):
   const oldRelease = join(f.home, first.release);
   chmodSync(oldRelease, 0o755);
   const d = deployer();
-  let error;
-  const { output } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn).catch((e) => { error = e; }));
+  // The deploy has committed, so pruning is best-effort: deploy resolves.
+  const { output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn));
   assert.equal(d.calls.length, 2);
-  // Known defect #56: deploy reports failure even though it has committed.
-  assert.equal(error?.message, `Refusing unsafe dev path: ${oldRelease}`);
-  assert.doesNotMatch(output, /DEV deployed/);
+  assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
+  assert.match(warnings, /Warning: DEV deployed, but 1 superseded release directory was not pruned/);
+  assert.ok(warnings.includes(`${oldRelease} (Refusing unsafe dev path: ${oldRelease})`), warnings);
+  assert.ok(warnings.includes(`rm -rf '${oldRelease}'`), warnings);
   const current = json(f.deploymentFile);
   assert.equal(current.commit, second);
   assert.notEqual(current.release, first.release);
   assert.ok(statSync(join(f.home, current.release)).isDirectory(), 'the new release stands');
   assert.ok(existsSync(join(f.home, current.release, 'dev-worker.ts')));
+  assert.ok(!warnings.includes(current.release), 'the new release is never named as unpruned');
   assert.deepEqual(releases(f.home), [first.release, current.release].sort());
   assert.equal(statSync(oldRelease).mode & 0o777, 0o755, 'the refused release is untouched');
   assert.deepEqual(leftovers(f.home), []);
+});
+
+test('pruning continues past refused releases in any listing order (#56): the superseded release between them is still pruned and every refused one is reported', async (t) => {
+  const f = fixture(t);
+  const first = await deployed(f, f.commit('first'));
+  // Two more superseded releases that are not owner-only. Their names sort
+  // before and after every mkdtemp release name. Whatever order the directory
+  // listing yields, pruning that stopped at the first refusal would leave one
+  // refused release unreported (and, on a sorted listing, the real one unpruned).
+  const refused = ['release-000', 'release-zzzzzzzzzz'].map((name) => join(f.home, name));
+  for (const dir of refused) { mkdirSync(dir); writeFileSync(join(dir, 'marker'), 'old'); chmodSync(dir, 0o755); }
+  assert.deepEqual(releases(f.home), ['release-000', first.release, 'release-zzzzzzzzzz']);
+  const second = f.commit('second');
+  const d = deployer();
+  const { output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn));
+  assert.equal(d.calls.length, 2);
+  assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
+  const current = json(f.deploymentFile);
+  assert.equal(current.commit, second);
+  assert.equal(existsSync(join(f.home, first.release)), false, 'the superseded release between the refused ones was pruned');
+  assert.deepEqual(releases(f.home), ['release-000', current.release, 'release-zzzzzzzzzz'].sort());
+  assert.match(warnings, /2 superseded release directories were not pruned/);
+  for (const dir of refused) {
+    assert.ok(warnings.includes(`${dir} (Refusing unsafe dev path: ${dir})`), warnings);
+    assert.ok(warnings.includes(`rm -rf '${dir}'`), warnings);
+    assert.equal(statSync(dir).mode & 0o777, 0o755, 'the refused release is untouched');
+    assert.equal(readFileSync(join(dir, 'marker'), 'utf8'), 'old');
+  }
+  assert.ok(!warnings.includes(first.release) && !warnings.includes(current.release), warnings);
+  assert.deepEqual(leftovers(f.home), []);
+});
+
+test('a directory listing failure after the new record is published (#56) is best-effort: deploy resolves, reports DEV deployed, and warns', async (t) => {
+  const f = fixture(t);
+  const first = await deployed(f, f.commit('first'));
+  const second = f.commit('second');
+  // After the real upload, make the dev home unlistable but still writable and
+  // traversable: the record still publishes, then readdir(home) fails.
+  const d = deployer((call, home) => { if (call === 2) chmodSync(home, 0o300); });
+  let output, warnings;
+  // Always restore listability, so the fixture can clean up even if deploy rejects.
+  try { ({ output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, d.fn))); } finally { chmodSync(f.home, 0o700); }
+  assert.equal(d.calls.length, 2);
+  assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
+  const current = json(f.deploymentFile);
+  assert.equal(current.commit, second);
+  assert.ok(existsSync(join(f.home, current.release, 'dev-worker.ts')), 'the new release stands');
+  assert.match(warnings, /superseded releases were not pruned: could not list .*EACCES/);
+  assert.ok(warnings.includes(`except ${current.release} by hand`), warnings);
+  assert.deepEqual(releases(f.home), [first.release, current.release].sort(), 'the superseded release remains');
+  assert.deepEqual(leftovers(f.home), []);
+});
+
+test('shellQuote makes a path a single literal shell word', () => {
+  for (const path of ["/tmp/it's here/release-a", '/tmp/$HOME `id` \\n "q"/release-b', '/plain/release-c']) {
+    assert.equal(execFileSync('sh', ['-c', `printf %s ${shellQuote(path)}`], { encoding: 'utf8' }), path);
+  }
+});
+
+test('a clean prune prints no warning', async (t) => {
+  const f = fixture(t);
+  await deployed(f, f.commit('first'));
+  const second = f.commit('second');
+  const { output, warnings } = await captureLog(() => deploy(f.home, { source: f.source, ref: second }, deployer().fn));
+  assert.match(output, new RegExp(`^DEV deployed ${second}$`, 'm'));
+  assert.equal(warnings, '');
+  assert.deepEqual(releases(f.home), [json(f.deploymentFile).release]);
 });
 
 // 5. Teardown ------------------------------------------------------------------
