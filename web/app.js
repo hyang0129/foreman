@@ -1953,17 +1953,28 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) poll();
 });
 window.addEventListener("online", poll);
-ui.signOut.addEventListener("click", async () => {
+// The sign-out still in progress (the push unsubscribe wait, then Firebase sign-out), if any.
+// Sign-in waits for it: a sign-in completed during the wait would otherwise be undone by the
+// Firebase sign-out that follows.
+let signingOut = null;
+ui.signOut.addEventListener("click", () => {
+  if (signingOut) return;
   // Capture the push subscription and token while still signed in; the server unsubscribe
   // must be sent with the token before Firebase sign-out. It never blocks signing out.
   const leaving = unsubscribeOnSignOut();
   revokeAccess("Sign in to open your session inbox.");
-  await leaving;
-  try {
-    await authSDK.signOut(firebaseAuth);
-  } catch (error) {
-    ui.authStatus.textContent = errorMessage(error);
-  }
+  ui.signIn.disabled = true;
+  signingOut = (async () => {
+    await leaving;
+    try {
+      await authSDK.signOut(firebaseAuth);
+    } catch (error) {
+      ui.authStatus.textContent = errorMessage(error);
+    }
+  })().finally(() => {
+    signingOut = null;
+    ui.signIn.disabled = false;
+  });
 });
 
 // Push notifications (epic #43 AND-05). Shown only in hosted mode when the relay has push
@@ -1977,6 +1988,9 @@ const PUSH_STATUS = {
   on: "This device gets Foreman notifications. They name the session and what it needs, never its conversation.",
 };
 const PUSH_SUMMARY = { off: "Off", blocked: "Blocked", on: "On" };
+// On, but every kind unticked: the subscription stays, and nothing can fire until one is ticked.
+const PUSH_NONE_SUMMARY = "On — all notification types are off";
+const PUSH_NONE_STATUS = "This device is subscribed, but every notification type is turned off, so Foreman sends nothing. Tick a type below to get notifications again.";
 const pushUi = {
   root: $("#notify-settings"),
   summary: $("#notify-summary"),
@@ -2043,8 +2057,9 @@ function renderPush(state) {
   // Unsupported (no push on the relay, local mode, or a browser without Push) hides the section.
   pushUi.root.hidden = state === "unsupported";
   if (state === "unsupported") return;
-  pushUi.summary.textContent = PUSH_SUMMARY[state];
-  pushUi.status.textContent = PUSH_STATUS[state];
+  const none = state === "on" && kindsFromToggles().length === 0;
+  pushUi.summary.textContent = none ? PUSH_NONE_SUMMARY : PUSH_SUMMARY[state];
+  pushUi.status.textContent = none ? PUSH_NONE_STATUS : PUSH_STATUS[state];
   pushUi.enable.hidden = state !== "off";
   pushUi.kinds.hidden = pushUi.actions.hidden = state !== "on";
 }
@@ -2155,10 +2170,12 @@ for (const toggle of pushUi.toggles)
       await postPushSubscription(subscription, kinds);
       if (epoch !== authEpoch) return;
       savePushKinds(kinds);
+      renderPush("on");
       pushFeedback("Saved.");
     } catch (error) {
       if (epoch !== authEpoch) return;
       showPushKinds(previous);
+      renderPush("on");
       pushFeedback(`Could not save. ${errorMessage(error)}`, true);
     } finally {
       setPushBusy(false);
@@ -2255,6 +2272,12 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && pushState !== "unsupported") void refreshPush();
 });
 ui.signIn.addEventListener("click", async () => {
+  // The button is disabled while a sign-out is pending; a click that slips in as it finishes
+  // (the auth state change re-enables the button first) waits for it.
+  if (signingOut) {
+    ui.signIn.disabled = true;
+    await signingOut;
+  }
   if (!firebaseAuth || !authSDK) {
     location.reload();
     return;

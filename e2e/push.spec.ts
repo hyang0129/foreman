@@ -41,7 +41,7 @@ const managed = {
 const second = { ...managed, session_key: "managed:beta", session_id: "native-beta", name: "Write docs", state: "idle" };
 
 type Call = { path: string; body: any; authorization: string | undefined };
-type Options = { push?: any; auth?: any; unsubscribeFails?: boolean; testStatus?: number };
+type Options = { push?: any; auth?: any; unsubscribeFails?: boolean; testStatus?: number; holdUnsubscribe?: Promise<void> };
 
 async function fixture(page: Page, options: Options = {}) {
   const state = { calls: [] as Call[], events: [] as string[] };
@@ -65,6 +65,7 @@ async function fixture(page: Page, options: Options = {}) {
     else if (path === "/api/push/subscribe") result = { ok: true, id: "sub-1" };
     else if (path === "/api/push/unsubscribe") {
       state.events.push("unsubscribe");
+      await options.holdUnsubscribe;
       if (options.unsubscribeFails) { await route.abort("failed"); return; }
       result = { ok: true, removed: true };
     } else if (path === "/api/push/test") {
@@ -83,7 +84,7 @@ async function fixture(page: Page, options: Options = {}) {
     export const getAuth = () => ({currentUser:user});
     export const onAuthStateChanged = (auth,fn) => { callback=fn; queueMicrotask(()=>fn(auth.currentUser)); };
     export class GoogleAuthProvider { setCustomParameters() {} }
-    export const signInWithPopup = async (auth) => { auth.currentUser = user; return { user }; };
+    export const signInWithPopup = async (auth) => { await window.__recordEvent('signIn'); auth.currentUser = user; return { user }; };
     export const signOut = async auth => { await window.__recordEvent('signOut'); auth.currentUser=null; callback(null); };
   ` }));
   return state;
@@ -261,6 +262,35 @@ test.describe("notification settings", () => {
     await expect(page.getByLabel("A session failed")).toBeChecked();
   });
 
+  test("unticking every kind says nothing can fire, and ticking one restores On", async ({ page, context }) => {
+    await stubPush(page, context);
+    const state = await fixture(page);
+    await page.goto("/");
+    await signedIn(page);
+    await enable(page, state);
+    await expect(page.locator("#notify-status")).toHaveText(/^This device gets Foreman notifications/);
+    const labels = ["Approvals and questions", "A session failed", "Project manager errors", "Mac offline"];
+    for (const [index, name] of labels.entries()) {
+      await page.getByLabel(name).tap();
+      await expect.poll(() => pushCalls(state, "/api/push/subscribe").length).toBe(index + 2);
+      await expect(page.locator("#notify-feedback")).toHaveText("Saved.");
+      // Still "On" while any kind is ticked.
+      if (index < labels.length - 1) await expect(page.locator("#notify-summary")).toHaveText("On");
+    }
+    expect(pushCalls(state, "/api/push/subscribe").at(-1)!.body.kinds).toEqual([]);
+    await expect(page.locator("#notify-summary")).toHaveText("On — all notification types are off");
+    await expect(page.locator("#notify-status")).toHaveText(/every notification type is turned off, so Foreman sends nothing/);
+    // Read back the same way after a reload.
+    await page.reload();
+    await signedIn(page);
+    await openSettings(page);
+    await expect(page.locator("#notify-summary")).toHaveText("On — all notification types are off");
+    await page.getByLabel("Mac offline").tap();
+    await expect(page.locator("#notify-feedback")).toHaveText("Saved.");
+    await expect(page.locator("#notify-summary")).toHaveText("On");
+    await expect(page.locator("#notify-status")).toHaveText(/^This device gets Foreman notifications/);
+  });
+
   test("Send test notification calls /api/push/test for this device and shows errors", async ({ page, context }) => {
     await stubPush(page, context);
     const state = await fixture(page, { testStatus: 429 });
@@ -350,6 +380,35 @@ test.describe("sign-out", () => {
     expect(await pushLog(page)).toMatchObject({ unsubscribed: [endpoint], endpoint: null });
   });
 
+  test("sign-in waits for a pending sign-out instead of being undone by it", async ({ page, context }) => {
+    await stubPush(page, context);
+    let release!: () => void;
+    const state = await fixture(page, { holdUnsubscribe: new Promise<void>((resolve) => { release = resolve; }) });
+    await page.goto("/");
+    await signedIn(page);
+    await enable(page, state);
+    state.events.length = 0;
+    await page.getByRole("button", { name: "Sign out" }).tap();
+    await expect(page.locator("#app")).toBeHidden();
+    // The relay unsubscribe is held, so Firebase sign-out is still pending.
+    await expect.poll(() => state.events).toEqual(["unsubscribe"]);
+    const signIn = page.getByRole("button", { name: "Continue with Google" });
+    await expect(signIn).toBeVisible();
+    await expect(signIn).toBeDisabled();
+    // A tap now waits (Playwright waits for the button to be enabled); nothing signs in yet.
+    const tapped = signIn.tap();
+    await page.waitForTimeout(500);
+    expect(state.events).toEqual(["unsubscribe"]);
+    release();
+    await tapped;
+    await expect.poll(() => state.events).toEqual(["unsubscribe", "signOut", "signIn"]);
+    await signedIn(page);
+    // Still signed in: no sign-out landed after the sign-in.
+    await page.waitForTimeout(500);
+    await expect(page.locator("#app")).toBeVisible();
+    expect(state.events).toEqual(["unsubscribe", "signOut", "signIn"]);
+  });
+
   test("a failing unsubscribe does not block sign-out", async ({ page, context }) => {
     await stubPush(page, context);
     const state = await fixture(page, { unsubscribeFails: true });
@@ -409,10 +468,10 @@ async function deliver(page: Page, data: string) {
   await expect.poll(() => sw.evaluate(() => (self as any).__pushWork.length), { message: "the push event reached the worker" }).toBe(before + 1);
   expect(await sw.evaluate((index) => (self as any).__pushWork[index], before)).toBe("shown");
 }
-type Shown = { title: string; body: string; tag: string; url: unknown; icon: string; renotify: boolean; data: unknown };
+type Shown = { title: string; body: string; tag: string; url: unknown; icon: string; badge: string; renotify: boolean; data: unknown };
 const shown = (page: Page) => page.evaluate(async () => {
   const registration = await navigator.serviceWorker.ready;
-  return (await registration.getNotifications()).map((n) => ({ title: n.title, body: n.body, tag: n.tag, url: n.data?.url, icon: n.icon, renotify: (n as any).renotify, data: n.data }));
+  return (await registration.getNotifications()).map((n) => ({ title: n.title, body: n.body, tag: n.tag, url: n.data?.url, icon: n.icon, badge: n.badge, renotify: (n as any).renotify, data: n.data }));
 }) as Promise<Shown[]>;
 function payload(overrides: Record<string, unknown> = {}) {
   return {
@@ -438,6 +497,8 @@ test.describe("service worker push", () => {
     const [note] = await shown(page);
     expect(note).toMatchObject({ title: "Approval needed", body: "Fix sign-in is waiting for your approval", tag: "session:managed:alpha", url: "/?session=managed%3Aalpha", renotify: true });
     expect(note.icon).toBe(`${ORIGIN}/icons/icon-192.png`);
+    // The monochrome status-bar badge (its image is checked in pwa.spec.ts).
+    expect(note.badge).toBe(`${ORIGIN}/icons/badge-96.png`);
     expect(note.data).toEqual({ url: "/?session=managed%3Aalpha" });
     expect(JSON.stringify(note)).not.toMatch(/SECRET|rm -rf|Dev Mac/);
   });
@@ -472,7 +533,7 @@ test.describe("service worker push", () => {
       await worker(page);
       await deliver(page, data);
       await expect.poll(() => shown(page)).toHaveLength(1);
-      expect((await shown(page))[0]).toMatchObject({ ...GENERIC, data: { url: "/" } });
+      expect((await shown(page))[0]).toMatchObject({ ...GENERIC, badge: `${ORIGIN}/icons/badge-96.png`, data: { url: "/" } });
     });
 });
 
@@ -542,6 +603,37 @@ test.describe("notification click", () => {
     await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on your Mac. Showing your inbox.");
     await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
     await expect.poll(() => page.url()).toBe(`${ORIGIN}/`);
+  });
+
+  test("a window showing the offline screen loads the notification's URL", async ({ page, context }) => {
+    await fixture(page);
+    await page.goto("/");
+    await signedIn(page);
+    const sw = await worker(page);
+    await deliver(page, JSON.stringify(payload()));
+    await expect.poll(() => shown(page)).toHaveLength(1);
+    await context.setOffline(true);
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "You’re offline" })).toBeVisible();
+    expect(page.url()).toBe(`${ORIGIN}/`);
+    // Only a relative same-origin app URL is followed, whatever posts it.
+    await page.evaluate(() => { (window as any).__offlineDocument = true; });
+    for (const url of ["https://evil.example/?session=managed%3Aalpha", "//evil.example/", "javascript:alert(1)", "/elsewhere.html", 42])
+      await sw.evaluate(async (url) => {
+        for (const client of await (self as any).clients.matchAll({ type: "window" })) client.postMessage({ type: "foreman:open", url });
+      }, url);
+    await page.waitForTimeout(300);
+    expect(page.url()).toBe(`${ORIGIN}/`);
+    expect(await page.evaluate(() => (window as any).__offlineDocument)).toBe(true);
+
+    await click(sw, "session:managed:alpha");
+    // Still offline, so the navigation shows the offline screen again, now at the target URL.
+    await expect(page).toHaveURL(`${ORIGIN}/?session=managed%3Aalpha`);
+    await expect(page.getByRole("heading", { name: "You’re offline" })).toBeVisible();
+    // Back online, the screen retries that URL and the app opens the session.
+    await context.setOffline(false);
+    await expect(page.getByRole("heading", { name: "Fix sign-in", exact: true })).toBeVisible();
+    await expect(page.getByText("History of Fix sign-in")).toBeVisible();
   });
 
   test("with no app window open, it opens one at the notification's URL", async ({ page, context }) => {

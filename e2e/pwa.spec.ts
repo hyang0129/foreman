@@ -126,6 +126,43 @@ test.describe("installability", () => {
       expect(ink).toBeGreaterThan(1000);
     }
 
+    // Apple touch icon: 180x180 and fully opaque (iOS fills transparent pixels with black).
+    const apple = await request.get("/icons/apple-touch-icon-180.png");
+    expect(apple.status()).toBe(200);
+    expect(apple.headers()["content-type"]).toBe("image/png");
+    const applePng = readPng(await apple.body());
+    expect(`${applePng.width}x${applePng.height}`).toBe("180x180");
+    const translucent: string[] = [];
+    for (let y = 0; y < applePng.height; y++)
+      for (let x = 0; x < applePng.width; x++)
+        if (applePng.channels === 4 && applePng.pixel(x, y)[3] !== 255) translucent.push(`${x},${y}`);
+    expect(translucent).toEqual([]);
+    // The corners are the brand ink, not a black or white fill.
+    for (const [x, y] of [[0, 0], [179, 0], [0, 179], [179, 179]]) expect(applePng.pixel(x, y).slice(0, 3)).toEqual([0x21, 0x37, 0x2d]);
+
+    // Notification badge (sw.js passes it as `badge`): Android uses only its alpha channel, so it
+    // is a white glyph on transparent, 96x96.
+    const badge = await request.get("/icons/badge-96.png");
+    expect(badge.status()).toBe(200);
+    expect(badge.headers()["content-type"]).toBe("image/png");
+    const badgePng = readPng(await badge.body());
+    expect(`${badgePng.width}x${badgePng.height}`).toBe("96x96");
+    expect(badgePng.channels).toBe(4);
+    let clear = 0, glyph = 0;
+    const colored: string[] = [];
+    for (let y = 0; y < badgePng.height; y++)
+      for (let x = 0; x < badgePng.width; x++) {
+        const [r, g, b, a] = badgePng.pixel(x, y);
+        if (a === 0) clear++;
+        if (a === 255) glyph++;
+        if (a > 0 && (r !== 255 || g !== 255 || b !== 255)) colored.push(`${x},${y}`);
+      }
+    expect(colored).toEqual([]);
+    // Mostly transparent, with a solid glyph (not an opaque square, not empty).
+    expect(clear).toBeGreaterThan(96 * 96 * 0.5);
+    expect(glyph).toBeGreaterThan(500);
+    for (const [x, y] of [[0, 0], [95, 0], [0, 95], [95, 95]]) expect(badgePng.pixel(x, y)[3]).toBe(0);
+
     const sw = await request.get("/sw.js");
     expect(sw.headers()["cache-control"]).toBe("no-cache");
     expect(sw.headers()["content-type"]).toBe("application/javascript");
@@ -135,7 +172,7 @@ test.describe("installability", () => {
 
     await page.goto("/");
     await expect(page.locator('link[rel="manifest"]')).toHaveAttribute("href", "/manifest.webmanifest");
-    await expect(page.locator('link[rel="apple-touch-icon"]')).toHaveAttribute("href", "/icons/icon-192.png");
+    await expect(page.locator('link[rel="apple-touch-icon"]')).toHaveAttribute("href", "/icons/apple-touch-icon-180.png");
     await controlled(page);
     const cdp = await page.context().newCDPSession(page);
     const parsed = await cdp.send("Page.getAppManifest");
