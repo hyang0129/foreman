@@ -562,8 +562,14 @@ export class LocalPmStore implements HostPmStore {
   /** Write-ahead: resolves only after the record is on disk. */
   async beginTurn(turnId: string, acceptedAt: string): Promise<void> {
     const args = this.check('turn.begin', { turn_id: turnId, accepted_at: acceptedAt });
-    if (this.state.turns.some((t) => t.turn_id === args.turn_id)) throw new PmStoreError('invalid', 'turn already recorded');
-    if (this.state.turns.filter((t) => t.state === 'open').length >= MAX_OPEN_TURNS) throw new PmStoreError('too_large', `at most ${MAX_OPEN_TURNS} open turns`);
+    // Same semantics as the relay DO: a repeated begin of a still-open turn is acknowledged again,
+    // an id already reported uncertain is invalid, and a 65th open turn is unavailable.
+    const existing = this.state.turns.find((t) => t.turn_id === args.turn_id);
+    if (existing) {
+      if (existing.state === 'open') return;
+      throw new PmStoreError('invalid', 'turn_id is already recorded');
+    }
+    if (this.state.turns.filter((t) => t.state === 'open').length >= MAX_OPEN_TURNS) throw new PmStoreError('unavailable', `At most ${MAX_OPEN_TURNS} PM turns can be open`);
     this.mutate((s) => { s.turns.push({ turn_id: args.turn_id, accepted_at: args.accepted_at, state: 'open', reason: null }); });
   }
   async endTurn(turnId: string, outcome: TurnOutcome): Promise<void> {

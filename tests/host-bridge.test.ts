@@ -417,6 +417,10 @@ test('rpc correlates replies by id, carries the assignment epoch, and validates 
   const d = f.instance.rpc('memory.log', { text: 'bad result' });
   socket.receive({ type: 'pm_rpc_result', id: rpcs(socket)[3].id, ok: true, result: { version: 1 } });
   await assert.rejects(d, (error: any) => error.code === 'invalid_result');
+  // A DO error message is redacted again on the host before it can reach the user.
+  const e = f.instance.rpc('memory.log', { text: 'leaky error' });
+  socket.receive({ type: 'pm_rpc_result', id: rpcs(socket)[4].id, ok: false, code: 'unavailable', message: `upstream said Authorization: Bearer ${TOKEN}` });
+  await assert.rejects(e, (error: any) => error.code === 'unavailable' && !error.message.includes(TOKEN) && error.message.includes('[REDACTED]'));
 });
 
 test('invalid args fail locally with the contract code and nothing is sent', async (t) => {

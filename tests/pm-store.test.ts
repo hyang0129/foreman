@@ -43,6 +43,8 @@ class FakeRelay {
   imports: any[] = [];
   hold: ((frame: any) => boolean) | null = null;
   held: (() => void)[] = [];
+  /** Frames lost in transit: recorded as sent, never applied or answered. */
+  swallow: ((frame: any) => boolean) | null = null;
   reportUninitialized = false;
 
   attach(socket: FakeSocket) { socket.on('sent', (frame) => this.receive(socket, frame)); }
@@ -66,6 +68,7 @@ class FakeRelay {
       return;
     }
     if (frame.type !== 'pm_rpc') return;
+    if (this.swallow?.(frame)) return;
     const parsed = parsePmRpc(frame);
     if (!parsed.ok) { if (parsed.id) this.reply(socket, frame, pmRpcError(parsed.id, parsed.code, parsed.error)); return; }
     const rpc = parsed.value;
@@ -98,8 +101,17 @@ class FakeRelay {
       }
       case 'memory.log': m.log.push({ seq: ++m.seq, at: now, text: a.text }); m.initialized = true; return pmRpcOk(rpc.id, rpc.op, { seq: m.seq });
       case 'settings.put': m.model = a.model; return pmRpcOk(rpc.id, rpc.op, {});
-      case 'turn.begin': this.turns.set(a.turn_id, { machine_id: machine, epoch: rpc.epoch, accepted_at: a.accepted_at, state: 'open', reason: null }); return pmRpcOk(rpc.id, rpc.op, {});
-      case 'turn.end': this.turns.delete(a.turn_id); return pmRpcOk(rpc.id, rpc.op, {});
+      case 'turn.begin': {
+        // As the DO (cloud/pm-state.ts): a repeated begin of the same open turn is acked again,
+        // any other existing id is invalid, and a 65th open turn is unavailable.
+        const existing = this.turns.get(a.turn_id);
+        if (existing) return existing.state === 'open' && existing.machine_id === machine ? pmRpcOk(rpc.id, rpc.op, {}) : pmRpcError(rpc.id, 'invalid', 'turn_id is already recorded');
+        if ([...this.turns.values()].filter((turn) => turn.state === 'open').length >= 64) return pmRpcError(rpc.id, 'unavailable', 'At most 64 PM turns can be open');
+        this.turns.set(a.turn_id, { machine_id: machine, epoch: rpc.epoch, accepted_at: a.accepted_at, state: 'open', reason: null });
+        return pmRpcOk(rpc.id, rpc.op, {});
+      }
+      // Only the open row: an uncertain row stays until turn.ack_uncertain.
+      case 'turn.end': if (this.turns.get(a.turn_id)?.state === 'open') this.turns.delete(a.turn_id); return pmRpcOk(rpc.id, rpc.op, {});
       case 'turn.ack_uncertain': for (const id of a.turn_ids) if (this.turns.get(id)?.state === 'uncertain') this.turns.delete(id); return pmRpcOk(rpc.id, rpc.op, {});
       default: return pmRpcError(rpc.id, 'invalid', 'unsupported in the fake');
     }
@@ -337,12 +349,52 @@ test('endTurn/ackUncertain queue while disconnected and flush in order on reconn
   await h.reconnect();
   const hello = relay.hellos().at(-1);
   assert.deepEqual(hello.pm_open_turns.sort(), ['turn-1', 'turn-2'], 'the PM survived the blip, so its turns are still open');
+  const helloAt = relay.frames.findIndex((f) => f.frame === hello);
+  const firstFlushAt = relay.frames.findIndex((f, i) => i > helloAt && f.frame.type === 'pm_rpc');
+  assert.ok(helloAt >= 0 && firstFlushAt > helloAt, 'the hello (with the still-open turns) goes out before the queued ends flush');
   const flushed = relay.rpcs().slice(sentBefore);
   assert.deepEqual(flushed.map((f) => [f.op, f.args.turn_id ?? f.args.turn_ids]), [['turn.end', 'turn-1'], ['turn.ack_uncertain', ['turn-old']], ['turn.end', 'turn-2']]);
+  // turn.end deletes only open rows, so an empty table proves turn-1/turn-2 were still open (not
+  // marked restarted) when their ends arrived.
   assert.equal(relay.turns.size, 0);
   assert.deepEqual(h.store.openTurnIds(), []);
   assert.deepEqual(h.store.uncertainTurns(), []);
   assert.ok(![...relay.turns.values()].some((turn) => turn.state === 'uncertain'), 'no false uncertain for turn-1/turn-2');
+});
+
+test('a timed-out beginTurn stays in pm_open_turns until its failed end is acked, across a reconnect', async (t) => {
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, tempHome(t), 'machine-a', { rpcTimeoutMs: 30 });
+  await h.connect();
+  // The DO records the turn but its ack never arrives; the follow-up failed end is lost in transit.
+  relay.hold = (frame) => frame.op === 'turn.begin';
+  relay.swallow = (frame) => frame.op === 'turn.end';
+  await assert.rejects(h.store.beginTurn('turn-t', AT), code('timeout'));
+  assert.equal(relay.turns.get('turn-t')?.state, 'open', 'the DO did record it');
+  assert.deepEqual(h.store.openTurnIds(), ['turn-t'], 'still listed: the failed end is not acked');
+  await new Promise((resolve) => setTimeout(resolve, 60)); await settle(); // the end times out too
+  assert.equal(relay.rpcs().filter((f) => f.op === 'turn.end').length, 1);
+  assert.deepEqual(h.store.openTurnIds(), ['turn-t'], 'still listed after the end timed out');
+  h.drop();
+  assert.deepEqual(h.store.openTurnIds(), ['turn-t'], 'still listed while disconnected');
+  relay.hold = null; relay.held = []; relay.swallow = null;
+  await h.reconnect();
+  assert.deepEqual(relay.hellos().at(-1).pm_open_turns, ['turn-t'], 'the reconnect hello lists it, so the DO does not mark it restarted');
+  assert.deepEqual(relay.rpcs().filter((f) => f.op === 'turn.end').map((f) => f.args), [{ turn_id: 'turn-t', outcome: 'failed' }, { turn_id: 'turn-t', outcome: 'failed' }]);
+  assert.equal(relay.turns.size, 0, 'removed by the flushed end, never surfaced as uncertain');
+  assert.deepEqual(h.store.openTurnIds(), []);
+  assert.deepEqual(h.store.uncertainTurns(), []);
+});
+
+test('turn.begin: a repeated begin of an open turn is acked again; a 65th open turn is unavailable (as the DO)', async (t) => {
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, tempHome(t), 'machine-a');
+  await h.connect();
+  for (let i = 0; i < 64; i++) await h.store.beginTurn(`turn-${i}`, AT);
+  await h.store.beginTurn('turn-0', AT);
+  await assert.rejects(h.store.beginTurn('turn-64', AT), code('unavailable'));
+  assert.equal(h.store.openTurnIds().includes('turn-64'), false, 'a refused begin is not listed as open');
+  assert.equal(h.store.openTurnIds().length, 64);
 });
 
 test('stale_epoch drops the queued outcomes and surfaces not_active', async (t) => {
@@ -513,7 +565,8 @@ test('local store: open turns persist and return once as uncertain (restarted) a
   await first.endTurn('turn-2', 'completed');
   await first.endTurn('unknown-turn', 'failed'); // unknown id is fine
   assert.deepEqual(first.openTurnIds(), ['turn-1']);
-  await assert.rejects(first.beginTurn('turn-1', AT), code('invalid'));
+  await first.beginTurn('turn-1', AT); // a repeated begin of an open turn is acknowledged again (as the DO)
+  assert.deepEqual(first.openTurnIds(), ['turn-1']);
   await assert.rejects(first.beginTurn('bad id', AT), code('invalid'));
   assert.deepEqual(first.uncertainTurns(), []);
   // Simulated daemon restart: a new store over the same file.
@@ -522,9 +575,21 @@ test('local store: open turns persist and return once as uncertain (restarted) a
   assert.deepEqual(second.uncertainTurns(), [{ turn_id: 'turn-1', accepted_at: AT, host: 'laptop', reason: 'restarted' }]);
   const heard = await new Promise<UncertainTurn[]>((resolve) => second.onAssignment((_a, uncertain) => resolve(uncertain)));
   assert.deepEqual(heard.map((u) => u.turn_id), ['turn-1']);
+  await assert.rejects(second.beginTurn('turn-1', AT), code('invalid'), 'an id already reported uncertain');
+  await second.endTurn('turn-1', 'completed');
+  assert.deepEqual(second.uncertainTurns().map((u) => u.turn_id), ['turn-1'], 'turn.end deletes only open rows');
   await second.ackUncertain(['turn-1']);
   const third = new LocalPmStore({ identity: IDENTITY, home: dir, log: () => {} });
   assert.deepEqual(third.uncertainTurns(), [], 'reported exactly once');
+});
+
+test('local store: a 65th open turn is unavailable (as the DO)', async (t) => {
+  const store = new LocalPmStore({ identity: IDENTITY, home: tempHome(t), log: () => {} });
+  for (let i = 0; i < 64; i++) await store.beginTurn(`turn-${i}`, AT);
+  await assert.rejects(store.beginTurn('turn-64', AT), code('unavailable'));
+  assert.equal(store.openTurnIds().length, 64);
+  await store.endTurn('turn-0', 'completed');
+  await store.beginTurn('turn-64', AT);
 });
 
 test('createPmStore: local without a bridge; a corrupt pm/state.json fails closed and is left alone', (t) => {

@@ -9,6 +9,7 @@ import {
   isPmId, parseHello, parsePmAssignment, parsePmOpArgs, parsePmOpResult, parsePmRpcResult,
   type HelloV2, type MachineIdentity, type PmAssignment, type PmErrorCode, type PmOp, type PmOpArgs, type PmOpResults,
 } from '../shared/pm-state.ts';
+import { redactSecrets } from '../shared/redact.ts';
 
 // Frames held while the relay socket is down: at most this many, none older than this. The relay
 // de-duplicates by frame id, so flushing a frame that also went out before a drop is harmless.
@@ -274,7 +275,8 @@ export class HostBridge {
     const parsed = parsePmRpcResult(raw);
     if (!parsed.ok) { call.reject(invalid()); return; }
     const result = parsed.value;
-    if (!result.ok) { call.reject(new PmRpcError(result.code, call.op, call.epoch, result.message)); return; }
+    // The DO already redacts its messages; redact again here since the text can reach the user.
+    if (!result.ok) { call.reject(new PmRpcError(result.code, call.op, call.epoch, redactSecrets(result.message))); return; }
     const value = parsePmOpResult(call.op, result.result);
     if (!value.ok) { call.reject(invalid()); return; }
     call.resolve(value.value);
