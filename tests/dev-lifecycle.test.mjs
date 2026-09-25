@@ -232,6 +232,33 @@ for (const [name, serve, pattern] of [
   assert.match(output, /DEV daemon stopped/);
 });
 
+// Right after dev:deploy the edge can still serve the previous Worker version for a few
+// seconds (seen for real on foreman-dev): start waits, bounded, for the deployed commit.
+test('start waits for the edge to serve the deployed commit, then starts', async (t) => {
+  const f = fixture(t), commit = f.commit(), port = await injectedPort();
+  await deployed(f, commit);
+  const seen = [];
+  const relay = { calls: 0 };
+  relay.fn = async () => { relay.calls++; const c = relay.calls <= 2 ? 'a'.repeat(40) : commit; seen.push(c); return { environment: 'dev', commit: c, relay: { online: relay.calls >= 5 } }; };
+  await captureLog(() => start(f.home, { relayStatus: relay.fn, execute: authMock().fn, port, versionInterval: 10 }));
+  assert.deepEqual(seen.slice(0, 3), ['a'.repeat(40), 'a'.repeat(40), commit]);
+  const pid = json(f.daemonFile).pid;
+  assert.equal(alive(pid), true);
+  await captureLog(() => stop(f.home));
+  await until(() => !alive(pid), 'daemon exit');
+});
+
+test('start refuses, without spawning, when the edge never serves the deployed commit', async (t) => {
+  const f = fixture(t), commit = f.commit(), port = await injectedPort();
+  await deployed(f, commit);
+  const relay = { calls: 0 };
+  relay.fn = async () => { relay.calls++; return { environment: 'dev', commit: 'b'.repeat(40), relay: { online: false } }; };
+  await assert.rejects(start(f.home, { relayStatus: relay.fn, execute: authMock().fn, port, versionAttempts: 3, versionInterval: 10 }), /Deployed Worker does not match the local snapshot; redeploy before starting/);
+  assert.equal(relay.calls, 4);
+  assert.equal(existsSync(join(f.home, 'fixture-pid')), false, 'no daemon was spawned');
+  assert.equal(existsSync(f.daemonFile), false);
+});
+
 // 2. Lock contention and crash -------------------------------------------------
 
 function lockHolder(t, home) {

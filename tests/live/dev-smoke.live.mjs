@@ -134,7 +134,15 @@ if (process.env.FOREMAN_DEV_SMOKE !== '1') {
     const deployed = dev('deploy', 15 * 60_000);
     assert.equal(deployed.status, 0, 'dev:deploy failed');
     assert.match(deployed.stdout, new RegExp(`DEV deployed ${commit}\\n${EXPECTED.url.replaceAll('.', '\\.')}`));
-    const afterDeploy = devStatus();
+    // Cloudflare serves a new Worker version at the edge a few seconds after the upload
+    // returns, so the old version can still answer briefly. Wait (bounded) for the edge to
+    // serve this commit; the assertions below still require the exact commit.
+    let afterDeploy = devStatus();
+    for (let i = 0; i < 90 && afterDeploy.relay?.commit !== commit; i++) {
+      if (i === 0) note(`edge still serves ${afterDeploy.relay?.commit ?? 'no status'}; waiting for ${commit}`);
+      await delay(1000);
+      afterDeploy = devStatus();
+    }
     note(`after deploy: ${summary(afterDeploy)}`);
     assert.equal(afterDeploy.error, undefined, `dev:status reported an error: ${afterDeploy.error}`);
     assert.equal(afterDeploy.commit, commit, 'local deployment record is not this commit');
@@ -146,8 +154,13 @@ if (process.env.FOREMAN_DEV_SMOKE !== '1') {
     note(`GET ${EXPECTED.url}/api/dev/status without credential -> ${anonymous.status}`);
     assert.equal(anonymous.status, 401);
     // The uploaded web assets are this commit's snapshot (DEV badge carries the short commit).
-    const page = await raw('/', 'GET');
-    const badge = page.body.match(/DEV · ([a-f0-9]{8}) · :4178/)?.[1];
+    let page, badge;
+    for (let i = 0; i < 30; i++) {
+      page = await raw('/', 'GET');
+      badge = page.body.match(/DEV · ([a-f0-9]{8}) · :4178/)?.[1];
+      if (badge === commit.slice(0, 8)) break;
+      await delay(1000);
+    }
     note(`GET ${EXPECTED.url}/ -> ${page.status}, title ${JSON.stringify(page.body.match(/<title>([^<]*)<\/title>/)?.[1])}, badge commit ${badge}`);
     assert.equal(page.status, 200);
     assert.equal(badge, commit.slice(0, 8));

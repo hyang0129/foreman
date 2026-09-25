@@ -530,7 +530,7 @@ export async function verifyDependencies(snapshot, deployment, identify = depend
   const identity = await readDependencies(linked, identify);
   if (identity !== recorded.identity) throw new Error(`Installed dependencies changed since deploy (${linked}: ${identity} != deployed ${recorded.identity}); ${redeploy}`);
 }
-export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500, spawnChild = spawn, exitGrace, identify, isolatedLogins = false } = {}) {
+export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500, spawnChild = spawn, exitGrace, identify, isolatedLogins = false, versionAttempts = 60, versionInterval = 1000 } = {}) {
   const current = inspect(home);
   if (current.daemon?.state === 'starting') throw new Error(`DEV daemon PID ${current.daemon.pid} was left by an interrupted start; run npm run dev:stop first`);
   if (current.daemon) throw new Error('DEV daemon already running; use dev:status or dev:stop');
@@ -541,7 +541,13 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
   // Before any spawn: the snapshot must still run against the exact installed tree deployed.
   await verifyDependencies(snapshot, deployment, identify);
   const pair = validatePairing(read(join(home, 'dev-pairing.json')));
-  const relay = await relayStatus(pair);
+  // Cloudflare activates a new Worker version across the edge shortly after the upload
+  // returns, so right after dev:deploy the old version can still answer (bounded wait).
+  let relay = await relayStatus(pair);
+  for (let i = 0; relay.commit !== deployment.commit && i < versionAttempts; i++) {
+    await delay(versionInterval);
+    relay = await relayStatus(pair);
+  }
   if (relay.commit !== deployment.commit) throw new Error('Deployed Worker does not match the local snapshot; redeploy before starting');
   if (relay.relay.online) throw new Error('Another dev host is connected; refusing to replace it');
   await (checkPort ?? (() => freePort(port)))();
