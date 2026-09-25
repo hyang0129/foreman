@@ -180,7 +180,8 @@ test("launch leaves the SDK environment unset so sessions and their hooks inheri
   assert.ok(h.options(), "the provider was launched");
   assert.equal(Object.hasOwn(h.options(), "env"), false);
   h.control.close(); await h.control.finished;
-  // The SDK's own default is the full process environment.
+  // The SDK's own default is the full process environment. A tripwire on the
+  // minified bundle: if an SDK upgrade breaks this match, re-verify the default.
   const sdk = readFileSync(fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk")), "utf8");
   assert.match(sdk, /env:[A-Za-z_$][\w$]*=\{\.\.\.process\.env\}/);
 });
