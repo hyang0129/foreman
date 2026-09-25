@@ -255,7 +255,8 @@ export class SessionService extends EventEmitter {
     this.changed(data);
     runtime.claude?.close(); runtime.codex?.close();
   }
-  private approvals(id: string): Approval[] {
+  /** Pending approvals of a managed session (copies), without copying its history or receipts as `detail()` does. [] for an unknown, observed, not-ready or closed session. */
+  approvals(id: string): Approval[] {
     const runtime = this.runtime.get(id); if (!runtime?.ready || this.closed) return [];
     if (runtime.claude) return runtime.claude.pendingApprovals().map((r) => ({ id: r.id, kind: r.tool === 'AskUserQuestion' ? 'question' : 'permission', tool: r.tool, input: clone(r.input), reason: r.reason,
       ...(r.tool === 'AskUserQuestion' ? { questions: (Array.isArray(r.input.questions) ? r.input.questions : []).map((q: any) => ({ id: q.question, question: q.question, options: q.options?.map((o: any) => o.label) })) } : {}) }));
