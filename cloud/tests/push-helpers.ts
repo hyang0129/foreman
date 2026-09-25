@@ -65,3 +65,16 @@ export async function verifyVapid(authorization: string) {
   const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, publicKey, jwt.signature, utf8(jwt.input));
   return { ...jwt, publicKey: match[2]!, valid };
 }
+
+// Exactly what Chrome on Android returns from `PushSubscription.toJSON()` for an FCM subscription:
+// the three keys in this order, `expirationTime: null`, an FCM endpoint whose token is
+// `<instance id>:APA91b<...>` (~150 characters), and unpadded base64url keys: p256dh an
+// uncompressed P-256 point (65 bytes, 87 characters) and auth 16 bytes (22 characters). The keys are
+// RFC 8291 Appendix A's user-agent key pair, so p256dh is a real curve point with a known private
+// key (CHROME_FCM_PRIVATE_KEY) and messages encrypted for it can be decrypted in tests.
+export const CHROME_FCM_SUBSCRIPTION = {
+  endpoint: 'https://fcm.googleapis.com/fcm/send/cT6vPq0x3Ls:APA91bHk2X8mYq9Zr4Tn0Wd7Fv3Jb6Pc1Ls5Qa8Ue2Gi4Ko9Mh7Nj0Rt3Yw6Xz1Bv5Cn8Dm2Ef4Gh6Ij8Kl0Mn2Op4Qr6St8Uv0Wx2Yz4Ab6Cd8Ef0Gh2Ij4Kl6Mn8Op0Qr2St4-Uv6_Wx8',
+  expirationTime: null,
+  keys: { p256dh: 'BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4', auth: 'BTBZMqHH6r4Tts7J_aSIgg' },
+};
+export const CHROME_FCM_PRIVATE_KEY = 'q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94';
