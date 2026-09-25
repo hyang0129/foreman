@@ -218,10 +218,11 @@ function releasePath(home, deployment) {
   if (!/^release-[a-zA-Z0-9]+$/.test(deployment?.release) || !/^[a-f0-9]{40}$/.test(deployment?.commit)) throw new Error('Invalid dev deployment record');
   const path = join(home, deployment.release); owned(path, true); return path;
 }
-export function processIdentity(pid) {
+export function processIdentity(pid, execute = run) {
   if (!Number.isSafeInteger(pid) || pid < 2) throw new Error('Invalid daemon PID');
   try {
-    const row = run('ps', ['-p', String(pid), '-o', 'stat=,lstart=,command=']).trim();
+    // -ww: never truncate the command line, which must match findOrphans' argv exactly.
+    const row = execute('ps', ['-p', String(pid), '-ww', '-o', 'stat=,lstart=,command=']).trim();
     const match = row.match(/^(\S+)\s+(.*)$/);
     // A terminated child may briefly remain as a zombie before its parent reaps it.
     return !match || match[1].startsWith('Z') ? '' : match[2];
@@ -399,14 +400,17 @@ export function codexLoginNotice(binary, configDir, env = process.env, execute =
 }
 // Terminate a child this process spawned (and still holds the handle to) and
 // prove it exited. Used only for a daemon whose record was never promoted.
-async function terminateChild(child) {
+async function terminateChild(child, { term = 10000, kill = 5000 } = {}) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const exit = new Promise((resolve) => child.once('exit', () => resolve(true)));
   const within = (ms) => Promise.race([exit, delay(ms, false, { ref: false })]);
   child.kill('SIGTERM');
-  if (await within(10000)) return;
+  if (await within(term)) return;
   child.kill('SIGKILL');
-  if (await within(5000)) return;
+  if (await within(kill)) return;
+  // Release the handle so this process can exit and report the error instead of
+  // waiting on a child that may never exit (#47). Its stdio is a file, not pipes.
+  child.unref();
   throw new Error(`DEV daemon PID ${child.pid} did not exit after a failed start; its startup record is kept for npm run dev:stop`);
 }
 const redeploy = 'reinstall matching dependencies and run npm run dev:deploy again';
@@ -419,7 +423,7 @@ export async function verifyDependencies(snapshot, deployment) {
   const identity = await dependencyIdentity(linked);
   if (identity !== recorded.identity) throw new Error(`Installed dependencies changed since deploy (${linked}: ${identity} != deployed ${recorded.identity}); ${redeploy}`);
 }
-export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500 } = {}) {
+export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500, spawnChild = spawn, exitGrace } = {}) {
   const current = inspect(home);
   if (current.daemon?.state === 'starting') throw new Error(`DEV daemon PID ${current.daemon.pid} was left by an interrupted start; run npm run dev:stop first`);
   if (current.daemon) throw new Error('DEV daemon already running; use dev:status or dev:stop');
@@ -456,7 +460,7 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
   try {
     const log = openSync(logPath, 'w', 0o600);
     try {
-      child = spawn(process.execPath, ['--experimental-strip-types', entry, id], {
+      child = spawnChild(process.execPath, ['--experimental-strip-types', entry, id], {
         cwd: snapshot, detached: true, stdio: ['ignore', log, log],
         env: { ...process.env, FOREMAN_HOME: home, FOREMAN_PORT: String(port), FOREMAN_RELAY_URL: TARGET.url, FOREMAN_HOST_TOKEN: pair.token,
           CLAUDE_CONFIG_DIR: join(home, 'claude'), CODEX_HOME: join(home, 'codex') },
@@ -473,7 +477,7 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
   } catch (error) {
     // Never leave an untracked daemon: stop the child we hold, prove its exit,
     // and only then discard the intent record.
-    await terminateChild(child);
+    await terminateChild(child, exitGrace);
     rmSync(daemonFile, { force: true });
     throw error;
   }
