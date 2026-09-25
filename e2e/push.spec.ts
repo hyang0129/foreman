@@ -372,8 +372,32 @@ async function worker(page: Page): Promise<Worker> {
   await expect.poll(() => page.context().serviceWorkers().length).toBeGreaterThan(0);
   return page.context().serviceWorkers()[0];
 }
-// Delivers a real push message (a trusted PushEvent) into the registered service worker.
+// Delivers a real push message (a trusted PushEvent) into the registered service worker, and
+// returns only once the shipped push handler's work (showNotification, handed to waitUntil) has
+// finished.
+//
+// Waiting matters (#120): Chromium's getNotifications() reconciles its notification database with
+// the notifications on display and deletes every stored notification that was created before the
+// call but is not displayed yet. showNotification stores the notification first and displays it
+// in a later task, so a read that overlaps it deletes the notification for good and the test sees
+// none. CDP deliverPushMessage returns before the push event runs, so without this wait the first
+// read of shown() raced the handler, and lost under load.
 async function deliver(page: Page, data: string) {
+  const sw = await worker(page);
+  // Record the work each push event hands to waitUntil. The recorder lives in the running worker;
+  // if that worker were ever replaced, the wait below fails loudly instead of passing.
+  const before = await sw.evaluate(() => {
+    const scope = self as any;
+    if (!scope.__pushWork) {
+      scope.__pushWork = [];
+      const waitUntil = ExtendableEvent.prototype.waitUntil;
+      ExtendableEvent.prototype.waitUntil = function (this: ExtendableEvent, work: Promise<unknown>) {
+        if (this.type === "push") scope.__pushWork.push(Promise.resolve(work).then(() => "shown", (error: unknown) => `failed: ${error}`));
+        return waitUntil.call(this, work);
+      };
+    }
+    return scope.__pushWork.length as number;
+  });
   const cdp = await page.context().newCDPSession(page);
   const registrations: { registrationId: string; isDeleted: boolean }[] = [];
   cdp.on("ServiceWorker.workerRegistrationUpdated", (event) => registrations.push(...event.registrations));
@@ -382,6 +406,8 @@ async function deliver(page: Page, data: string) {
   const { registrationId } = registrations.find((r) => !r.isDeleted)!;
   await cdp.send("ServiceWorker.deliverPushMessage", { origin: `${ORIGIN}/`, registrationId, data });
   await cdp.detach();
+  await expect.poll(() => sw.evaluate(() => (self as any).__pushWork.length), { message: "the push event reached the worker" }).toBe(before + 1);
+  expect(await sw.evaluate((index) => (self as any).__pushWork[index], before)).toBe("shown");
 }
 type Shown = { title: string; body: string; tag: string; url: unknown; icon: string; renotify: boolean; data: unknown };
 const shown = (page: Page) => page.evaluate(async () => {
