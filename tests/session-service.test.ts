@@ -87,6 +87,27 @@ test('Claude approval and questions are exact, stale-safe and disappear on close
   service.close(); assert.equal(service.detail(session.session_key).approvals.length, 0);
 });
 
+test('#126: approvals(id) matches detail().approvals as copies, and is [] for unknown, observed or closed sessions', async (t) => {
+  const { service, claude, codex, input } = fixture(t);
+  assert.deepEqual(service.approvals('fm:00000000-0000-0000-0000-000000000000'), []);
+  assert.deepEqual(service.approvals('claude:observed'), []);
+  const session = await service.create(input); await tick();
+  assert.deepEqual(service.approvals(session.session_key), []);
+  claude.pending.push({ id: 'permission', tool: 'Bash', input: { command: 'pwd' } });
+  claude.pending.push({ id: 'question', tool: 'AskUserQuestion', input: { questions: [{ question: 'Which?', options: [{ label: 'A' }] }] } });
+  const approvals = service.approvals(session.session_key);
+  assert.deepEqual(approvals, service.detail(session.session_key).approvals);
+  assert.deepEqual(approvals.map((r) => [r.id, r.kind]), [['permission', 'permission'], ['question', 'question']]);
+  approvals[0]!.input.command = 'mutated';
+  assert.equal(claude.pending[0].input.command, 'pwd', 'callers get copies');
+  const other = await service.create({ ...input, id: 'creation-2', provider: 'codex' }); await tick();
+  codex.pending.push({ id: 7, method: 'item/commandExecution/requestApproval', params: { threadId: 'native-codex', command: 'ls' } });
+  codex.pending.push({ id: 8, method: 'item/tool/call', params: { threadId: 'native-codex' } });
+  assert.deepEqual(service.approvals(other.session_key).map((r) => [r.id, r.kind]), [['7', 'permission']]);
+  service.close();
+  assert.deepEqual(service.approvals(session.session_key), []);
+});
+
 test('Codex serializes turns, persists assistant output, and answers provider questions', async (t) => {
   const { service, codex, input } = fixture(t); const session = await service.create({ ...input, provider: 'codex' }); await tick();
   service.send(session.session_key, 'Second task', 'second'); assert.equal(codex.sent.length, 1);
