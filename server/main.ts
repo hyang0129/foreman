@@ -4,12 +4,12 @@ import { readFileSync, existsSync } from "node:fs";
 import { join, extname } from "node:path";
 import { Fleet, transcriptTail } from "./fleet.ts";
 import { modelCatalog } from "./models.ts";
-import { ProjectManager } from "./pm.ts";
+import { ProjectManager, choosePmStore } from "./pm.ts";
 import { Launcher } from "./launcher.ts";
 import { ProjectRegistry } from "./projects.ts";
 import { SessionService } from "./session-service.ts";
 import { preparePeerTools } from "./peer-tools.ts";
-import { startHostBridge } from "./host-bridge.ts";
+import { startHostBridge, readBridgeConfig } from "./host-bridge.ts";
 import { Notifier } from "./notifier.ts";
 import { runClaude } from "./tools.ts";
 import { PORT, REPO_ROOT, ensureDirs, HOST, FOREMAN_HOME } from "./paths.ts";
@@ -32,7 +32,7 @@ const sessions = new SessionService({ fleet, projects });
 projects.seed(sessions.list());
 sessions.setPrepare((session) => preparePeerTools(sessions, session));
 // Machine identity (machine.json). As with an invalid cloud.json (logged, and the daemon runs
-// without the relay), an invalid, symlinked or foreign-owned machine.json is logged and the daemon
+// without the relay and without a PM), an invalid, symlinked or foreign-owned machine.json is logged and the daemon
 // keeps running: without an identity it speaks the legacy relay protocol and runs no PM, and the
 // PM's error names the cause. machine.json is never regenerated over a bad file.
 let identity: MachineIdentity | null = null;
@@ -193,9 +193,13 @@ server.listen(PORT, "127.0.0.1", () => {
   const notify = bridge.notify?.bind(bridge);
   if (notify) notifier = new Notifier({ sessions, pm, send: notify }).start();
   if (!identity) { pm.failUnavailable(`machine.json is invalid (${identityError})`); return; }
+  // Never two PMs: LocalPmStore only when no relay is configured at all (no cloud.json, no relay
+  // env). A configured relay that is invalid or did not start means no PM on this machine.
+  const choice = choosePmStore(readBridgeConfig, Boolean(bridge.bridge));
+  if (choice.mode === 'unavailable') { pm.failUnavailable(choice.reason); return; }
   try {
     // RelayPmStore when the relay is configured (a v2 bridge), else LocalPmStore (pm/state.json).
-    store = createPmStore({ identity, bridge: bridge.bridge ?? null });
+    store = createPmStore({ identity, bridge: choice.mode === 'relay' ? bridge.bridge! : null });
   } catch (error) {
     const reason = redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300);
     console.error('foreman: PM state store error:', reason);

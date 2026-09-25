@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseNotifyFrame, MAX_DISPLAY_NAME, type NotifyFrame } from '../shared/notify.ts';
@@ -13,7 +13,8 @@ test.after(() => rmSync(pmHome, { recursive: true, force: true }));
 const { SessionService } = await import('../server/session-service.ts');
 const { Notifier } = await import('../server/notifier.ts');
 const { ProjectManager } = await import('../server/pm.ts');
-const { ensureDirs, PM_HISTORY_FILE, PM_SESSION_FILE } = await import('../server/paths.ts');
+const { ensureDirs } = await import('../server/paths.ts');
+const { LocalPmStore } = await import('../server/pm-store.ts');
 ensureDirs();
 
 // Sensitive markers the fakes carry; none may ever appear in a serialized frame.
@@ -309,9 +310,9 @@ test('control: without closing the notifier first, shutdown would read as a sess
 
 // pm_failed through the real ProjectManager (scripted provider): its lastError/event surface.
 test('with the real ProjectManager: failed turn -> one pm_failed; success re-arms; next failure -> second', async (t) => {
-  writeFileSync(PM_HISTORY_FILE, ''); writeFileSync(PM_SESSION_FILE, '');
   t.mock.method(console, 'error', () => {});
   const pm = new ProjectManager({} as any);
+  pm.attach(new LocalPmStore({ identity: { machine_id: '3f1c2b1e-8e0a-4f3c-9b2a-0d6f5c4e3a21', name: 'test-mac' }, home: mkdtempSync(join(pmHome, 'store-')), log: () => {} }), { autoStart: false });
   const results = [
     { type: 'result', is_error: true, subtype: 'error_during_execution', errors: ['ENOENT stack trace /Users/hong/secret-project'] },
     { type: 'result', is_error: true, subtype: 'error_during_execution', errors: ['second ENOENT stack trace'] },
@@ -331,7 +332,8 @@ test('with the real ProjectManager: failed turn -> one pm_failed; success re-arm
         while (next < results.length) {
           const input = await Promise.race([prompt.next(), stopped.then(() => null)]);
           if (!input || input.done) return;
-          yield { ...results[next++], total_cost_usd: 0 };
+          // Like the installed CLI, the result names the input it answers.
+          yield { ...results[next++], total_cost_usd: 0, user_message_uuids: [input.value.uuid] };
         }
         await stopped;
       },
@@ -345,15 +347,15 @@ test('with the real ProjectManager: failed turn -> one pm_failed; success re-arm
   let turns = 0;
   pm.on('event', (event: any) => { if (event.type === 'turn_end') turns++; });
   const settle = async (count: number) => { for (let i = 0; i < 200 && turns < count; i++) await new Promise((r) => setTimeout(r, 5)); assert.equal(turns, count); };
-  pm.send('first'); await settle(1);
+  await pm.send('first'); await settle(1);
   assert.deepEqual(frames.map((f) => f.kind), ['pm_failed']);
-  pm.send('second'); await settle(2);
+  await pm.send('second'); await settle(2);
   assert.equal(frames.length, 1, 'still failed: no repeat');
-  pm.send('third'); await settle(3);
+  await pm.send('third'); await settle(3);
   assert.equal(pm.lastError, null);
   assert.equal(frames.length, 1);
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() + 1000 });
-  pm.send('fourth'); await settle(4);
+  await pm.send('fourth'); await settle(4);
   assert.deepEqual(frames.map((f) => f.kind), ['pm_failed', 'pm_failed']);
   assert.notEqual(frames[0]!.id, frames[1]!.id);
   for (const frame of frames) { const raw = JSON.stringify(frame); for (const secret of [...SECRETS, 'notifier-session']) assert.ok(!raw.includes(secret), `leaked ${secret}`); }

@@ -18,7 +18,7 @@ test.after(() => rmSync(root, { recursive: true, force: true }));
 const { HostBridge } = await import('../server/host-bridge.ts');
 const { loadMachineIdentity } = await import('../server/machine.ts');
 const { LocalPmStore, RelayPmStore } = await import('../server/pm-store.ts');
-const { ProjectManager } = await import('../server/pm.ts');
+const { ProjectManager, choosePmStore } = await import('../server/pm.ts');
 
 const TOKEN = 'synthetic-test-host-credential'.repeat(2);
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
@@ -391,4 +391,32 @@ test('local-only mode: a restart mid-turn reports one uncertain entry, with no r
   assert.deepEqual(store.uncertainTurns(), [], 'acknowledged');
   const third = run(new LocalPmStore({ identity, home: dir, log: () => {} }));
   assert.equal(third.pm.history().length, 0, 'shown once');
+});
+
+// Never two PMs (plan default 5): local-only mode only when no relay is configured at all. A
+// present-but-invalid cloud.json (or relay env) means the relay holds the PM, so no PM runs here.
+// server/main.ts uses choosePmStore; tests/pm-status-api.test.mjs drives the daemon end to end.
+test('store selection: absent relay config is local; configured-but-invalid is no PM, and sends are refused with the cause', async (t) => {
+  const noEnv = {};
+  assert.deepEqual(choosePmStore(() => null, false, noEnv), { mode: 'local' }, 'no cloud.json: local store');
+  assert.deepEqual(choosePmStore(() => ({ url: 'wss://relay', token: TOKEN }), true, noEnv), { mode: 'relay' });
+  const invalid = choosePmStore(() => { throw new Error('Invalid cloud.json'); }, false, noEnv);
+  assert.deepEqual(invalid, { mode: 'unavailable', reason: 'cloud.json is invalid (Invalid cloud.json); the PM is unavailable on this machine' });
+  const badMode = choosePmStore(() => { throw new Error('cloud.json must be an owned regular file with mode 0600'); }, false, noEnv);
+  assert.equal(badMode.mode, 'unavailable');
+  const badEnv = choosePmStore(() => { throw new Error('Set both FOREMAN_RELAY_URL and FOREMAN_HOST_TOKEN'); }, false, { FOREMAN_RELAY_URL: 'wss://relay' });
+  assert.match((badEnv as any).reason, /^the relay configuration \(FOREMAN_RELAY_URL\/FOREMAN_HOST_TOKEN\) is invalid \(Set both/);
+  const noBridge = choosePmStore(() => ({ url: 'wss://relay', token: TOKEN }), false, noEnv);
+  assert.equal(noBridge.mode, 'unavailable', 'a valid relay config whose bridge did not start never falls back to local');
+  const leaked = choosePmStore(() => { throw new Error(`bad token ${'sk-ant-api03-' + 'x'.repeat(40)}`); }, false, noEnv);
+  assert.ok(!(leaked as any).reason.includes('sk-ant-api03-'), 'the cause is redacted');
+
+  // The daemon's path for an unavailable choice: a PM with no store, whose error names the cause.
+  t.mock.method(console, 'error', () => {});
+  const pm = new ProjectManager({} as any, { machineName: 'laptop' });
+  t.after(() => pm.close());
+  pm.failUnavailable((invalid as { reason: string }).reason);
+  await assert.rejects(pm.send('hello'), /cloud\.json is invalid \(Invalid cloud\.json\); the PM is unavailable on this machine/);
+  assert.match(pm.lastError!, /cloud\.json is invalid/);
+  assert.equal(pm.history().filter((e) => e.role === 'user').length, 0, 'nothing was accepted');
 });

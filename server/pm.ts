@@ -72,6 +72,26 @@ export interface PmAttachOptions {
 export const FRESH_SESSION_NOTICE = 'Started a fresh PM session. It answers from memory, not from the messages above.';
 export const RELAY_UNREACHABLE_MESSAGE = 'The cloud relay is unreachable; the PM is unavailable on this machine.';
 
+export type PmStoreChoice = { mode: 'relay' | 'local' } | { mode: 'unavailable'; reason: string };
+/**
+ * Which PM state store this daemon may use (epic #26: never two PMs). Local-only mode applies only
+ * when no relay is configured at all (`readRelayConfig` returns null: no cloud.json, no relay env).
+ * A relay that is configured but invalid, or whose bridge did not start, means the relay holds the
+ * PM: this machine runs no PM rather than a local one built from its own files.
+ */
+export function choosePmStore(readRelayConfig: () => unknown, hasBridge: boolean, env: NodeJS.ProcessEnv = process.env): PmStoreChoice {
+  let config: unknown;
+  try { config = readRelayConfig(); }
+  catch (error) {
+    const cause = safe(errorText(error), 300);
+    const source = env.FOREMAN_RELAY_URL || env.FOREMAN_HOST_TOKEN ? 'the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN)' : 'cloud.json';
+    return { mode: 'unavailable', reason: `${source} is invalid (${cause}); the PM is unavailable on this machine` };
+  }
+  if (hasBridge) return { mode: 'relay' };
+  if (config === null || config === undefined) return { mode: 'local' };
+  return { mode: 'unavailable', reason: 'the cloud relay is configured but its connection could not be started; the PM is unavailable on this machine' };
+}
+
 // Human text for each uncertain reason, used in "could not be confirmed (<reason>)".
 export const UNCERTAIN_REASON_TEXT: Readonly<Record<HostUncertainReason, string>> = {
   restarted: 'Foreman restarted',

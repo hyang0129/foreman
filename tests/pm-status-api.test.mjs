@@ -134,3 +134,25 @@ test('an invalid machine.json is logged and the daemon runs without a PM, whose 
   assert.equal((await fetch(`${origin}/api/sessions`, { headers })).status, 200, 'the rest of the daemon keeps working');
   assert.match(stderr(), /machine identity error: Invalid machine\.json/);
 });
+
+// Never two PMs: a present-but-invalid cloud.json means a relay IS configured (and holds the PM),
+// so this machine runs no PM at all, rather than a local one built from its own files.
+test('an invalid cloud.json runs no PM: sends answer 503 naming the cause, and no local store is created', { timeout:15000 }, async (t) => {
+  const { home, origin, headers, stderr } = await daemon(t, (dir) => {
+    writeFileSync(join(dir, 'cloud.json'), 'not json', { mode:0o600 });
+    mkdirSync(join(dir, 'memory'), { recursive:true });
+    writeFileSync(join(dir, 'memory', 'PROJECTS.md'), '# Projects\n\n## zebra-project\n');
+  });
+  const cause = /cloud\.json is invalid \(Invalid cloud\.json\); the PM is unavailable on this machine/;
+  const history = await fetch(`${origin}/api/pm/history?summary=1`, { headers }).then((r) => r.json());
+  assert.match(history.error, cause);
+  const res = await fetch(`${origin}/api/pm/message`, { method:'POST', headers:{ ...headers, 'content-type':'application/json' }, body:JSON.stringify({ text:'hello' }) });
+  assert.equal(res.status, 503);
+  assert.match((await res.json()).error, cause);
+  assert.equal((await fetch(`${origin}/api/memory`, { headers })).status, 503, 'no store, so no memory');
+  assert.equal(existsSync(join(home, 'pm', 'state.json')), false, 'no local PM store was created');
+  assert.equal(existsSync(join(home, 'memory', '.imported.json')), false, 'nothing was imported locally');
+  assert.equal(readFileSync(join(home, 'cloud.json'), 'utf8'), 'not json', 'the bad file is left alone');
+  assert.equal((await fetch(`${origin}/api/sessions`, { headers })).status, 200, 'the rest of the daemon keeps working');
+  assert.match(stderr(), /cloud bridge configuration error: Invalid cloud\.json/);
+});
