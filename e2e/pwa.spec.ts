@@ -297,6 +297,30 @@ test.describe("service worker", () => {
     await controlled(page);
     await expect(page.getByRole("button", { name: /Fix sign-in/ })).toBeAttached();
   });
+
+  test("a direct navigation to an /api URL is left to the network", async ({ page, context }) => {
+    await fixture(page);
+    await page.goto("/");
+    await controlled(page);
+    // Real network from here on: the test server answers anything under /api with its 404.
+    await page.unrouteAll();
+    for (const path of ["/api", "/api/sessions"]) {
+      // Online: the browser fetched it itself; the worker never answered it.
+      const response = await page.goto(path);
+      expect(response!.status()).toBe(404);
+      expect(response!.fromServiceWorker()).toBe(false);
+      // A control: an app navigation from the same page does go through the worker.
+      expect((await page.goto("/"))!.fromServiceWorker()).toBe(true);
+      await controlled(page);
+      // Offline: a plain network error, never the offline screen or the app shell.
+      await context.setOffline(true);
+      await expect(page.goto(path)).rejects.toThrow(/ERR_INTERNET_DISCONNECTED/);
+      await expect(page.getByRole("heading", { name: "You’re offline" })).toHaveCount(0);
+      await context.setOffline(false);
+      await page.goto("/");
+      await controlled(page);
+    }
+  });
 });
 
 test.describe("deep links", () => {
@@ -339,6 +363,30 @@ test.describe("deep links", () => {
       await expect(page.locator("#app-notice")).toBeHidden();
     });
   }
+
+  test("Forward after Back from a rejected link repeats the neutral notice", async ({ page }) => {
+    const state = await fixture(page);
+    await page.goto("/?session=fm:not-on-this-mac");
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on your Mac. Showing your inbox.");
+    await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
+    await expect.poll(() => page.evaluate(() => history.state?.view ?? null)).toBeNull();
+    // Dismiss the first notice so the next one is observably new.
+    await page.locator("#app-notice").evaluate((notice: HTMLElement) => { notice.hidden = true; });
+    await page.goForward();
+    await expect(page.locator("#app-notice")).toBeVisible();
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on your Mac. Showing your inbox.");
+    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
+    await page.waitForTimeout(300);
+    await expect(page.locator("#error-banner")).toBeHidden();
+    expect(state.calls.filter((c) => c.path === "/api/session")).toEqual([]);
+    // The app stays usable: a conversation opens and Back returns to the inbox.
+    await page.getByRole("button", { name: "Open session navigation" }).tap();
+    await page.getByRole("button", { name: /Write docs/ }).tap();
+    await expect(page.getByText("History of Write docs")).toBeVisible();
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+  });
 
   test("selecting conversations updates the URL and reload keeps the view", async ({ page }) => {
     await fixture(page);
@@ -439,6 +487,52 @@ test.describe("Android Back", () => {
     await expect.poll(() => page.evaluate(() => history.state?.overlay ?? null)).toBeNull();
     await page.goBack();
     expect(page.url()).toBe("about:blank");
+  });
+
+  test("a reload with the drawer open leaves no duplicate entry: one Back returns to the inbox", async ({ page }) => {
+    await fixture(page);
+    await page.goto("/");
+    const openNav = page.getByRole("button", { name: "Open session navigation" });
+    await openNav.tap();
+    await page.getByRole("button", { name: /Fix sign-in/ }).tap();
+    await expect(page.getByText("History of Fix sign-in")).toBeVisible();
+    await openNav.tap();
+    await expect(openNav).toHaveAttribute("aria-expanded", "true");
+    await page.reload();
+    await expect(page.getByText("History of Fix sign-in")).toBeVisible();
+    await expect(openNav).toHaveAttribute("aria-expanded", "false");
+    await expect.poll(() => page.evaluate(() => history.state)).toEqual({ foreman: 1, view: "managed:alpha" });
+    // One Back is a visible navigation, not a silent step between identical entries.
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    expect(page.url()).toBe("http://127.0.0.1:4188/");
+    // Forward returns to the conversation; the dead drawer entry beyond it is not a stop either.
+    await page.goForward();
+    await expect(page.getByText("History of Fix sign-in")).toBeVisible();
+    await page.goForward();
+    await expect.poll(() => page.evaluate(() => history.state)).toEqual({ foreman: 1, view: "managed:alpha" });
+    await expect(openNav).toHaveAttribute("aria-expanded", "false");
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await page.goBack();
+    expect(page.url()).toBe("about:blank");
+  });
+
+  test("a reload with a dialog over the drawer leaves no duplicate entries", async ({ page }) => {
+    await fixture(page);
+    await page.goto("/?view=pm");
+    await expect(page.getByRole("heading", { name: "Claude · Project manager" })).toBeVisible();
+    await page.getByRole("button", { name: "Open session navigation" }).tap();
+    await page.getByRole("button", { name: "New session", exact: true }).tap();
+    await expect(page.locator("#new-dialog")).toBeVisible();
+    await expect.poll(() => page.evaluate(() => history.state?.overlay ?? null)).toBe("dialog");
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager" })).toBeVisible();
+    await expect(page.locator("#new-dialog")).toBeHidden();
+    await expect.poll(() => page.evaluate(() => history.state)).toEqual({ foreman: 1, view: "pm" });
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    expect(page.url()).toBe("http://127.0.0.1:4188/");
   });
 
   test("Forward after Back returns to the conversation", async ({ page }) => {
