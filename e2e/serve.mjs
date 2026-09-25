@@ -19,6 +19,8 @@ const allowed = new Map([
   ["/icons/icon-192.png", "icons/icon-192.png"],
   ["/icons/icon-512.png", "icons/icon-512.png"],
   ["/icons/maskable-512.png", "icons/maskable-512.png"],
+  ["/icons/apple-touch-icon-180.png", "icons/apple-touch-icon-180.png"],
+  ["/icons/badge-96.png", "icons/badge-96.png"],
 ]);
 const mime = {
   html: "text/html",
