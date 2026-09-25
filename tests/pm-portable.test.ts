@@ -362,6 +362,57 @@ test('a duplicate delivery of an uncertain turn (its ack lost) is shown once and
   assert.ok(relay.frames.filter((f) => f.frame.op === 'turn.ack_uncertain').length >= 2);
 });
 
+test('#116: an uncertain entry whose ack was lost is not shown again after a restart', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const dirB = home('machine-b', '## p\nx\n');
+  const B = daemon(t, relay, dirB, 'machine-b');
+  await B.connect(); await until(() => B.launches.length === 1);
+  await B.pm.send('HOLD: work'); await until(() => B.launches[0]!.consumed.length === 1);
+  const turn = B.pm.outstandingTurnIds()[0]!;
+  B.kill();
+  relay.swallow = (frame) => frame.op === 'turn.ack_uncertain'; // the ack is lost in transit
+  const B2 = daemon(t, relay, dirB, 'machine-b', { rpcTimeoutMs: 100 });
+  await B2.connect(); await until(() => B2.uncertain().length === 1, 'shown after the first restart');
+  await until(() => relay.frames.some((f) => f.frame.op === 'turn.ack_uncertain'));
+  B2.kill(); // restarts again before the ack is retried
+  relay.swallow = null;
+  assert.equal(relay.turns.get(turn)?.state, 'uncertain', 'the relay still holds it');
+  const B3 = daemon(t, relay, dirB, 'machine-b');
+  await B3.connect(); await until(() => B3.launches.length === 1);
+  await until(() => !relay.turns.has(turn), 'acknowledged by the next run');
+  assert.equal(B3.uncertain().length, 0, 'not shown a second time');
+});
+
+test('#116: a send whose begin failed (503, never dispatched) leaves no uncertain entry after a restart', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const dirB = home('machine-b', '## p\nx\n');
+  const B = daemon(t, relay, dirB, 'machine-b', { rpcTimeoutMs: 100 });
+  await B.connect(); await until(() => B.launches.length === 1);
+  // The relay records the turn but its ack never arrives; the failed end is lost too.
+  let turnId = '';
+  relay.swallow = (frame) => {
+    if (frame.op === 'turn.end') return true;
+    if (frame.op !== 'turn.begin') return false;
+    const parsed = parsePmRpc(frame);
+    assert.ok(parsed.ok);
+    turnId = frame.args.turn_id;
+    (relay as any).apply(parsed.value, B.identity.machine_id);
+    return true;
+  };
+  await assert.rejects(B.pm.send('never dispatched'), /could not record your message, so it was not sent/);
+  assert.equal(relay.turns.get(turnId)?.state, 'open');
+  assert.deepEqual(B.launches[0]!.consumed, [], 'not dispatched');
+  B.kill(); // restart before the failed end reaches the relay
+  relay.swallow = null;
+  const B2 = daemon(t, relay, dirB, 'machine-b');
+  await B2.connect(); await until(() => B2.launches.length === 1);
+  await until(() => !relay.turns.has(turnId), 'the failed end flushed after the restart');
+  await tick(); await tick();
+  assert.equal(B2.uncertain().length, 0, 'no "could not be confirmed" entry for a message that was never dispatched');
+});
+
 test('local-only mode: a restart mid-turn reports one uncertain entry, with no replay', { timeout: 20_000 }, async (t) => {
   t.mock.method(console, 'error', () => {});
   const dir = home('local', '## p\nx\n');

@@ -314,15 +314,16 @@ export class ProjectManager extends EventEmitter {
   }
 
   // Each uncertain turn is shown once per process (the store re-sends the list on every connection
-  // or assignment change), then acknowledged.
+  // or assignment change) and acknowledged. #116: the acknowledgement is handed to the store first —
+  // the store records it durably before this reports anything — so a restart never repeats one.
   private reportUncertain(turns: UncertainTurn[]) {
+    if (turns.length && this.store) {
+      this.store.ackUncertain(turns.map((turn) => turn.turn_id)).catch((error) => this.diagnostic('foreman: pm uncertain ack failed', { error: errorText(error) }));
+    }
     for (const turn of turns) {
       if (this.shownUncertain.has(turn.turn_id)) continue;
       this.shownUncertain.add(turn.turn_id);
       this.reportFailureEntry(uncertainText(turn.accepted_at, turn.host, UNCERTAIN_REASON_TEXT[turn.reason] ?? turn.reason));
-    }
-    if (turns.length && this.store) {
-      this.store.ackUncertain(turns.map((turn) => turn.turn_id)).catch((error) => this.diagnostic('foreman: pm uncertain ack failed', { error: errorText(error) }));
     }
   }
 

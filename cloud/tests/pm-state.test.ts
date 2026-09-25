@@ -7,6 +7,7 @@ import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { MAX_PM_HOST_BODY, OFFLINE_AFTER, type HostRelay } from '../worker.ts';
+import { MAX_UNCERTAIN_TURNS } from '../pm-state.ts';
 import { allowedRequest } from '../../shared/relay.ts';
 import {
   MAX_LOG_KEPT, MAX_LOG_READ, MAX_OPEN_TURNS, parsePmAssignment, parsePmOpResult, parsePmRpcResult, pmHostOfflineMessage,
@@ -538,6 +539,43 @@ describe('in-flight turns and uncertainty', () => {
     const back = await machine(stub, 'machine-a', { machine_id: a.machine_id, openTurns: ['orphan-turn'] });
     expect(lastAssignment(back)).toMatchObject({ active: false, epoch: 2, uncertain_turns: [] });
     expect(await turns(stub)).toMatchObject([{ state: 'uncertain', reason: 'host_lost' }]);
+  });
+
+  // #116: uncertain rows are capped overall, dropping the oldest (accepted_at, then turn_id).
+  const seedUncertain = (stub: Stub, machineId: string, count: number) => runInDurableObject(stub, (_instance: HostRelay, ctx) => {
+    for (let i = 0; i < count; i++) {
+      ctx.storage.sql.exec("INSERT INTO pm_turns (turn_id, machine_id, epoch, accepted_at, state, reason) VALUES (?, ?, 1, ?, 'uncertain', 'restarted')",
+        `old-${String(i).padStart(4, '0')}`, machineId, Date.parse('2026-01-01T00:00:00.000Z') + Math.floor(i / 2) * 1000);
+    }
+  });
+  it(`uncertain rows are capped at ${MAX_UNCERTAIN_TURNS} on reassignment, dropping the oldest deterministically`, async () => {
+    const { stub, a, b } = await pair();
+    await seedUncertain(stub, a.machine_id, MAX_UNCERTAIN_TURNS - 1);
+    await ok(a, 'turn.begin', { turn_id: 'new-1', accepted_at: at(-2000) }, 1);
+    await ok(a, 'turn.begin', { turn_id: 'new-2', accepted_at: at(-1000) }, 1);
+    await ok(a, 'turn.begin', { turn_id: 'new-3', accepted_at: at() }, 1);
+    expect((await move(stub, { machine_id: b.machine_id, expected_epoch: 1 })).status).toBe(200);
+    const rows = (await turns(stub)).filter((t) => t.state === 'uncertain');
+    expect(rows).toHaveLength(MAX_UNCERTAIN_TURNS);
+    expect((await pmHost(stub)).uncertain_turns).toBe(MAX_UNCERTAIN_TURNS);
+    // old-0000 and old-0001 share the oldest accepted_at: both go (the tie is broken by turn_id).
+    const ids = rows.map((t) => t.turn_id);
+    expect(ids.slice(0, 2)).toEqual(['old-0002', 'old-0003']);
+    expect(ids.slice(-3)).toEqual(['new-1', 'new-2', 'new-3']);
+    await until(() => assignments(b).length === 2, 'assignment frame to B');
+    expect(lastAssignment(b).uncertain_turns.map((t) => t.turn_id)[0]).toBe('old-0002');
+  });
+
+  it(`uncertain rows are capped at ${MAX_UNCERTAIN_TURNS} on a restart reconciliation too`, async () => {
+    const { stub, a } = await pair();
+    await seedUncertain(stub, a.machine_id, MAX_UNCERTAIN_TURNS);
+    await ok(a, 'turn.begin', { turn_id: 'lost-turn', accepted_at: at() }, 1);
+    await disconnect(stub, a);
+    await machine(stub, 'machine-a', { machine_id: a.machine_id, openTurns: [] });
+    const rows = (await turns(stub)).filter((t) => t.state === 'uncertain');
+    expect(rows).toHaveLength(MAX_UNCERTAIN_TURNS);
+    expect(rows[0]!.turn_id).toBe('old-0001');
+    expect(rows.at(-1)!.turn_id).toBe('lost-turn');
   });
 
   it('uncertain turns are delivered to the active host until acked, then never again', async () => {
