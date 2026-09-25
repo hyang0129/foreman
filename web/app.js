@@ -429,13 +429,34 @@ function closeNav() {
   setNav(false);
   popOverlay("nav");
 }
+// An overlay entry whose layer is gone (the page was reloaded with the drawer or a dialog open,
+// or Forward/Back reached it after the layer closed). Every overlay entry sits directly above an
+// entry for the same view, so stepping back onto it removes the dead layer without leaving two
+// identical entries behind (which made the next Back appear to do nothing). `budget` bounds the
+// steps (the stack holds at most two overlays); if it runs out, the entry is kept as a plain view.
+function deadOverlay(state) {
+  return (state?.overlay === "nav" && !navOpen()) || (state?.overlay === "dialog" && !ui.dialog.open) || (state?.overlay === "move" && !ui.moveDialog.open);
+}
+function dropDeadOverlay(budget = 3) {
+  afterHistory(() => {
+    const state = history.state;
+    if (!state?.foreman || !deadOverlay(state)) return;
+    if (budget <= 0) {
+      history.replaceState(historyState(state.view), "", location.href);
+      return;
+    }
+    historyBack();
+    dropDeadOverlay(budget - 1);
+  });
+}
 function initHistory() {
   const url = viewUrl(selected);
   const state = history.state;
   if (state?.foreman && (state.view || null) === selected) {
     // A reload or restore of an entry this app created keeps its stack; an overlay that
-    // no longer exists after the reload is dropped from the entry.
-    if (state.overlay || location.pathname + location.search !== url) history.replaceState(historyState(selected), "", url);
+    // no longer exists after the reload is stepped off (see dropDeadOverlay).
+    if (state.overlay) dropDeadOverlay();
+    else if (location.pathname + location.search !== url) history.replaceState(historyState(selected), "", url);
   } else if (selected) {
     // A fresh deep link: put the inbox beneath it, so Back returns to the inbox, not out.
     history.replaceState(historyState(null), "", "/");
@@ -452,11 +473,18 @@ window.addEventListener("popstate", (event) => {
     setNav(false);
     $("#open-nav").focus({ preventScroll: true });
   }
-  // Forward into an overlay entry whose layer is gone: keep the entry as a plain view.
-  if ((state.overlay === "nav" && !navOpen()) || (state.overlay === "dialog" && !ui.dialog.open) || (state.overlay === "move" && !ui.moveDialog.open))
-    history.replaceState(historyState(state.view), "", location.href);
+  // Forward into an overlay entry whose layer is gone: step back off it (same view beneath).
+  if (event.state?.foreman && deadOverlay(state)) dropDeadOverlay();
   const view = state.view || null;
   if (view === selected) return;
+  // Forward onto a deep link that was rejected: the same neutral inbox fallback, not the
+  // conversation's error, unless the host has since listed that session.
+  if (view && state.rejected && !sessions.some((s) => s.session_key === view)) {
+    showInbox();
+    showNotice(UNKNOWN_LINK_NOTICE);
+    historyBack();
+    return;
+  }
   if (view) void selectSession(view, false);
   else showInbox();
 });
@@ -1185,8 +1213,14 @@ function showInbox() {
   renderHeading();
 }
 // The deep-linked session is not on this host: fall back to the inbox with a neutral notice.
+// Its entry is marked rejected before Back leaves it, so Forward repeats this fallback.
 function rejectDeepLink() {
+  const key = selected;
   showInbox();
+  afterHistory(() => {
+    const state = history.state;
+    if (state?.foreman && state.view === key && !state.overlay) history.replaceState({ ...state, rejected: true }, "", location.href);
+  });
   recordView(null);
   showNotice(UNKNOWN_LINK_NOTICE);
 }
