@@ -73,13 +73,18 @@ const unknownInitialLink = initialLink?.session === "pm" || (!initialLink && new
 let selected = initialLink?.view === "pm" ? "pm" : initialLink?.session && initialLink.session !== "pm" ? initialLink.session : null;
 // A deep-linked session opens optimistically and is checked against the host's list once.
 let deepLinkPending = selected && selected !== "pm" ? selected : null, initialNoticeShown = false;
-const UNKNOWN_LINK_NOTICE = "That conversation isn’t available on your Mac. Showing your inbox.";
+const UNKNOWN_LINK_NOTICE = "That conversation isn’t available on the execution host. Showing your inbox.";
 let sessions = [],
   detail = null,
   host = { online: false },
   // GET /api/pm/host (epic #26 contract D): which machine runs the PM. null until read, or
   // when the host or relay does not serve the route.
   pmHost = null,
+  // Whether /api/pm/host has answered since sign-in (the PM view shows a placeholder until then),
+  // and a relay-mode local daemon's own view of the assignment (its 404 body), shown instead.
+  pmHostChecked = false,
+  pmHostView = null,
+  hostError = "",
   authorized = false,
   authRequired = false,
   localAuthMode = false,
@@ -297,6 +302,7 @@ async function api(path, options = {}, retry = true) {
       result.error || `Request failed (${response.status}).`,
     );
     error.status = response.status;
+    error.body = result;
     throw error;
   }
   return result;
@@ -324,7 +330,7 @@ function revokeAccess(message) {
   sessionsLoaded = false;
   detail = null;
   host = { online: false };
-  pmHost = null;
+  pmHost = null; pmHostChecked = false; pmHostView = null; hostError = "";
   renderPmHost();
   ui.moveDialog.close();
   clearDrafts();
@@ -476,17 +482,28 @@ function hideNotice() {
   clearTimeout(noticeTimer);
   $("#app-notice").hidden = true;
 }
+// GET /api/host names the machine this app talks to (the PM's machine with the relay). Its name
+// when known, never an assumed platform.
+function hostName(fallback) {
+  return typeof host.host === "string" && host.host.trim() ? host.host.trim() : fallback;
+}
 function renderHost() {
   $("#host-dot").className = `dot ${host.online ? "online" : "offline"}`;
   $("#host-status").textContent = !hostChecked ? "Connecting to execution host…" : host.online
-    ? `${host.host || "Execution host"} · online`
-    : "Execution host offline";
-  const banner = $("#connection-banner");
-  banner.hidden = !!host.online || !hostChecked;
-  banner.textContent =
-    "Your Mac is disconnected. Showing the last available state. Messages and approvals will be available when it reconnects.";
+    ? `${hostName("Execution host")} · online`
+    : hostName("") ? `${hostName("")} · offline` : "Execution host offline";
+  renderConnectionBanner();
   updateControls();
   if (ui.messages.querySelector(".empty-state") && !conversationLoading) renderMessages();
+}
+function renderConnectionBanner() {
+  const banner = $("#connection-banner");
+  const text = hostError ? `Cannot reach the execution host. ${hostError} Retrying automatically.`
+    : `${hostName("The execution host")} is disconnected. Showing the last available state. Messages and approvals will be available when it reconnects.`;
+  if (banner.textContent !== text) banner.textContent = text;
+  // In the PM view the machine line already says the PM's machine is offline.
+  const saidByPmLine = selected === "pm" && !$("#pm-host").hidden && !$("#pm-host-offline").hidden;
+  banner.hidden = !!host.online || !hostChecked || (!hostError && saidByPmLine);
 }
 function renderRail() {
   const focusedKey = document.activeElement?.dataset?.session;
@@ -557,7 +574,7 @@ function renderRail() {
     const noMatches = !!query && sessionsLoaded;
     empty.append(node("p", "", noMatches ? "No sessions match your search."
       : !hostChecked || (host.online && !sessionsLoaded) ? "Loading sessions…"
-      : !host.online ? "Your Mac is offline. Reconnect to see sessions."
+      : !host.online ? `${hostName("The execution host")} is offline. Reconnect to see sessions.`
       : "No sessions yet. Start a session above."));
     if (noMatches) {
       const clear = node("button", "btn ghost", "Clear search");
@@ -597,13 +614,15 @@ function updateControls() {
     !authorized ||
     !host.online ||
     (isPm ? !pmBusy : !session?.capabilities?.interrupt) ||
+    // Until a PM send's 202 arrives its turn is not dispatched yet, so Stop could not reach it.
+    (isPm && sending) ||
     ui.interrupt.dataset.busy === "true";
   ui.interrupt.textContent = ui.interrupt.dataset.busy === "true" ? "Interrupting…" : "Interrupt";
   renderActionFeedback();
   ui.input.placeholder = !selected
     ? "Choose a session to start a conversation"
     : !host.online
-      ? "Reconnect your Mac to send a message"
+      ? `Reconnect ${hostName("the execution host")} to send a message`
       : !canMessage
         ? "This session is available for monitoring"
         : isPm
@@ -782,18 +801,23 @@ function dayLabel(date, now) {
   yesterday.setDate(yesterday.getDate() - 1);
   return localDay(date) === localDay(yesterday) ? "Yesterday" : date.toLocaleDateString([], { dateStyle: "medium" });
 }
+const PM_MOVED_TEXT = /^(The PM now runs on |This machine is no longer the PM host)/;
 function messageNode(entry, receipt, entryKey) {
   const role = ["user", "assistant", "tool", "system"].includes(entry.role)
     ? entry.role
     : "system";
   const failed = role === "system" && entry.error === true;
-  const article = node("article", `message ${role}${failed ? " error" : ""}`);
+  // server/pm.ts records this when the PM moves away from this machine; it explains why sends
+  // here are refused, so it stands out from routine system lines.
+  const moved = role === "system" && !failed && selected === "pm" && PM_MOVED_TEXT.test(String(entry.text || ""));
+  const article = node("article", `message ${role}${failed ? " error" : ""}${moved ? " pm-moved" : ""}`);
   if (failed) article.setAttribute("aria-label", failureLabel());
+  if (moved) article.setAttribute("aria-label", "The PM moved");
   const sender = sourceLabel(entry.source);
   const label = node(
     "div",
     "message-label",
-    failed ? failureLabel() : sender
+    failed ? failureLabel() : moved ? "PM moved" : sender
       ? `From ${sender}`
       : role === "user"
         ? "You"
@@ -914,12 +938,12 @@ function renderMessages(history = [], receipts = []) {
   timelineEntries = entries;
   if (!history.length && !receipts.length) {
     const loading = !hostChecked || (host.online && !sessionsLoaded && !selected);
-    const title = loading ? "Loading sessions…" : !host.online ? "Your Mac is offline"
+    const title = loading ? "Loading sessions…" : !host.online ? `${hostName("The execution host")} is offline`
       : selected === "pm" ? "New conversation."
       : selected ? (detail?.session?.capabilities?.message ? "Ready when you are." : "No readable history yet.")
       : sessions.filter((s) => s.name !== "foreman-pm").length ? "Choose a conversation" : "No sessions yet";
     const text = loading ? "Checking your execution host for sessions."
-      : !host.online ? "Reconnect your Mac to view sessions and continue work."
+      : !host.online ? `Reconnect ${hostName("the execution host")} to view sessions and continue work.`
       : selected === "pm" ? "The PM remembers projects and decisions, not past chats."
       : selected ? (detail?.session?.capabilities?.message ? "Send a task or a follow-up to begin the conversation." : "No readable conversation is available yet. Activity will appear as this session runs.")
       : "Choose an existing conversation or start a Claude or Codex session.";
@@ -1154,7 +1178,7 @@ async function selectSession(key, record = true) {
     ui.title.tabIndex = -1;
     ui.title.focus({ preventScroll: true });
   }
-  if (!host.online) showConversationLoading("Conversation unavailable while your Mac is offline. It will open when your Mac reconnects.", true);
+  if (!host.online) showConversationLoading(`Conversation unavailable while ${hostName("the execution host")} is offline. It will open when it reconnects.`, true);
   try {
     await refreshSelected();
   } catch (error) {
@@ -1305,13 +1329,35 @@ function lastSeenText(ms) {
     : seconds < 86400 ? `Last seen ${Math.floor(seconds / 3600)} h ago`
     : `Last seen ${Math.floor(seconds / 86400)} d ago`;
 }
+// A relay-mode daemon's local UI (localhost) gets 404 from /api/pm/host: only the relay knows every
+// machine and whether it is online. Its body carries what this machine does know (server/main.ts
+// pmHost()): whether it is connected, whether it runs the PM, and the active machine's name.
+function readPmHostView(raw) {
+  const view = raw?.view;
+  if (!view || typeof view !== "object" || view.mode !== "relay") return null;
+  const name = (value) => (typeof value === "string" && value.trim() ? value.trim() : null);
+  return { connected: view.connected === true, thisActive: view.this_machine_active === true,
+    activeName: name(view.active_machine?.host), thisName: name(view.this_machine?.name) };
+}
+function pmHostViewLabel(view) {
+  const details = "PM host details are in the hosted app";
+  if (view.thisActive) return `PM on ${view.activeName || view.thisName || "this machine"} (this machine) · ${details}`;
+  if (view.connected && view.activeName) return `PM on ${view.activeName} · ${details}`;
+  if (!view.connected) return `${view.thisName || "This machine"} isn’t connected to the cloud relay · ${details}`;
+  return details;
+}
 function renderPmHost() {
   const bar = $("#pm-host"), active = pmHost?.active || null;
-  bar.hidden = selected !== "pm" || !pmHost;
+  const view = pmHost ? null : pmHostView;
+  // Until the first answer the PM view holds the line's place with a placeholder.
+  bar.hidden = selected !== "pm" || !authorized || (pmHostChecked && !pmHost && !view);
+  bar.setAttribute("aria-busy", String(!pmHostChecked));
   const offline = !!active && !active.online;
-  const label = !pmHost ? "" : active ? `PM on ${active.name} · ${active.online ? "online" : "offline"}` : "No machine runs the PM yet";
+  const label = !pmHostChecked ? "Checking which machine runs the PM…"
+    : pmHost ? (active ? `PM on ${active.name} · ${active.online ? "online" : "offline"}` : "No machine runs the PM yet")
+    : view ? pmHostViewLabel(view) : "";
   if ($("#pm-host-label").textContent !== label) $("#pm-host-label").textContent = label;
-  $("#pm-host-dot").className = `dot ${active?.online ? "online" : active ? "offline" : "unknown"}`;
+  $("#pm-host-dot").className = `dot ${active?.online || view?.thisActive ? "online" : active ? "offline" : "unknown"}`;
   const offlineText = offline ? pmHostOfflineMessage(active.name) : "";
   const offlineLine = $("#pm-host-offline");
   if (offlineLine.textContent !== offlineText) offlineLine.textContent = offlineText;
@@ -1319,17 +1365,21 @@ function renderPmHost() {
   bar.classList.toggle("is-offline", offline);
   $("#move-pm").hidden = !moveTargets().length;
   if (ui.moveDialog.open) renderMoveList();
+  renderConnectionBanner();
 }
 async function refreshPmHost(epoch) {
   try {
     const result = await api("/api/pm/host");
     if (!authorized || epoch !== authEpoch) return;
     pmHost = readPmHost(result);
+    pmHostView = null;
   } catch (error) {
     if (!authorized || epoch !== authEpoch) return;
-    // A host or relay without the route shows no PM machine; other failures keep the last answer.
-    if (error?.status === 404) pmHost = null;
+    // A host or relay without the route shows no PM machine (a relay-mode daemon's own view
+    // instead, when it gives one); other failures keep the last answer.
+    if (error?.status === 404) { pmHost = null; pmHostView = readPmHostView(error.body); }
   }
+  pmHostChecked = true;
   renderPmHost();
 }
 let moveOpener = null, moveBusy = false, moveEpoch = 0, moveChoice = null, moveSignature = "";
@@ -1491,16 +1541,18 @@ async function poll() {
   if (!authorized || polling) return;
   polling = true;
   const epoch = authEpoch;
+  let pmHostRead;
   try {
     const nextHost = await api("/api/host");
     if (!authorized || epoch !== authEpoch) return;
     host = nextHost;
     hostChecked = true;
+    hostError = "";
     renderHost();
     // The PM machine is answered by the relay even while that machine is offline, so it is
-    // read on every poll, exactly once, whether or not the host is online.
-    await refreshPmHost(epoch);
-    if (!authorized || epoch !== authEpoch) return;
+    // read on every poll, exactly once, whether or not the host is online. It is read alongside
+    // the sessions, so a slow answer never holds up the session list.
+    pmHostRead = refreshPmHost(epoch);
     if (host.online) {
       const rows = await api("/api/sessions");
       if (!authorized || epoch !== authEpoch) return;
@@ -1519,7 +1571,7 @@ async function poll() {
       }
       await refreshPmSummary(epoch);
     } else {
-      if (conversationLoading) showConversationLoading("Conversation unavailable while your Mac is offline. It will open when your Mac reconnects.", true);
+      if (conversationLoading) showConversationLoading(`Conversation unavailable while ${hostName("the execution host")} is offline. It will open when it reconnects.`, true);
       renderRail();
       renderHeading();
     }
@@ -1527,14 +1579,15 @@ async function poll() {
     if (authorized && epoch === authEpoch) {
       host = { online: false };
       hostChecked = true;
+      hostError = errorMessage(error);
       renderHost();
       renderRail();
       renderHeading();
-      $("#connection-banner").textContent =
-        `Cannot reach the execution host. ${errorMessage(error)} Retrying automatically.`;
-      if (conversationLoading) showConversationLoading("Conversation unavailable while your Mac is offline. Retrying automatically.", true);
+      if (conversationLoading) showConversationLoading("Conversation unavailable while the execution host is unreachable. Retrying automatically.", true);
     }
   } finally {
+    // One PM machine read per poll: the next poll starts only after this one's answer.
+    await pmHostRead?.catch(() => { /* Display only; the next poll reads it again. */ });
     polling = false;
     if (authorized)
       pollTimer = setTimeout(poll, document.hidden ? 10000 : 3000);
@@ -1771,7 +1824,7 @@ async function changeProject(action) {
     if (epoch !== authEpoch || revision !== projectRevision || !ui.dialog.open) return;
     if (action === "remove") { $("#new-cwd").value = ""; await loadProjects(); await resolveNewProject(); }
     else { $("#new-cwd").value = result.path; await loadProjects(); await resolveNewProject(); }
-    $("#project-feedback").textContent = action === "remove" ? "Project removed. Existing sessions are unchanged." : "Project saved on your Mac.";
+    $("#project-feedback").textContent = action === "remove" ? "Project removed. Existing sessions are unchanged." : `Project saved on ${hostName("the execution host")}.`;
     $("#new-cwd").focus();
   } catch (error) { if (epoch === authEpoch && revision === projectRevision) $("#project-feedback").textContent = errorMessage(error); }
   finally { button.disabled = false; }
@@ -2284,6 +2337,7 @@ function enterApp(user) {
   clearError();
   setPmRailError(null);
   renderHost();
+  renderPmHost();
   renderRail();
   renderHeading();
   if (selected && !ui.input.value) {

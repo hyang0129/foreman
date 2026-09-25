@@ -318,7 +318,7 @@ test("host disconnection disables mutations and preserves last conversation", as
   state.online = false;
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
   await expect(
-    page.getByText("Execution host offline", { exact: true }),
+    page.getByText("Dev Mac · offline", { exact: true }),
   ).toBeVisible();
   await expect(page.getByLabel("Message this session")).toBeDisabled();
   await expect(page.locator("#activity-status")).toContainText("Last known · Working…");
@@ -1670,7 +1670,7 @@ test("loading, no sessions and offline empty states retain authoritative Start a
   expect(state.calls.filter((call) => call.body)).toHaveLength(0);
   state.online = false;
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
-  await expect(page.getByRole("heading", { name: "Your Mac is offline", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Dev Mac is offline", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Start a session", exact: true })).toBeDisabled();
   await expect(page.getByRole("button", { name: "New session", exact: true })).toBeDisabled();
   state.online = true;
