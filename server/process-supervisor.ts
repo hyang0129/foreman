@@ -31,7 +31,10 @@ process.stdout.on('error', () => { void stop(); });
 process.stderr.on('error', () => { void stop(); });
 function watch(active: boolean) {
   clearInterval(timer);
-  timer = setInterval(() => { try { tree!.sample(); } catch { void stop(1); } }, active ? 50 : 1000);
+  timer = setInterval(() => {
+    try { tree!.sample(); }
+    catch (error) { process.stderr.write(`Foreman process ownership sample failed: ${String(error)}\n`); void stop(1); }
+  }, active ? 50 : 1000);
 }
 process.on('message', (message: { type?: string; active?: boolean; command: string; args: string[]; cwd?: string; env: NodeJS.ProcessEnv }) => {
   if (message.type === 'active') { if (tree && !stopping) watch(!!message.active); return; }
@@ -48,7 +51,10 @@ process.on('message', (message: { type?: string; active?: boolean; command: stri
     // Keep ownership while the parent relationship still exists. The final
     // sample on exit also picks up descendants created since the last tick.
     watch(true);
-    if (!tree.sample().some((entry) => entry.pid === child!.pid)) {
+    let recorded = false;
+    try { recorded = tree.sample().some((entry) => entry.pid === child!.pid); }
+    catch (error) { process.stderr.write(`${String(error)}\n`); }
+    if (!recorded) {
       process.stderr.write('Could not record provider process ownership\n');
       void stop(2); return;
     }
