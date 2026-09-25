@@ -7,6 +7,7 @@ import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { MAX_PM_HOST_BODY, OFFLINE_AFTER, type HostRelay } from '../worker.ts';
+import { MAX_UNCERTAIN_TURNS } from '../pm-state.ts';
 import { allowedRequest } from '../../shared/relay.ts';
 import {
   MAX_LOG_KEPT, MAX_LOG_READ, MAX_OPEN_TURNS, parsePmAssignment, parsePmOpResult, parsePmRpcResult, pmHostOfflineMessage,
@@ -542,6 +543,43 @@ describe('in-flight turns and uncertainty', () => {
     expect(await turns(stub)).toMatchObject([{ state: 'uncertain', reason: 'host_lost' }]);
   });
 
+  // #116: uncertain rows are capped overall, dropping the oldest (accepted_at, then turn_id).
+  const seedUncertain = (stub: Stub, machineId: string, count: number) => runInDurableObject(stub, (_instance: HostRelay, ctx) => {
+    for (let i = 0; i < count; i++) {
+      ctx.storage.sql.exec("INSERT INTO pm_turns (turn_id, machine_id, epoch, accepted_at, state, reason) VALUES (?, ?, 1, ?, 'uncertain', 'restarted')",
+        `old-${String(i).padStart(4, '0')}`, machineId, Date.parse('2026-01-01T00:00:00.000Z') + Math.floor(i / 2) * 1000);
+    }
+  });
+  it(`uncertain rows are capped at ${MAX_UNCERTAIN_TURNS} on reassignment, dropping the oldest deterministically`, async () => {
+    const { stub, a, b } = await pair();
+    await seedUncertain(stub, a.machine_id, MAX_UNCERTAIN_TURNS - 1);
+    await ok(a, 'turn.begin', { turn_id: 'new-1', accepted_at: at(-2000) }, 1);
+    await ok(a, 'turn.begin', { turn_id: 'new-2', accepted_at: at(-1000) }, 1);
+    await ok(a, 'turn.begin', { turn_id: 'new-3', accepted_at: at() }, 1);
+    expect((await move(stub, { machine_id: b.machine_id, expected_epoch: 1 })).status).toBe(200);
+    const rows = (await turns(stub)).filter((t) => t.state === 'uncertain');
+    expect(rows).toHaveLength(MAX_UNCERTAIN_TURNS);
+    expect((await pmHost(stub)).uncertain_turns).toBe(MAX_UNCERTAIN_TURNS);
+    // old-0000 and old-0001 share the oldest accepted_at: both go (the tie is broken by turn_id).
+    const ids = rows.map((t) => t.turn_id);
+    expect(ids.slice(0, 2)).toEqual(['old-0002', 'old-0003']);
+    expect(ids.slice(-3)).toEqual(['new-1', 'new-2', 'new-3']);
+    await until(() => assignments(b).length === 2, 'assignment frame to B');
+    expect(lastAssignment(b).uncertain_turns.map((t) => t.turn_id)[0]).toBe('old-0002');
+  });
+
+  it(`uncertain rows are capped at ${MAX_UNCERTAIN_TURNS} on a restart reconciliation too`, async () => {
+    const { stub, a } = await pair();
+    await seedUncertain(stub, a.machine_id, MAX_UNCERTAIN_TURNS);
+    await ok(a, 'turn.begin', { turn_id: 'lost-turn', accepted_at: at() }, 1);
+    await disconnect(stub, a);
+    await machine(stub, 'machine-a', { machine_id: a.machine_id, openTurns: [] });
+    const rows = (await turns(stub)).filter((t) => t.state === 'uncertain');
+    expect(rows).toHaveLength(MAX_UNCERTAIN_TURNS);
+    expect(rows[0]!.turn_id).toBe('old-0001');
+    expect(rows.at(-1)!.turn_id).toBe('lost-turn');
+  });
+
   it('uncertain turns are delivered to the active host until acked, then never again', async () => {
     const { stub, a, b } = await pair();
     await ok(a, 'turn.begin', { turn_id: 'u1', accepted_at: at(-2000) }, 1);
@@ -694,5 +732,52 @@ describe('#43 host-offline alarm follows the active PM host', () => {
     await runDurableObjectAlarm(stub);
     expect(pushes).toHaveLength(2);
     expect(pushes[1]!.payload).toMatchObject({ kind: 'host_offline', host: 'machine-b' });
+  });
+});
+
+describe('#122 heartbeat and offline diagnostics', () => {
+  const lastSeen = async (stub: Stub, machineId: string) => (await sql<{ last_seen: number }>(stub, 'SELECT last_seen FROM machines WHERE machine_id = ?', machineId))[0]!.last_seen;
+  const setLastSeen = (stub: Stub, machineId: string, value: number) => sql(stub, 'UPDATE machines SET last_seen = ? WHERE machine_id = ?', value, machineId);
+
+  it('a pm_rpc frame refreshes its socket\'s heartbeat, so an active host that only sends rpcs stays online', async () => {
+    const stub = relay();
+    const a = await machine(stub, 'machine-a');
+    await runInDurableObject(stub, (_instance: HostRelay, ctx) => {
+      for (const socket of ctx.getWebSockets('host')) socket.serializeAttachment({ ...socket.deserializeAttachment(), lastSeen: Date.now() - 120_000 });
+    });
+    expect((await hostStatus(stub)).online).toBe(false);
+    await ok(a, 'memory.get', {}, 1);
+    expect((await hostStatus(stub)).online).toBe(true);
+    expect((await pmHost(stub)).machines.find((m) => m.machine_id === a.machine_id)?.online).toBe(true);
+  });
+
+  it('machines.last_seen is written at most once a minute per machine by heartbeats (pings and pm_rpc)', async () => {
+    const stub = relay();
+    const a = await machine(stub, 'machine-a');
+    // Seen 30 s ago: a ping and an rpc within the interval write nothing.
+    const recent = Date.now() - 30_000;
+    await setLastSeen(stub, a.machine_id, recent);
+    await flush(a);
+    await ok(a, 'memory.get', {}, 1);
+    expect(await lastSeen(stub, a.machine_id)).toBe(recent);
+    // Seen over a minute ago: the next heartbeat writes it.
+    const old = Date.now() - 61_000;
+    await setLastSeen(stub, a.machine_id, old);
+    await flush(a);
+    expect(await lastSeen(stub, a.machine_id)).toBeGreaterThan(old + 60_000);
+    // Online is the socket's own freshness, never the stored value.
+    await setLastSeen(stub, a.machine_id, Date.now() - 30 * 60_000);
+    expect((await pmHost(stub)).machines[0]).toMatchObject({ online: true });
+    // A hello always writes it.
+    await hello(a);
+    expect(await lastSeen(stub, a.machine_id)).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it('with no host at all, the offline answer is platform-neutral', async () => {
+    const stub = relay();
+    const response = await stub.fetch(`${ORIGIN}/api/session/message`, { method: 'POST', body: '{}' });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'The execution host is offline. Open Foreman on it and reconnect.' });
+    expect(await hostStatus(stub)).toEqual({ online: false, host: null, machine_id: null, standby_online: false });
   });
 });

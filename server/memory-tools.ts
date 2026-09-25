@@ -61,9 +61,13 @@ export function memoryToolError(action: string, error: unknown): ToolResult {
       return fail(`too_large: ${action} was not saved because the result is over the size limit. Nothing was saved — summarize (shorten or condense the content, dropping stale detail) and retry.${said}`);
     case "invalid":
       return fail(`invalid: ${action} was rejected by the memory store. Nothing was saved — fix the input and retry.${said}`);
+    // #122: `stale_epoch` means the assignment changed since this PM started (it was moved away).
+    // `not_active` only says this machine is not the PM host right now: it may never have been
+    // (e.g. a new relay connection whose assignment has not arrived), so it claims no move.
     case "not_active":
+      return fail(`not_active: ${action} was not saved because this machine is not the active PM host right now. Nothing was saved — tell the developer the memory update did not happen.${said}`);
     case "stale_epoch":
-      return fail(`${code}: ${action} was not saved because this machine is no longer the active PM host. Nothing was saved — tell the developer the memory update did not happen.${said}`);
+      return fail(`stale_epoch: ${action} was not saved because this machine is no longer the active PM host (the PM was moved). Nothing was saved — tell the developer the memory update did not happen.${said}`);
     case "unavailable":
       return fail(`unavailable: ${action} failed because PM memory is unreachable right now. Nothing was saved — tell the developer the memory update did not happen; try again later.${said}`);
     case "already_initialized":

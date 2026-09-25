@@ -600,7 +600,7 @@ test.describe("notification click", () => {
     await deliver(page, JSON.stringify(payload({ session_key: "fm:gone", tag: "session:fm:gone", url: "/?session=fm%3Agone" })));
     await expect.poll(() => shown(page)).toHaveLength(1);
     await click(sw, "session:fm:gone");
-    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on your Mac. Showing your inbox.");
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing your inbox.");
     await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
     await expect.poll(() => page.url()).toBe(`${ORIGIN}/`);
   });

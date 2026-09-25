@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
+import { assertTestHome } from '../server/home-guard.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const TARGET = Object.freeze({ worker: 'foreman-dev', url: 'https://foreman-dev.hooong-yang.workers.dev', account: 'b107d26298de0cc01f30edf0db8e92b1', port: 4178 });
@@ -668,6 +669,8 @@ export function acquireLock(home) {
 }
 export async function main(args = process.argv.slice(2)) {
   const options = argumentsFor(args); guardEnvironment(process.env);
+  // Story #121: under node --test, the CLI must run with HOME at a temp dir, never the real ~/.foreman-dev.
+  assertTestHome(join(homedir(), '.foreman-dev'), { variable: 'HOME' });
   const home = openHome(homedir(), !['status', 'stop'].includes(options.command));
   if (!existsSync(home)) {
     if (options.command === 'status') await status(home);

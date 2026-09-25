@@ -1,13 +1,15 @@
+// Pin FOREMAN_HOME to a temp dir before any server module loads (story #121 guard).
+import './fixtures/temp-foreman-home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HostBridge } from '../server/host-bridge.ts';
 import { loadMachineIdentity } from '../server/machine.ts';
 import {
-  ALREADY_INITIALIZED_MESSAGE, LocalPmStore, PmStoreError, RelayPmStore, createPmStore, fitImportFrame, importFrameBytes,
+  ALREADY_INITIALIZED_MESSAGE, IMPORT_REPLY_LOST_MESSAGE, LocalPmStore, PmStoreError, RELAY_MEMORY_NOT_MERGED_NOTICE, RelayPmStore, createPmStore, fitImportFrame, importFrameBytes,
   parseLogLines, readImportPayload, truncateAtLine,
 } from '../server/pm-store.ts';
 import { utf8Length } from '../shared/notify.ts';
@@ -156,7 +158,7 @@ function snapshot(dir: string) {
   });
 }
 
-function relayHost(t: test.TestContext, relay: FakeRelay, dir: string, name: string, options: { rpcTimeoutMs?: number } = {}) {
+function relayHost(t: test.TestContext, relay: FakeRelay, dir: string, name: string, options: { rpcTimeoutMs?: number; retryBaseMs?: number } = {}) {
   t.mock.method(console, 'log', () => {});
   const identity = loadMachineIdentity({ home: dir, env: { FOREMAN_MACHINE_NAME: name } });
   const logs: string[] = [];
@@ -167,7 +169,7 @@ function relayHost(t: test.TestContext, relay: FakeRelay, dir: string, name: str
     pmOpenTurns: () => store?.openTurnIds() ?? [],
     socketFactory: () => { const socket = new FakeSocket(); relay.attach(socket); sockets.push(socket); return socket as any; },
   });
-  store = new RelayPmStore(bridge, { identity, home: dir, log: (line) => logs.push(line) });
+  store = new RelayPmStore(bridge, { identity, home: dir, log: (line) => logs.push(line), retryBaseMs: options.retryBaseMs });
   bridge.start();
   t.after(() => { store!.close(); bridge.close(); });
   return {
@@ -386,6 +388,127 @@ test('a timed-out beginTurn stays in pm_open_turns until its failed end is acked
   assert.deepEqual(h.store.uncertainTurns(), []);
 });
 
+// ---- #116: uncertain reporting across restarts ------------------------------------------------
+
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** The daemon process dies: nothing more is flushed. */
+const kill = (h: { store: RelayPmStore; bridge: HostBridge }) => { h.store.close(); h.bridge.close(); };
+
+test('#116: an uncertain turn whose ack was lost is not reported again after a restart, and is acked then', async (t) => {
+  const relay = new FakeRelay();
+  const dir = tempHome(t);
+  const first = relayHost(t, relay, dir, 'machine-a', { rpcTimeoutMs: 30 });
+  relay.assignment = { machine_id: first.identity.machine_id, epoch: 1 };
+  relay.machines.set(first.identity.machine_id, { name: 'machine-a', socket: null });
+  relay.turns.set('turn-u', { machine_id: first.identity.machine_id, epoch: 1, accepted_at: AT, state: 'uncertain', reason: 'restarted' });
+  await first.connect();
+  assert.deepEqual(first.store.uncertainTurns().map((u) => u.turn_id), ['turn-u'], 'reported to this process');
+  relay.swallow = (frame) => frame.op === 'turn.ack_uncertain'; // the ack is lost in transit
+  await first.store.ackUncertain(['turn-u']);
+  await settle();
+  assert.equal(relay.turns.get('turn-u')?.state, 'uncertain', 'the DO never got the ack');
+  kill(first); // restart before the ack is retried
+  relay.swallow = null;
+  const before = relay.rpcs().length;
+  const second = relayHost(t, relay, dir, 'machine-a');
+  const heard: UncertainTurn[][] = [];
+  second.store.onAssignment((a, uncertain) => { if (a.active) heard.push(uncertain); });
+  await second.connect();
+  assert.equal(second.identity.machine_id, first.identity.machine_id);
+  assert.deepEqual(second.store.uncertainTurns(), [], 'not reported again after the restart');
+  assert.ok(heard.length > 0 && heard.every((list) => list.length === 0), 'no listener hears it');
+  assert.equal(relay.turns.has('turn-u'), false, 'acknowledged on activation');
+  assert.deepEqual(relay.rpcs().slice(before).filter((f) => f.op === 'turn.ack_uncertain').map((f) => f.args.turn_ids), [['turn-u']]);
+  // Once confirmed, the record is forgotten: a third run neither lists nor acks it.
+  kill(second);
+  const third = relayHost(t, relay, dir, 'machine-a');
+  await third.connect();
+  assert.equal(relay.rpcs().filter((f) => f.op === 'turn.ack_uncertain').length, 2);
+});
+
+test('#116: a begin that failed (never dispatched) and a restart before its failed end flushes yields no uncertain entry', async (t) => {
+  const relay = new FakeRelay();
+  const dir = tempHome(t);
+  const first = relayHost(t, relay, dir, 'machine-a', { rpcTimeoutMs: 30 });
+  await first.connect();
+  // The DO records the turn but its ack never arrives; the failed end is lost in transit too.
+  relay.hold = (frame) => frame.op === 'turn.begin';
+  relay.swallow = (frame) => frame.op === 'turn.end';
+  await assert.rejects(first.store.beginTurn('turn-t', AT), code('timeout'));
+  assert.equal(relay.turns.get('turn-t')?.state, 'open', 'the DO did record it');
+  kill(first); // restart before the failed end is confirmed
+  relay.hold = null; relay.held = []; relay.swallow = null;
+  const before = relay.rpcs().length;
+  const second = relayHost(t, relay, dir, 'machine-a');
+  await second.connect();
+  assert.deepEqual(relay.hellos().at(-1).pm_open_turns, ['turn-t'], 'the restarted host still lists it, so the DO does not mark it restarted');
+  assert.deepEqual(second.store.uncertainTurns(), []);
+  assert.equal(relay.turns.size, 0, 'removed by the failed end flushed on activation');
+  assert.deepEqual(relay.rpcs().slice(before).filter((f) => f.op === 'turn.end').map((f) => f.args), [{ turn_id: 'turn-t', outcome: 'failed' }]);
+  assert.deepEqual(second.store.openTurnIds(), []);
+});
+
+test('#116: a turn with a recorded outcome that the DO already marked uncertain is acknowledged, not reported', async (t) => {
+  const relay = new FakeRelay();
+  const dir = tempHome(t);
+  const first = relayHost(t, relay, dir, 'machine-a', { rpcTimeoutMs: 30 });
+  await first.connect();
+  relay.hold = (frame) => frame.op === 'turn.begin';
+  relay.swallow = (frame) => frame.op === 'turn.end';
+  await assert.rejects(first.store.beginTurn('turn-t', AT), code('timeout'));
+  kill(first);
+  relay.hold = null; relay.held = []; relay.swallow = null;
+  // Meanwhile the DO reconciled it (e.g. a hello from an older build of this daemon): uncertain.
+  const turn = relay.turns.get('turn-t')!; turn.state = 'uncertain'; turn.reason = 'restarted';
+  const before = relay.rpcs().length;
+  const second = relayHost(t, relay, dir, 'machine-a');
+  await second.connect();
+  assert.deepEqual(second.store.uncertainTurns(), [], 'never dispatched, so never reported');
+  assert.equal(relay.turns.size, 0, 'acknowledged instead');
+  assert.deepEqual(relay.rpcs().slice(before).filter((f) => f.op === 'turn.ack_uncertain').map((f) => f.args.turn_ids), [['turn-t']]);
+});
+
+test('#116: a turn.end that times out while still connected is retried with backoff, not left until the next item', async (t) => {
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, tempHome(t), 'machine-a', { rpcTimeoutMs: 30, retryBaseMs: 20 });
+  await h.connect();
+  await h.store.beginTurn('turn-1', AT);
+  let lost = 1;
+  relay.swallow = (frame) => frame.op === 'turn.end' && lost-- > 0; // only the first end is lost
+  await h.store.endTurn('turn-1', 'completed');
+  for (let i = 0; i < 100 && relay.turns.size; i++) await wait(10);
+  assert.equal(relay.turns.size, 0, 'the DO row was closed by the retry, while still connected');
+  assert.equal(h.store.assignment().connected, true);
+  assert.deepEqual(relay.rpcs().filter((f) => f.op === 'turn.end').map((f) => f.args.turn_id), ['turn-1', 'turn-1']);
+  assert.deepEqual(h.store.openTurnIds(), []);
+  await wait(100);
+  assert.equal(relay.rpcs().filter((f) => f.op === 'turn.end').length, 2, 'nothing more once confirmed');
+});
+
+test('#116: retries back off (no hot loop) and stop on disconnect and on close', async (t) => {
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, tempHome(t), 'machine-a', { rpcTimeoutMs: 20, retryBaseMs: 20 });
+  await h.connect();
+  await h.store.beginTurn('turn-1', AT);
+  relay.swallow = (frame) => frame.op === 'turn.ack_uncertain' || frame.op === 'turn.end'; // every update is lost
+  await h.store.endTurn('turn-1', 'completed');
+  await wait(400);
+  const ends = () => relay.rpcs().filter((f) => f.op === 'turn.end').length;
+  // Sends at ~0, 40, 100, 200, 380 ms (20 ms timeout + 20/40/80/160 ms backoff); a hot loop would be ~20.
+  assert.ok(ends() >= 2 && ends() <= 6, `retried with backoff (${ends()} sends)`);
+  h.drop();
+  const atDrop = ends();
+  await wait(200);
+  assert.equal(ends(), atDrop, 'no retries while disconnected');
+  await h.reconnect();
+  assert.equal(ends(), atDrop + 1, 'the reconnect flushes it once');
+  await wait(30);
+  h.store.close();
+  const atClose = ends();
+  await wait(300);
+  assert.equal(ends(), atClose, 'no retries after close');
+});
+
 test('turn.begin: a repeated begin of an open turn is acked again; a 65th open turn is unavailable (as the DO)', async (t) => {
   const relay = new FakeRelay();
   const h = relayHost(t, relay, tempHome(t), 'machine-a');
@@ -599,4 +722,196 @@ test('createPmStore: local without a bridge; a corrupt pm/state.json fails close
   writeFileSync(join(dir, 'pm/state.json'), '{"version":1, broken');
   assert.throws(() => new LocalPmStore({ identity: IDENTITY, home: dir, log: () => {} }), /Invalid pm\/state.json/);
   assert.equal(readFileSync(join(dir, 'pm/state.json'), 'utf8'), '{"version":1, broken');
+});
+
+// ---------------------------------------------------------------------------------------------
+// #117: local-only ↔ relay transitions
+// ---------------------------------------------------------------------------------------------
+
+const LEGACY = { projects: '# Legacy projects\n', log: '- legacy line one\n', settings: '{"model":"claude-opus-4-5"}' };
+
+/** A home that ran local-only: legacy files imported into pm/state.json, then the PM learned more there. */
+async function localOnlyHome(t: test.TestContext, name = 'machine-a') {
+  const dir = tempHome(t);
+  seed(dir, LEGACY);
+  const identity = loadMachineIdentity({ home: dir, env: { FOREMAN_MACHINE_NAME: name } });
+  const local = new LocalPmStore({ identity, home: dir, log: () => {} });
+  await local.write('projects', '# Projects learned locally\n## foreman\n', 1);
+  await local.write('preferences', 'terse answers', 0);
+  await local.log('decided locally');
+  await local.setModel('claude-sonnet-4-5');
+  local.close();
+  return { dir, identity };
+}
+
+const stateFile = (dir: string) => join(dir, 'pm/state.json');
+const fileState = (path: string) => ({ bytes: readFileSync(path).toString('base64'), mtime: statSync(path).mtimeMs, mode: statSync(path).mode });
+
+test('#117 local-only → relay: an empty relay imports pm/state.json (projects, preferences, log, model), not the legacy files', async (t) => {
+  const { dir } = await localOnlyHome(t);
+  const before = fileState(stateFile(dir));
+  const legacyBefore = snapshot(dir);
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'imported');
+  assert.equal(relay.imports.length, 1);
+  assert.deepEqual(relay.imports[0], {
+    projects: '# Projects learned locally\n## foreman\n', log: ['legacy line one', 'decided locally'], model: 'claude-sonnet-4-5', source_machine: h.identity.machine_id,
+  });
+  const memory = await h.store.read();
+  assert.equal(memory.preferences.content, 'terse answers', 'preferences follow as the first write of the empty doc');
+  assert.equal(memory.projects.content, '# Projects learned locally\n## foreman\n');
+  assert.ok(h.logs.some((l) => l.includes('from pm/state.json')), h.logs.join('\n'));
+  assert.deepEqual(fileState(stateFile(dir)), before, 'pm/state.json is only read');
+  assert.deepEqual(snapshot(dir), legacyBefore, 'legacy files untouched');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'memory/.imported.json'), 'utf8')).target, 'relay');
+  const mode = JSON.parse(readFileSync(join(dir, 'memory/.pm-mode.json'), 'utf8'));
+  assert.equal(mode.mode, 'relay'); assert.equal(mode.machine_id, h.identity.machine_id);
+  assert.equal(statSync(join(dir, 'memory/.pm-mode.json')).mode & 0o777, 0o600);
+});
+
+test('#117 local-only → relay: a relay that already has memory wins; pm/state.json stays byte-identical', async (t) => {
+  const { dir } = await localOnlyHome(t);
+  const before = fileState(stateFile(dir));
+  const relay = new FakeRelay();
+  relay.memory.initialized = true; relay.memory.projects = { content: '# Theirs\n', version: 4, updated_at: AT };
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  assert.equal(relay.rpcs().filter((f) => f.op === 'memory.import' || f.op === 'memory.put').length, 0, 'nothing sent, nothing merged');
+  assert.equal(relay.memory.projects.content, '# Theirs\n');
+  assert.deepEqual(fileState(stateFile(dir)), before, 'never modified, renamed or deleted');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'memory/.imported.json'), 'utf8')).target, 'local', 'the earlier local import marker is kept as is');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'memory/.pm-mode.json'), 'utf8')).mode, 'relay', 'this machine now uses relay memory');
+});
+
+test('#117 local-only → relay: without pm/state.json the legacy import is unchanged', async (t) => {
+  const dir = tempHome(t);
+  seed(dir, LEGACY);
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'imported');
+  assert.deepEqual(relay.imports[0], readImportPayload(dir, h.identity.machine_id, () => {}));
+  assert.deepEqual(relay.imports[0].log, ['legacy line one']);
+  assert.equal(relay.rpcs().filter((f) => f.op === 'memory.put').length, 0);
+  assert.equal(existsSync(stateFile(dir)), false, 'relay mode creates no pm/state.json');
+  assert.ok(h.logs.some((l) => l.includes('from memory/PROJECTS.md and memory/LOG.md')), h.logs.join('\n'));
+  assert.equal(JSON.parse(readFileSync(join(dir, 'memory/.pm-mode.json'), 'utf8')).mode, 'relay');
+});
+
+test('#117 local-only → relay: a corrupt, invalid or symlinked pm/state.json is not imported; legacy files are, with a notice', async (t) => {
+  for (const kind of ['corrupt', 'invalid', 'symlink'] as const) {
+    const dir = tempHome(t);
+    seed(dir, LEGACY);
+    let expected: string;
+    if (kind === 'corrupt') { expected = '{"version":1, broken'; writeFileSync(stateFile(dir), expected); }
+    else if (kind === 'invalid') { expected = JSON.stringify({ version: 1, initialized: true, docs: {}, log: [], next_seq: 1, model: null, turns: [] }); writeFileSync(stateFile(dir), expected); }
+    else {
+      // A valid local state elsewhere, reached through a symlink: never followed.
+      const { dir: other } = await localOnlyHome(t, 'machine-z');
+      symlinkSync(stateFile(other), stateFile(dir));
+      expected = readFileSync(stateFile(other), 'utf8');
+    }
+    const relay = new FakeRelay();
+    const h = relayHost(t, relay, dir, 'machine-a');
+    await h.connect();
+    assert.equal(await h.store.ensureImported(), 'imported', kind);
+    assert.equal(relay.imports[0].projects, '# Legacy projects\n', kind);
+    assert.deepEqual(relay.imports[0].log, ['legacy line one'], kind);
+    assert.equal(relay.imports[0].model, 'claude-opus-4-5', kind);
+    assert.equal(relay.memory.preferences.content, '', kind);
+    assert.ok(h.logs.some((l) => /pm\/state\.json is (invalid|not a regular file); not importing it/.test(l)), `${kind}: ${h.logs.join('\n')}`);
+    assert.equal(readFileSync(stateFile(dir), 'utf8'), expected, `${kind}: left untouched`);
+    if (kind === 'symlink') assert.ok(lstatSync(stateFile(dir)).isSymbolicLink(), 'the symlink is left in place');
+    h.store.close(); h.bridge.close();
+  }
+});
+
+test('#117 relay → local-only: the local store keeps pm/state.json and logs that relay memory is not merged', async (t) => {
+  const { dir, identity } = await localOnlyHome(t);
+  // This machine then ran in relay mode (the relay already had memory: nothing imported).
+  const relay = new FakeRelay();
+  relay.memory.initialized = true; relay.memory.projects = { content: '# Relay memory\n', version: 7, updated_at: AT };
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  h.store.close(); h.bridge.close();
+  const before = readFileSync(stateFile(dir), 'utf8');
+
+  // Back to local-only (no relay configured): every start says so, and memory is the local file's.
+  for (let start = 0; start < 2; start++) {
+    const logs: string[] = [];
+    const local = createPmStore({ identity, home: dir, log: (l) => logs.push(l) });
+    assert.ok(local instanceof LocalPmStore);
+    assert.ok(logs.some((l) => l.includes(RELAY_MEMORY_NOT_MERGED_NOTICE)), logs.join('\n'));
+    const memory = await local.read();
+    assert.equal(memory.projects.content, '# Projects learned locally\n## foreman\n', 'local memory, not the relay memory');
+    assert.equal(memory.preferences.content, 'terse answers');
+    assert.equal(await local.ensureImported(), 'already_initialized', 'nothing re-imported');
+    local.close();
+  }
+  assert.equal(readFileSync(stateFile(dir), 'utf8'), before);
+  assert.equal(relay.memory.projects.content, '# Relay memory\n', 'the relay is not touched either');
+});
+
+test('#117 relay → local-only without pm/state.json: legacy files are imported once as today, with the notice', async (t) => {
+  const dir = tempHome(t);
+  seed(dir, LEGACY);
+  const relay = new FakeRelay();
+  relay.memory.initialized = true;
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  h.store.close(); h.bridge.close();
+  const logs: string[] = [];
+  const local = new LocalPmStore({ identity: h.identity, home: dir, log: (l) => logs.push(l) });
+  assert.equal(await local.ensureImported(), 'imported');
+  assert.equal((await local.read()).projects.content, '# Legacy projects\n');
+  assert.ok(logs.some((l) => l.includes(RELAY_MEMORY_NOT_MERGED_NOTICE)), logs.join('\n'));
+});
+
+test('#117 a machine that never used relay memory logs no relay notice in local-only mode', (t) => {
+  const dir = tempHome(t);
+  const logs: string[] = [];
+  new LocalPmStore({ identity: IDENTITY, home: dir, log: (l) => logs.push(l) }).close();
+  new LocalPmStore({ identity: IDENTITY, home: dir, log: (l) => logs.push(l) }).close();
+  assert.ok(!logs.some((l) => l.includes('cloud relay')), logs.join('\n'));
+});
+
+test('#122: an import whose reply was lost is not later logged as "local memory not imported"', async (t) => {
+  const dir = tempHome(t);
+  seed(dir, { projects: '# Mine\n' });
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, dir, 'machine-a', { rpcTimeoutMs: 30 });
+  // The relay applies the import, but its reply is lost in transit.
+  relay.swallow = (frame) => {
+    if (frame.op !== 'memory.import') return false;
+    relay.swallow = null;
+    relay.imports.push(frame.args); relay.memory.initialized = true;
+    relay.memory.projects = { content: frame.args.projects, version: 1, updated_at: AT };
+    return true;
+  };
+  await h.connect();
+  await assert.rejects(h.store.ensureImported(), code('timeout'));
+  // The retry finds the relay initialized (by that very import).
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  const line = h.logs.find((l) => l.includes('already initialized'));
+  assert.equal(line, `foreman: ${IMPORT_REPLY_LOST_MESSAGE}`, h.logs.join('\n'));
+  assert.ok(!h.logs.some((l) => l.includes(ALREADY_INITIALIZED_MESSAGE)), 'never "local memory not imported"');
+  assert.equal(relay.imports.length, 1, 'not imported twice');
+  assert.equal(relay.memory.projects.content, '# Mine\n');
+});
+
+test('#122: a relay initialized by another machine is still logged as "local memory not imported"', async (t) => {
+  const dir = tempHome(t);
+  seed(dir, { projects: '# Mine\n' });
+  const relay = new FakeRelay();
+  relay.memory.initialized = true;
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  assert.ok(h.logs.includes(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`), h.logs.join('\n'));
+  assert.ok(!h.logs.some((l) => l.includes(IMPORT_REPLY_LOST_MESSAGE)));
 });

@@ -21,6 +21,8 @@ export const TEST_LIMIT = 5;
 export const OFFLINE_AFTER = 5 * 60_000;
 export const CHECK_INTERVAL = 60_000;
 const HOST_FRESH = 65_000;
+/** 503 text while no PM host is assigned and no legacy host is connected (#122: platform-neutral). */
+export const HOST_OFFLINE_MESSAGE = 'The execution host is offline. Open Foreman on it and reconnect.';
 
 function pushRoute(method: string, url: URL) {
   return method === 'POST' && !url.search && PUSH_ROUTES.includes(url.pathname);
@@ -203,12 +205,13 @@ export class HostRelay extends DurableObject<Env> {
     if (url.pathname.startsWith('/api/push/')) return this.pushRequest(request, url);
     // The PM host record is answered here, never relayed, and works while every host is offline.
     if (url.pathname === PM_HOST_ROUTE) return this.pmHostRequest(request, url);
-    const socket = this.hostSocket();
-    if (url.pathname === '/api/host') return json({ ...this.hostStatus(socket), push: this.pushCounters() } satisfies HostStatusWithPush);
-    if (!socket) {
+    const offline = () => {
       const assignment = this.pm.assignment();
-      return json({ error: assignment ? pmHostOfflineMessage(this.pm.machineName(assignment.machine_id)) : 'Your Mac is offline. Open Foreman on the Mac and reconnect.' }, 503);
-    }
+      return json({ error: assignment ? pmHostOfflineMessage(this.pm.machineName(assignment.machine_id)) : HOST_OFFLINE_MESSAGE }, 503);
+    };
+    let socket = this.hostSocket();
+    if (url.pathname === '/api/host') return json({ ...this.hostStatus(socket), push: this.pushCounters() } satisfies HostStatusWithPush);
+    if (!socket) return offline();
     if (this.pending.size >= 64) return json({ error: 'Host is busy; try again shortly' }, 429);
     if (!allowedRequest(request.method, url.pathname + url.search)) return json({ error: 'Unknown API route' }, 404);
     if (Number(request.headers.get('content-length') ?? 0) > MAX_BODY) return json({ error: 'Request too large' }, 413);
@@ -224,6 +227,9 @@ export class HostRelay extends DurableObject<Env> {
       const bytes = new Uint8Array(length); let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       body = new TextDecoder().decode(bytes);
+      // #115: the PM may have moved while the body was read; route to the host that is the target now.
+      socket = this.hostSocket();
+      if (!socket) return offline();
     }
     const id = crypto.randomUUID();
     return new Promise<Response>((resolve) => {
@@ -272,7 +278,7 @@ export class HostRelay extends DurableObject<Env> {
       socket.send(JSON.stringify({ type: 'pong' })); return;
     }
     if (message.type === 'notify') { try { this.acceptNotify(message); } catch {} return; }
-    if (message.type === 'pm_rpc') { this.acceptPmRpc(socket, message); return; }
+    if (message.type === 'pm_rpc') { this.refreshHeartbeat(socket); this.acceptPmRpc(socket, message); return; }
     if (message.type !== 'response') return;
     const reply = message as RelayResponse;
     const pending = this.pending.get(reply.id);
@@ -296,7 +302,8 @@ export class HostRelay extends DurableObject<Env> {
 
   private hostStatus(socket: WebSocket | undefined): HostStatusResponse {
     const assignment = this.pm.assignment();
-    if (!assignment) return { online: Boolean(socket), host: (socket && HostRelay.attachment(socket)?.host) ?? 'Mac', machine_id: null, standby_online: false };
+    // #122: no host connected and no PM host assigned: no name (the app shows a platform-neutral one).
+    if (!assignment) return { online: Boolean(socket), host: (socket && HostRelay.attachment(socket)?.host) ?? null, machine_id: null, standby_online: false };
     return {
       online: Boolean(socket), host: this.pm.machineName(assignment.machine_id), machine_id: assignment.machine_id,
       standby_online: this.pm.machines().some((m) => m.machine_id !== assignment.machine_id && this.online(m.machine_id)),
@@ -333,6 +340,16 @@ export class HostRelay extends DurableObject<Env> {
   }
   private sendAssignment(socket: WebSocket, machineId: string) {
     try { socket.send(JSON.stringify(this.assignmentFrame(machineId))); } catch {}
+  }
+
+  // #122: a pm_rpc frame proves its identified socket is alive just as a ping does: it keeps the
+  // socket fresh (HOST_FRESH) and its machine's last_seen (a throttled write, see PmState.touch).
+  private refreshHeartbeat(socket: WebSocket) {
+    const state = HostRelay.attachment(socket);
+    if (!state?.machine_id) return;
+    const now = Date.now();
+    socket.serializeAttachment({ ...state, lastSeen: now } satisfies Attachment);
+    this.pm.touch(state.machine_id, now);
   }
 
   private acceptPmRpc(socket: WebSocket, message: unknown) {

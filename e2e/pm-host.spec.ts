@@ -33,6 +33,16 @@ async function fixture(page: Page, options: { machines?: Machine[]; active?: str
     pmHistory: [{ id: "hello", role: "assistant", text: "How can I help the fleet?" }] as any[],
     pmError: null as string | null,
     pmHostStatus: 200,
+    // The body of a non-200 GET /api/pm/host (a relay-mode daemon's own view, #119).
+    pmHostBody: { error: "Not found" } as any,
+    pmBusy: false,
+    // Held requests ("METHOD /path"): each waits until its release is called.
+    gates: new Map<string, Promise<void>>(),
+    hold(key: string) {
+      let release!: () => void;
+      state.gates.set(key, new Promise<void>((resolve) => { release = resolve; }));
+      return () => { state.gates.delete(key); release(); };
+    },
     // A one-shot answer for the next POST /api/pm/host, and a change the server makes first.
     moveReply: null as null | { status: number; error: string; before?: () => void },
     calls: [] as { method: string; path: string; search: string; body: any }[],
@@ -60,6 +70,8 @@ async function fixture(page: Page, options: { machines?: Machine[]; active?: str
       method = request.method();
     const body = method === "POST" ? request.postDataJSON() : null;
     state.calls.push({ method, path, search: url.search, body });
+    const gate = state.gates.get(`${method} ${path}`);
+    if (gate) await gate;
     const active = state.active ? state.machine(state.active) : null;
     let result: any = {},
       status = 200;
@@ -73,7 +85,7 @@ async function fixture(page: Page, options: { machines?: Machine[]; active?: str
       };
     else if (path === "/api/pm/host" && method === "GET") {
       status = state.pmHostStatus;
-      result = status === 200 ? state.pmHost() : { error: "Not found" };
+      result = status === 200 ? state.pmHost() : state.pmHostBody;
     } else if (path === "/api/pm/host" && method === "POST") {
       const reply = state.moveReply;
       state.moveReply = null;
@@ -95,11 +107,15 @@ async function fixture(page: Page, options: { machines?: Machine[]; active?: str
     } else if (path === "/api/sessions") result = [structuredClone(managed)];
     else if (path === "/api/session")
       result = { session: managed, history: [{ id: "r", role: "assistant", text: "Working on it." }], receipts: [], approvals: [] };
+    else if (path === "/api/pm/message" && method === "POST") {
+      status = 202;
+      result = { ok: true };
+    } else if (path === "/api/pm/interrupt" && method === "POST") result = { ok: true };
     else if (path === "/api/models") result = { models: [{ value: "haiku", displayName: "Haiku" }] };
     else if (path === "/api/pm/history")
       result = url.searchParams.get("summary") === "1"
-        ? { error: state.pmError, busy: false }
-        : { history: state.pmHistory, error: state.pmError, busy: false, session_id: null, model: null };
+        ? { error: state.pmError, busy: state.pmBusy }
+        : { history: state.pmHistory, error: state.pmError, busy: state.pmBusy, session_id: null, model: null };
     else {
       status = 404;
       result = { error: "Unknown mock route" };
@@ -502,3 +518,156 @@ for (const scenario of ["the PM selected", "the inbox", "the PM's machine offlin
     expect(movePosts(state)).toHaveLength(0);
   });
 }
+
+// #119: PM view polish after the portable PM.
+test("the machine line holds its place until the first /api/pm/host answer", async ({ page }) => {
+  const state = await fixture(page);
+  const release = state.hold("GET /api/pm/host");
+  await openPm(page);
+  await expect(page.locator("#pm-host")).toBeVisible();
+  await expect(label(page)).toHaveText("Checking which machine runs the PM…");
+  await expect(page.locator("#pm-host")).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator("#pm-host-dot")).toHaveClass(/\bunknown\b/);
+  release();
+  await expect(label(page)).toHaveText("PM on machine-a · online");
+  await expect(page.locator("#pm-host")).toHaveAttribute("aria-busy", "false");
+});
+
+test("a slow /api/pm/host answer does not hold up the session list", async ({ page }) => {
+  const state = await fixture(page);
+  const release = state.hold("GET /api/pm/host");
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: /Fix sign-in/ })).toBeVisible();
+  expect(pmHostGets(state).length).toBe(1);
+  release();
+  // The poll finishes once the machine answer arrives, and the next poll reads it again.
+  await pollNow(page);
+  await expect.poll(() => pmHostGets(state).length).toBeGreaterThan(1);
+});
+
+test("the relay-mode local UI shows this machine's own view and points to the hosted app", async ({ page }) => {
+  const state = await fixture(page);
+  const view = (over: object) => ({
+    error: "The cloud relay answers /api/pm/host; open the hosted app to see every machine or move the PM.",
+    view: { mode: "relay", connected: true, this_machine_active: true, epoch: 4,
+      active_machine: { machine_id: A, host: "machine-a" }, this_machine: { machine_id: A, name: "machine-a" }, ...over },
+  });
+  state.pmHostStatus = 404;
+  state.pmHostBody = view({});
+  await openPm(page);
+  await expect(label(page)).toHaveText("PM on machine-a (this machine) · PM host details are in the hosted app");
+  await expect(page.locator("#pm-host-dot")).toHaveClass(/\bonline\b/);
+  await expect(moveButton(page)).toBeHidden();
+  await expect(page.locator("#error-banner")).toBeHidden();
+
+  // Another machine runs the PM: its name, but not whether it is online (this machine can't know).
+  state.pmHostBody = view({ this_machine_active: false, active_machine: { machine_id: B, host: "machine-b" } });
+  await pollNow(page);
+  await expect(label(page)).toHaveText("PM on machine-b · PM host details are in the hosted app");
+  await expect(page.locator("#pm-host-dot")).toHaveClass(/\bunknown\b/);
+
+  // Not connected to the relay.
+  state.pmHostBody = view({ connected: false, this_machine_active: false, epoch: null, active_machine: null });
+  await pollNow(page);
+  await expect(label(page)).toHaveText("machine-a isn’t connected to the cloud relay · PM host details are in the hosted app");
+  await expect(page.locator("#pm-host-dot")).toHaveClass(/\bunknown\b/);
+  await expect(moveButton(page)).toBeHidden();
+  expect(movePosts(state)).toHaveLength(0);
+});
+
+test("no PM host yet has its own dot style in light and dark themes", async ({ page }) => {
+  await fixture(page, { active: null });
+  const read = () => page.locator("#pm-host-dot").evaluate((el) => {
+    const style = getComputedStyle(el);
+    const plain = document.createElement("span");
+    plain.className = "dot";
+    document.body.append(plain);
+    const base = getComputedStyle(plain).backgroundColor;
+    plain.remove();
+    return { background: style.backgroundColor, base, border: style.borderTopStyle, color: style.borderTopColor };
+  });
+  await page.emulateMedia({ colorScheme: "light" });
+  await openPm(page);
+  await expect(label(page)).toHaveText("No machine runs the PM yet");
+  await expect(page.locator("#pm-host-dot")).toHaveClass(/\bunknown\b/);
+  const light = await read();
+  expect(light.background).not.toBe(light.base);
+  expect(light.background).toBe("rgba(0, 0, 0, 0)");
+  expect(light.border).toBe("dashed");
+  await page.emulateMedia({ colorScheme: "dark" });
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  const dark = await read();
+  expect(dark.background).toBe("rgba(0, 0, 0, 0)");
+  expect(dark.border).toBe("dashed");
+  // The ring follows the theme's tokens.
+  expect(dark.color).not.toBe(light.color);
+});
+
+test("the machine line and the footer name the machine, and the offline copy is said once", async ({ page }) => {
+  const state = await fixture(page, {
+    machines: [{ machine_id: A, name: "build-box", platform: "linux", online: true, last_seen: Date.now() }],
+  });
+  await openPm(page);
+  await expect(page.locator("#host-status")).toHaveText("build-box · online");
+  state.machine(A).online = false;
+  await pollNow(page);
+  await expect(page.locator("#pm-host-offline")).toHaveText("Your PM's machine (build-box) is offline.");
+  await expect(page.locator("#host-status")).toHaveText("build-box · offline");
+  // The machine line already says it; the connection banner does not repeat it in the PM view.
+  await expect(page.locator("#connection-banner")).toBeHidden();
+  // (The notification kind named "Mac offline" belongs to the notifications settings, not this copy.)
+  const noMac = async () => {
+    expect(await page.locator("main").innerText()).not.toMatch(/\bMac\b/);
+    expect(await page.locator("main textarea").getAttribute("placeholder")).not.toMatch(/\bMac\b/);
+    expect(await page.locator("#rail").innerText()).not.toMatch(/\bMac\b/);
+  };
+  await noMac();
+  // Elsewhere the banner says it, by name and without assuming a platform.
+  await page.goto("/");
+  await expect(page.locator("#connection-banner")).toBeVisible();
+  await expect(page.locator("#connection-banner")).toHaveText(
+    "build-box is disconnected. Showing the last available state. Messages and approvals will be available when it reconnects.",
+  );
+  await expect(page.getByRole("heading", { name: "build-box is offline", exact: true })).toBeVisible();
+  await expect(page.locator(".rail-empty")).toHaveText("build-box is offline. Reconnect to see sessions.");
+  await noMac();
+});
+
+test("Interrupt stays disabled until the PM send's 202 arrives", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmBusy = true;
+  await openPm(page);
+  const interrupt = page.getByRole("button", { name: "Interrupt", exact: true });
+  await expect(interrupt).toBeEnabled();
+  const release = state.hold("POST /api/pm/message");
+  await page.getByRole("textbox", { name: "Message this session" }).fill("Also check the docs");
+  await page.getByRole("textbox", { name: "Message this session" }).press("Enter");
+  await expect.poll(() => state.calls.some((c) => c.method === "POST" && c.path === "/api/pm/message")).toBe(true);
+  await expect(interrupt).toBeDisabled();
+  release();
+  await expect(page.locator("#send-feedback")).toHaveText("Message accepted.");
+  await expect(interrupt).toBeEnabled();
+  await interrupt.click();
+  await expect.poll(() => state.calls.filter((c) => c.path === "/api/pm/interrupt").length).toBe(1);
+});
+
+test("the 'PM now runs on' entry stands out in the conversation", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmHistory = [
+    { role: "assistant", text: "How can I help the fleet?", at: new Date().toISOString() },
+    { role: "system", text: "The PM now runs on machine-b. This machine no longer runs it; messages sent here are refused.", at: new Date().toISOString() },
+    { role: "system", text: "A routine status line.", at: new Date().toISOString() },
+  ];
+  await openPm(page);
+  const moved = page.getByRole("article", { name: "The PM moved" });
+  await expect(moved).toHaveCount(1);
+  await expect(moved).toContainText("The PM now runs on machine-b");
+  await expect(moved.locator(".message-label")).toHaveText(/^PM moved/);
+  const routine = page.locator(".message.system").filter({ hasText: "A routine status line." });
+  await expect(routine).not.toHaveClass(/pm-moved/);
+  const [movedBackground, routineBackground] = await Promise.all([
+    moved.evaluate((el) => getComputedStyle(el).backgroundColor),
+    routine.evaluate((el) => getComputedStyle(el).backgroundColor),
+  ]);
+  expect(movedBackground).not.toBe(routineBackground);
+});

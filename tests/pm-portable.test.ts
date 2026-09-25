@@ -129,7 +129,7 @@ type Launch = { closed: boolean; consumed: string[]; prompt: string; options: an
  * The provider answers "what is <project> blocked on?" from the memory block in its system prompt,
  * and holds any input containing HOLD until `release()` (or until it is closed).
  */
-function daemon(t: any, relay: FakeRelay, dir: string, name: string, options: { rpcTimeoutMs?: number } = {}) {
+function daemon(t: any, relay: FakeRelay, dir: string, name: string, options: { rpcTimeoutMs?: number; autoStart?: boolean } = {}) {
   const identity = loadMachineIdentity({ home: dir, env: { FOREMAN_MACHINE_NAME: name } });
   const sockets: FakeSocket[] = [];
   let store: InstanceType<typeof RelayPmStore> | undefined;
@@ -169,7 +169,7 @@ function daemon(t: any, relay: FakeRelay, dir: string, name: string, options: { 
       },
     };
   };
-  pm.attach(store, { bridge });
+  pm.attach(store, { bridge, autoStart: options.autoStart });
   bridge.start();
   const h = {
     name, identity, bridge, store, pm, sockets, launches,
@@ -362,6 +362,57 @@ test('a duplicate delivery of an uncertain turn (its ack lost) is shown once and
   assert.ok(relay.frames.filter((f) => f.frame.op === 'turn.ack_uncertain').length >= 2);
 });
 
+test('#116: an uncertain entry whose ack was lost is not shown again after a restart', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const dirB = home('machine-b', '## p\nx\n');
+  const B = daemon(t, relay, dirB, 'machine-b');
+  await B.connect(); await until(() => B.launches.length === 1);
+  await B.pm.send('HOLD: work'); await until(() => B.launches[0]!.consumed.length === 1);
+  const turn = B.pm.outstandingTurnIds()[0]!;
+  B.kill();
+  relay.swallow = (frame) => frame.op === 'turn.ack_uncertain'; // the ack is lost in transit
+  const B2 = daemon(t, relay, dirB, 'machine-b', { rpcTimeoutMs: 100 });
+  await B2.connect(); await until(() => B2.uncertain().length === 1, 'shown after the first restart');
+  await until(() => relay.frames.some((f) => f.frame.op === 'turn.ack_uncertain'));
+  B2.kill(); // restarts again before the ack is retried
+  relay.swallow = null;
+  assert.equal(relay.turns.get(turn)?.state, 'uncertain', 'the relay still holds it');
+  const B3 = daemon(t, relay, dirB, 'machine-b');
+  await B3.connect(); await until(() => B3.launches.length === 1);
+  await until(() => !relay.turns.has(turn), 'acknowledged by the next run');
+  assert.equal(B3.uncertain().length, 0, 'not shown a second time');
+});
+
+test('#116: a send whose begin failed (503, never dispatched) leaves no uncertain entry after a restart', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const dirB = home('machine-b', '## p\nx\n');
+  const B = daemon(t, relay, dirB, 'machine-b', { rpcTimeoutMs: 100 });
+  await B.connect(); await until(() => B.launches.length === 1);
+  // The relay records the turn but its ack never arrives; the failed end is lost too.
+  let turnId = '';
+  relay.swallow = (frame) => {
+    if (frame.op === 'turn.end') return true;
+    if (frame.op !== 'turn.begin') return false;
+    const parsed = parsePmRpc(frame);
+    assert.ok(parsed.ok);
+    turnId = frame.args.turn_id;
+    (relay as any).apply(parsed.value, B.identity.machine_id);
+    return true;
+  };
+  await assert.rejects(B.pm.send('never dispatched'), /could not record your message, so it was not sent/);
+  assert.equal(relay.turns.get(turnId)?.state, 'open');
+  assert.deepEqual(B.launches[0]!.consumed, [], 'not dispatched');
+  B.kill(); // restart before the failed end reaches the relay
+  relay.swallow = null;
+  const B2 = daemon(t, relay, dirB, 'machine-b');
+  await B2.connect(); await until(() => B2.launches.length === 1);
+  await until(() => !relay.turns.has(turnId), 'the failed end flushed after the restart');
+  await tick(); await tick();
+  assert.equal(B2.uncertain().length, 0, 'no "could not be confirmed" entry for a message that was never dispatched');
+});
+
 test('local-only mode: a restart mid-turn reports one uncertain entry, with no replay', { timeout: 20_000 }, async (t) => {
   t.mock.method(console, 'error', () => {});
   const dir = home('local', '## p\nx\n');
@@ -393,6 +444,105 @@ test('local-only mode: a restart mid-turn reports one uncertain entry, with no r
   assert.equal(third.pm.history().length, 0, 'shown once');
 });
 
+// ---- #115: move races around send dispatch --------------------------------------------------
+
+function spyEnds(h: ReturnType<typeof daemon>) {
+  const ends: [string, string][] = [];
+  const end = h.store.endTurn.bind(h.store);
+  h.store.endTurn = (id: string, outcome: any) => { ends.push([id, outcome]); return end(id, outcome); };
+  return ends;
+}
+
+test('#115: a send whose epoch changes across beginTurn (A→B→A) is not dispatched, and the relay\'s "moved" entry stands', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const A = daemon(t, relay, home('machine-a', '## p\nx\n'), 'machine-a');
+  await A.connect(); await until(() => A.launches.length === 1, 'A started its PM');
+  const B = daemon(t, relay, home('machine-b'), 'machine-b');
+  await B.connect();
+  const ends = spyEnds(A);
+  // The DO records the turn at epoch 1; the PM then moves to B and back to A (epoch 3) before
+  // A receives the ack.
+  let turnId = '';
+  relay.swallow = (frame) => {
+    if (frame.op !== 'turn.begin') return false;
+    relay.swallow = null;
+    turnId = frame.args.turn_id;
+    const parsed = parsePmRpc(frame);
+    assert.ok(parsed.ok);
+    const ack = (relay as any).apply(parsed.value, A.identity.machine_id);
+    relay.reassign(B.identity.machine_id);
+    relay.reassign(A.identity.machine_id);
+    setTimeout(() => A.sockets.at(-1)!.receive(ack), 50);
+    return true;
+  };
+  await assert.rejects(A.pm.send('must not be dispatched'), /^Error: The PM was moved while your message was being sent\. It was not delivered; send it again\.$/);
+  await until(() => A.launches.length === 2, 'A restarted its PM at epoch 3');
+  await tick(); await tick();
+  for (const launch of A.launches) assert.ok(!launch.consumed.includes('must not be dispatched'), 'never dispatched');
+  assert.deepEqual(A.pm.outstandingTurnIds(), []);
+  assert.equal(A.pm.history().some((e) => e.role === 'user'), false, 'not recorded as sent');
+  // The relay reported it as reassigned; A shows exactly that entry, and never ends it as completed.
+  assert.equal(A.uncertain().length, 1);
+  assert.match(A.uncertain()[0]!, /could not be confirmed \(the PM was moved\)\. It was not replayed\./);
+  assert.equal(ends.some(([id, outcome]) => id === turnId && outcome === 'completed'), false);
+  await until(() => !relay.turns.has(turnId), 'A acknowledged the uncertain turn');
+  // The PM keeps working at the new epoch.
+  await A.pm.send('after the round trip');
+  await until(() => A.answers().length === 1);
+  assert.deepEqual(A.launches[1]!.consumed, ['after the round trip']);
+});
+
+test('#115: a move while the provider is being launched for a send: nothing is recorded or dispatched, the developer is told, and the new host shows no entry', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  // A is the PM host but its provider is not running yet: the next send launches it.
+  const A = daemon(t, relay, home('machine-a', '## p\nx\n'), 'machine-a', { autoStart: false });
+  await A.connect();
+  await until(() => relay.imports.length === 1, 'A imported its memory');
+  await tick();
+  const B = daemon(t, relay, home('machine-b'), 'machine-b');
+  await B.connect();
+  assert.equal(A.launches.length, 0);
+  // The developer moves the PM to B while A reads memory to launch the provider for this send.
+  let armed = true;
+  relay.swallow = (frame) => {
+    if (armed && frame.op === 'memory.get') { armed = false; relay.reassign(B.identity.machine_id); }
+    return false;
+  };
+  await assert.rejects(A.pm.send('sent during the move'), /^Error: The PM was moved to machine-b while your message was being sent\. It was not delivered; send it again there\.$/);
+  assert.equal(armed, false, 'the move happened during the launch');
+  await until(() => B.launches.length === 1, 'B started its PM');
+  await tick(); await tick();
+  assert.equal(relay.frames.some((f) => f.frame.op === 'turn.begin'), false, 'no turn was recorded for it');
+  assert.equal(relay.turns.size, 0);
+  assert.deepEqual(B.uncertain(), [], 'B shows no "could not be confirmed" entry for a message that was never dispatched');
+  assert.deepEqual(B.pm.history(), []);
+  assert.equal(A.launches.length, 0);
+  assert.equal(A.pm.history().some((e) => e.role === 'user'), false);
+});
+
+test('#115: deactivation never ends an in-flight input as completed; the relay reconciles it and the new host reports it', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const A = daemon(t, relay, home('machine-a', '## p\nx\n'), 'machine-a');
+  await A.connect(); await until(() => A.launches.length === 1);
+  const B = daemon(t, relay, home('machine-b'), 'machine-b');
+  await B.connect();
+  const ends = spyEnds(A);
+  await A.pm.send('HOLD: in flight'); await until(() => A.launches[0]!.consumed.length === 1);
+  const inFlight = A.pm.outstandingTurnIds()[0]!;
+  relay.reassign(B.identity.machine_id);
+  await until(() => A.launches[0]!.closed, 'A closed its PM');
+  A.release(); await tick(); await tick();
+  assert.deepEqual(ends, [], 'A sends no outcome for the in-flight input');
+  assert.equal(relay.frames.some((f) => f.machine_id === A.identity.machine_id && f.frame.op === 'turn.end'), false);
+  assert.deepEqual(A.pm.outstandingTurnIds(), []);
+  await until(() => B.uncertain().length === 1, 'B reports the reassigned turn');
+  assert.match(B.uncertain()[0]!, /could not be confirmed \(the PM was moved\)/);
+  await until(() => !relay.turns.has(inFlight), 'B acknowledged it');
+});
+
 // Never two PMs (plan default 5): local-only mode only when no relay is configured at all. A
 // present-but-invalid cloud.json (or relay env) means the relay holds the PM, so no PM runs here.
 // server/main.ts uses choosePmStore; tests/pm-status-api.test.mjs drives the daemon end to end.
@@ -419,4 +569,110 @@ test('store selection: absent relay config is local; configured-but-invalid is n
   await assert.rejects(pm.send('hello'), /cloud\.json is invalid \(Invalid cloud\.json\); the PM is unavailable on this machine/);
   assert.match(pm.lastError!, /cloud\.json is invalid/);
   assert.equal(pm.history().filter((e) => e.role === 'user').length, 0, 'nothing was accepted');
+});
+
+// ---------------------------------------------------------------------------------------------
+// #122 diagnostics
+// ---------------------------------------------------------------------------------------------
+
+test('#122: a failed one-time import is reported as an import failure, not as "memory could not be read"', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const A = daemon(t, relay, home('machine-a', '## p\nx\n'), 'machine-a');
+  // The relay refuses the import (as the DO does for an oversized frame).
+  relay.swallow = (frame) => {
+    if (frame.op !== 'memory.import') return false;
+    queueMicrotask(() => A.sockets.at(-1)!.receive(pmRpcError(frame.id, 'too_large', 'memory.import frame is too large')));
+    return true;
+  };
+  await A.connect();
+  await until(() => A.pm.lastError !== null, 'the launch failure is reported');
+  assert.match(A.pm.lastError!, /the one-time import of this machine's PM memory into the cloud relay failed, so the PM did not start \(it is retried at the next start\): memory\.import frame is too large/);
+  assert.doesNotMatch(A.pm.lastError!, /could not be read/);
+  assert.equal(A.launches.length, 0, 'no provider started');
+  // A send retries the import and rejects with the same specific cause; nothing is dispatched.
+  await assert.rejects(A.pm.send('hello'), /one-time import of this machine's PM memory into the cloud relay failed/);
+  assert.equal(A.launches.length, 0);
+  // Once the relay accepts it, the next send imports and starts the PM.
+  relay.swallow = null;
+  await A.pm.send('hello again');
+  await until(() => A.answers().length === 1);
+  assert.equal(relay.imports.length, 1);
+});
+
+test('#122: a memory read failure after a good import keeps its own wording', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  relay.memory.initialized = true;
+  const A = daemon(t, relay, home('machine-a'), 'machine-a');
+  let gets = 0;
+  // The import's memory.get succeeds; the read that follows it is refused.
+  relay.swallow = (frame) => {
+    if (frame.op !== 'memory.get' || ++gets < 2) return false;
+    queueMicrotask(() => A.sockets.at(-1)!.receive(pmRpcError(frame.id, 'unavailable', 'PM state storage failed')));
+    return true;
+  };
+  await A.connect();
+  await until(() => A.pm.lastError !== null, 'the launch failure is reported');
+  assert.match(A.pm.lastError!, /PM memory could not be read, so the PM did not start: PM state storage failed/);
+  assert.doesNotMatch(A.pm.lastError!, /import/);
+});
+
+test('#122: the model is known before the first PM start, read from the store without starting a provider', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const previous = process.env.FOREMAN_PM_MODEL;
+  t.after(() => { if (previous === undefined) delete process.env.FOREMAN_PM_MODEL; else process.env.FOREMAN_PM_MODEL = previous; });
+  process.env.FOREMAN_PM_MODEL = 'claude-default-from-env';
+  const relay = new FakeRelay();
+  relay.memory.initialized = true; relay.memory.model = 'claude-sonnet-4-5';
+  const A = daemon(t, relay, home('machine-a'), 'machine-a', { autoStart: false });
+  // Not the PM host yet (never connected): the configured default.
+  assert.equal(await A.pm.displayModel(), 'claude-default-from-env');
+  await A.connect();
+  assert.equal(A.pm.model, undefined, 'no provider start has set it');
+  assert.equal(await A.pm.displayModel(), 'claude-sonnet-4-5');
+  assert.equal(A.launches.length, 0, 'reading the model starts no provider');
+  // Cached: a second read sends no second memory.get.
+  const gets = () => relay.frames.filter((f) => f.frame.op === 'memory.get').length;
+  const before = gets();
+  assert.equal(await A.pm.displayModel(), 'claude-sonnet-4-5');
+  assert.equal(gets(), before);
+  // With no saved model, the configured default (as the next start would pick it).
+  relay.memory.model = null;
+  const B = daemon(t, relay, home('machine-b'), 'machine-b', { autoStart: false });
+  relay.assignment = null; // B bootstraps as the PM host of a fresh relay record
+  await B.connect();
+  assert.equal(await B.pm.displayModel(), 'claude-default-from-env');
+  // After a start, the live selection.
+  await B.pm.send('hello');
+  await until(() => B.answers().length === 1);
+  assert.equal(await B.pm.displayModel(), 'claude-default-from-env');
+  assert.equal(B.launches[0]!.options.model, 'claude-default-from-env');
+});
+
+test('#122: while the relay refuses this machine by policy, sends name the refusal and when it retries', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const relay = new FakeRelay();
+  const A = daemon(t, relay, home('machine-a'), 'machine-a');
+  const socket = A.sockets.at(-1)!;
+  socket.readyState = 3; socket.emit('close', 1008, Buffer.from('Too many machines'));
+  const retryAt = A.bridge.refusal()!.retry_at;
+  clearTimeout((A.bridge as any).reconnect);
+  const expected = new Date(retryAt).toISOString().slice(0, 16).replace('T', ' ');
+  await assert.rejects(A.pm.send('hello'), (error: Error) => {
+    assert.equal(error.message, `The cloud relay is unreachable; the PM is unavailable on this machine. The relay refused this machine: Too many machines. It retries at ${expected} UTC.`);
+    return true;
+  });
+  // An ordinary outage keeps the ordinary message.
+  const B = daemon(t, relay, home('machine-b'), 'machine-b');
+  await assert.rejects(B.pm.send('hello'), /^Error: The cloud relay is unreachable; the PM is unavailable on this machine\.$/);
+});
+
+test('#122: store selection names the bridge\'s own reason for a configured relay that did not start', () => {
+  const config = () => ({ url: 'http://relay', token: TOKEN });
+  assert.deepEqual(choosePmStore(config, false, {}, 'Relay URL must be an HTTPS origin'),
+    { mode: 'unavailable', reason: 'cloud.json is invalid (Relay URL must be an HTTPS origin); the PM is unavailable on this machine' });
+  assert.deepEqual(choosePmStore(config, false, { FOREMAN_RELAY_URL: 'http://relay', FOREMAN_HOST_TOKEN: 'short' }, 'Invalid host token'),
+    { mode: 'unavailable', reason: 'the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN) is invalid (Invalid host token); the PM is unavailable on this machine' });
+  assert.equal(choosePmStore(config, true, {}, 'ignored').mode, 'relay');
 });
