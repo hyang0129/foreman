@@ -89,7 +89,14 @@ if (process.env.FOREMAN_DEV_SMOKE !== '1') {
   }
 
   test('real dev preview smoke: deploy, status, start, relay, PWA headers, stop', { timeout: 20 * 60_000 }, async (t) => {
+    // Set once dev:start has been attempted, cleared once dev:stop succeeded: a failure in
+    // between must not leave the dev daemon running (unless FOREMAN_DEV_SMOKE_KEEP=1).
+    let daemonMayRun = false;
     t.after(() => {
+      if (daemonMayRun && !keep) {
+        note('the test ended after dev:start without a successful dev:stop: stopping the dev daemon');
+        dev('stop');
+      }
       console.log('\n===== dev-smoke evidence =====');
       for (const line of evidence) console.log(line);
       console.log('==============================');
@@ -146,6 +153,7 @@ if (process.env.FOREMAN_DEV_SMOKE !== '1') {
     assert.equal(badge, commit.slice(0, 8));
 
     // 3. Start with the host's normal logins; local health and relay convergence.
+    daemonMayRun = true;
     const started = dev('start', 5 * 60_000);
     assert.equal(started.status, 0, 'dev:start failed');
     for (const line of started.stderr.split('\n').filter((l) => l.startsWith('Notice:'))) note(`dev:start ${line}`);
@@ -189,6 +197,7 @@ if (process.env.FOREMAN_DEV_SMOKE !== '1') {
     if (keep) { note('FOREMAN_DEV_SMOKE_KEEP=1: leaving the dev daemon running'); return; }
     const stopped = dev('stop');
     assert.equal(stopped.status, 0, 'dev:stop failed');
+    daemonMayRun = false;
     assert.match(stopped.stdout, /DEV daemon stopped/);
     let after;
     for (let i = 0; i < 30; i++) {
