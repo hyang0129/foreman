@@ -171,8 +171,10 @@ export default {
 // the tree is read. Other special files (FIFOs, sockets, devices) contribute
 // their type only and are never opened, since reading one could block or have
 // side effects. Each entry is hashed as one JSON-framed record. The result
-// does not depend on listing or hashing order.
-export async function dependencyIdentity(dir, { concurrency = 32 } = {}) {
+// does not depend on listing or hashing order. When one file read fails, the
+// remaining in-flight reads are aborted and no further files are opened; the
+// first error is the one reported. `openFile` is a seam for tests.
+export async function dependencyIdentity(dir, { concurrency = 32, openFile = createReadStream } = {}) {
   const entries = [];
   async function walk(relative) {
     for (const name of (await readdir(join(dir, relative))).sort()) {
@@ -187,10 +189,12 @@ export async function dependencyIdentity(dir, { concurrency = 32 } = {}) {
   await walk('');
   const files = entries.filter((entry) => entry.fields === null);
   let next = 0;
+  const abort = new AbortController();
   async function worker() {
-    while (next < files.length) {
+    while (next < files.length && !abort.signal.aborted) {
       const entry = files[next++], hash = createHash('sha256');
-      await pipeline(createReadStream(join(dir, entry.path)), hash);
+      try { await pipeline(openFile(join(dir, entry.path)), hash, { signal: abort.signal }); }
+      catch (error) { abort.abort(); throw error; }
       entry.fields = ['f', entry.exec, hash.digest('hex')];
     }
   }
@@ -414,16 +418,23 @@ async function terminateChild(child, { term = 10000, kill = 5000 } = {}) {
   throw new Error(`DEV daemon PID ${child.pid} did not exit after a failed start; its startup record is kept for npm run dev:stop`);
 }
 const redeploy = 'reinstall matching dependencies and run npm run dev:deploy again';
-export async function verifyDependencies(snapshot, deployment) {
+export async function verifyDependencies(snapshot, deployment, identify = dependencyIdentity) {
   const recorded = deployment.dependencies;
   if (typeof recorded?.realpath !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(recorded?.identity ?? '')) throw new Error('Dev deployment has no installed-dependency record (deployed by an older workflow); run npm run dev:deploy again');
   let linked;
   try { linked = realpathSync(join(snapshot, 'node_modules')); } catch { linked = null; }
   if (linked !== recorded.realpath) throw new Error(`Snapshot node_modules resolves to ${linked ?? 'nothing'}, not the deployed ${recorded.realpath}; ${redeploy}`);
-  const identity = await dependencyIdentity(linked);
+  let identity;
+  // Unreadable entries, a node_modules link resolving to a regular file, or an
+  // entry removed mid-walk: refuse with the recovery step, keeping the cause.
+  try { identity = await identify(linked); }
+  catch (error) {
+    const detail = [error?.code, error?.path].filter(Boolean).join(' ') || error?.message || String(error);
+    throw Object.assign(new Error(`Could not read installed dependencies at ${linked} (${detail}); ${redeploy}`, { cause: error }), { code: error?.code, path: error?.path });
+  }
   if (identity !== recorded.identity) throw new Error(`Installed dependencies changed since deploy (${linked}: ${identity} != deployed ${recorded.identity}); ${redeploy}`);
 }
-export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500, spawnChild = spawn, exitGrace } = {}) {
+export async function start(home, { relayStatus = remote, checkPort, execute = run, port = TARGET.port, saveRecord = save, readyAttempts = 60, readyInterval = 500, spawnChild = spawn, exitGrace, identify } = {}) {
   const current = inspect(home);
   if (current.daemon?.state === 'starting') throw new Error(`DEV daemon PID ${current.daemon.pid} was left by an interrupted start; run npm run dev:stop first`);
   if (current.daemon) throw new Error('DEV daemon already running; use dev:status or dev:stop');
@@ -432,7 +443,7 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
   const deployment = read(join(home, 'deployment.json'));
   const snapshot = releasePath(home, deployment);
   // Before any spawn: the snapshot must still run against the exact installed tree deployed.
-  await verifyDependencies(snapshot, deployment);
+  await verifyDependencies(snapshot, deployment, identify);
   const pair = validatePairing(read(join(home, 'dev-pairing.json')));
   const relay = await relayStatus(pair);
   if (relay.commit !== deployment.commit) throw new Error('Deployed Worker does not match the local snapshot; redeploy before starting');
