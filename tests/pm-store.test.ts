@@ -3,13 +3,13 @@ import './fixtures/temp-foreman-home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HostBridge } from '../server/host-bridge.ts';
 import { loadMachineIdentity } from '../server/machine.ts';
 import {
-  ALREADY_INITIALIZED_MESSAGE, LocalPmStore, PmStoreError, RelayPmStore, createPmStore, fitImportFrame, importFrameBytes,
+  ALREADY_INITIALIZED_MESSAGE, LocalPmStore, PmStoreError, RELAY_MEMORY_NOT_MERGED_NOTICE, RelayPmStore, createPmStore, fitImportFrame, importFrameBytes,
   parseLogLines, readImportPayload, truncateAtLine,
 } from '../server/pm-store.ts';
 import { utf8Length } from '../shared/notify.ts';
@@ -722,4 +722,160 @@ test('createPmStore: local without a bridge; a corrupt pm/state.json fails close
   writeFileSync(join(dir, 'pm/state.json'), '{"version":1, broken');
   assert.throws(() => new LocalPmStore({ identity: IDENTITY, home: dir, log: () => {} }), /Invalid pm\/state.json/);
   assert.equal(readFileSync(join(dir, 'pm/state.json'), 'utf8'), '{"version":1, broken');
+});
+
+// ---------------------------------------------------------------------------------------------
+// #117: local-only ↔ relay transitions
+// ---------------------------------------------------------------------------------------------
+
+const LEGACY = { projects: '# Legacy projects\n', log: '- legacy line one\n', settings: '{"model":"claude-opus-4-5"}' };
+
+/** A home that ran local-only: legacy files imported into pm/state.json, then the PM learned more there. */
+async function localOnlyHome(t: test.TestContext, name = 'machine-a') {
+  const dir = tempHome(t);
+  seed(dir, LEGACY);
+  const identity = loadMachineIdentity({ home: dir, env: { FOREMAN_MACHINE_NAME: name } });
+  const local = new LocalPmStore({ identity, home: dir, log: () => {} });
+  await local.write('projects', '# Projects learned locally\n## foreman\n', 1);
+  await local.write('preferences', 'terse answers', 0);
+  await local.log('decided locally');
+  await local.setModel('claude-sonnet-4-5');
+  local.close();
+  return { dir, identity };
+}
+
+const stateFile = (dir: string) => join(dir, 'pm/state.json');
+const fileState = (path: string) => ({ bytes: readFileSync(path).toString('base64'), mtime: statSync(path).mtimeMs, mode: statSync(path).mode });
+
+test('#117 local-only → relay: an empty relay imports pm/state.json (projects, preferences, log, model), not the legacy files', async (t) => {
+  const { dir } = await localOnlyHome(t);
+  const before = fileState(stateFile(dir));
+  const legacyBefore = snapshot(dir);
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'imported');
+  assert.equal(relay.imports.length, 1);
+  assert.deepEqual(relay.imports[0], {
+    projects: '# Projects learned locally\n## foreman\n', log: ['legacy line one', 'decided locally'], model: 'claude-sonnet-4-5', source_machine: h.identity.machine_id,
+  });
+  const memory = await h.store.read();
+  assert.equal(memory.preferences.content, 'terse answers', 'preferences follow as the first write of the empty doc');
+  assert.equal(memory.projects.content, '# Projects learned locally\n## foreman\n');
+  assert.ok(h.logs.some((l) => l.includes('from pm/state.json')), h.logs.join('\n'));
+  assert.deepEqual(fileState(stateFile(dir)), before, 'pm/state.json is only read');
+  assert.deepEqual(snapshot(dir), legacyBefore, 'legacy files untouched');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'memory/.imported.json'), 'utf8')).target, 'relay');
+  const mode = JSON.parse(readFileSync(join(dir, 'memory/.pm-mode.json'), 'utf8'));
+  assert.equal(mode.mode, 'relay'); assert.equal(mode.machine_id, h.identity.machine_id);
+  assert.equal(statSync(join(dir, 'memory/.pm-mode.json')).mode & 0o777, 0o600);
+});
+
+test('#117 local-only → relay: a relay that already has memory wins; pm/state.json stays byte-identical', async (t) => {
+  const { dir } = await localOnlyHome(t);
+  const before = fileState(stateFile(dir));
+  const relay = new FakeRelay();
+  relay.memory.initialized = true; relay.memory.projects = { content: '# Theirs\n', version: 4, updated_at: AT };
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  assert.equal(relay.rpcs().filter((f) => f.op === 'memory.import' || f.op === 'memory.put').length, 0, 'nothing sent, nothing merged');
+  assert.equal(relay.memory.projects.content, '# Theirs\n');
+  assert.deepEqual(fileState(stateFile(dir)), before, 'never modified, renamed or deleted');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'memory/.imported.json'), 'utf8')).target, 'local', 'the earlier local import marker is kept as is');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'memory/.pm-mode.json'), 'utf8')).mode, 'relay', 'this machine now uses relay memory');
+});
+
+test('#117 local-only → relay: without pm/state.json the legacy import is unchanged', async (t) => {
+  const dir = tempHome(t);
+  seed(dir, LEGACY);
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'imported');
+  assert.deepEqual(relay.imports[0], readImportPayload(dir, h.identity.machine_id, () => {}));
+  assert.deepEqual(relay.imports[0].log, ['legacy line one']);
+  assert.equal(relay.rpcs().filter((f) => f.op === 'memory.put').length, 0);
+  assert.equal(existsSync(stateFile(dir)), false, 'relay mode creates no pm/state.json');
+  assert.ok(h.logs.some((l) => l.includes('from memory/PROJECTS.md and memory/LOG.md')), h.logs.join('\n'));
+  assert.equal(JSON.parse(readFileSync(join(dir, 'memory/.pm-mode.json'), 'utf8')).mode, 'relay');
+});
+
+test('#117 local-only → relay: a corrupt, invalid or symlinked pm/state.json is not imported; legacy files are, with a notice', async (t) => {
+  for (const kind of ['corrupt', 'invalid', 'symlink'] as const) {
+    const dir = tempHome(t);
+    seed(dir, LEGACY);
+    let expected: string;
+    if (kind === 'corrupt') { expected = '{"version":1, broken'; writeFileSync(stateFile(dir), expected); }
+    else if (kind === 'invalid') { expected = JSON.stringify({ version: 1, initialized: true, docs: {}, log: [], next_seq: 1, model: null, turns: [] }); writeFileSync(stateFile(dir), expected); }
+    else {
+      // A valid local state elsewhere, reached through a symlink: never followed.
+      const { dir: other } = await localOnlyHome(t, 'machine-z');
+      symlinkSync(stateFile(other), stateFile(dir));
+      expected = readFileSync(stateFile(other), 'utf8');
+    }
+    const relay = new FakeRelay();
+    const h = relayHost(t, relay, dir, 'machine-a');
+    await h.connect();
+    assert.equal(await h.store.ensureImported(), 'imported', kind);
+    assert.equal(relay.imports[0].projects, '# Legacy projects\n', kind);
+    assert.deepEqual(relay.imports[0].log, ['legacy line one'], kind);
+    assert.equal(relay.imports[0].model, 'claude-opus-4-5', kind);
+    assert.equal(relay.memory.preferences.content, '', kind);
+    assert.ok(h.logs.some((l) => /pm\/state\.json is (invalid|not a regular file); not importing it/.test(l)), `${kind}: ${h.logs.join('\n')}`);
+    assert.equal(readFileSync(stateFile(dir), 'utf8'), expected, `${kind}: left untouched`);
+    if (kind === 'symlink') assert.ok(lstatSync(stateFile(dir)).isSymbolicLink(), 'the symlink is left in place');
+    h.store.close(); h.bridge.close();
+  }
+});
+
+test('#117 relay → local-only: the local store keeps pm/state.json and logs that relay memory is not merged', async (t) => {
+  const { dir, identity } = await localOnlyHome(t);
+  // This machine then ran in relay mode (the relay already had memory: nothing imported).
+  const relay = new FakeRelay();
+  relay.memory.initialized = true; relay.memory.projects = { content: '# Relay memory\n', version: 7, updated_at: AT };
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  h.store.close(); h.bridge.close();
+  const before = readFileSync(stateFile(dir), 'utf8');
+
+  // Back to local-only (no relay configured): every start says so, and memory is the local file's.
+  for (let start = 0; start < 2; start++) {
+    const logs: string[] = [];
+    const local = createPmStore({ identity, home: dir, log: (l) => logs.push(l) });
+    assert.ok(local instanceof LocalPmStore);
+    assert.ok(logs.some((l) => l.includes(RELAY_MEMORY_NOT_MERGED_NOTICE)), logs.join('\n'));
+    const memory = await local.read();
+    assert.equal(memory.projects.content, '# Projects learned locally\n## foreman\n', 'local memory, not the relay memory');
+    assert.equal(memory.preferences.content, 'terse answers');
+    assert.equal(await local.ensureImported(), 'already_initialized', 'nothing re-imported');
+    local.close();
+  }
+  assert.equal(readFileSync(stateFile(dir), 'utf8'), before);
+  assert.equal(relay.memory.projects.content, '# Relay memory\n', 'the relay is not touched either');
+});
+
+test('#117 relay → local-only without pm/state.json: legacy files are imported once as today, with the notice', async (t) => {
+  const dir = tempHome(t);
+  seed(dir, LEGACY);
+  const relay = new FakeRelay();
+  relay.memory.initialized = true;
+  const h = relayHost(t, relay, dir, 'machine-a');
+  await h.connect();
+  assert.equal(await h.store.ensureImported(), 'already_initialized');
+  h.store.close(); h.bridge.close();
+  const logs: string[] = [];
+  const local = new LocalPmStore({ identity: h.identity, home: dir, log: (l) => logs.push(l) });
+  assert.equal(await local.ensureImported(), 'imported');
+  assert.equal((await local.read()).projects.content, '# Legacy projects\n');
+  assert.ok(logs.some((l) => l.includes(RELAY_MEMORY_NOT_MERGED_NOTICE)), logs.join('\n'));
+});
+
+test('#117 a machine that never used relay memory logs no relay notice in local-only mode', (t) => {
+  const dir = tempHome(t);
+  const logs: string[] = [];
+  new LocalPmStore({ identity: IDENTITY, home: dir, log: (l) => logs.push(l) }).close();
+  new LocalPmStore({ identity: IDENTITY, home: dir, log: (l) => logs.push(l) }).close();
+  assert.ok(!logs.some((l) => l.includes('cloud relay')), logs.join('\n'));
 });
