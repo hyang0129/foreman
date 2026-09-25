@@ -1,7 +1,9 @@
 // Host PM state stores (epic #26, contract E): `RelayPmStore` keeps PM memory, settings and the
 // in-flight turn records in the relay Durable Object (over the host bridge's `pm_rpc`), and
 // `LocalPmStore` keeps the same things in `<FOREMAN_HOME>/pm/state.json` for local-only mode.
-// Both perform the one-time import of the pre-#26 file memory.
+// Both perform the one-time import of this machine's memory: the relay store imports pm/state.json
+// (what the PM learned in local-only mode) when it is valid, else the pre-#26 file memory; the local
+// store imports the pre-#26 file memory (#117).
 //
 // Invariants: no PM message text is stored or sent (turn records are ids and timestamps); a turn
 // is begun write-ahead (`beginTurn` resolves only on a durable record); nothing is replayed; the
@@ -9,13 +11,13 @@
 // pm/session.quarantine.jsonl.
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { FOREMAN_HOME } from './paths.ts';
 import { PmRpcError, type HostBridge, type PmRpcFailure } from './host-bridge.ts';
 import { utf8Length } from '../shared/notify.ts';
 import {
-  MAX_LOG_ENTRY, MAX_LOG_KEPT, MAX_LOG_READ, MAX_OPEN_TURNS, MAX_PM_IMPORT_FRAME, MAX_PROJECTS_DOC, MAX_RPC_ID, MIN_LOG_ENTRY,
+  MAX_LOG_ENTRY, MAX_LOG_KEPT, MAX_LOG_READ, MAX_OPEN_TURNS, MAX_PM_IMPORT_FRAME, MAX_PREFERENCES_DOC, MAX_PROJECTS_DOC, MAX_RPC_ID, MIN_LOG_ENTRY,
   PM_DOC_NAMES, TURN_OUTCOMES, isLogText, isPmId, isPmModel, parsePmOpArgs,
   type Doc, type LogEntry, type MachineIdentity, type PmAssignment, type PmDocName, type PmOp, type PmOpArgs, type PmOpResults,
   type PmStateStore, type TurnOutcome, type UncertainTurn,
@@ -49,6 +51,10 @@ const defaultLog: Logger = (line) => console.log(line);
 
 export const ALREADY_INITIALIZED_MESSAGE = 'relay memory already initialized; local memory not imported';
 export const IMPORT_MARKER_FILE = '.imported.json';
+/** #117: `<home>/memory/.pm-mode.json`, `{ version: 1, mode: 'relay', machine_id, at }`: this machine has used relay PM memory. */
+export const PM_MODE_FILE = '.pm-mode.json';
+/** #117: logged on every local-only start of a machine that has used relay PM memory. */
+export const RELAY_MEMORY_NOT_MERGED_NOTICE = 'this machine has used PM memory held in the cloud relay; that memory is not available in local-only mode and is not merged into pm/state.json. The local PM uses pm/state.json only. Pair this machine with the relay again (cloud.json) to use the relay memory; delete memory/.pm-mode.json to silence this notice.';
 
 // ---------------------------------------------------------------------------------------------
 // One-time import
@@ -126,6 +132,84 @@ export function readImportPayload(home: string, machineId: string, log: Logger =
   const fitted = fitImportFrame({ projects: projects.content, log: lines, model, source_machine: machineId });
   if (fitted.dropped) log(`foreman: memory import: dropped the ${fitted.dropped} oldest LOG.md lines to fit the import frame`);
   return fitted.payload;
+}
+
+/** What the relay import sends: the `memory.import` payload plus, from pm/state.json only, the `preferences` doc. */
+export interface PmImportSource { payload: PmImportPayload; preferences: string; source: 'state' | 'legacy' }
+
+/**
+ * #117: reads `<home>/pm/state.json` for the relay import. Returns null (logging why, unless the
+ * file is simply absent or was never initialized) when it is missing, a symlink or not a regular
+ * file, owned by another user, unparseable, fails LocalPmStore's validation (`parseLocalState`), or
+ * was never initialized. Writes nothing.
+ */
+export function readLocalStateForImport(home: string, log: Logger = defaultLog): LocalState | null {
+  const file = join(home, 'pm', 'state.json');
+  let why: string;
+  try {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) why = 'not a regular file';
+    else if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) why = 'owned by another user';
+    else {
+      let raw: unknown;
+      try { raw = JSON.parse(readFileSync(file, 'utf8')); } catch { raw = undefined; }
+      const state = raw === undefined ? null : parseLocalState(raw);
+      if (!state) why = 'invalid';
+      else return state.initialized ? state : null;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    why = 'unreadable';
+  }
+  log(`foreman: memory import: pm/state.json is ${why}; not importing it, importing memory/PROJECTS.md and memory/LOG.md instead (the file is left untouched)`);
+  return null;
+}
+
+/** #117: the `memory.import` payload (and preferences) from a valid local-only pm/state.json, within the same limits as the legacy import. */
+export function importFromLocalState(state: LocalState, machineId: string, log: Logger = defaultLog): PmImportSource {
+  const text = state.docs.projects.content;
+  const projects = truncateAtLine(text, MAX_PROJECTS_DOC);
+  if (projects.truncated) log(`foreman: memory import: the projects doc in pm/state.json is ${utf8Length(text)} bytes, over the ${MAX_PROJECTS_DOC}-byte limit; importing the first ${utf8Length(projects.content)} bytes, cut at a line boundary`);
+  const prefsText = state.docs.preferences.content;
+  const preferences = truncateAtLine(prefsText, MAX_PREFERENCES_DOC);
+  if (preferences.truncated) log(`foreman: memory import: the preferences doc in pm/state.json is ${utf8Length(prefsText)} bytes, over the ${MAX_PREFERENCES_DOC}-byte limit; importing the first ${utf8Length(preferences.content)} bytes, cut at a line boundary`);
+  const lines = state.log
+    .map((entry) => truncateChars(entry.text.trim(), MAX_LOG_ENTRY).trim())
+    .filter((entry) => entry.length >= MIN_LOG_ENTRY && isLogText(entry))
+    .slice(-MAX_LOG_KEPT);
+  const model = isPmModel(state.model) ? state.model : null;
+  const fitted = fitImportFrame({ projects: projects.content, log: lines, model, source_machine: machineId });
+  if (fitted.dropped) log(`foreman: memory import: dropped the ${fitted.dropped} oldest pm/state.json log entries to fit the import frame`);
+  return { payload: fitted.payload, preferences: preferences.content, source: 'state' };
+}
+
+/**
+ * #117: this machine's memory for the relay import: pm/state.json when it is a valid, initialized,
+ * owned regular file (what the PM learned in local-only mode), else the pre-#26 files, as
+ * `readImportPayload`. Reads only; never modifies, renames or deletes a file.
+ */
+export function readRelayImportSource(home: string, machineId: string, log: Logger = defaultLog): PmImportSource {
+  const state = readLocalStateForImport(home, log);
+  if (state) return importFromLocalState(state, machineId, log);
+  return { payload: readImportPayload(home, machineId, log), preferences: '', source: 'legacy' };
+}
+
+/** #117: records in `<home>/memory/.pm-mode.json` that this machine's PM memory is in the relay (mode 0600). */
+export function writeRelayModeMarker(home: string, machineId: string, at: string): void {
+  atomicWrite(join(home, 'memory', PM_MODE_FILE), JSON.stringify({ version: 1, mode: 'relay', machine_id: machineId, at }) + '\n');
+}
+
+/** #117: the `at` of a valid relay marker in `<home>/memory/.pm-mode.json` (an owned regular file), else null. */
+export function readRelayModeMarker(home: string): { at: string } | null {
+  const file = join(home, 'memory', PM_MODE_FILE);
+  try {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null;
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    if (!isObject(raw) || raw.version !== 1 || raw.mode !== 'relay' || typeof raw.at !== 'string') return null;
+    return { at: raw.at };
+  } catch { return null; }
 }
 
 /** Records the import in `<home>/memory/.imported.json` as `{ machine_id, at, target }` (mode 0600). */
@@ -382,19 +466,35 @@ export class RelayPmStore implements HostPmStore {
     return this.importRun;
   }
 
+  // #117: the relay wins when it already has memory (local files are left untouched); otherwise
+  // pm/state.json is imported when valid, else the pre-#26 files.
   private async runImport(): Promise<PmImportOutcome> {
     const memory = await this.request('memory.get', {});
-    if (memory.initialized) { this.logger(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`); return 'already_initialized'; }
-    const payload = readImportPayload(this.home, this.identity.machine_id, this.logger);
+    if (memory.initialized) { this.logger(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
+    const { payload, preferences, source } = readRelayImportSource(this.home, this.identity.machine_id, this.logger);
     try {
       await this.request('memory.import', payload);
     } catch (error) {
-      if ((error as PmStoreError).code === 'already_initialized') { this.logger(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`); return 'already_initialized'; }
+      if ((error as PmStoreError).code === 'already_initialized') { this.logger(`foreman: ${ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
       throw error;
     }
+    // memory.import carries no preferences doc: a non-empty one from pm/state.json follows as the
+    // first write of the fresh doc (expected version 0). Best effort: a failure is logged.
+    let prefs = '';
+    if (preferences) {
+      try { await this.request('memory.put', { doc: 'preferences', content: preferences, expected_version: 0 }); prefs = `, ${utf8Length(preferences)} bytes of preferences`; }
+      catch (error) { this.logger(`foreman: memory import: the preferences doc from pm/state.json was not imported (${(error as PmStoreError).code ?? 'error'})`); }
+    }
     writeImportMarker(this.home, this.identity.machine_id, 'relay', this.now().toISOString());
-    this.logger(`foreman: imported local PM memory into the relay (${utf8Length(payload.projects)} bytes of projects, ${payload.log.length} log entries)`);
+    this.markRelayMode();
+    const from = source === 'state' ? 'pm/state.json (local-only PM memory)' : 'memory/PROJECTS.md and memory/LOG.md';
+    this.logger(`foreman: imported local PM memory into the relay from ${from} (${utf8Length(payload.projects)} bytes of projects, ${payload.log.length} log entries${prefs})`);
     return 'imported';
+  }
+  // #117: remember that this machine's PM memory is in the relay, for a later local-only start.
+  private markRelayMode() {
+    try { writeRelayModeMarker(this.home, this.identity.machine_id, this.now().toISOString()); }
+    catch { this.logger('foreman: could not save memory/.pm-mode.json'); }
   }
   private async importSettled() {
     if (this.importRun) await this.importRun.catch(() => {});
@@ -549,7 +649,7 @@ export class RelayPmStore implements HostPmStore {
 // ---------------------------------------------------------------------------------------------
 
 interface LocalTurn { turn_id: string; accepted_at: string; state: 'open' | 'uncertain'; reason: 'restarted' | null }
-interface LocalState {
+export interface LocalState {
   version: 1;
   initialized: boolean;
   docs: Record<PmDocName, Doc>;
@@ -610,6 +710,9 @@ export class LocalPmStore implements HostPmStore {
     this.identity = options.identity; this.home = options.home ?? FOREMAN_HOME;
     this.file = options.file ?? join(this.home, 'pm', 'state.json');
     this.log_ = options.log ?? defaultLog; this.now = options.now ?? (() => new Date());
+    // #117: relay → local-only never merges; say so on every local-only start while the marker applies.
+    const relayMarker = readRelayModeMarker(this.home);
+    if (relayMarker) this.log_(`foreman: PM memory: ${RELAY_MEMORY_NOT_MERGED_NOTICE} (relay mode last used ${relayMarker.at})`);
     let state = freshState();
     if (existsSync(this.file)) {
       let raw: unknown;

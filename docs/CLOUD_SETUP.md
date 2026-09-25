@@ -55,6 +55,7 @@ This release moves PM memory into the relay's Durable Object ([details](DESIGN.m
 
 1. Update the checkout on each machine to this release. Then run `npm run cloud:deploy` on the paired machine (the one holding `cloud.json` and `vapid.json`).
 2. Restart the daemon of the machine whose PM memory you want to keep (`npm run service:restart`). The first upgraded daemon to connect becomes the PM host, and it imports its own `memory/PROJECTS.md`, `memory/LOG.md` and `pm/settings.json` model into the relay once. The import writes `memory/.imported.json` and leaves the source files untouched. First importer wins: a machine that becomes the PM host later imports nothing.
+   A machine that ran local-only imports its `pm/state.json` instead of those files when it holds valid memory. Unpairing a machine later does not copy the relay's memory down: the local-only daemon uses its own `pm/state.json` and logs that the relay memory is not merged ([details](DESIGN.md#switching-between-local-only-and-relay-mode)).
 3. Start or restart any other machines. They join as standbys.
 
 A daemon that has not been upgraded keeps working against the new Worker until the first upgraded daemon connects. From then on the relay sends everything to the PM host. An upgraded daemon against the old Worker never receives a PM assignment, so it runs no PM (fail closed) until the Worker is deployed.
