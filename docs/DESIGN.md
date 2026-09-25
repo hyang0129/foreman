@@ -173,8 +173,10 @@ substituted. `FOREMAN_PM_MODEL` is used only while no model has been saved.
 
 Each `FOREMAN_HOME` is one **machine**. `machine.json` holds a random `machine_id` and a display
 name (`server/machine.ts`). The name defaults to the short hostname. `FOREMAN_MACHINE_NAME` overrides
-it, and the override is saved to `machine.json`. Every daemon with a valid identity greets the relay
-with a protocol-2 hello: its `machine_id`, name and platform, and the PM turns it still holds.
+it, and the override is saved to `machine.json`. The macOS service installer copies a
+`FOREMAN_MACHINE_NAME` set at install time into the service (refusing an invalid one), and the
+service saves it when it starts. A service installed without it keeps the saved name. Every daemon
+with a valid identity greets the relay with a protocol-2 hello: its `machine_id`, name and platform, and the PM turns it still holds.
 Several machines can be connected at once, and the relay remembers up to 16.
 
 The Durable Object records exactly one **active PM host**, with an **epoch** (`cloud/worker.ts`,
@@ -278,8 +280,9 @@ longer reads or writes them. They are left on disk and are safe to delete by han
 ### Hung provider
 
 Suppose a message is outstanding and the provider has sent nothing for **5 minutes**
-(`FOREMAN_PM_HUNG_MS` overrides this, in milliseconds; the macOS service installer does not pass it
-to the installed service). The next message you send then acts on it:
+(`FOREMAN_PM_HUNG_MS` overrides this, in milliseconds; the macOS service installer copies it into
+the installed service when it is set at install time, and refuses a value that is not a positive
+integer). The next message you send then acts on it:
 
 1. Every outstanding message is reported as uncertain (*the PM stopped responding*).
 2. The provider is retired.
