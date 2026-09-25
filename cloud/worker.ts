@@ -166,7 +166,7 @@ export class HostRelay extends DurableObject<Env> {
       catch { clearTimeout(timer); this.pending.delete(id); resolve(json({ error: 'Host disconnected; refresh before retrying' }, 503)); }
     });
   }
-  webSocketMessage(socket: WebSocket, raw: string | ArrayBuffer) {
+  async webSocketMessage(socket: WebSocket, raw: string | ArrayBuffer) {
     if (typeof raw !== 'string' || raw.length > MAX_RESPONSE_FRAME) { socket.close(1009, 'Invalid frame'); this.failPending(socket); return; }
     let message: any;
     try { message = JSON.parse(raw); } catch { socket.close(1003, 'Invalid JSON'); this.failPending(socket); return; }
@@ -176,6 +176,12 @@ export class HostRelay extends DurableObject<Env> {
       const host = typeof message.host === 'string' ? message.host.slice(0, 100) : previous.host;
       socket.serializeAttachment({ host, lastSeen: Date.now() });
       if (message.type === 'hello') this.setState('host_name', host);
+      // A heartbeat on a socket that had gone stale ends that outage just like a reconnect does,
+      // so the next outage notifies again and the periodic check resumes.
+      if (this.getState('outage_since') !== null || this.getState('offline_notified') !== null) {
+        this.setState('outage_since', null); this.setState('offline_notified', null);
+        await this.armOfflineCheck();
+      }
       socket.send(JSON.stringify({ type: 'pong' })); return;
     }
     if (message.type === 'notify') { try { this.acceptNotify(message); } catch {} return; }
@@ -306,8 +312,9 @@ export class HostRelay extends DurableObject<Env> {
     if (sql.exec("SELECT 1 FROM push_log WHERE source = 'notify' AND id = ?", frame.id).toArray().length) return;
     const recent = sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM push_log WHERE source = 'notify' AND sent = 1 AND at > ?", now - RATE_WINDOW).one().count;
     const allowed = recent < RATE_LIMIT;
-    sql.exec("INSERT INTO push_log (source, id, at, sent) VALUES ('notify', ?, ?, ?)", frame.id, now, allowed ? 1 : 0);
-    if (allowed) this.ctx.waitUntil(this.deliver(frame, frame.kind).catch(() => {}));
+    // Idempotent: if the id is already logged, nothing is inserted and nothing is sent.
+    const inserted = sql.exec("INSERT INTO push_log (source, id, at, sent) VALUES ('notify', ?, ?, ?) ON CONFLICT (source, id) DO NOTHING RETURNING id", frame.id, now, allowed ? 1 : 0).toArray().length;
+    if (inserted && allowed) this.ctx.waitUntil(this.deliver(frame, frame.kind).catch(() => {}));
   }
 
   // Renders once with the shared renderer, then encrypts and sends per subscription. A 404/410
@@ -334,7 +341,8 @@ export class HostRelay extends DurableObject<Env> {
   // State: `outage_since` (ms) while no live host socket exists, `offline_notified` once the one
   // notification for that outage went out. The alarm only runs while someone wants host_offline:
   // every CHECK_INTERVAL while a host is connected (catching a silently stale socket), then once
-  // at the 5-minute mark of an outage. It stops after notifying until a host reconnects.
+  // at the 5-minute mark of an outage. It stops after notifying until a host reconnects or a stale
+  // socket heartbeats again.
 
   private async scheduleAt(at: number) {
     const current = await this.ctx.storage.getAlarm();

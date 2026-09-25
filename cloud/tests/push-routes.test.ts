@@ -281,6 +281,43 @@ describe('notify frames from the host', () => {
     await flush(host); await new Promise((r) => setTimeout(r, 100));
     expect(pushes.map((push) => push.payload.kind).sort()).toEqual(['approval_requested', 'pm_failed']);
   });
+  // The two dedupe layers are tested separately, so deleting either one fails a test.
+  const DEDUPE_CHECK = "SELECT 1 FROM push_log WHERE source = 'notify' AND id = ?";
+  function spySql(ctx: DurableObjectState, { skipCheck }: { skipCheck: boolean }) {
+    const sql = ctx.storage.sql, exec = sql.exec.bind(sql), calls = { checks: 0, inserts: 0 };
+    sql.exec = ((query: string, ...bindings: unknown[]) => {
+      if (query === DEDUPE_CHECK) { calls.checks++; if (skipCheck) return exec('SELECT 1 WHERE 0'); }
+      if (query.startsWith('INSERT INTO push_log')) calls.inserts++;
+      return exec(query, ...bindings);
+    }) as typeof sql.exec;
+    return { calls, restore: () => { sql.exec = exec as typeof sql.exec; } };
+  }
+  it('the explicit dedupe check stops a repeated id before it reaches the insert', async () => {
+    const stub = relay(); await subscribe(stub);
+    const notify = frame();
+    const calls = await runInDurableObject(stub, (instance: HostRelay, ctx) => {
+      const spy = spySql(ctx, { skipCheck: false });
+      try { (instance as any).acceptNotify(notify); (instance as any).acceptNotify(notify); } finally { spy.restore(); }
+      return spy.calls;
+    });
+    expect(calls).toEqual({ checks: 2, inserts: 1 });
+    await until(() => pushes.length === 1, 'one push'); await new Promise((r) => setTimeout(r, 100));
+    expect(pushes).toHaveLength(1);
+  });
+  it('the insert alone is idempotent: a repeated id past the check neither throws nor pushes again', async () => {
+    const stub = relay(); await subscribe(stub);
+    const notify = frame();
+    const calls = await runInDurableObject(stub, (instance: HostRelay, ctx) => {
+      const spy = spySql(ctx, { skipCheck: true });
+      try { (instance as any).acceptNotify(notify); (instance as any).acceptNotify(notify); } finally { spy.restore(); }
+      return spy.calls;
+    });
+    // Both calls really went through the insert path (the check was forced to miss).
+    expect(calls).toEqual({ checks: 2, inserts: 2 });
+    await until(() => pushes.length === 1, 'one push'); await new Promise((r) => setTimeout(r, 100));
+    expect(pushes).toHaveLength(1);
+    expect(await runInDurableObject(stub, (_i: HostRelay, ctx) => ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM push_log WHERE source = 'notify'").one().n)).toBe(1);
+  });
   it('sends only to subscriptions whose kinds include the frame kind', async () => {
     const stub = relay(), host = await connect(stub);
     const approvals = await subscribe(stub, ['approval_requested']);
@@ -356,6 +393,29 @@ describe('Mac offline alarm', () => {
     await disconnect(stub, again); await backdate(stub);
     await runDurableObjectAlarm(stub);
     expect(pushes).toHaveLength(2);
+  });
+  it('a stale socket that resumes pinging ends the outage, so a later outage notifies again', async () => {
+    const stub = relay(), host = await connect(stub); await subscribe(stub);
+    const goStale = () => runInDurableObject(stub, (_instance: HostRelay, ctx) => {
+      for (const socket of ctx.getWebSockets('host')) socket.serializeAttachment({ host: 'Test Mac', lastSeen: Date.now() - OFFLINE_AFTER - 70_000 });
+    });
+    const alarm = () => runInDurableObject(stub, (_i: HostRelay, ctx) => ctx.storage.getAlarm());
+    await goStale();
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(pushes).toHaveLength(1);
+    expect(await state(stub, 'offline_notified')).toBe('1');
+    expect(await alarm()).toBeNull();
+    // The same socket heartbeats again without reconnecting: the outage is over and checks resume.
+    await flush(host);
+    expect(await state(stub, 'offline_notified')).toBeNull();
+    expect(await state(stub, 'outage_since')).toBeNull();
+    expect(await alarm()).not.toBeNull();
+    expect(host.socket.readyState).toBe(1);
+    // It goes stale again for more than 5 minutes: a second host_offline push is sent.
+    await goStale();
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(pushes).toHaveLength(2);
+    expect(pushes.map((push) => push.payload.kind)).toEqual(['host_offline', 'host_offline']);
   });
   it('sends nothing when the host reconnects within 5 minutes', async () => {
     const stub = relay(), host = await connect(stub); await subscribe(stub);
