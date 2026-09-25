@@ -387,6 +387,12 @@ export function requireCodexAuth(binary, configDir, env = process.env, execute =
   } catch { /* Never include provider output: it may contain credentials. */ }
   throw new Error(`DEV Codex is not signed in. Run CODEX_HOME="${configDir}" "${binary}" login, then run npm run dev:start. Dev requires its own login; production OAuth credentials are never copied.`);
 }
+// The dev Codex login is optional (#69): without it DEV still starts, and only
+// Codex sessions are unavailable. Returns the one-line notice, or null when signed in.
+export function codexLoginNotice(binary, configDir, env = process.env, execute = run) {
+  try { requireCodexAuth(binary, configDir, env, execute); return null; } catch { /* binary missing or not signed in */ }
+  return `Notice: DEV Codex is not signed in, so Codex sessions are unavailable in DEV. To enable them run CODEX_HOME="${configDir}" ${binary} login, then restart dev (npm run dev:stop && npm run dev:start).`;
+}
 // Terminate a child this process spawned (and still holds the handle to) and
 // prove it exited. Used only for a daemon whose record was never promoted.
 async function terminateChild(child) {
@@ -429,8 +435,10 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
     if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
     owned(path, true);
   }
-  requireCodexAuth('codex', join(home, 'codex'), process.env, execute);
+  // Claude is required; Codex is optional and only reported.
   requireClaudeAuth(join(snapshot, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude'), join(home, 'claude'), process.env, execute);
+  const codexNotice = codexLoginNotice('codex', join(home, 'codex'), process.env, execute);
+  if (codexNotice) console.warn(codexNotice);
   const entry = join(home, 'run.mjs');
   if (existsSync(entry)) owned(entry);
   writeFileSync(entry, `console.log('FOREMAN DEV ${deployment.commit}');\nawait import(${JSON.stringify(pathToFileURL(join(snapshot, 'server/main.ts')).href)});\n`, { mode: 0o600 });

@@ -20,7 +20,7 @@ function fixture(t) {
 }
 const releases = home => readdirSync(home).filter(n=>n.startsWith('release-'));
 const save = (path, value) => writeFileSync(path,JSON.stringify(value),{mode:0o600});
-test('startup never copies a production Codex rotating credential and requires an isolated login', async t => {
+test('startup never copies a production Codex rotating credential; a missing isolated Codex login is only a notice (#69)', async t => {
   const f=fixture(t), release='release-fixture', commit='a'.repeat(40);
   mkdirSync(join(f.home,release),{mode:0o700});
   symlinkSync(join(f.source,'node_modules'),join(f.home,release,'node_modules'));
@@ -31,11 +31,17 @@ test('startup never copies a production Codex rotating credential and requires a
   writeFileSync(join(prod,'auth.json'),credential);
   const prev=process.env.CODEX_HOME; process.env.CODEX_HOME=prod;
   t.after(()=>{if(prev===undefined)delete process.env.CODEX_HOME;else process.env.CODEX_HOME=prev;});
+  // Claude is signed in; the isolated Codex home is not. Stop just before spawn.
+  const execute=(bin,args)=>{if(bin==='codex')throw Error('not logged in');return '{"loggedIn":true}';};
+  const saveRecord=()=>{throw Error('injected stop before spawn');};
+  const warnings=[],warn=console.warn;console.warn=(...a)=>warnings.push(a.join(' '));
   let rejected;
-  try { await start(f.home,{relayStatus:async()=>({commit,relay:{online:false}}),checkPort:async()=>{},execute:()=>{throw Error('not logged in');}}); } catch(error) { rejected=error; }
+  try { await start(f.home,{relayStatus:async()=>({commit,relay:{online:false}}),checkPort:async()=>{},execute,saveRecord}); } catch(error) { rejected=error; } finally { console.warn=warn; }
   assert.equal(readdirSync(join(f.home,'codex')).includes('auth.json'),false);
   assert.equal(readFileSync(join(prod,'auth.json'),'utf8'),credential);
-  assert.match(rejected?.message ?? '', /DEV Codex is not signed in.*CODEX_HOME=.*login/);
+  assert.match(rejected?.message ?? '', /injected stop before spawn/);
+  assert.equal(warnings.length,1);
+  assert.match(warnings[0], /Codex sessions are unavailable in DEV.*CODEX_HOME=".*\/codex" codex login/);
 });
 test('CODEX_HOME cannot retarget dev credential discovery',()=>assert.throws(()=>guardEnvironment({CODEX_HOME:'/production'}),/Unset CODEX_HOME/));
 for(const failure of ['lockfile','html','dry-run','upload']) test(`failed deploy cleans snapshot and preserves previous deployment: ${failure}`, async t=>{

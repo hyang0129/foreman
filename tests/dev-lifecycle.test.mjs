@@ -164,9 +164,10 @@ test('actual startup: a real deploy then start runs a real daemon to health and 
   // 4th is the final status report.
   assert.equal(relay.calls, 4);
   assert.deepEqual(relay.tokens, Array(4).fill(pair.token));
-  assert.deepEqual(auth.calls.map((c) => c.args), [['login', 'status'], ['auth', 'status', '--json']]);
-  assert.equal(auth.calls[0].env.CODEX_HOME, join(f.home, 'codex'));
-  assert.equal(auth.calls[1].env.CLAUDE_CONFIG_DIR, join(f.home, 'claude'));
+  // Claude (required) is checked before Codex (optional, notice only; #69).
+  assert.deepEqual(auth.calls.map((c) => c.args), [['auth', 'status', '--json'], ['login', 'status']]);
+  assert.equal(auth.calls[0].env.CLAUDE_CONFIG_DIR, join(f.home, 'claude'));
+  assert.equal(auth.calls[1].env.CODEX_HOME, join(f.home, 'codex'));
 
   const pid = Number(readFileSync(join(f.home, 'fixture-pid'), 'utf8'));
   assert.equal(alive(pid), true);
