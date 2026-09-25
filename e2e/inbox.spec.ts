@@ -1657,26 +1657,28 @@ test("no-match search offers a keyboard clear action that preserves focus throug
   expect(state.calls.filter((call) => call.body)).toHaveLength(0);
 });
 
-test("loading, no sessions and offline empty states retain authoritative Start availability", async ({ page }) => {
+test("loading, no sessions and offline states retain authoritative New session availability", async ({ page }) => {
+  // The app opens on the PM, so the session states live in the rail.
   const state = await fixture(page);
   state.sessions = [];
   const release = state.defer("/api/sessions");
+  const rail = page.locator("#session-list");
+  const newSession = page.getByRole("button", { name: "New session", exact: true });
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Loading sessions…", exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "No sessions yet", exact: true })).toHaveCount(0);
+  await expect(rail).toContainText("Loading sessions…");
+  await expect(rail).not.toContainText("No sessions yet");
   release();
-  await expect(page.getByRole("heading", { name: "No sessions yet", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start a session", exact: true })).toBeEnabled();
+  await expect(rail).toContainText("No sessions yet. Start a session above.");
+  await expect(newSession).toBeEnabled();
   expect(state.calls.filter((call) => call.body)).toHaveLength(0);
   state.online = false;
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
-  await expect(page.getByRole("heading", { name: "Dev Mac is offline", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start a session", exact: true })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "New session", exact: true })).toBeDisabled();
+  await expect(rail).toContainText("Dev Mac is offline. Reconnect to see sessions.");
+  await expect(newSession).toBeDisabled();
   state.online = true;
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
-  await expect(page.getByRole("heading", { name: "No sessions yet", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Start a session", exact: true }).click();
+  await expect(rail).toContainText("No sessions yet. Start a session above.");
+  await newSession.click();
   await expect(page.getByRole("dialog")).toBeVisible();
   expect(state.calls.filter((call) => call.path === "/api/launch/propose" || (call.path === "/api/sessions" && call.body))).toHaveLength(0);
 });

@@ -176,7 +176,7 @@ test.describe("notification settings", () => {
     await fixture(page, { auth: { required: false } });
     await page.goto("/");
     await expect(page.locator("#app")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
     await expect(page.locator("#notify-settings")).toBeHidden();
   });
 
@@ -557,11 +557,11 @@ test.describe("notification click", () => {
     await context.grantPermissions(["notifications"], { origin: ORIGIN });
   });
 
-  test("routes the open app to the session in place, and Back returns to the inbox", async ({ page }) => {
+  test("routes the open app to the session in place, and Back returns to the PM", async ({ page }) => {
     const state = await fixture(page);
     await page.goto("/");
     await signedIn(page);
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
     const sw = await worker(page);
     await page.evaluate(() => { (window as any).__sameDocument = true; });
     await deliver(page, JSON.stringify(payload()));
@@ -576,7 +576,7 @@ test.describe("notification click", () => {
     // The notification was closed.
     expect(await shown(page)).toEqual([]);
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
   });
 
   test("a PM notification opens the project manager", async ({ page }) => {
@@ -588,11 +588,12 @@ test.describe("notification click", () => {
     await deliver(page, JSON.stringify(payload({ kind: "pm_failed", session_key: undefined, tag: "pm", url: "/?view=pm", title: "PM needs attention", body: "The project manager hit an error." })));
     await expect.poll(() => shown(page)).toHaveLength(1);
     await click(sw, "pm");
-    await expect(page).toHaveURL(`${ORIGIN}/?view=pm`);
+    // The PM is the home view: its canonical URL is "/".
+    await expect(page).toHaveURL(`${ORIGIN}/`);
     await expect(page.getByRole("heading", { name: "Claude · Project manager" })).toBeVisible();
   });
 
-  test("a session missing from the Mac falls back to the inbox with the neutral notice", async ({ page }) => {
+  test("a session missing from the Mac falls back to the PM with the neutral notice", async ({ page }) => {
     await fixture(page);
     await page.goto("/");
     await signedIn(page);
@@ -600,8 +601,8 @@ test.describe("notification click", () => {
     await deliver(page, JSON.stringify(payload({ session_key: "fm:gone", tag: "session:fm:gone", url: "/?session=fm%3Agone" })));
     await expect.poll(() => shown(page)).toHaveLength(1);
     await click(sw, "session:fm:gone");
-    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing your inbox.");
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing the project manager.");
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
     await expect.poll(() => page.url()).toBe(`${ORIGIN}/`);
   });
 

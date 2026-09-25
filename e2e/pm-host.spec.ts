@@ -409,7 +409,8 @@ test("Back closes the Move PM dialog before leaving the PM", async ({ page }) =>
   await expect(dialog(page)).toBeVisible();
   await page.goBack();
   await expect(dialog(page)).toBeHidden();
-  await expect(page).toHaveURL(/\?view=pm$/);
+  // The PM is the home view, at "/".
+  await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
 });
 
@@ -622,13 +623,14 @@ test("the machine line and the footer name the machine, and the offline copy is 
     expect(await page.locator("#rail").innerText()).not.toMatch(/\bMac\b/);
   };
   await noMac();
-  // Elsewhere the banner says it, by name and without assuming a platform.
-  await page.goto("/");
+  // Elsewhere (a session, since "/" is the PM) the banner says it, by name and without
+  // assuming a platform.
+  await page.goto("/?session=managed%3Aalpha");
   await expect(page.locator("#connection-banner")).toBeVisible();
   await expect(page.locator("#connection-banner")).toHaveText(
     "build-box is disconnected. Showing the last available state. Messages and approvals will be available when it reconnects.",
   );
-  await expect(page.getByRole("heading", { name: "build-box is offline", exact: true })).toBeVisible();
+  await expect(page.locator("main")).toContainText("Conversation unavailable while build-box is offline.");
   await expect(page.locator(".rail-empty")).toHaveText("build-box is offline. Reconnect to see sessions.");
   await noMac();
 });

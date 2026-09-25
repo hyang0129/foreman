@@ -331,28 +331,42 @@ test.describe("deep links", () => {
     await expect(page.getByText("History of Fix sign-in")).toBeVisible();
     expect(page.url()).toBe("http://127.0.0.1:4188/?session=managed%3Aalpha");
     expect(state.calls.filter((c) => c.path === "/api/session").every((c) => c.search === "?id=managed%3Aalpha")).toBe(true);
-    // The inbox sits beneath a deep link, so Back returns to it rather than leaving.
+    // The PM sits beneath a deep link, so Back returns to it rather than leaving.
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
     expect(page.url()).toBe("http://127.0.0.1:4188/");
   });
 
-  test("the PM link opens the project manager", async ({ page }) => {
+  test("the PM link opens the project manager at its canonical home URL", async ({ page }) => {
     await fixture(page);
     await page.goto("/?view=pm");
     await expect(page.getByRole("heading", { name: "Claude · Project manager" })).toBeVisible();
     await expect(page.getByText("How can I help the fleet?")).toBeVisible();
-    expect(page.url()).toBe("http://127.0.0.1:4188/?view=pm");
+    expect(page.url()).toBe("http://127.0.0.1:4188/");
+  });
+
+  test("the app opens on the project manager, ready to message", async ({ page }) => {
+    await fixture(page);
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
+    await expect(page.getByText("How can I help the fleet?")).toBeVisible();
+    const composer = page.getByLabel("Message this session");
+    await expect(composer).toBeEnabled();
+    await expect(composer).toHaveAttribute("placeholder", "What are we working on?");
+    // A tap focuses it (on a phone, this is what raises the keyboard).
+    await composer.tap();
+    await expect(composer).toBeFocused();
+    expect(page.url()).toBe("http://127.0.0.1:4188/");
   });
 
   for (const [label, link] of [["unknown", "/?session=fm:not-on-this-mac"], ["malformed", "/?session=has%20space"], ["the PM sentinel", "/?session=pm"]]) {
-    test(`an ${label} session link falls back to the inbox with a neutral notice`, async ({ page }) => {
+    test(`an ${label} session link falls back to the PM with a neutral notice`, async ({ page }) => {
       const state = await fixture(page);
       await page.goto(link);
-      await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing your inbox.");
+      await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing the project manager.");
       await expect(page.locator("#app-notice")).toHaveAttribute("role", "status");
-      await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
-      await expect(page.getByRole("heading", { name: "Choose a conversation" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
+      await expect(page.getByText("How can I help the fleet?")).toBeVisible();
       await expect(page.locator("#error-banner")).toBeHidden();
       await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
       expect(state.calls.filter((c) => c.path === "/api/session")).toEqual([]);
@@ -367,25 +381,25 @@ test.describe("deep links", () => {
   test("Forward after Back from a rejected link repeats the neutral notice", async ({ page }) => {
     const state = await fixture(page);
     await page.goto("/?session=fm:not-on-this-mac");
-    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing your inbox.");
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing the project manager.");
     await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
     await expect.poll(() => page.evaluate(() => history.state?.view ?? null)).toBeNull();
     // Dismiss the first notice so the next one is observably new.
     await page.locator("#app-notice").evaluate((notice: HTMLElement) => { notice.hidden = true; });
     await page.goForward();
     await expect(page.locator("#app-notice")).toBeVisible();
-    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing your inbox.");
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing the project manager.");
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
     await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
     await page.waitForTimeout(300);
     await expect(page.locator("#error-banner")).toBeHidden();
     expect(state.calls.filter((c) => c.path === "/api/session")).toEqual([]);
-    // The app stays usable: a conversation opens and Back returns to the inbox.
+    // The app stays usable: a conversation opens and Back returns to the PM.
     await page.getByRole("button", { name: "Open session navigation" }).tap();
     await page.getByRole("button", { name: /Write docs/ }).tap();
     await expect(page.getByText("History of Write docs")).toBeVisible();
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
   });
 
   test("selecting conversations updates the URL and reload keeps the view", async ({ page }) => {
@@ -398,7 +412,7 @@ test.describe("deep links", () => {
     await expect(page.getByText("History of Write docs")).toBeVisible();
     await page.getByRole("button", { name: "Open session navigation" }).tap();
     await page.locator("#select-pm").tap();
-    await expect(page).toHaveURL("http://127.0.0.1:4188/?view=pm");
+    await expect(page).toHaveURL("http://127.0.0.1:4188/");
     await page.reload();
     await expect(page.getByRole("heading", { name: "Claude · Project manager" })).toBeVisible();
   });
@@ -430,7 +444,7 @@ test.describe("Android Back", () => {
     await page.goto("/");
     const openNav = page.getByRole("button", { name: "Open session navigation" });
 
-    // Drawer: Back closes it and keeps the inbox.
+    // Drawer: Back closes it and keeps the PM.
     await openNav.tap();
     await expect(openNav).toHaveAttribute("aria-expanded", "true");
     await page.goBack();
@@ -447,23 +461,24 @@ test.describe("Android Back", () => {
       await expect.poll(() => page.evaluate(() => history.state?.overlay ?? null)).toBeNull();
     }
 
-    // Conversation from the drawer, then Back to the inbox.
+    // Conversation from the drawer, then Back to the PM.
     await openNav.tap();
     await page.getByRole("button", { name: /Fix sign-in/ }).tap();
     await expect(page.getByText("History of Fix sign-in")).toBeVisible();
     await expect(page).toHaveURL(/\?session=managed%3Aalpha$/);
-    // Switching conversations replaces the entry: Back still goes to the inbox.
+    // Switching conversations replaces the entry: Back still goes to the PM.
     await openNav.tap();
     await page.getByRole("button", { name: /Write docs/ }).tap();
     await expect(page.getByText("History of Write docs")).toBeVisible();
     await expect(page).toHaveURL(/\?session=managed%3Abeta$/);
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Choose a conversation" })).toBeVisible();
-    await expect(page.getByLabel("Message this session")).toBeDisabled();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
+    await expect(page.getByText("How can I help the fleet?")).toBeVisible();
+    // The PM home view is ready to message, never an empty screen with a dead composer.
+    await expect(page.getByLabel("Message this session")).toBeEnabled();
     expect(page.url()).toBe("http://127.0.0.1:4188/");
 
-    // From the inbox, Back leaves the app: nothing is trapped and nothing is blank.
+    // From the PM, Back leaves the app: nothing is trapped and nothing is blank.
     await page.goBack();
     expect(page.url()).toBe("about:blank");
   });
@@ -489,7 +504,7 @@ test.describe("Android Back", () => {
     expect(page.url()).toBe("about:blank");
   });
 
-  test("a reload with the drawer open leaves no duplicate entry: one Back returns to the inbox", async ({ page }) => {
+  test("a reload with the drawer open leaves no duplicate entry: one Back returns to the PM", async ({ page }) => {
     await fixture(page);
     await page.goto("/");
     const openNav = page.getByRole("button", { name: "Open session navigation" });
@@ -504,7 +519,7 @@ test.describe("Android Back", () => {
     await expect.poll(() => page.evaluate(() => history.state)).toEqual({ foreman: 1, view: "managed:alpha" });
     // One Back is a visible navigation, not a silent step between identical entries.
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
     expect(page.url()).toBe("http://127.0.0.1:4188/");
     // Forward returns to the conversation; the dead drawer entry beyond it is not a stop either.
     await page.goForward();
@@ -513,7 +528,7 @@ test.describe("Android Back", () => {
     await expect.poll(() => page.evaluate(() => history.state)).toEqual({ foreman: 1, view: "managed:alpha" });
     await expect(openNav).toHaveAttribute("aria-expanded", "false");
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
     await page.goBack();
     expect(page.url()).toBe("about:blank");
   });
@@ -529,10 +544,12 @@ test.describe("Android Back", () => {
     await page.reload();
     await expect(page.getByRole("heading", { name: "Claude · Project manager" })).toBeVisible();
     await expect(page.locator("#new-dialog")).toBeHidden();
-    await expect.poll(() => page.evaluate(() => history.state)).toEqual({ foreman: 1, view: "pm" });
-    await page.goBack();
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    // The PM home entry records view null, at "/".
+    await expect.poll(() => page.evaluate(() => history.state)).toEqual({ foreman: 1, view: null });
     expect(page.url()).toBe("http://127.0.0.1:4188/");
+    // Both dead overlay entries were stepped off, so one Back leaves the app.
+    await page.goBack();
+    expect(page.url()).toBe("about:blank");
   });
 
   test("Forward after Back returns to the conversation", async ({ page }) => {
@@ -542,7 +559,7 @@ test.describe("Android Back", () => {
     await page.getByRole("button", { name: /Fix sign-in/ }).tap();
     await expect(page.getByText("History of Fix sign-in")).toBeVisible();
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Your session inbox" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
     await page.goForward();
     await expect(page.getByText("History of Fix sign-in")).toBeVisible();
   });
