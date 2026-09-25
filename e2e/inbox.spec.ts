@@ -24,6 +24,7 @@ const observed = {
   control_reason:
     "Observed session; Foreman does not own its input connection.",
 };
+const DEV_MAC_ID = "6f1c2b8e-4a3d-4c5e-9f70-1a2b3c4d5e6f";
 async function fixture(
   page: Page,
   options: {
@@ -88,7 +89,16 @@ async function fixture(
       status = 403;
       result = { error: "Not authorized" };
     } else if (path === "/api/host")
-      result = { online: state.online, host: "Dev Mac" };
+      result = { online: state.online, host: "Dev Mac", machine_id: DEV_MAC_ID, standby_online: false };
+    // Epic #26 contract D: the relay's answer for a single machine that runs the PM.
+    else if (path === "/api/pm/host" && request.method() === "GET")
+      result = {
+        active: { machine_id: DEV_MAC_ID, name: "Dev Mac", online: state.online, epoch: 1, assigned_at: Date.parse("2026-09-01T00:00:00Z"), assigned_by: "bootstrap" },
+        machines: [{ machine_id: DEV_MAC_ID, name: "Dev Mac", platform: "darwin", online: state.online, last_seen: Date.now(), active: true }],
+        open_turns: 0,
+        uncertain_turns: 0,
+        mode: "relay",
+      };
     else if (path === "/api/projects") result = { projects: state.projects };
     else if (path === "/api/projects/resolve") {
       const reference = body.reference.toLowerCase().replace(/^the /, "");

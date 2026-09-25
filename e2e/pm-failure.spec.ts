@@ -14,6 +14,7 @@ const managed = {
   updated_at: new Date().toISOString(),
 };
 
+const DEV_MAC_ID = "6f1c2b8e-4a3d-4c5e-9f70-1a2b3c4d5e6f";
 async function fixture(page: Page, options: { pmHistory?: any[]; auth?: any } = {}) {
   const state = {
     pmError: null as string | null,
@@ -37,7 +38,16 @@ async function fixture(page: Page, options: { pmHistory?: any[]; auth?: any } = 
     let result: any = {},
       status = 200;
     if (path === "/api/config") result = { auth: options.auth ?? { required: false } };
-    else if (path === "/api/host") result = { online: true, host: "Dev Mac" };
+    else if (path === "/api/host") result = { online: true, host: "Dev Mac", machine_id: DEV_MAC_ID, standby_online: false };
+    // Epic #26 contract D: the relay's answer for a single machine that runs the PM.
+    else if (path === "/api/pm/host")
+      result = {
+        active: { machine_id: DEV_MAC_ID, name: "Dev Mac", online: true, epoch: 1, assigned_at: Date.parse("2026-09-01T00:00:00Z"), assigned_by: "bootstrap" },
+        machines: [{ machine_id: DEV_MAC_ID, name: "Dev Mac", platform: "darwin", online: true, last_seen: Date.now(), active: true }],
+        open_turns: 0,
+        uncertain_turns: 0,
+        mode: "relay",
+      };
     else if (path === "/api/sessions") result = [structuredClone(managed)];
     else if (path === "/api/session")
       result = {

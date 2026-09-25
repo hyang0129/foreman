@@ -1110,3 +1110,29 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 .notify-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .5rem; }
 #notify-feedback:empty { display: none; }
 #notify-feedback.error { color: var(--error); }
+
+/* PM machine (epic #26): which machine runs the PM, and the Move PM dialog. */
+.pm-host { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 4px max(24px, env(safe-area-inset-right)) 4px 24px; font-size: .75rem; color: var(--secondary); border-bottom: 1px solid var(--line); flex-shrink: 0; max-height: 25%; overflow-y: auto; }
+.pm-host[hidden] { display: none; }
+.pm-host p { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+.pm-host-line { display: flex; align-items: center; gap: 8px; min-height: 24px; }
+.pm-host-offline { flex-basis: 100%; font-weight: 600; }
+.pm-host-offline[hidden] { display: none; }
+.pm-host.is-offline { background: var(--warning-soft); color: var(--warning); }
+.pm-host .btn { margin-left: auto; }
+.machine-choices { border: 0; padding: 0; margin: 0; min-width: 0; }
+.machine-choices legend { font-size: .75rem; font-weight: 600; margin-bottom: 8px; padding: 0; }
+.machine-list { display: grid; gap: 6px; }
+.machine-choice { display: flex; align-items: flex-start; gap: 12px; min-height: 44px; margin: 0; padding: 10px 12px; border: 1px solid var(--control-line); border-radius: 8px; background: var(--surface); color: var(--ink); cursor: pointer; font-weight: 400; overflow-wrap: anywhere; }
+dialog label.machine-choice { margin-top: 0; }
+.machine-choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.machine-choice:has(input:focus-visible) { outline: 3px solid var(--accent); outline-offset: 2px; }
+.machine-choice.is-disabled { cursor: default; border-color: var(--line); color: var(--secondary); }
+label.machine-choice input[type="radio"] { flex-shrink: 0; width: 20px; height: 20px; min-height: 0; margin: 2px 0 0; padding: 0; accent-color: var(--accent); }
+.machine-text { display: grid; gap: 2px; min-width: 0; }
+.machine-name { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.machine-meta, .machine-note { font-size: .75rem; color: var(--secondary); }
+.machine-list > .field-hint { margin: 4px 0 0; }
+@media (max-width: 760px) {
+  .pm-host { padding: 2px max(13px, env(safe-area-inset-right)) 2px max(13px, env(safe-area-inset-left)); }
+}
