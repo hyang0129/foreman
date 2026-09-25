@@ -6,9 +6,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, realpathSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { experimental_readRawConfig } from 'wrangler';
 import { deploy, openHome, workerConfig, contractDivergences, SUPPORTED_WORKER_CONTRACT, UNSUPPORTED_BINDING_KEYS, TARGET } from '../scripts/dev-environment.mjs';
+// Resolve repository files against this test, not the working directory (#53).
+const repo = fileURLToPath(new URL('..', import.meta.url));
 
 const conforming = () => ({ vars: { FIREBASE_CONFIG: 'public' }, assets: { directory: './web', binding: 'ASSETS' }, ...structuredClone({ durable_objects: SUPPORTED_WORKER_CONTRACT.durable_objects, migrations: SUPPORTED_WORKER_CONTRACT.migrations }) });
 const relay = { name: 'RELAY', class_name: 'HostRelay' }, v1 = { tag: 'v1', new_sqlite_classes: ['HostRelay'] };
@@ -83,7 +86,7 @@ test('refuses every binding kind the dev config would silently drop', () => {
 // Guards a Wrangler upgrade: every top-level key its config schema knows must
 // be classified as contract, refused binding kind, or deliberately ignored.
 test('every Wrangler top-level config key is classified', () => {
-  const schema = JSON.parse(readFileSync(realpathSync('node_modules/wrangler/config-schema.json'), 'utf8'));
+  const schema = JSON.parse(readFileSync(realpathSync(join(repo, 'node_modules/wrangler/config-schema.json')), 'utf8'));
   const keys = Object.keys(schema.definitions.RawConfig.properties);
   const ignored = ['$schema', 'env', 'name', 'account_id', 'compatibility_date', 'compatibility_flags', 'main', 'find_additional_modules', 'preserve_file_names',
     'base_dir', 'workers_dev', 'preview_urls', 'routes', 'route', 'tsconfig', 'jsx_factory', 'jsx_fragment', 'triggers', 'limits', 'rules', 'build', 'no_bundle',
@@ -97,7 +100,7 @@ test('every Wrangler top-level config key is classified', () => {
 });
 
 test('the real repository wrangler.jsonc conforms and yields the same bindings and migrations', () => {
-  const { rawConfig } = experimental_readRawConfig({ config: realpathSync('wrangler.jsonc') });
+  const { rawConfig } = experimental_readRawConfig({ config: realpathSync(join(repo, 'wrangler.jsonc')) });
   assert.deepEqual(contractDivergences(rawConfig), []);
   const config = workerConfig(rawConfig);
   assert.deepEqual(config.durable_objects.bindings, rawConfig.durable_objects.bindings);
