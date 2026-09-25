@@ -82,6 +82,26 @@ type Subscription = PushTarget & { id: string; kinds: string[] };
 type SubscriptionRow = { id: string; endpoint: string; p256dh: string; auth: string; kinds: string };
 type Delivery = { sent: number; failed: number };
 
+// Push delivery counters (#127), reported additively as `push` on GET /api/host. They are kept in
+// the existing `push_state` key/value table (created with CREATE TABLE IF NOT EXISTS on a class
+// that is already SQLite-backed, so no storage migration), not in memory: the relay DO hibernates
+// between host frames, and in-memory counts would reset every time it is evicted. Counts are
+// cumulative since the table was created. They carry no endpoints, keys or payloads — only
+// integers, and for the most recent failure its HTTP status (null when no response arrived) and time.
+const PUSH_COUNTERS = {
+  sent: 'push_sent',                     // 2xx from the push service
+  failed: 'push_failed',                 // non-2xx or no response (includes expired_removed)
+  expired_removed: 'push_expired',       // 404/410: the subscription was deleted
+  payloadless: 'push_payloadless',       // sent without an encrypted payload (fallback)
+  invalid_notify: 'invalid_notify',      // host notify frames that failed validation
+} as const;
+const LAST_FAILURE = 'push_last_failure';
+export interface PushCounters {
+  sent: number; failed: number; expired_removed: number; payloadless: number; invalid_notify: number;
+  last_failure: { status: number | null; at: string } | null;
+}
+export type HostStatusWithPush = HostStatusResponse & { push: PushCounters };
+
 const SUBSCRIBE_KEYS = new Set(['subscription', 'device_label', 'kinds']);
 const SUBSCRIPTION_KEYS = new Set(['endpoint', 'expirationTime', 'keys']);
 const SELECT_KEYS = new Set(['id', 'endpoint']);
@@ -184,7 +204,7 @@ export class HostRelay extends DurableObject<Env> {
     // The PM host record is answered here, never relayed, and works while every host is offline.
     if (url.pathname === PM_HOST_ROUTE) return this.pmHostRequest(request, url);
     const socket = this.hostSocket();
-    if (url.pathname === '/api/host') return json(this.hostStatus(socket));
+    if (url.pathname === '/api/host') return json({ ...this.hostStatus(socket), push: this.pushCounters() } satisfies HostStatusWithPush);
     if (!socket) {
       const assignment = this.pm.assignment();
       return json({ error: assignment ? pmHostOfflineMessage(this.pm.machineName(assignment.machine_id)) : 'Your Mac is offline. Open Foreman on the Mac and reconnect.' }, 503);
@@ -364,6 +384,23 @@ export class HostRelay extends DurableObject<Env> {
     if (value === null) this.ctx.storage.sql.exec('DELETE FROM push_state WHERE key = ?', key);
     else this.ctx.storage.sql.exec('INSERT INTO push_state (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value', key, value);
   }
+  // Synchronous read-then-write: nothing else runs in the DO between the two storage calls.
+  private count(key: string) {
+    const current = Number(this.getState(key) ?? 0);
+    this.setState(key, String((Number.isSafeInteger(current) && current > 0 ? current : 0) + 1));
+  }
+  private pushCounters(): PushCounters {
+    const read = (key: string) => { const value = Number(this.getState(key) ?? 0); return Number.isSafeInteger(value) && value > 0 ? value : 0; };
+    let last_failure: PushCounters['last_failure'] = null;
+    try {
+      const parsed = JSON.parse(this.getState(LAST_FAILURE) ?? 'null');
+      if (parsed && (parsed.status === null || Number.isInteger(parsed.status)) && typeof parsed.at === 'string') last_failure = { status: parsed.status, at: parsed.at };
+    } catch {}
+    return {
+      sent: read(PUSH_COUNTERS.sent), failed: read(PUSH_COUNTERS.failed), expired_removed: read(PUSH_COUNTERS.expired_removed),
+      payloadless: read(PUSH_COUNTERS.payloadless), invalid_notify: read(PUSH_COUNTERS.invalid_notify), last_failure,
+    };
+  }
   private subscriptions(): Subscription[] {
     return this.ctx.storage.sql.exec<SubscriptionRow>('SELECT id, endpoint, p256dh, auth, kinds FROM push_subscriptions ORDER BY created_at, rowid').toArray().map((row) => {
       let kinds: string[] = [];
@@ -459,7 +496,7 @@ export class HostRelay extends DurableObject<Env> {
   // push failures can never affect request relaying.
   private acceptNotify(message: unknown) {
     const frame = parseNotifyFrame(message);
-    if (!frame) { this.setState('invalid_notify', String(Number(this.getState('invalid_notify') ?? 0) + 1)); return; }
+    if (!frame) { this.count(PUSH_COUNTERS.invalid_notify); return; }
     const sql = this.ctx.storage.sql, now = Date.now();
     sql.exec('DELETE FROM push_log WHERE at < ?', now - DEDUPE_WINDOW);
     if (sql.exec("SELECT 1 FROM push_log WHERE source = 'notify' AND id = ?", frame.id).toArray().length) return;
@@ -480,11 +517,23 @@ export class HostRelay extends DurableObject<Env> {
     const topic = await topicFor(payload.tag);
     const recipients = targets ?? this.subscriptions().filter((subscription) => kind === 'test' || subscription.kinds.includes(kind));
     const outcomes = await Promise.all(recipients.map(async (subscription) => {
+      let status: number | null = null;
       try {
-        const status = await sendPush(subscription, bytes, { vapid, subject: `mailto:${this.env.ALLOWED_EMAIL}`, topic });
-        if (status === 404 || status === 410) this.ctx.storage.sql.exec('DELETE FROM push_subscriptions WHERE id = ?', subscription.id);
-        return status >= 200 && status < 300;
-      } catch { return false; }
+        const result = await sendPush(subscription, bytes, { vapid, subject: `mailto:${this.env.ALLOWED_EMAIL}`, topic });
+        status = result.status;
+        if (result.payloadless) this.count(PUSH_COUNTERS.payloadless);
+        if (status === 404 || status === 410) {
+          this.ctx.storage.sql.exec('DELETE FROM push_subscriptions WHERE id = ?', subscription.id);
+          this.count(PUSH_COUNTERS.expired_removed);
+        }
+      } catch {}
+      const ok = status !== null && status >= 200 && status < 300;
+      if (ok) this.count(PUSH_COUNTERS.sent);
+      else {
+        this.count(PUSH_COUNTERS.failed);
+        this.setState(LAST_FAILURE, JSON.stringify({ status, at: new Date().toISOString() }));
+      }
+      return ok;
     }));
     const sent = outcomes.filter(Boolean).length;
     return { sent, failed: outcomes.length - sent };
@@ -509,9 +558,19 @@ export class HostRelay extends DurableObject<Env> {
     const now = Date.now();
     if (this.hostSocket()) return this.scheduleAt(now + CHECK_INTERVAL);
     if (this.getState('offline_notified')) return;
-    const since = Number(this.getState('outage_since') ?? now);
+    const recorded = Number(this.getState('outage_since') ?? NaN);
+    const since = Number.isFinite(recorded) ? recorded : this.silentSince(now);
     this.setState('outage_since', String(since));
     return this.scheduleAt(since + OFFLINE_AFTER);
+  }
+
+  // When an outage has no recorded start, it began at the relay target's last heartbeat (a socket
+  // that went silent without closing), not "now": otherwise subscribing while the host socket is
+  // stale-but-open would push the offline alert back by up to the staleness window (~65 s). With
+  // no such socket at all, nothing better than `now` is known.
+  private silentSince(now: number) {
+    const seen = this.ctx.getWebSockets('host').filter((socket) => this.isTarget(socket)).map((socket) => HostRelay.attachment(socket)?.lastSeen ?? 0);
+    return Math.min(now, Math.max(0, ...seen) || now);
   }
 
   // Only the relay target's socket matters: a standby machine going away is not an outage.
@@ -532,9 +591,7 @@ export class HostRelay extends DurableObject<Env> {
     if (this.getState('offline_notified')) return;
     let since = Number(this.getState('outage_since') ?? NaN);
     if (!Number.isFinite(since)) {
-      // A socket that went silent without closing: the outage began at its last heartbeat.
-      const seen = this.ctx.getWebSockets('host').filter((socket) => this.isTarget(socket)).map((socket) => HostRelay.attachment(socket)?.lastSeen ?? 0);
-      since = Math.min(now, Math.max(0, ...seen) || now);
+      since = this.silentSince(now);
       this.setState('outage_since', String(since));
     }
     if (now - since < OFFLINE_AFTER) { await this.ctx.storage.setAlarm(since + OFFLINE_AFTER); return; }

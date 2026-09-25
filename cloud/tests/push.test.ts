@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:workers';
 import { describe, expect, it } from 'vitest';
 import { b64u, encryptPayload, fromB64u, loadVapidKeys, pushEndpointAllowed, sendPush, topicFor, validReceiverKeys, vapidJwt, VAPID_LIFETIME } from '../push.ts';
-import { decodeJwt, decryptPush, ecdhPrivateKey, newReceiver, verifyVapid } from './push-helpers.ts';
+import { CHROME_FCM_PRIVATE_KEY, CHROME_FCM_SUBSCRIPTION, decodeJwt, decryptPush, ecdhPrivateKey, newReceiver, verifyVapid } from './push-helpers.ts';
 
 // RFC 8291 Section 5 / Appendix A, verbatim (whitespace from the RFC's line wrapping removed).
 const strip = (text: string) => text.replace(/\s+/g, '');
@@ -122,8 +122,8 @@ describe('sending', () => {
     const calls: { url: string; init: RequestInit }[] = [];
     const fetcher = (async (url: string, init: RequestInit) => { calls.push({ url, init }); return new Response(null, { status: 201 }); }) as unknown as typeof fetch;
     const topic = await topicFor('session:fm:123');
-    const status = await sendPush({ endpoint: 'https://fcm.googleapis.com/fcm/send/abc', ...receiver }, utf8('{"v":1}'), { vapid: keys, subject: 'mailto:owner@example.com', topic, fetcher });
-    expect(status).toBe(201);
+    const result = await sendPush({ endpoint: 'https://fcm.googleapis.com/fcm/send/abc', ...receiver }, utf8('{"v":1}'), { vapid: keys, subject: 'mailto:owner@example.com', topic, fetcher });
+    expect(result).toEqual({ status: 201, payloadless: false });
     expect(calls).toHaveLength(1);
     const headers = calls[0]!.init.headers as Record<string, string>;
     expect(calls[0]!.url).toBe('https://fcm.googleapis.com/fcm/send/abc');
@@ -139,13 +139,55 @@ describe('sending', () => {
     const receiver = await newReceiver(), keys = (await loadVapidKeys(env.VAPID_PRIVATE_KEY))!;
     const calls: RequestInit[] = [];
     const fetcher = (async (_url: string, init: RequestInit) => { calls.push(init); return new Response(null, { status: 201 }); }) as unknown as typeof fetch;
-    await sendPush({ endpoint: 'https://fcm.googleapis.com/fcm/send/abc', ...receiver }, null, { vapid: keys, subject: 'mailto:owner@example.com', fetcher });
+    expect(await sendPush({ endpoint: 'https://fcm.googleapis.com/fcm/send/abc', ...receiver }, null, { vapid: keys, subject: 'mailto:owner@example.com', fetcher })).toEqual({ status: 201, payloadless: true });
     const headers = calls[0]!.headers as Record<string, string>;
-    expect(calls[0]!.body).toBeNull();
+    expect((calls[0]!.body as Uint8Array).byteLength).toBe(0);
     expect(headers['content-encoding']).toBeUndefined();
     expect(headers['content-length']).toBe('0');
     expect((await verifyVapid(headers.authorization!)).valid).toBe(true);
     await expect(sendPush({ endpoint: 'https://attacker.invalid/x', ...receiver }, null, { vapid: keys, subject: 'mailto:x@example.com', fetcher })).rejects.toThrow(/not allowed/);
     expect(calls).toHaveLength(1);
+  });
+  // FCM answers 411 Length Required to a bodiless POST with no length. Build the request the way
+  // the runtime's fetch does (a real Request from the same init) and check what goes on the wire.
+  it('the payload-less request carries Content-Length: 0 and a zero-length body, also when encryption fails', async () => {
+    const receiver = await newReceiver(), keys = (await loadVapidKeys(env.VAPID_PRIVATE_KEY))!;
+    const requests: Request[] = [];
+    const fetcher = (async (url: string, init: RequestInit) => { requests.push(new Request(url, init)); return new Response(null, { status: 201 }); }) as unknown as typeof fetch;
+    const endpoint = 'https://fcm.googleapis.com/fcm/send/abc';
+    expect((await sendPush({ endpoint, ...receiver }, null, { vapid: keys, subject: 'mailto:owner@example.com', fetcher })).payloadless).toBe(true);
+    // Keys that cannot encrypt (they pass no validation here) degrade to the same fallback.
+    expect((await sendPush({ endpoint, p256dh: 'not-a-key', auth: receiver.auth }, utf8('{"v":1}'), { vapid: keys, subject: 'mailto:owner@example.com', fetcher })).payloadless).toBe(true);
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect(request.method).toBe('POST');
+      expect(request.headers.get('content-length')).toBe('0');
+      expect(request.headers.get('content-encoding')).toBeNull();
+      expect(request.body).not.toBeNull();
+      expect((await request.arrayBuffer()).byteLength).toBe(0);
+    }
+  });
+});
+
+describe('a real-browser-shaped subscription (Chrome / FCM toJSON)', () => {
+  it('has the real field lengths and passes the relay key and endpoint validators', () => {
+    const { endpoint, keys } = CHROME_FCM_SUBSCRIPTION;
+    expect(Object.keys(CHROME_FCM_SUBSCRIPTION)).toEqual(['endpoint', 'expirationTime', 'keys']);
+    expect(Object.keys(keys)).toEqual(['p256dh', 'auth']);
+    expect(endpoint).toMatch(/^https:\/\/fcm\.googleapis\.com\/fcm\/send\/[A-Za-z0-9_-]{11}:APA91b[A-Za-z0-9_-]+$/);
+    expect(keys.p256dh).toHaveLength(87);
+    expect(keys.auth).toHaveLength(22);
+    expect(fromB64u(keys.p256dh)!.length).toBe(65);
+    expect(fromB64u(keys.p256dh)![0]).toBe(4);
+    expect(fromB64u(keys.auth)!.length).toBe(16);
+    expect(pushEndpointAllowed(endpoint)).toBe(true);
+    expect(validReceiverKeys(keys.p256dh, keys.auth)).toBe(true);
+    // The fixture's keys are RFC 8291's user-agent key pair.
+    expect(keys).toEqual({ p256dh: RFC.uaPublic, auth: RFC.authSecret });
+  });
+  it('encrypts for it end to end: the holder of the matching private key decrypts', async () => {
+    const receiver = { privateKey: await ecdhPrivateKey(CHROME_FCM_PRIVATE_KEY, CHROME_FCM_SUBSCRIPTION.keys.p256dh), ...CHROME_FCM_SUBSCRIPTION.keys };
+    const body = await encryptPayload(utf8('{"v":1,"kind":"test"}'), receiver.p256dh, receiver.auth);
+    expect(await decryptPush(body, receiver)).toBe('{"v":1,"kind":"test"}');
   });
 });
