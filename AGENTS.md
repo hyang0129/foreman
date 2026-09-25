@@ -70,15 +70,25 @@ A **sprint** is done when every acceptance criterion maps to a test or a review 
 
 The epic PR body carries the evidence the developer needs and nothing they should have to dig for: the exact head SHA, real verification numbers, what changed and what did not, known limitations, and a short human QA checklist — at most a dozen items, each with setup, action, and expected result. Do not ask the developer to inspect source, story PRs, logs, or raw artifacts to answer a checklist item.
 
+## Deploying and restarting
+
+Agents may deploy and restart the service, but only to ship code that has already landed.
+
+- **Only merged `main`.** Deploy and restart only a commit that is on `main` and on which all five checks passed. Never deploy a story branch, an epic branch, or a dirty tree.
+- **The service checkout.** The Foreman service runs from `/Users/hong/code/foreman`. Bring it up to date with `git pull --ff-only` on `main` only. If the tree is dirty or the pull is not a fast-forward, stop and ask the developer.
+- **Restart (`npm run service:restart`).** A restart interrupts every managed session and any active PM turn. Run `npm run status` first. If sessions are working or the PM is mid-turn, ask the developer before restarting, unless they already said to restart anyway. Never restart if your own process was started by the Foreman service (a managed session or the PM): the restart kills you mid-task. Ask the developer instead. After restarting, confirm with `npm run service:status` and `npm run status`.
+- **Cloud (`npm run cloud:deploy`).** The Worker serves `web/`, so web changes reach the hosted app only after this runs. The script reuses the existing pairing in `~/.foreman/cloud.json`. Never delete, rotate, or hand-edit that file or any Cloudflare secret. After deploying, confirm the hosted app loads and the host shows as connected.
+- **Dev preview (`npm run dev:deploy`, `dev:start`, `dev:stop`, `dev:destroy`).** These are isolated from production and may be used whenever a task needs them.
+- **Report it.** State the exact commit you deployed or restarted onto, each command's result, and what you checked afterwards, including failures.
+
 ## Feedback that is not blocking
 
 Blocking means it fails an approved acceptance criterion. Everything else — a good idea, a nit, an adjacent bug — becomes its own issue rather than growing the current sprint. Before proposing the next sprint, review those issues and record a disposition for each: included, deferred, duplicate, or declined.
 
 ## Things not to do
 
-- Do not deploy to Cloudflare (`npm run cloud:deploy`) or restart the Foreman service. The developer does both. A daemon usually runs from this same source tree; restarting it can kill the session doing the work.
 - Do not modify `package.json` or `package-lock.json` unless the task is specifically about dependencies.
-- Do not touch `~/.foreman`, `wrangler.jsonc` credentials, or the `.claude` directory.
+- Do not touch `~/.foreman`, `wrangler.jsonc` credentials, or the `.claude` directory, except through the deploy and service scripts described under [Deploying and restarting](#deploying-and-restarting).
 - Do not weaken a failing assertion to make a suite green. Fix the behavior, or report that you could not. The same applies to skipping a test, raising a tolerance, updating a golden, or relaxing a budget — unless the sprint explicitly changed that expectation.
 - Do not treat a passing retry as proof a flaky test is fine. Flakiness is itself a failure.
 - Do not report a check as passing if it was skipped, run against a dirty tree, or run against a different commit than the one you pushed.
