@@ -12,6 +12,9 @@ export const LOCAL_API_TOKEN_NAME = "local-api-token";
 export const LOCAL_API_TOKEN_FILE = join(FOREMAN_HOME, LOCAL_API_TOKEN_NAME);
 export const PM_SESSION_FILE = join(PM_DIR, "session");
 export const PM_HISTORY_FILE = join(PM_DIR, "history.jsonl");
+// Epic #26: this FOREMAN_HOME's machine identity, and the local-only PM state store.
+export const MACHINE_FILE = join(FOREMAN_HOME, "machine.json");
+export const PM_LOCAL_STATE_FILE = join(PM_DIR, "state.json");
 export const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 export const CLAUDE_REGISTRY_DIR = join(CLAUDE_CONFIG_DIR, "sessions");
 // Prefer the Claude Code binary bundled with the Agent SDK (newest), else whatever is on PATH.
