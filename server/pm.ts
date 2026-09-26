@@ -167,7 +167,7 @@ export const INVESTIGATOR_PROMPT = [
   'Answer the question you were given, concisely, with the facts you found and where you found them (file, issue, PR, commit).',
   'You are read-only. You can Read, Grep and Glob files outside Foreman\'s own state and credential directories, fetch web pages, and run only these read-only commands, exactly, with no shell operators, quotes, variables, globs or redirection:',
   '`gh issue view|list ...`, `gh pr view|list|diff|checks ...`, `gh run view|list ...` (pass `-R owner/repo`), and `git -C <absolute checkout directory> log|show|status|diff|branch ...`.',
-  'Grep and Glob need an explicit `path`; Grep with `output_mode: "content"` needs a single file, and a directory Grep always skips .env files. Git commands run with forced read-only options (no pager, no optional locks, no fsmonitor, signature or external-diff programs), and log/show/diff always leave out .env files (all added for you; `--follow`, `-L` and `status -v` are not available). Never try to change anything. If the answer needs more than a lookup, say so and stop.',
+  'Grep and Glob need an explicit `path`; Grep with `output_mode: "content"` needs a single file, and a directory Grep always skips .env files. Git commands run with forced read-only options (no pager, no optional locks, no fsmonitor, signature or external-diff programs), and log/show/diff always leave out .env files (all added for you; `--follow`, `-L`, `status -v` and any `--submodule` but `--submodule=short` are not available, and a value-taking option written last must use `--opt=value`). Never try to change anything. If the answer needs more than a lookup, say so and stop.',
 ].join('\n');
 
 /**
@@ -319,12 +319,16 @@ const GIT_SIGNATURE_FORMAT = /%G|%\(signature/;
  * optional locks (`git status` never rewrites `.git/index`), no fsmonitor hook program, and no
  * signature program: every gpg/x509/ssh verifier is forced to `/usr/bin/false`, because a format
  * from repository config (`format.pretty`, a `pretty.<alias>`) can still ask for a signature.
+ * Submodules are shown as commit ids only (`diff.submodule=short`, no status summary): the other
+ * formats run git inside the submodule, whose git directory is never checked and whose files
+ * (a submodule's `.env`) the exclusion pathspecs do not reach.
  * log/show/diff also get `--no-ext-diff --no-textconv`, so repository config cannot make a read
  * run a program.
  */
 export const GIT_FORCED_GLOBALS = [
   '--no-pager', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'log.showSignature=false',
   '-c', 'gpg.program=/usr/bin/false', '-c', 'gpg.x509.program=/usr/bin/false', '-c', 'gpg.ssh.program=/usr/bin/false',
+  '-c', 'diff.submodule=short', '-c', 'status.submoduleSummary=false',
 ] as const;
 export const GIT_FORCED_DIFF_OPTIONS = ['--no-ext-diff', '--no-textconv'] as const;
 /**
@@ -351,8 +355,8 @@ const readText = (p: string) => { try { return readFileSync(p, 'utf8'); } catch 
  * at, or a directory that is itself a git directory; then that git directory's `commondir` and its
  * object `alternates` (recursively). A directory that only looks like a git directory (git may
  * reject it and keep walking) does not stop the walk: every candidate up to the first `.git` entry
- * is included. Null when `dir` is not inside a checkout; a string when git's metadata cannot be
- * checked. Each location gets the investigator path denial, so a gitfile, commondir or alternates
+ * is included. Null when no `.git` entry is found (a bare repository on its own is no checkout);
+ * `invalid` when git's metadata is not in the exact form git reads (so it cannot be checked). Each location gets the investigator path denial, so a gitfile, commondir or alternates
  * entry pointing into a protected directory (or a work tree that contains one, like a dotfiles
  * repository in `~`) is refused.
  */
@@ -360,45 +364,64 @@ function gitLocations(dir: string): { locations: string[] } | { invalid: string 
   const out: string[] = [];
   const addGitDir = (gitDir: string): string | null => {
     const dirs = [gitDir];
-    const common = readText(join(gitDir, 'commondir'))?.trim();
-    if (common) dirs.push(resolve(gitDir, common));
+    const commondir = readText(join(gitDir, 'commondir'));
+    if (commondir !== null) {
+      // git strips only the trailing line ending and keeps any other whitespace.
+      const common = gitPathValue(commondir);
+      if (common === null) return 'its commondir file is not a plain path';
+      dirs.push(resolve(gitDir, common));
+    }
     out.push(...dirs);
     // Object alternates, followed recursively (git itself stops at depth 5).
     const objectDirs = dirs.map((d) => join(d, 'objects'));
     for (let i = 0; i < objectDirs.length; i++) {
       if (objectDirs.length > 64) return 'too many object alternates to check';
       for (const line of (readText(join(objectDirs[i], 'info', 'alternates')) ?? '').split('\n')) {
-        const entry = line.trim();
-        if (!entry || entry.startsWith('#')) continue;
+        if (!line || line.startsWith('#')) continue;
+        // A C-quoted entry, or one with whitespace git would keep as part of the path, is refused.
+        const entry = gitPathValue(line);
+        if (entry === null || entry.startsWith('"')) return 'its object alternates are not plain paths';
         const alt = resolve(objectDirs[i], entry);
         if (!objectDirs.includes(alt)) { objectDirs.push(alt); out.push(alt); }
       }
     }
     return null;
   };
-  let candidate = false;
   for (let at = dir; ; at = dirname(at)) {
     const dotGit = join(at, '.git');
     if (existsSync(dotGit)) {
       out.push(at, dotGit);
       let gitDir = dotGit;
       if (isFile(dotGit)) {
-        // Exactly one `gitdir: <path>` line, as git requires; anything else makes git fail and is refused here.
-        const target = /^gitdir: *(.+?)\s*$/.exec(readText(dotGit) ?? '')?.[1];
-        if (!target) return { invalid: 'its .git file is not a valid gitfile' };
+        // Exactly `gitdir: <path>`, as git reads it (literal prefix, trailing line ending stripped);
+        // anything else, or a path with whitespace git would keep, is refused.
+        const content = readText(dotGit) ?? '';
+        const target = content.startsWith('gitdir: ') ? gitPathValue(content.slice('gitdir: '.length)) : null;
+        if (target === null) return { invalid: 'its .git file is not a plain gitfile (gitdir: <path>)' };
         gitDir = resolve(at, target);
       }
       const invalid = addGitDir(gitDir);
       return invalid ? { invalid } : { locations: out };
     }
+    // A directory that looks like a git directory is checked too, but only a `.git` entry above it
+    // makes this a checkout: a bare repository on its own is refused, as before #198.
     if (isFile(join(at, 'HEAD')) && (isDir(join(at, 'objects')) || isFile(join(at, 'commondir')))) {
-      // `dir` is inside what may be a git directory (a bare repository, or `.git` itself).
-      candidate = true;
       const invalid = addGitDir(at);
       if (invalid) return { invalid };
     }
-    if (dirname(at) === at) return candidate ? { locations: out } : null;
+    if (dirname(at) === at) return null;
   }
+}
+
+/**
+ * A path value from a git metadata file (gitfile, commondir, alternates line) with only its
+ * trailing line ending removed, as git does; null (refused) when it is empty or still has leading
+ * or trailing whitespace or a line break, which git would keep but a check could misread.
+ */
+function gitPathValue(raw: string): string | null {
+  const value = raw.replace(/[\r\n]+$/, '');
+  if (!value || /[\r\n]/.test(value) || value.trim() !== value) return null;
+  return value;
 }
 
 /** Why `git -C dir` may not run in `dir` (a realpath): a location git would read is refused, or it is no checkout. */
@@ -427,10 +450,44 @@ const outsideValue = (value: string) => isAbsolute(value) || value.startsWith('~
  * without `--`) a non-option argument naming an existing path under `dir`. Only decides whether
  * GIT_FORCED_HISTORY_OPTIONS keep the listing unchanged; the .env exclusion is added either way.
  */
-const hasPathspec = (opts: string[], dir: string) => {
+/**
+ * Splits git arguments at the pathspec, so the .env exclusions can always be placed after a `--`
+ * (never where a value-taking option such as `--src-prefix` or `--grep` would take one as its
+ * value). With a `--` of the command's own, everything after it is the pathspec. Without one, the
+ * pathspec is git's own: a trailing run of non-option arguments naming existing paths under `dir`
+ * (git takes every argument after the first path as a path too). `hasPathspec` only decides
+ * whether GIT_FORCED_HISTORY_OPTIONS keep the listing unchanged.
+ */
+/**
+ * Options known to take no separate value. The argument right before the `--` that precedes the
+ * .env exclusions must be one of these, a `--opt=value` spelling, or not an option at all: a
+ * value-taking option there (`--src-prefix`, `--line-prefix`, `--grep`, `-S`, …) would take the
+ * `--` as its value and leave the exclusions as ordinary arguments. Unknown options fail closed.
+ */
+const GIT_NO_VALUE_OPTIONS = new Set([
+  '-p', '-u', '--patch', '-s', '--no-patch', '--stat', '--shortstat', '--numstat', '--dirstat', '--summary', '--name-only', '--name-status', '--raw',
+  '--oneline', '--graph', '--all', '--branches', '--tags', '--remotes', '--merges', '--no-merges', '--first-parent', '--reverse', '--topo-order', '--date-order',
+  '--author-date-order', '--decorate', '--no-decorate', '--abbrev-commit', '--no-abbrev-commit', '--no-abbrev', '--full-history', '--sparse', '--dense',
+  '--simplify-merges', '--simplify-by-decoration', '--ancestry-path', '--left-right', '--left-only', '--right-only', '--cherry-pick', '--cherry-mark', '--cherry',
+  '--boundary', '--count', '--no-walk', '--do-walk', '--no-ext-diff', '--no-textconv', '--cached', '--staged', '--text', '-a', '-R', '-w', '-b',
+  '--ignore-all-space', '--ignore-space-change', '--ignore-space-at-eol', '--ignore-blank-lines', '--minimal', '--patience', '--histogram', '--word-diff',
+  '--color-words', '--color', '--no-color', '--pickaxe-all', '--pickaxe-regex', '-m', '-c', '--cc', '--dd', '--remerge-diff', '--no-renames', '--find-renames',
+  '--find-copies', '--find-copies-harder', '--full-index', '--binary', '--check', '--exit-code', '--quiet', '--relative', '--no-relative', '--compact-summary',
+  '--full-name', '--show-notes', '--no-notes', '--source', '--use-mailmap', '--mailmap', '--no-use-mailmap', '--log-size', '--regexp-ignore-case', '-i',
+  '--basic-regexp', '--extended-regexp', '-E', '--fixed-strings', '-F', '--perl-regexp', '-P', '--all-match', '--invert-grep', '--parents', '--children',
+  '--no-min-parents', '--no-max-parents', '--ignore-submodules', '-z', '-t', '-r', '--root', '--no-prefix', '--default-prefix', '--function-context', '-W',
+  '--indent-heuristic', '--no-indent-heuristic', '-M', '-C', '-B', '-D', '--irreversible-delete', '--minimal', '--no-color-moved', '--show-pulls', '--no-graph',
+]);
+// A short option (or cluster) takes the next argument only when it ends in a letter that needs a
+// value (`-n`, `-pS`, `-G`, `-I`, `-l`, and the refused `-O`/`-L`); `-n5` or `-Sfoo` carry theirs.
+const optionTakesNoValue = (arg: string) => !arg.startsWith('-') || arg.includes('=') || GIT_NO_VALUE_OPTIONS.has(arg)
+  || (!arg.startsWith('--') && arg.length > 1 && !/[nSGOLIl]$/.test(arg));
+const splitPathspec =(opts: string[], dir: string): { before: string[]; paths: string[]; hasPathspec: boolean } => {
   const end = opts.indexOf('--');
-  if (end >= 0) return end < opts.length - 1;
-  return opts.some((a) => !a.startsWith('-') && existsSync(join(dir, a)));
+  if (end >= 0) return { before: opts.slice(0, end), paths: opts.slice(end + 1), hasPathspec: end < opts.length - 1 };
+  let start = opts.length;
+  while (start > 0 && !opts[start - 1].startsWith('-') && existsSync(join(dir, opts[start - 1]))) start--;
+  return { before: opts.slice(0, start), paths: opts.slice(start), hasPathspec: start < opts.length };
 };
 
 /**
@@ -483,6 +540,8 @@ export function investigatorBashCheck(input: unknown, ctx: InvestigatorContext =
       for (const a of opts) {
         const name = a.split('=')[0];
         if ((name.length >= 5 && '--follow'.startsWith(name)) || /^-[^-]*L/.test(a)) return no(`git ${sub} ${name.startsWith('--') ? '--follow' : '-L'} is not available to investigators (it cannot be combined with the .env exclusion)`);
+        // `--submodule` (=log, =diff) runs git inside the submodule; only the forced short form is allowed.
+        if (name.length >= 5 && '--submodule'.startsWith(name) && a !== '--submodule=short') return no('git --submodule is limited to --submodule=short (other forms read inside the submodule)');
       }
     }
     // `status -v` prints staged diffs through the repository's diff drivers (textconv) and could show a staged .env.
@@ -506,8 +565,12 @@ export function investigatorBashCheck(input: unknown, ctx: InvestigatorContext =
       }
     }
     if (!history) return { command: ['git', ...GIT_FORCED_GLOBALS, '-C', dir, sub!, ...opts].join(' ') };
-    const forcedOptions = [...GIT_FORCED_DIFF_OPTIONS, ...(sub !== 'diff' && !hasPathspec(opts, real) ? GIT_FORCED_HISTORY_OPTIONS : [])].filter((o) => !opts.includes(o));
-    return { command: `${['git', ...GIT_FORCED_GLOBALS, '-C', dir, sub!, ...forcedOptions, ...opts].join(' ')} ${GIT_ENV_EXCLUSION_SUFFIX}` };
+    // The exclusions always follow a real `--`: the command's own, or one placed before its pathspec.
+    const { before, paths, hasPathspec } = splitPathspec(opts, real);
+    const last = before.at(-1);
+    if (last !== undefined && !optionTakesNoValue(last)) return no(`git option ${last} may take a value; write it as ${last.startsWith('--') ? `${last}=<value>` : `${last}<value>`} or put it before another argument`);
+    const forcedOptions = [...GIT_FORCED_DIFF_OPTIONS, ...(sub !== 'diff' && !hasPathspec ? GIT_FORCED_HISTORY_OPTIONS : [])].filter((o) => !opts.includes(o));
+    return { command: `${['git', ...GIT_FORCED_GLOBALS, '-C', dir, sub!, ...forcedOptions, ...before, '--', ...paths].join(' ')} ${GIT_ENV_EXCLUSION_SUFFIX}` };
   }
   return no('only read-only gh and git commands are allowed');
 }

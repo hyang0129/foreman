@@ -420,16 +420,16 @@ test('git: blocked options are refused in abbreviated and --opt=value spellings,
 
 test('git: every allowed command runs with the forced read-only options, added by the hook (never taken from input)', async () => {
   const forced = GIT_FORCED_GLOBALS.join(' ');
-  assert.equal(forced, '--no-pager --no-optional-locks -c core.fsmonitor=false -c log.showSignature=false -c gpg.program=/usr/bin/false -c gpg.x509.program=/usr/bin/false -c gpg.ssh.program=/usr/bin/false');
-  // log/show/diff always end with the quoted .env exclusion; log/show without a pathspec keep their full listing.
+  assert.equal(forced, '--no-pager --no-optional-locks -c core.fsmonitor=false -c log.showSignature=false -c gpg.program=/usr/bin/false -c gpg.x509.program=/usr/bin/false -c gpg.ssh.program=/usr/bin/false -c diff.submodule=short -c status.submoduleSummary=false');
+  // log/show/diff always end with -- and the quoted .env exclusion; log/show without a pathspec keep their full listing.
   const env = envSuffix;
   assert.equal(env, "':(top,exclude,glob,icase)**/.env*' ':(top,exclude,glob,icase)**/.env*/**'");
-  assert.equal(rewritten(`git -C ${project} log --oneline -n 5`), `git ${forced} -C ${project} log --no-ext-diff --no-textconv --full-history --sparse --oneline -n 5 ${env}`);
-  assert.equal(rewritten(`git -C ${project} show HEAD`), `git ${forced} -C ${project} show --no-ext-diff --no-textconv --full-history --sparse HEAD ${env}`);
-  assert.equal(rewritten(`git -C ${project} diff --no-ext-diff HEAD`), `git ${forced} -C ${project} diff --no-textconv --no-ext-diff HEAD ${env}`);
+  assert.equal(rewritten(`git -C ${project} log --oneline -n 5`), `git ${forced} -C ${project} log --no-ext-diff --no-textconv --full-history --sparse --oneline -n 5 -- ${env}`);
+  assert.equal(rewritten(`git -C ${project} show HEAD`), `git ${forced} -C ${project} show --no-ext-diff --no-textconv --full-history --sparse HEAD -- ${env}`);
+  assert.equal(rewritten(`git -C ${project} diff --no-ext-diff HEAD`), `git ${forced} -C ${project} diff --no-textconv --no-ext-diff HEAD -- ${env}`);
   // A pathspec of the command's own (after --, or an existing path) keeps git's usual history simplification.
   assert.equal(rewritten(`git -C ${project} log -- src`), `git ${forced} -C ${project} log --no-ext-diff --no-textconv -- src ${env}`);
-  assert.equal(rewritten(`git -C ${project} log -p src/index.ts`), `git ${forced} -C ${project} log --no-ext-diff --no-textconv -p src/index.ts ${env}`);
+  assert.equal(rewritten(`git -C ${project} log -p src/index.ts`), `git ${forced} -C ${project} log --no-ext-diff --no-textconv -p -- src/index.ts ${env}`);
   assert.equal(rewritten(`git -C ${project} status`), `git ${forced} -C ${project} status`);
   assert.equal(rewritten(`git -C ${project} branch -a`), `git ${forced} -C ${project} branch -a`);
   // Idempotent: the rewritten command passes the check unchanged (canUseTool may see it after the hook).
@@ -450,7 +450,7 @@ test('git: every allowed command runs with the forced read-only options, added b
   const hook = (pm as any).enforceToolBoundary;
   const r = await hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: `git -C ${project} log -n 1`, description: 'x' }, tool_use_id: 't1', agent_id: 'agent-1', agent_type: 'investigator' });
   assert.equal(r.hookSpecificOutput.permissionDecision, 'allow');
-  assert.deepEqual(r.hookSpecificOutput.updatedInput, { command: `git ${forced} -C ${project} log --no-ext-diff --no-textconv --full-history --sparse -n 1 ${env}`, description: 'x' });
+  assert.deepEqual(r.hookSpecificOutput.updatedInput, { command: `git ${forced} -C ${project} log --no-ext-diff --no-textconv --full-history --sparse -n 1 -- ${env}`, description: 'x' });
   assert.deepEqual(await hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'gh pr view 1 -R o/r' }, tool_use_id: 't2', agent_id: 'agent-1' }), {});
   const viaGuard = await (pm as any).canUseTool('Bash', { command: `git -C ${project} status` }, { agentID: 'agent-1' });
   assert.equal(viaGuard.updatedInput.command, `git ${forced} -C ${project} status`);
@@ -762,4 +762,105 @@ test('an empty or non-string agent_id is refused, never given the Coordinator ma
   assert.equal(slots.inUse, 1, 'a call with an empty agent_id is not the Coordinator ending its Agent call');
   await fire('PostToolUse', { tool_name: 'Agent', tool_use_id: 'slot-a' });
   assert.equal(slots.inUse, 0);
+});
+
+// --- #217 review: the .env exclusions, submodules, bare repositories and git metadata parsing -----
+const envRepo = () => {
+  const { repo, git } = newRepo('review-');
+  writeFileSync(join(repo, 'README'), 'hi\n'); writeFileSync(join(repo, '.env'), 'SECRET=topsecret\n');
+  git('add', '-A'); assert.equal(git('commit', '-qm', 'init').status, 0);
+  writeFileSync(join(repo, '.env'), 'SECRET=changed\n'); writeFileSync(join(repo, 'README'), 'hi\nmore\n');
+  assert.equal(git('commit', '-qam', 'two').status, 0);
+  return { repo, git };
+};
+
+test('git: a trailing value-taking option can never take the .env exclusions as its value (#217 review)', () => {
+  const { repo } = envRepo();
+  const leak = /SECRET|\.env/i;
+  // Control: exclusions placed right after a value-taking option, as the first #205 version did, leak.
+  for (const tail of ['log -p --src-prefix', 'show HEAD --line-prefix', 'log -p --invert-grep -F --grep']) {
+    assert.match(sh(`git -C ${repo} ${tail} ${envSuffix}`).stdout, leak, `control: ${tail} takes the first exclusion as its value`);
+  }
+  // Now: a value-taking option right before the pathspec separator is refused, in every placement.
+  for (const command of ['log -p --src-prefix', 'show HEAD --line-prefix', 'log -p --invert-grep -F --grep', 'log -p --dst-prefix', 'log -p --author',
+    'log -p -S', 'log -p -G', 'log -p -n', 'log -pn', 'diff HEAD --src-prefix', 'log -p --src-prefix -- README', 'log -p --grep -- README', 'show HEAD --line-prefix --']) {
+    assert.match(investigatorBashDenial(`git -C ${repo} ${command}`) ?? '', /may take a value/, command);
+  }
+  // Allowed forms put the exclusions after a real `--` and show no .env.
+  for (const command of ['log -p --src-prefix=x/', 'show HEAD --line-prefix=Z', 'log -p --invert-grep -F --grep=zzz', 'log -p -n 2', 'log -p -n2', 'log -p -Shi',
+    'log -p -S hi', 'log -p README', 'log -p -- README', 'log -p --stat', 'show HEAD -p', 'diff HEAD~1', 'log -p --grep hi']) {
+    if (/[~]/.test(command)) continue; // not in the safe character set
+    const once = rewritten(`git -C ${repo} ${command}`);
+    assert.ok(once.endsWith(` ${envSuffix}`) && once.split(' ').includes('--'), once);
+    const r = sh(once);
+    assert.equal(r.status, 0, `${command}: ${r.stderr}`);
+    assert.doesNotMatch(r.stdout, leak, command);
+  }
+  assert.match(sh(rewritten(`git -C ${repo} log -p --src-prefix=x/`)).stdout, /x\/README/);
+});
+
+test('git: submodules show as commit ids only, so a submodule .env never leaks (#217 review)', () => {
+  const { repo: sub, git: subGit } = envRepo();
+  const { repo, git } = newRepo('super-');
+  writeFileSync(join(repo, 'a.txt'), 'a\n'); git('add', '.'); assert.equal(git('commit', '-qm', 'base').status, 0);
+  const [first, second] = subGit('rev-list', '--reverse', 'HEAD').stdout.trim().split('\n');
+  assert.equal(git('-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub, 'mod').status, 0);
+  const mod = gitIn(join(repo, 'mod'));
+  assert.equal(mod('checkout', '-q', first).status, 0); git('add', 'mod'); assert.equal(git('commit', '-qm', 'add mod').status, 0);
+  assert.equal(mod('checkout', '-q', second).status, 0); git('add', 'mod'); assert.equal(git('commit', '-qm', 'bump mod').status, 0);
+  const leak = /SECRET/;
+  // Controls: --submodule=diff, and the repository's own diff.submodule=diff on a plain log -p, show the submodule's .env.
+  assert.match(sh(`git -C ${repo} log -p --submodule=diff`).stdout, leak, 'control: --submodule=diff');
+  for (const arg of ['--submodule=diff', '--submodule=log', '--submodule', '--submod=diff', '--submo']) {
+    assert.match(investigatorBashDenial(`git -C ${repo} log -p ${arg}`) ?? '', /submodule/, arg);
+    assert.notEqual(investigatorBashDenial(`git -C ${repo} diff ${arg}`), null, arg);
+  }
+  assert.equal(git('config', 'diff.submodule', 'diff').status, 0);
+  assert.match(sh(`git -C ${repo} log -p`).stdout, leak, 'control: diff.submodule=diff in repository config');
+  for (const command of ['log -p', 'log -p --submodule=short', 'show HEAD', 'diff HEAD~1 HEAD', 'status']) {
+    if (/[~]/.test(command)) continue;
+    const r = sh(rewritten(`git -C ${repo} ${command}`));
+    assert.equal(r.status, 0, `${command}: ${r.stderr}`);
+    assert.doesNotMatch(r.stdout, leak, command);
+  }
+  assert.match(sh(rewritten(`git -C ${repo} log -p`)).stdout, /Subproject commit/);
+});
+
+test('git -C: a bare repository (or a directory inside one) outside any checkout is refused, as before #198 (#217 review)', () => {
+  const { repo, git } = newRepo('bare-src-');
+  writeFileSync(join(repo, 'f'), 'x\n'); git('add', 'f'); assert.equal(git('commit', '-qm', 'c').status, 0);
+  const bare = join(dirname(repo), `${basename(repo)}-bare.git`);
+  assert.equal(spawnSync('git', ['clone', '-q', '--bare', repo, bare], { env: gitEnv }).status, 0);
+  for (const dir of [bare, join(bare, 'objects'), join(bare, 'refs')]) {
+    assert.match(investigatorBashDenial(`git -C ${dir} log --oneline -n 1`) ?? '', /not a directory inside a git checkout/, dir);
+  }
+  // Control: the git directory of a checkout is still inside that checkout.
+  assert.equal(investigatorBashDenial(`git -C ${join(repo, '.git')} log --oneline -n 1`), null);
+});
+
+test('git -C: gitfile, commondir and alternates values are read exactly as git reads them; stray whitespace or quoting is refused (#217 review)', () => {
+  const base = mkdtempSync(join(root, 'parse-'));
+  const checkout = (name: string, gitfile: string, extra?: (at: string) => void) => {
+    const at = join(base, name); mkdirSync(join(at, 'decoy.git'), { recursive: true }); mkdirSync(join(at, 'gd', 'cd'), { recursive: true });
+    extra?.(at); writeFileSync(join(at, '.git'), gitfile); return at;
+  };
+  // Each names a path git keeps whitespace in (` decoy.git`, `decoy.git `, ` cd`); the host must not trim it to the harmless decoy.
+  const refused = [
+    checkout('two-spaces', 'gitdir:  decoy.git\n', (at) => symlinkSync(join(home, '.ssh'), join(at, ' decoy.git'))),
+    checkout('trailing-space', 'gitdir: decoy.git \n', (at) => symlinkSync(join(home, '.ssh'), join(at, 'decoy.git '))),
+    checkout('no-space', 'gitdir:decoy.git\n'),
+    checkout('two-lines', 'gitdir: decoy.git\ngitdir: decoy.git\n'),
+    checkout('commondir-space', 'gitdir: gd\n', (at) => { writeFileSync(join(at, 'gd', 'commondir'), ' cd\n'); symlinkSync(join(home, '.ssh'), join(at, 'gd', ' cd')); }),
+    checkout('commondir-empty', 'gitdir: gd\n', (at) => writeFileSync(join(at, 'gd', 'commondir'), '\n')),
+    checkout('alternates-quoted', 'gitdir: gd\n', (at) => { mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), '"../../decoy.git"\n'); }),
+    checkout('alternates-space', 'gitdir: gd\n', (at) => { mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), ' ../../decoy.git\n'); }),
+  ];
+  for (const at of refused) assert.match(investigatorBashDenial(`git -C ${at} log`) ?? '', /not (a )?plain/, at);
+  // Controls: the exact forms git writes, including a CRLF line ending and a commondir/alternates entry, pass.
+  const plain = [
+    checkout('plain', 'gitdir: decoy.git\n'), checkout('crlf', 'gitdir: decoy.git\r\n'), checkout('no-newline', 'gitdir: decoy.git'),
+    checkout('commondir', 'gitdir: gd\n', (at) => writeFileSync(join(at, 'gd', 'commondir'), 'cd\n')),
+    checkout('alternates', 'gitdir: gd\n', (at) => { mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), '# c\n\n../../decoy.git\n'); }),
+  ];
+  for (const at of plain) assert.equal(investigatorBashDenial(`git -C ${at} log`), null, at);
 });

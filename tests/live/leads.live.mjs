@@ -200,7 +200,7 @@ if (process.env.FOREMAN_LIVE !== '1') {
     // The read-only git log passed the hook, rewritten with the forced options, and actually ran.
     const logCalls = bash(/ log --oneline/).filter((e) => e.decision === 'allow');
     assert.ok(logCalls.length > 0, 'the read-only git log passed the hook');
-    assert.ok(logCalls.every((e) => /^git --no-pager -c core\.fsmonitor=false -c log\.showSignature=false -C \S+ log --no-ext-diff --no-textconv --oneline/.test(e.updatedInput?.command ?? '')), JSON.stringify(logCalls.map((e) => e.updatedInput)));
+    assert.ok(logCalls.every((e) => /^git --no-pager --no-optional-locks -c core\.fsmonitor=false -c log\.showSignature=false -c gpg\.program=\/usr\/bin\/false -c gpg\.x509\.program=\/usr\/bin\/false -c gpg\.ssh\.program=\/usr\/bin\/false -c diff\.submodule=short -c status\.submoduleSummary=false -C \S+ log --no-ext-diff --no-textconv --full-history --sparse --oneline(?: \S+)* -- ':\(top,exclude,glob,icase\)\*\*\/\.env\*' ':\(top,exclude,glob,icase\)\*\*\/\.env\*\/\*\*'$/.test(e.updatedInput?.command ?? '')), JSON.stringify(logCalls.map((e) => e.updatedInput)));
     const logResults = logCalls.map((e) => toolResults.get(e.tool_use_id)).filter(Boolean);
     t.diagnostic(`git log tool results: ${JSON.stringify(logResults)}`);
     assert.ok(logResults.some((r) => !r.is_error && /\binitial\b/.test(r.text)), 'the git log produced a tool result naming the commit');
