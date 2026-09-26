@@ -2,12 +2,13 @@
 import './fixtures/temp-foreman-home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { bindPeerTools, leadSystemPrompt, makeSessionPrep, peerMessageId, PEER_ALLOWED_TOOLS, PEER_INSTRUCTIONS, preparePeerTools, prepareSessionTools, type PeerService, type PeerSource } from '../server/peer-tools.ts';
+import { bindPeerTools, leadSystemPrompt, makeSessionPrep, NARRATION_INSTRUCTIONS, peerMessageId, PEER_ALLOWED_TOOLS, PEER_INSTRUCTIONS, preparePeerTools, prepareSessionTools, type PeerService, type PeerSource } from '../server/peer-tools.ts';
 import { LEAD_ALLOWED_TOOLS } from '../server/lead-tools.ts';
 import { ProjectManager } from '../server/pm.ts';
 import { SessionService } from '../server/session-service.ts';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -162,7 +163,7 @@ test('prepareSessionTools: a Lead gets peer tools, its bound lead server and the
     const prepared = prepareSessionTools(service, { session_key: 'b', provider: 'claude', role }, { leadServer });
     assert.deepEqual(Object.keys(prepared.claude!.mcpServers!), ['peers']);
     assert.deepEqual(prepared.claude!.allowedTools, PEER_ALLOWED_TOOLS);
-    assert.equal((prepared.claude!.systemPrompt as any).append, PEER_INSTRUCTIONS);
+    assert.equal((prepared.claude!.systemPrompt as any).append, `${PEER_INSTRUCTIONS}\n\n${NARRATION_INSTRUCTIONS}`);
     assert.ok(!JSON.stringify(prepared.claude!.allowedTools).includes('spawn'));
   }
   assert.deepEqual(bound, ['a']);
@@ -174,4 +175,21 @@ test('prepareSessionTools: a Lead gets peer tools, its bound lead server and the
   assert.throws(() => preparePeerTools(service, { session_key: 'a', provider: 'claude', role: 'lead' }), /Lead tools are unavailable/);
   assert.throws(() => prepareSessionTools(service, { session_key: 'a', provider: 'codex', role: 'lead' }, { leadServer }), /Claude only/);
   assert.deepEqual(Object.keys(makeSessionPrep(service, { leadServer })({ session_key: 'c', provider: 'claude', role: 'lead' }).claude!.mcpServers!).sort(), ['lead', 'peers']);
+});
+
+test('#201: Leads, workers and Codex sessions are asked to narrate progress in prose; the Coordinator prompt says its prose is all the developer sees', () => {
+  const { service } = fixture();
+  const leadServer = () => ({ type: 'sdk', name: 'lead', instance: {} } as any);
+  const lead = (prepareSessionTools(service, { session_key: 'a', provider: 'claude', role: 'lead' }, { leadServer }).claude!.systemPrompt as any).append as string;
+  const worker = (prepareSessionTools(service, { session_key: 'b', provider: 'claude', role: 'worker' }).claude!.systemPrompt as any).append as string;
+  const codex = prepareSessionTools(service, { session_key: 'b', provider: 'codex', role: 'worker' }).codexTools!.developerInstructions!;
+  for (const instructions of [lead, worker, codex]) {
+    assert.ok(instructions.startsWith(PEER_INSTRUCTIONS));
+    assert.ok(instructions.includes(NARRATION_INSTRUCTIONS));
+  }
+  assert.ok(lead.indexOf(NARRATION_INSTRUCTIONS) < lead.indexOf(leadSystemPrompt().trim()), 'the Lead prompt still comes last');
+  assert.match(NARRATION_INSTRUCTIONS, /shows only your prose/);
+  assert.match(NARRATION_INSTRUCTIONS, /senior engineer/);
+  const coordinator = readFileSync(fileURLToPath(new URL('../agents/coordinator-system-prompt.md', import.meta.url)), 'utf8');
+  assert.match(coordinator, /sees only your prose/);
 });

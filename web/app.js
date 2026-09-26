@@ -419,6 +419,7 @@ function revokeAccess(message) {
   copyStatus("");
   messageMenuText = "";
   messageMenuTarget = null;
+  shownHistory = []; shownReceipts = []; hiddenSteps = 0; showSteps = false;
   clearDrafts();
   // A PM failure seen by the previous identity is not shown to the next one.
   polledPmError = null;
@@ -616,7 +617,7 @@ function renderHost() {
     : hostName("") ? `${hostName("")} · offline` : "Execution host offline";
   renderConnectionBanner();
   updateControls();
-  if (ui.messages.querySelector(".empty-state") && !conversationLoading) renderMessages();
+  if (ui.messages.querySelector(".empty-state") && !conversationLoading) renderMessages(shownHistory, shownReceipts);
 }
 function renderConnectionBanner() {
   const banner = $("#connection-banner");
@@ -651,7 +652,7 @@ function workerSurfaces(s, query) {
 }
 function rowSummary(s) {
   if (s.state === "needs_input") return s.reason === HELD_LAUNCH_REASON ? "Launch with Bypass? Waiting for your approval" : s.reason || "Waiting for your response";
-  if (s.state === "working") return s.current_tool || "Working on your task";
+  if (s.state === "working") return s.current_tool ? stepPhrase({ name: baseToolName(s.current_tool), detail: "" }) : "Working on your task";
   return launchOutcome(s) || s.last_message || projectName(s);
 }
 let archivedOpen = false;
@@ -975,8 +976,9 @@ function renderActivity() {
   const status = $("#activity-status"), label = $("#activity-label");
   const state = selected === "pm" ? (pmModelReady ? (pmBusy ? "working" : "turn_finished") : null) : detail?.session?.state;
   const working = state === "working";
-  const tool = working && selected !== "pm" ? detail?.session?.current_tool : null;
-  const text = state ? `${host.online ? "" : "Last known · "}${working ? "Working…" : LABEL[state] || state}${tool ? ` · ${tool}` : ""}` : "";
+  // One line in plain words for the running turn (#201): never a tool name, JSON or a path.
+  const doing = working ? workingPhrase(shownHistory, selected !== "pm" ? detail?.session?.current_tool : null) : "";
+  const text = state ? `${host.online ? "" : "Last known · "}${working ? doing : LABEL[state] || state}` : "";
   status.hidden = !text;
   // Keep the live region and symbol mounted; only announce actual transitions.
   if (label.textContent !== text) label.textContent = text;
@@ -1080,8 +1082,190 @@ function dayLabel(date, now) {
   yesterday.setDate(yesterday.getDate() - 1);
   return localDay(date) === localDay(yesterday) ? "Yesterday" : date.toLocaleDateString([], { dateStyle: "medium" });
 }
+// #201: conversations read as the user's messages, the agent's prose, approvals and receipts.
+// Tool calls, tool results and subagent/peer chatter are hidden; while a turn runs, the header's
+// one status line says in plain words what the agent is doing, derived here from the tool entries
+// the history already carries (Coordinator: { role: "tool", name, summary }; Codex sessions:
+// { role: "tool", text: "<itemType>: <command or tool> (<status>)" }) or from a session's
+// current_tool. Sending an investigator, a subagent or a Lead stays visible as one compact line.
+const STEP_PHRASES = {
+  ToolSearch: "Getting ready…",
+  Read: "Reading files…",
+  Glob: "Searching the code…",
+  Grep: "Searching the code…",
+  LS: "Looking through files…",
+  Bash: "Running a command…",
+  BashOutput: "Checking a command…",
+  Edit: "Editing files…",
+  MultiEdit: "Editing files…",
+  Write: "Editing files…",
+  NotebookEdit: "Editing files…",
+  WebFetch: "Reading a web page…",
+  WebSearch: "Searching the web…",
+  TodoWrite: "Planning the work…",
+  ListAgents: "Checking running agents…",
+  SendMessage: "Sending a message…",
+  list_projects: "Checking your projects…",
+  resolve_project: "Finding the project…",
+  register_project: "Registering a project…",
+  list_sessions: "Checking sessions…",
+  list_models: "Checking available models…",
+  session_tail: "Reading a session…",
+  session_state: "Checking a session…",
+  spawn_session: "Starting a worker…",
+  stop_session: "Stopping a session…",
+  memory_read: "Reading its memory…",
+  memory_write: "Updating its memory…",
+  memory_edit: "Updating its memory…",
+  log_note: "Noting a decision…",
+  send_message: "Sending a message…",
+  request_update: "Asking for an update…",
+  message_status: "Checking a message…",
+  start_lead: "Starting a Lead…",
+  retire_lead: "Retiring a Lead…",
+  list_leads: "Checking the Leads…",
+  read_handoff: "Reading a Lead's handoff…",
+  write_handoff: "Writing a handoff…",
+  list_workers: "Checking workers…",
+  commandExecution: "Running a command…",
+  fileChange: "Editing files…",
+};
+const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+// "mcp__fleet__list_projects", "fleet.list_projects" and "list_projects" name the same tool.
+function baseToolName(name) {
+  return String(name || "").trim().replace(/^mcp__.+?__/, "").replace(/^(fleet|leads|lead|peers)\./, "");
+}
+// Model-written text shown to the developer never carries paths or JSON.
+function plainWords(text, max = 80) {
+  const words = String(text || "")
+    .replace(/[{}[\]"`]/g, " ")
+    // Any token with a slash or backslash: absolute, relative and Windows paths, and URLs.
+    .replace(/\S*[/\\]\S*/g, " ")
+    // What JSON leaves behind: punctuation-only tokens, and space before punctuation.
+    .replace(/(^|\s)[^\w\s#]+(?=\s|$)/g, " ")
+    .replace(/\s+([:;,.])/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[\s.:;,]+|[\s.:;,…]+$/g, "");
+  return words.length > max ? `${words.slice(0, max - 1).trimEnd()}…` : words;
+}
+// A tool entry as { name, detail }: Coordinator entries carry name and summary; Codex entries
+// carry "<itemType>: <command or tool> (<status>)" as text.
+function toolStep(entry) {
+  if (entry.name) return { name: baseToolName(entry.name), detail: String(entry.summary ?? entry.text ?? "") };
+  const text = String(entry.text || entry.summary || "");
+  const match = /^(\w+):\s*([\s\S]*?)\s*(?:\((\w+)\))?$/.exec(text);
+  if (!match) return { name: "", detail: text };
+  if (["mcpToolCall", "dynamicToolCall"].includes(match[1])) return { name: baseToolName(match[2]), detail: "" };
+  return { name: match[1], detail: match[2] };
+}
+function subagentParts(detail) {
+  // server/pm.ts summarizes an Agent call as "<subagent_type>: <description>".
+  const match = /^([\w-]+):\s*([\s\S]*)$/.exec(String(detail || ""));
+  const type = match ? match[1] : "";
+  return { who: type === "investigator" ? "an investigator" : "a subagent", description: plainWords(match ? match[2] : "") };
+}
+function stepPhrase({ name, detail }) {
+  if (SUBAGENT_TOOLS.has(name)) {
+    const { who, description } = subagentParts(detail);
+    return description ? `Asking ${who}: ${description}…` : `Asking ${who}…`;
+  }
+  if (name === "ToolSearch") {
+    // Loading tools names what comes next: {"query":"select:mcp__fleet__list_projects,…"}.
+    const next = baseToolName(/select:([^,"\s}]+)/.exec(detail)?.[1]);
+    if (next && next !== "ToolSearch" && STEP_PHRASES[next]) return STEP_PHRASES[next];
+  }
+  if (name === "Read" && /tool-results/.test(detail)) return "Reading the results…";
+  if (name === "commandExecution" && /\b(test|tests|vitest|jest|pytest|playwright|typecheck)\b/.test(detail)) return "Running tests…";
+  return STEP_PHRASES[name] || "Working…";
+}
+// The one compact line for sending an investigator, a subagent, a Lead or a worker; null otherwise.
+function dispatchLine({ name, detail }) {
+  if (SUBAGENT_TOOLS.has(name)) {
+    const { who, description } = subagentParts(detail);
+    // The call is recorded before its permission check, so say what was asked, not that it ran.
+    return `Asked for ${who}${description ? `: ${description}` : ""}`;
+  }
+  if (name === "start_lead") {
+    // server/pm.ts summarizes start_lead as "<project> / <workstream>".
+    const parts = String(detail).split(" / ").map((part) => plainWords(part, 40)).filter((part) => part && part !== "undefined");
+    return parts.length ? `Asked to start Lead ${parts.join(" · ")}` : "Asked to start a Lead";
+  }
+  if (name === "spawn_session") return "Asked to start a worker";
+  return null;
+}
+// What the agent is doing now: the latest tool step of the running turn, in plain words.
+function workingPhrase(history, currentTool) {
+  if (currentTool) return stepPhrase({ name: baseToolName(currentTool), detail: "" });
+  for (let i = history.length - 1; i >= 0; i--) {
+    const entry = history[i];
+    if (entry.role === "user" || entry.role === "peer") break;
+    if (entry.role === "tool") return stepPhrase(toolStep(entry));
+  }
+  return "Working…";
+}
+// Observed transcripts arrive as one "role (time): text" blob with [tool …] markers. Keep the
+// prose; the markers become hidden steps. Other formats pass through unchanged.
+const TOOL_MARKER = /\[tool result\]|\[tool [^\]\n]*\]/g;
+function splitObservedTail(entry) {
+  const steps = [];
+  const records = String(entry.text || "")
+    .split(/\n\n(?=(?:user|assistant) \([^)\n]*\): )/)
+    .flatMap((record) => {
+      const match = record.match(/^((user|assistant) \([^)\n]*\): )([\s\S]*)$/);
+      const markers = match?.[3].match(TOOL_MARKER);
+      if (!markers) return [record];
+      steps.push({ id: `observed-step-${steps.length}`, role: "tool", text: `${match[2]} ${markers.join(" ")}`, at: entry.at });
+      const prose = match[3].replace(TOOL_MARKER, "").replace(/[ \t]{2,}/g, " ").trim();
+      return prose ? [match[1] + prose] : [];
+    });
+  return { entry: records.length ? { ...entry, text: records.join("\n\n") } : null, steps };
+}
+// Steps are a debugging aid: off by default, shown from the conversation menu. No per-turn chrome.
+let showSteps = false, hiddenSteps = 0, shownHistory = [], shownReceipts = [];
+function conversationEntries(history) {
+  const out = [];
+  let steps = 0;
+  const step = (entry) => {
+    steps++;
+    if (showSteps) out.push({ ...entry, role: "step", stepRole: entry.role });
+  };
+  for (const entry of history) {
+    if (entry.role === "system" && entry.id === "observed-tail") {
+      const split = splitObservedTail(entry);
+      if (split.entry) out.push(split.entry);
+      split.steps.forEach(step);
+    } else if (entry.role === "tool") {
+      const line = dispatchLine(toolStep(entry));
+      if (line) out.push({ ...entry, role: "dispatch", text: line, summary: undefined });
+      else step(entry);
+    } else if (entry.role === "peer") step(entry);
+    else if (entry.role === "assistant" && !String(entry.text || "").trim()) continue;
+    else out.push(entry);
+  }
+  hiddenSteps = steps;
+  return out;
+}
+function dispatchNode(entry) {
+  const line = node("p", "dispatch-line");
+  const symbol = node("span", "dispatch-symbol", "↗");
+  symbol.setAttribute("aria-hidden", "true");
+  line.append(symbol, node("span", "dispatch-text", entry.text));
+  return line;
+}
+function stepNode(entry) {
+  const row = node("div", "step-line");
+  const text = [entry.name, entry.text || entry.summary].filter(Boolean).join(" · ");
+  row.append(
+    node("span", "step-kind", entry.stepRole === "peer" ? "Message" : "Step"),
+    node("span", "step-text", text.length > 600 ? `${text.slice(0, 600)}…` : text),
+  );
+  return row;
+}
 const PM_MOVED_TEXT = /^(The (PM|Coordinator) now runs on |This machine is no longer the (PM|Coordinator) host)/;
 function messageNode(entry, receipt, entryKey) {
+  if (entry.role === "dispatch") return dispatchNode(entry);
+  if (entry.role === "step") return stepNode(entry);
   const role = ["user", "assistant", "tool", "system"].includes(entry.role)
     ? entry.role
     : "system";
@@ -1154,8 +1338,9 @@ function renderMessages(history = [], receipts = []) {
   // Match the exact host-owned shape so actual provider/message text is never hidden.
   if (detail?.session?.managed === false && history.length === 1 && history[0].id === "observed-tail" && history[0].role === "system"
     && ["(no transcript available)", "(transcript unavailable)", "(no transcript on disk)", "(no message records found)"].includes(history[0].text)) history = [];
+  shownHistory = history; shownReceipts = receipts;
   const now = new Date();
-  const signature = JSON.stringify([selected, history, receipts, localDay(now), hostChecked, host.online, sessionsLoaded, sessions.length, detail?.session?.capabilities?.message]);
+  const signature = JSON.stringify([selected, history, receipts, localDay(now), hostChecked, host.online, sessionsLoaded, sessions.length, detail?.session?.capabilities?.message, showSteps]);
   if (signature === messageSignature) return;
   const wasNearBottom = stillPinned();
   const firstRender = !messageSignature;
@@ -1169,7 +1354,7 @@ function renderMessages(history = [], receipts = []) {
     .filter((item) => item.bottom > 0);
   messageSignature = signature;
   const fragment = document.createDocumentFragment(), used = new Set(), entries = [];
-  for (const entry of history) {
+  for (const entry of conversationEntries(history)) {
     const receipt = entry.role === "user"
       ? receipts.find((r) => !used.has(r.id) && (r.id === entry.id || r.text === entry.text)) : null;
     if (receipt) used.add(receipt.id);
@@ -1220,7 +1405,7 @@ function renderMessages(history = [], receipts = []) {
     fragment.append(item.element);
   }
   timelineEntries = entries;
-  if (!history.length && !receipts.length) {
+  if (!entries.length) {
     const loading = !hostChecked || (host.online && !sessionsLoaded && !selected);
     const title = loading ? "Loading sessions…" : !host.online ? `${hostName("The execution host")} is offline`
       : selected === "pm" ? "New conversation."
@@ -1463,6 +1648,7 @@ function launchDetails(input) {
 // `record` is false when the history entry already exists (Back/Forward).
 async function selectSession(key, record = true) {
   if (selected) setDraft(selected, ui.input.value);
+  if (key !== selected) showSteps = false; // the debug steps belong to one chat
   selected = key;
   deepLinkPending = null;
   hideNotice();
@@ -1474,6 +1660,7 @@ async function selectSession(key, record = true) {
   pmBusy = false;
   pmModelReady = false;
   messageSignature = "";
+  shownHistory = []; shownReceipts = []; hiddenSteps = 0;
   resetLatest();
   approvalSignature = "";
   ui.input.value = drafts.get(key) || "";
@@ -2126,7 +2313,15 @@ ui.menu.addEventListener("beforetoggle", (event) => {
   if (event.newState !== "open") return;
   $("#open-info").hidden = !selected;
   $("#copy-last").hidden = typeof lastMessage()?.copyText !== "string";
+  const steps = $("#toggle-steps");
+  steps.hidden = !selected || !hiddenSteps;
+  steps.textContent = showSteps ? "Hide steps" : `Show ${hiddenSteps} ${hiddenSteps === 1 ? "step" : "steps"}`;
   placeMenu(ui.menu, $("#conversation-menu-button").getBoundingClientRect());
+});
+$("#toggle-steps").addEventListener("click", () => {
+  ui.menu.hidePopover();
+  showSteps = !showSteps;
+  renderMessages(shownHistory, shownReceipts);
 });
 let copyStatusTimer;
 function copyStatus(text, error = false) {
