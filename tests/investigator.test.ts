@@ -854,6 +854,12 @@ test('git -C: gitfile, commondir and alternates values are read exactly as git r
     checkout('commondir-empty', 'gitdir: gd\n', (at) => writeFileSync(join(at, 'gd', 'commondir'), '\n')),
     checkout('alternates-quoted', 'gitdir: gd\n', (at) => { mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), '"../../decoy.git"\n'); }),
     checkout('alternates-space', 'gitdir: gd\n', (at) => { mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), ' ../../decoy.git\n'); }),
+    // git splits alternates on \n only: `decoy\r` (a symlink into ~/.ssh), not the empty `decoy`, is what it reads.
+    checkout('alternates-crlf', 'gitdir: gd\n', (at) => {
+      mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); mkdirSync(join(at, 'decoy'));
+      symlinkSync(join(home, '.ssh'), join(at, 'decoy\r'));
+      writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), `${join(at, 'decoy')}\r\n`);
+    }),
   ];
   for (const at of refused) assert.match(investigatorBashDenial(`git -C ${at} log`) ?? '', /not (a )?plain/, at);
   // Controls: the exact forms git writes, including a CRLF line ending and a commondir/alternates entry, pass.

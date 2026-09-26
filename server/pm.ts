@@ -378,8 +378,9 @@ function gitLocations(dir: string): { locations: string[] } | { invalid: string 
       if (objectDirs.length > 64) return 'too many object alternates to check';
       for (const line of (readText(join(objectDirs[i], 'info', 'alternates')) ?? '').split('\n')) {
         if (!line || line.startsWith('#')) continue;
-        // A C-quoted entry, or one with whitespace git would keep as part of the path, is refused.
-        const entry = gitPathValue(line);
+        // git splits alternates on \n only and keeps a \r as part of the path, so an entry with a
+        // \r (a CRLF file), a C-quoted entry, or one with other whitespace git would keep is refused.
+        const entry = line.includes('\r') ? null : gitPathValue(line);
         if (entry === null || entry.startsWith('"')) return 'its object alternates are not plain paths';
         const alt = resolve(objectDirs[i], entry);
         if (!objectDirs.includes(alt)) { objectDirs.push(alt); out.push(alt); }
@@ -414,8 +415,8 @@ function gitLocations(dir: string): { locations: string[] } | { invalid: string 
 }
 
 /**
- * A path value from a git metadata file (gitfile, commondir, alternates line) with only its
- * trailing line ending removed, as git does; null (refused) when it is empty or still has leading
+ * A path value from a git metadata file (gitfile, commondir; alternates lines are refused before
+ * this if they hold a \r) with only its trailing line ending removed, as git does; null (refused) when it is empty or still has leading
  * or trailing whitespace or a line break, which git would keep but a check could misread.
  */
 function gitPathValue(raw: string): string | null {
@@ -446,19 +447,6 @@ const blockedLongOption = (arg: string): boolean => {
 // A value that could name a file outside the checkout (`--opt=/abs`, `--opt=~/x`, `--opt=../x`).
 const outsideValue = (value: string) => isAbsolute(value) || value.startsWith('~') || value.split('/').includes('..');
 /**
- * True when git arguments carry a pathspec of their own: anything after `--`, or (git's own rule
- * without `--`) a non-option argument naming an existing path under `dir`. Only decides whether
- * GIT_FORCED_HISTORY_OPTIONS keep the listing unchanged; the .env exclusion is added either way.
- */
-/**
- * Splits git arguments at the pathspec, so the .env exclusions can always be placed after a `--`
- * (never where a value-taking option such as `--src-prefix` or `--grep` would take one as its
- * value). With a `--` of the command's own, everything after it is the pathspec. Without one, the
- * pathspec is git's own: a trailing run of non-option arguments naming existing paths under `dir`
- * (git takes every argument after the first path as a path too). `hasPathspec` only decides
- * whether GIT_FORCED_HISTORY_OPTIONS keep the listing unchanged.
- */
-/**
  * Options known to take no separate value. The argument right before the `--` that precedes the
  * .env exclusions must be one of these, a `--opt=value` spelling, or not an option at all: a
  * value-taking option there (`--src-prefix`, `--line-prefix`, `--grep`, `-S`, …) would take the
@@ -482,7 +470,15 @@ const GIT_NO_VALUE_OPTIONS = new Set([
 // value (`-n`, `-pS`, `-G`, `-I`, `-l`, and the refused `-O`/`-L`); `-n5` or `-Sfoo` carry theirs.
 const optionTakesNoValue = (arg: string) => !arg.startsWith('-') || arg.includes('=') || GIT_NO_VALUE_OPTIONS.has(arg)
   || (!arg.startsWith('--') && arg.length > 1 && !/[nSGOLIl]$/.test(arg));
-const splitPathspec =(opts: string[], dir: string): { before: string[]; paths: string[]; hasPathspec: boolean } => {
+/**
+ * Splits git arguments at the pathspec, so the .env exclusions can always be placed after a `--`
+ * (never where a value-taking option such as `--src-prefix` or `--grep` would take one as its
+ * value). With a `--` of the command's own, everything after it is the pathspec. Without one, the
+ * pathspec is git's own: a trailing run of non-option arguments naming existing paths under `dir`
+ * (git takes every argument after the first path as a path too). `hasPathspec` only decides
+ * whether GIT_FORCED_HISTORY_OPTIONS keep the listing unchanged.
+ */
+const splitPathspec = (opts: string[], dir: string): { before: string[]; paths: string[]; hasPathspec: boolean } => {
   const end = opts.indexOf('--');
   if (end >= 0) return { before: opts.slice(0, end), paths: opts.slice(end + 1), hasPathspec: end < opts.length - 1 };
   let start = opts.length;
