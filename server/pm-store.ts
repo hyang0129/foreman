@@ -11,15 +11,15 @@
 // pm/session.quarantine.jsonl.
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { FOREMAN_HOME } from './paths.ts';
-import { PmRpcError, type HostBridge, type PmRpcFailure } from './host-bridge.ts';
+import { PmRpcError, type HostBridge, type PmRpcFailure, type RelayRefusal } from './host-bridge.ts';
 import { utf8Length } from '../shared/notify.ts';
 import {
   MAX_LOG_ENTRY, MAX_LOG_KEPT, MAX_LOG_READ, MAX_OPEN_TURNS, MAX_PM_IMPORT_FRAME, MAX_PREFERENCES_DOC, MAX_PROJECTS_DOC, MAX_RPC_ID, MIN_LOG_ENTRY,
   PM_DOC_NAMES, TURN_OUTCOMES, isLogText, isPmId, isPmModel, parsePmOpArgs,
-  type Doc, type LogEntry, type MachineIdentity, type PmAssignment, type PmDocName, type PmOp, type PmOpArgs, type PmOpResults,
+  type Doc, type LogEntry, type MachineIdentity, type MemoryGetResult, type PmAssignment, type PmDocName, type PmHostLocalView, type PmOp, type PmOpArgs, type PmOpResults,
   type PmStateStore, type TurnOutcome, type UncertainTurn,
 } from '../shared/pm-state.ts';
 
@@ -43,6 +43,11 @@ export interface HostPmStore extends PmStateStore {
   uncertainTurns(): UncertainTurn[];
   /** Runs (or joins) the one-time import; resolves once memory is known to be initialized. */
   ensureImported(): Promise<PmImportOutcome>;
+  /**
+   * #145: how many import runs this store has started. A reader that saw uninitialized memory may
+   * reuse what it read only while this count is unchanged (a later import may bring a model).
+   */
+  importAttempts?(): number;
   close(): void;
 }
 
@@ -52,9 +57,10 @@ const defaultLog: Logger = (line) => console.log(line);
 export const ALREADY_INITIALIZED_MESSAGE = 'relay memory already initialized; local memory not imported';
 /**
  * #122: logged instead of ALREADY_INITIALIZED_MESSAGE when this store's own earlier memory.import
- * may have been applied without its reply arriving (timeout, lost connection): the relay's memory
- * may be this machine's import, so "not imported" would mislead. Nothing more is sent (a
- * pm/state.json preferences doc included): the relay's memory is not known to be this machine's.
+ * may have been applied without its reply arriving (timeout, lost connection), but the relay's
+ * memory no longer matches what that import sent: "not imported" would mislead, and nothing more is
+ * sent (a pm/state.json preferences doc included). #145: when the relay's memory still matches the
+ * import exactly, the import is taken as applied and completed instead (see `appliedImport`).
  */
 export const IMPORT_REPLY_LOST_MESSAGE = "relay memory already initialized, possibly by this machine's earlier import attempt whose reply was lost; nothing more is imported (a pm/state.json preferences doc, if any, was not sent)";
 export const IMPORT_MARKER_FILE = '.imported.json';
@@ -151,25 +157,45 @@ export interface PmImportSource { payload: PmImportPayload; preferences: string;
  * was never initialized. Writes nothing.
  */
 export function readLocalStateForImport(home: string, log: Logger = defaultLog): LocalState | null {
-  const file = join(home, 'pm', 'state.json');
+  const read = readOwnedFile(join(home, 'pm', 'state.json'));
+  if ('missing' in read) return null;
   let why: string;
-  try {
-    const stat = lstatSync(file);
-    if (stat.isSymbolicLink() || !stat.isFile()) why = 'not a regular file';
-    else if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) why = 'owned by another user';
-    else {
-      let raw: unknown;
-      try { raw = JSON.parse(readFileSync(file, 'utf8')); } catch { raw = undefined; }
-      const state = raw === undefined ? null : parseLocalState(raw);
-      if (!state) why = 'invalid';
-      else return state.initialized ? state : null;
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
-    why = 'unreadable';
+  if ('refused' in read) why = read.refused;
+  else {
+    let raw: unknown;
+    try { raw = JSON.parse(read.text); } catch { raw = undefined; }
+    const state = raw === undefined ? null : parseLocalState(raw);
+    if (!state) why = 'invalid';
+    else return state.initialized ? state : null;
   }
   log(`foreman: memory import: pm/state.json is ${why}; not importing it, importing memory/PROJECTS.md and memory/LOG.md instead (the file is left untouched)`);
   return null;
+}
+
+/**
+ * #145: reads `file` in one open (no check-then-read): the open refuses a symlink (O_NOFOLLOW) and
+ * never blocks (O_NONBLOCK, e.g. on a FIFO), and the checks run on the opened descriptor, so what is
+ * checked is what is read. `refused` says why a present file is not used: not a regular file (a
+ * symlink included), owned by another user, or unreadable.
+ */
+export function readOwnedFile(file: string): { text: string } | { missing: true } | { refused: 'not a regular file' | 'owned by another user' | 'unreadable' } {
+  let fd: number;
+  try { fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0)); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') return { missing: true };
+    // O_NOFOLLOW on a symlink: ELOOP (Linux, macOS); some systems report EMLINK or EFTYPE.
+    if (code === 'ELOOP' || code === 'EMLINK' || code === 'EFTYPE') return { refused: 'not a regular file' };
+    return { refused: 'unreadable' };
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { refused: 'not a regular file' };
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return { refused: 'owned by another user' };
+    return { text: readFileSync(fd, 'utf8') };
+  } catch {
+    return { refused: 'unreadable' };
+  } finally { closeSync(fd); }
 }
 
 /** #117: the `memory.import` payload (and preferences) from a valid local-only pm/state.json, within the same limits as the legacy import. */
@@ -201,6 +227,20 @@ export function readRelayImportSource(home: string, machineId: string, log: Logg
   return { payload: readImportPayload(home, machineId, log), preferences: '', source: 'legacy' };
 }
 
+/**
+ * #145: whether the relay's memory is exactly what `payload` imports into a fresh DO (and nothing
+ * has been written since): projects at version 1 with the payload's content (version 0 when it was
+ * empty), the preferences doc never written, the payload's model, and the payload's log lines (the
+ * newest MAX_LOG_READ, as memory.get returns them).
+ */
+export function appliedImport(memory: MemoryGetResult, payload: PmImportPayload): boolean {
+  const { projects, preferences } = memory.docs;
+  if (payload.projects ? projects.version !== 1 || projects.content !== payload.projects : projects.version !== 0) return false;
+  if (preferences.version !== 0 || memory.settings.model !== payload.model) return false;
+  const expected = payload.log.slice(-MAX_LOG_READ);
+  return memory.log.length === expected.length && memory.log.every((entry, i) => entry.text === expected[i]);
+}
+
 /** #117: records in `<home>/memory/.pm-mode.json` that this machine's PM memory is in the relay (mode 0600). */
 export function writeRelayModeMarker(home: string, machineId: string, at: string): void {
   atomicWrite(join(home, 'memory', PM_MODE_FILE), JSON.stringify({ version: 1, mode: 'relay', machine_id: machineId, at }) + '\n');
@@ -210,10 +250,9 @@ export function writeRelayModeMarker(home: string, machineId: string, at: string
 export function readRelayModeMarker(home: string): { at: string } | null {
   const file = join(home, 'memory', PM_MODE_FILE);
   try {
-    const stat = lstatSync(file);
-    if (stat.isSymbolicLink() || !stat.isFile()) return null;
-    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null;
-    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    const read = readOwnedFile(file);
+    if (!('text' in read)) return null;
+    const raw = JSON.parse(read.text);
     if (!isObject(raw) || raw.version !== 1 || raw.mode !== 'relay' || typeof raw.at !== 'string') return null;
     return { at: raw.at };
   } catch { return null; }
@@ -315,8 +354,10 @@ export class RelayPmStore implements HostPmStore {
   private flushing = false;
   private importRun: Promise<PmImportOutcome> | null = null;
   private importOutcome: PmImportOutcome | null = null;
-  // #122: a memory.import this store sent may have been applied (no reply: timeout, lost connection).
-  private importUnconfirmed = false;
+  // #122: a memory.import this store sent may have been applied (no reply: timeout, lost connection):
+  // what it sent, so a later run can tell (#145) whether the relay's memory is that import.
+  private unconfirmedImport: PmImportSource | null = null;
+  private importRuns = 0;
   private listeners = new Set<PmAssignmentListener>();
   private unsubscribe: (() => void)[] = [];
   private closed = false;
@@ -468,27 +509,45 @@ export class RelayPmStore implements HostPmStore {
   ensureImported(): Promise<PmImportOutcome> {
     if (this.importOutcome) return Promise.resolve(this.importOutcome);
     if (!this.importRun) {
+      this.importRuns++;
       this.importRun = this.runImport()
         .then((outcome) => { this.importOutcome = outcome; return outcome; })
         .finally(() => { this.importRun = null; });
     }
     return this.importRun;
   }
+  importAttempts(): number { return this.importRuns; }
 
   // #117: the relay wins when it already has memory (local files are left untouched); otherwise
   // pm/state.json is imported when valid, else the pre-#26 files.
   private async runImport(): Promise<PmImportOutcome> {
     const memory = await this.request('memory.get', {});
-    if (memory.initialized) { this.logger(`foreman: ${this.importUnconfirmed ? IMPORT_REPLY_LOST_MESSAGE : ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
-    const { payload, preferences, source } = readRelayImportSource(this.home, this.identity.machine_id, this.logger);
+    if (memory.initialized) {
+      // #145: an earlier import of this store whose reply was lost, and the relay's memory is still
+      // exactly what it sent: it was applied, so the import is completed (preferences included).
+      const earlier = this.unconfirmedImport;
+      if (earlier && appliedImport(memory, earlier.payload)) return this.completeImport(earlier, true);
+      return this.alreadyInitialized();
+    }
+    const source = readRelayImportSource(this.home, this.identity.machine_id, this.logger);
     try {
-      await this.request('memory.import', payload);
+      await this.request('memory.import', source.payload);
     } catch (error) {
       const code = (error as PmStoreError).code;
-      if (code === 'already_initialized') { this.logger(`foreman: ${this.importUnconfirmed ? IMPORT_REPLY_LOST_MESSAGE : ALREADY_INITIALIZED_MESSAGE}`); this.markRelayMode(); return 'already_initialized'; }
-      if (code === 'timeout' || code === 'disconnected' || code === 'invalid_result') this.importUnconfirmed = true;
+      if (code === 'already_initialized') return this.alreadyInitialized();
+      if (code === 'timeout' || code === 'disconnected' || code === 'invalid_result') this.unconfirmedImport = source;
       throw error;
     }
+    return this.completeImport(source, false);
+  }
+  private alreadyInitialized(): PmImportOutcome {
+    this.logger(`foreman: ${this.unconfirmedImport ? IMPORT_REPLY_LOST_MESSAGE : ALREADY_INITIALIZED_MESSAGE}`);
+    this.markRelayMode();
+    return 'already_initialized';
+  }
+  // The import was applied: send the preferences doc, record the import, and log it.
+  private async completeImport({ payload, preferences, source }: PmImportSource, replyLost: boolean): Promise<PmImportOutcome> {
+    this.unconfirmedImport = null;
     // memory.import carries no preferences doc: a non-empty one from pm/state.json follows as the
     // first write of the fresh doc (expected version 0). Best effort: a failure is logged.
     let prefs = '';
@@ -499,7 +558,8 @@ export class RelayPmStore implements HostPmStore {
     writeImportMarker(this.home, this.identity.machine_id, 'relay', this.now().toISOString());
     this.markRelayMode();
     const from = source === 'state' ? 'pm/state.json (local-only PM memory)' : 'memory/PROJECTS.md and memory/LOG.md';
-    this.logger(`foreman: imported local PM memory into the relay from ${from} (${utf8Length(payload.projects)} bytes of projects, ${payload.log.length} log entries${prefs})`);
+    const lost = replyLost ? '; the relay applied an earlier attempt whose reply was lost' : '';
+    this.logger(`foreman: imported local PM memory into the relay from ${from} (${utf8Length(payload.projects)} bytes of projects, ${payload.log.length} log entries${prefs})${lost}`);
     return 'imported';
   }
   // #117: remember that this machine's PM memory is in the relay, for a later local-only start.
@@ -544,6 +604,7 @@ export class RelayPmStore implements HostPmStore {
   private fence() {
     if (this.fenced) return;
     this.fenced = true;
+    this.clearRetry(); this.retryAttempts = 0; // #143: nothing is left to retry here
     this.dropQueue('this machine is no longer the PM host');
     this.emit();
   }
@@ -588,8 +649,11 @@ export class RelayPmStore implements HostPmStore {
             continue;
           }
           this.queue.shift(); if (item.kind === 'end') this.open.delete(item.turnId); this.settle(item);
-          this.confirmed(item);
-          this.logger(`foreman: PM turn update rejected by the relay (${code})`);
+          // #143: a refused end is forgotten (the DO keeps the row; a restart reports it). A refused
+          // ack stays recorded: the turn was already shown, so it is never reported again here, and
+          // the next activation sends the ack again (acks are idempotent; the record is bounded).
+          if (item.kind === 'end') this.confirmed(item);
+          this.logger(`foreman: PM turn update rejected by the relay (${code})${item.kind === 'ack' ? '; the acknowledgement is kept and sent again on the next activation' : ''}`);
           continue;
         }
         this.retryAttempts = 0;
@@ -617,6 +681,8 @@ export class RelayPmStore implements HostPmStore {
     this.activeHost = assignment.active_machine?.host ?? null;
     this.uncertain = assignment.active ? this.unreported(assignment.uncertain_turns) : [];
     if (!assignment.active) {
+      // #143: a move away drops the queue, so a pending retry has nothing left to send.
+      this.clearRetry(); this.retryAttempts = 0;
       this.dropQueue(`the PM runs on ${this.activeHost ?? 'no machine'}`);
       // Turns this machine held were reconciled by the DO on reassignment.
       this.open.clear();
@@ -725,15 +791,19 @@ export class LocalPmStore implements HostPmStore {
     const relayMarker = readRelayModeMarker(this.home);
     if (relayMarker) this.log_(`foreman: PM memory: ${RELAY_MEMORY_NOT_MERGED_NOTICE} (relay mode last used ${relayMarker.at})`);
     let state = freshState();
-    if (existsSync(this.file)) {
+    // #145: one open and read; a symlink, a non-regular file or a foreign-owned file is refused (the
+    // store fails closed and leaves it alone, as for a corrupt file), never followed.
+    const existing = readOwnedFile(this.file);
+    if ('refused' in existing) throw new Error(`pm/state.json is ${existing.refused}; it is left untouched`);
+    if ('text' in existing) {
       let raw: unknown;
-      try { raw = JSON.parse(readFileSync(this.file, 'utf8')); } catch { throw new Error('Invalid pm/state.json'); }
+      try { raw = JSON.parse(existing.text); } catch { throw new Error('Invalid pm/state.json'); }
       const parsed = parseLocalState(raw);
       if (!parsed) throw new Error('Invalid pm/state.json');
       state = parsed;
     }
     // A turn still open from a previous daemon cannot be confirmed: report it once as uncertain.
-    let changed = !existsSync(this.file);
+    let changed = 'missing' in existing;
     for (const turn of state.turns) if (turn.state === 'open') { turn.state = 'uncertain'; turn.reason = 'restarted'; changed = true; }
     this.importOutcome = 'already_initialized';
     if (!state.initialized) {
@@ -769,6 +839,7 @@ export class LocalPmStore implements HostPmStore {
     return this.state.turns.filter((t) => t.state === 'uncertain').map((t) => ({ turn_id: t.turn_id, accepted_at: t.accepted_at, host: this.identity.name, reason: 'restarted' as const }));
   }
   ensureImported(): Promise<PmImportOutcome> { return Promise.resolve(this.importOutcome); }
+  importAttempts(): number { return 0; }
   close(): void { this.listeners.clear(); }
 
   async read() {
@@ -840,6 +911,20 @@ export class LocalPmStore implements HostPmStore {
     this.state = next;
   }
   private persist(state: LocalState) { atomicWrite(this.file, JSON.stringify(state)); }
+}
+
+/**
+ * #119/#144: a relay-mode host's own view of the Coordinator assignment, for its local GET
+ * /api/pm/host 404 answer, including why the relay last refused this machine (a 1008 close).
+ */
+export function relayHostView(store: Pick<HostPmStore, 'assignment'>, bridge: { currentAssignment(): PmAssignment | null; refusal(): RelayRefusal | null } | null, identity: MachineIdentity | null): PmHostLocalView {
+  const a = store.assignment(), frame = bridge?.currentAssignment() ?? null;
+  const refusal = bridge?.refusal() ?? null;
+  return {
+    mode: 'relay', connected: a.connected, this_machine_active: a.active, epoch: frame?.epoch ?? null, active_machine: frame?.active_machine ?? null,
+    this_machine: identity ? { machine_id: identity.machine_id, name: identity.name } : null,
+    relay_refusal: refusal ? { code: refusal.code, reason: refusal.reason, at: refusal.at, retry_at: refusal.retry_at } : null,
+  };
 }
 
 // ---------------------------------------------------------------------------------------------

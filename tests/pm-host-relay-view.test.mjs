@@ -59,6 +59,7 @@ test('relay mode: the local GET /api/pm/host answers 404 with this machine\'s ow
   assert.deepEqual(body.view, {
     mode: 'relay', connected: false, this_machine_active: false, epoch: null, active_machine: null,
     this_machine: { machine_id: machine.machine_id, name: 'view-test-box' },
+    relay_refusal: null, // #144: no policy refusal (the relay is unreachable, not refusing)
   });
   assert.equal('machines' in body, false);
   assert.equal('active' in body, false);
