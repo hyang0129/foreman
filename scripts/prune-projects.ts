@@ -6,14 +6,17 @@
 // The running daemon holds the registry in memory and rewrites projects.json on its next save,
 // which would undo this edit, so the script refuses while anything listens on FOREMAN_PORT.
 import { copyFileSync, existsSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { FOREMAN_HOME, PORT } from '../server/paths.ts';
 import { ProjectRegistry } from '../server/projects.ts';
-import { assertPortAvailable } from './service.mjs';
 
 const args = process.argv.slice(2), apply = args.includes('--apply');
 if (args.some((arg) => arg !== '--apply')) { console.error('Usage: node scripts/prune-projects.ts [--apply]'); process.exit(2); }
-try { await assertPortAvailable(PORT); } catch {
+// Same probe as assertPortAvailable() in scripts/service.mjs (not imported: it has no type declarations).
+try {
+  await new Promise<void>((resolve, reject) => { const probe = createServer(); probe.once('error', reject); probe.listen(PORT, '127.0.0.1', () => probe.close(() => resolve())); });
+} catch {
   console.error(`Foreman appears to be running on 127.0.0.1:${PORT}. Stop it first (launchctl bootout gui/$(id -u)/com.foreman.daemon, or stop npm start), then rerun. Nothing was changed.`);
   process.exit(1);
 }
