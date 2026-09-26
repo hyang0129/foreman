@@ -3,14 +3,18 @@
 Foreman selects native provider permissions. It adds no execution sandbox,
 credential deny list, command parser, or approval classifier.
 
-`POST /api/sessions`, `SessionService.create`, and managed `spawn_session` accept
-`permission_mode: "native" | "bypass"`. Omission means `native`; JSON null in
-the HTTP API also selects `native`.
+There are three policies: `native`, `bypass` and `auto`. `POST /api/sessions`
+and `SessionService.create` (developer launches) accept all three. Omission
+means `native`; JSON null in the HTTP API also selects `native`. The New
+session dialog offers Native (the default) and Bypass. Sessions that agents
+start (Leads and their workers) never run Native: see
+[Agent launches](#agent-launches).
 
 | Mode | Claude | Codex |
 | --- | --- | --- |
 | **Native** (default) | `permissionMode: default`; normal provider permission rules and prompts; sandbox settings inherited from provider configuration | `sandbox: workspace-write`, `approvalPolicy: on-request`, workspace command networking disabled; normal native shell and file tools |
 | **Bypass** | `permissionMode: bypassPermissions`, `allowDangerouslySkipPermissions: true`, native sandbox disabled | `sandbox: danger-full-access`, `approvalPolicy: never` |
+| **Auto** | `permissionMode: auto` (Claude's model-classifier mode); no `allowDangerouslySkipPermissions`; sandbox settings inherited from provider configuration | Unsupported: refused before anything is saved ("Auto is not supported for Codex") |
 
 Native is a choice to use the provider's permission system, not a promise of
 identical filesystem boundaries or prompt counts. In particular, Claude's default
@@ -19,12 +23,20 @@ still apply. Codex uses `approvalsReviewer: user`; automatic review is not enabl
 Foreman does not override native search, delegation, worktree, or shell tools.
 The existing peer-tool allow list is retained; it is not a blanket tool allowance.
 
-Claude initialization must report the requested native permission mode. Codex's
-thread-start response must report the requested sandbox and approval policy,
-including disabled workspace networking for Native. A mismatch fails startup.
+Claude initialization must report the requested permission mode (`default`,
+`bypassPermissions` or `auto`). Codex's thread-start response must report the
+requested sandbox and approval policy, including disabled workspace networking
+for Native. A mismatch fails startup.
 These are checks of provider-reported settings, not independent enforcement
 attestation. There is no mandatory Foreman hook or replacement execution tool.
 Provider authentication and Git credential helpers are retained.
+
+**Auto depends on the model.** Whether the Claude CLI applies `auto` depends on
+the CLI and the model. On CLI 2.1.280, `sonnet` and `opus[1m]` (the Lead default)
+report `auto`, but `haiku` silently reports `default`. The init check is not
+relaxed for this, so an Auto launch on such a model fails: the session becomes
+unavailable with "Claude did not apply the requested launch policy: requested
+auto, provider reported default; this model may not support Auto".
 
 ## What Bypass permits
 
@@ -48,11 +60,12 @@ API surface; they are not a security boundary against an unrestricted shell.
 
 ## Selection, approvals, and recovery
 
-The launcher defaults to Native every time it opens. Bypass has a visible warning
-in the launcher and running-session display and requires a confirmation checkbox.
-API callers opt in by explicitly sending `bypass`. The selected mode is persisted
-and participates in creation-ID deduplication. Reusing an ID with different input
-is rejected. Foreman provides no endpoint to change a running session's mode.
+The New session dialog defaults to Native every time it opens. Bypass has a
+visible warning in the dialog and on the running session, and requires a
+confirmation checkbox. API callers opt in by explicitly sending `bypass` (or
+`auto`). The selected mode is persisted and participates in creation-ID
+deduplication. Reusing an ID with different input is rejected. Foreman provides
+no endpoint to change a running session's mode.
 
 Native execution approvals identify the pending provider request and original
 input. Foreman sends only a one-time decision, not persistent permission updates
@@ -75,9 +88,9 @@ that arbitrary approved scripts do only what their command text suggests.
 
 Task questions remain questions, including in Bypass; they are never automatically
 answered as execution approvals. Peer tools cannot launch sessions or approve
-requests. The project manager retains its separate role restrictions and may
-propose Bypass, but cannot grant it through its managed or legacy launch tool.
-The developer selects Bypass in New session.
+requests. The Coordinator has no `spawn_session`: it starts Leads with
+`start_lead`, and only Leads start workers. Both go through the agent-launch
+policy below, which never lets an agent choose Native or grant itself Bypass.
 
 Read-only, Workspace, Trusted, and Full are retired and rejected for new managed
 launches. Their shared grants depended on the deleted enforcement runtime. Full
@@ -86,6 +99,92 @@ Historical rows keep their original policy values and display as legacy policies
 On recovery they remain unavailable, with history retained and uncertain work
 never replayed. Old creation IDs cannot silently acquire the new semantics; use a
 new session. Existing legacy `bg`/`tab` provider flags remain separate.
+
+## Agent launches
+
+Sessions that agents start go through `SessionService.launchAgent`, never through
+`create()`: a Lead started by the Coordinator (`start_lead`) and a worker started
+by its Lead (the Lead's `spawn_session`). Agent launches are Claude only. The
+tools accept an optional `permission_mode` of `bypass` or `auto`; `native` is
+refused ("Agents cannot launch Native sessions…"). The host decides the policy on
+every launch, in this order (`resolveAgentLaunchPolicy` in `shared/roles.ts`):
+
+1. **`auto` requested:** Auto. The grant is not read.
+2. **Grant unreadable:** Auto. That covers the relay not answering within 5 s,
+   local-only mode (no relay, so no settings), no Lead store on this machine, and
+   a settings view that fails validation. It never falls back to Bypass or to an
+   approval card.
+3. **Standing grant off** for the requester's role and the target project: Auto,
+   even when the agent asked for `bypass`.
+4. **Grant on and "Ask me before each Bypass launch" set:** a held launch (below).
+5. **Grant on:** Bypass, recorded as `bypass_grant: standing:<role>/<project|*>`.
+
+So with no mode (or `bypass`) and the default settings, an agent launch runs
+Bypass. Every launch that reads the grant asks the relay's Durable Object, with
+no cache, so turning a grant off applies to the next launch. Every
+agent-launched session records `role`, `launched_by`, its effective
+`permission_mode`, `policy_reason` and, for Bypass, `bypass_grant`. The chat list
+labels it **⚠ Bypass · standing**, **⚠ Bypass · approved** or **Auto**. No
+request field can set `bypass_grant` or `policy_reason`, and nothing on this path
+ever launches Native or upgrades a request.
+
+### Standing grants
+
+The grant is a list of `{ role, project, allow }` entries (the `bypass_grants`
+developer setting). `role` is the **requester's** role: a `coordinator` entry
+covers Leads the Coordinator starts, and a `lead` entry covers workers that Leads
+start. `project` is a registered project name or `*`. For a launch, an entry for
+that exact project (matched case-insensitively) wins over the role's `*` entry
+(the most specific entry wins); a launch into a directory that is not a
+registered project matches only `*`. `allow: false` turns Bypass off for that
+scope, and those launches run Auto.
+
+**The grant is on by default.** Until the developer changes it, the grant is
+`{ coordinator, *, allow: true }` and `{ lead, *, allow: true }`, and
+"Ask me before each Bypass launch" is off. A stored value that fails validation
+fails toward lower privilege: grants read as none (Auto) and "ask" reads as on.
+
+The developer changes these in **Settings** in the hosted app (⋮ → Settings):
+one checkbox per role for all projects, per-project overrides (on or off), and
+"Ask me before each Bypass launch". Grants are written **only** by the Worker's
+`POST /api/settings`, which requires the Firebase bearer, the allowed email and
+the same-origin check. Hosts can only read them (`lead_rpc` op `settings.get`);
+no host op, Foreman tool or agent path writes them. The local UI shows the
+settings read-only, and the host answers `POST /api/settings` with 400.
+
+### Held launches
+
+With "Ask me before each Bypass launch" on, a launch that the grant would run in
+Bypass is held instead. A held launch is saved but not started: state
+`needs_input`, reason `awaiting_bypass_approval`, no permission mode, and nothing
+runs. The tool returns at once with `status: awaiting_developer_approval`. The
+session has one approval, tool `foreman.launch_bypass`, shown as a
+**Launch with Bypass** card naming the session, project, directory, provider,
+model and effort, role, who asked, and the first task (at most 2000 characters).
+It sends the usual approval push, and the card answers through the existing
+`POST /api/session/approval`.
+
+- **Launch with Bypass:** the session starts in Bypass with the normal launch
+  verification, recorded as `bypass_grant: approved:<approval id>`.
+- **Deny:** the session is ended ("Bypass launch denied by developer; nothing
+  ran"). Its first message is marked failed, not uncertain.
+- **Restart while held:** the session is ended ("Launch approval expired; nothing
+  was launched"). No `session_failed` push is sent.
+
+A held launch never runs Native, and it never starts until approved. A Lead that
+asked is told the outcome by a Foreman message in its own session, sent once and
+never replayed. The Coordinator sees the outcome in `list_leads` and
+`session_state`. Held launches count toward the Lead and worker limits.
+
+### The local API token caveat
+
+"An agent can never set or widen its own grant" holds for the grant itself: only
+the hosted Worker route writes it. It does **not** hold for what a Bypass agent
+can do on the machine. A Bypass session with a shell can read
+`~/.foreman/local-api-token` and call the local API as the developer, for
+example `POST /api/sessions` with `bypass`. So the invariant holds only for agents
+that do not run in Bypass. This is accepted, consistent with the rest of this
+page: Foreman adds no sandbox.
 
 ## Managed Codex process lifetime
 
@@ -140,11 +239,13 @@ FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 \
   FOREMAN_LIVE_PRIVATE_REPO=owner/private-repository \
   npm --prefix tests/live run test:policy
 FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 \
+  npm --prefix tests/live run test:leads
+FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 \
   node --experimental-strip-types --test --test-concurrency=1 tests/live/lifecycle.live.mjs
 ```
 
 The live suite starts a separate Foreman server on an assigned loopback port with
-PM disabled and disposable `FOREMAN_HOME`. It never restarts the installed service.
+the Coordinator (PM) disabled and disposable `FOREMAN_HOME`. It never restarts the installed service.
 Claude uses an isolated config directory bootstrapped from the macOS Keychain
 with explicit opt-in, no user/project settings, and no persistent transcript.
 It does not read or copy the real `.claude` directories. Codex uses a temporary
@@ -155,6 +256,13 @@ The suite requires successful real provider turns before asserting reporting. It
 checks API/peer/browser mode reporting, native shell execution, Native one-time
 approvals, and Bypass access to a synthetic `.env`, outside writes, authenticated
 private-repository `gh`, private Git fetch, and native command interruption.
+Its agent-launch cases start Leads through `launchAgent` and record the
+provider's own init mode: a standing-grant launch with no mode is verified
+`bypassPermissions`; with the grant off it is verified `auto`; `haiku` with Auto
+is refused; and a held launch shows no provider activity until it is approved,
+then is verified `bypassPermissions` with `approved:<id>`. `test:leads` runs the
+Coordinator → Lead path (`start_lead`, a handoff, `list_leads`) and one
+investigator whose mutating `git` call is denied.
 Tool results, independent filesystem artifacts, and process-table observations establish execution;
 assistant prose and missing provider calls cannot pass. Git fetch downloads into
 a disposable repository without checking out or executing private code. Existing

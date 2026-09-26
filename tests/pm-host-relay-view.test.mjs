@@ -67,5 +67,5 @@ test('relay mode: the local GET /api/pm/host answers 404 with this machine\'s ow
   const move = await fetch(`${origin}/api/pm/host`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
     body: JSON.stringify({ machine_id: machine.machine_id, expected_epoch: 1 }) });
   assert.equal(move.status, 400);
-  assert.deepEqual(await move.json(), { error: 'Move the PM from the hosted app; the cloud relay makes that change.' });
+  assert.deepEqual(await move.json(), { error: 'Move the Coordinator from the hosted app; the cloud relay makes that change.' });
 });

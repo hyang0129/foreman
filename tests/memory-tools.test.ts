@@ -149,11 +149,11 @@ test('store too_large and other codes come back as clear tool errors with next s
   // #122: not_active claims no move (this machine may never have been the PM host); stale_epoch does.
   mem.failNext = new PmStoreError('not_active', 'not the PM host');
   const inactive = text(await invoke('log_note', { note: 'abc' }));
-  assert.match(inactive, /^not_active: .*is not the active PM host right now\. Nothing was saved/);
+  assert.match(inactive, /^not_active: .*is not the active Coordinator host right now\. Nothing was saved/);
   assert.doesNotMatch(inactive, /no longer|moved/);
   mem.failNext = new PmStoreError('stale_epoch', 'stale epoch');
   const moved = text(await invoke('log_note', { note: 'abc' }));
-  assert.match(moved, /^stale_epoch: .*no longer the active PM host \(the PM was moved\)\. Nothing was saved/);
+  assert.match(moved, /^stale_epoch: .*no longer the active Coordinator host \(the Coordinator was moved\)\. Nothing was saved/);
   mem.failNext = new Error('disk exploded');
   const plain = await invoke('memory_read', {});
   assert.equal(plain.isError, true); assert.match(text(plain), /disk exploded/);
@@ -264,8 +264,8 @@ test('log_note collapses whitespace, enforces 3-500 characters after collapsing,
   assert.equal((await invoke('log_note', { note: ' ab ' })).isError, true);
 });
 
-test('PM system prompt describes portable tool-backed memory, not ~/.foreman/memory files', () => {
-  const prompt = readFileSync(join(ROOT, 'agents', 'pm-system-prompt.md'), 'utf8');
+test('Coordinator system prompt describes portable tool-backed memory, not ~/.foreman/memory files', () => {
+  const prompt = readFileSync(join(ROOT, 'agents', 'coordinator-system-prompt.md'), 'utf8');
   assert.doesNotMatch(prompt, /~\/\.foreman\/memory|\.foreman\/memory/);
   assert.doesNotMatch(prompt, /PROJECTS\.md|LOG\.md/);
   for (const full of PM_MEMORY_TOOLS) assert.ok(prompt.includes(`\`${full.replace('mcp__fleet__', '')}\``), `${full} named`);

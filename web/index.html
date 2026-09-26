@@ -46,7 +46,7 @@
         </button>
         <button class="pm-row" id="select-pm">
           <span class="pm-icon" aria-hidden="true">◈</span
-          ><span>Project manager<small>Plan and delegate</small></span
+          ><span>Coordinator<small>Plan and delegate</small></span
           ><span class="pinned">PINNED</span>
         </button>
         <div class="rail-heading">
@@ -74,8 +74,8 @@
                 <legend>Notify me about</legend>
                 <label><input type="checkbox" data-kinds="approval_requested question_asked" checked />Approvals and questions</label>
                 <label><input type="checkbox" data-kinds="session_failed" checked />A session failed</label>
-                <label><input type="checkbox" data-kinds="pm_failed" checked />Project manager errors</label>
-                <label><input type="checkbox" data-kinds="host_offline" checked />Mac offline</label>
+                <label><input type="checkbox" data-kinds="pm_failed" checked />Coordinator errors</label>
+                <label><input type="checkbox" data-kinds="host_offline" checked />Machine offline</label>
               </fieldset>
               <div id="notify-actions" class="notify-actions" hidden>
                 <button id="notify-test" class="btn ghost" type="button">Send test notification</button>
@@ -114,7 +114,7 @@
           <!-- Minimal messaging header: name, one status line, Interrupt only while a turn runs,
                and one overflow menu. Configuration lives on the info screen (#info-dialog). -->
           <div class="conversation-heading" id="conversation-heading">
-            <h1 id="conversation-title">Your session inbox</h1>
+            <h1 id="conversation-title">Loading…</h1>
             <div id="activity-status" class="activity-status" role="status" aria-live="polite" aria-atomic="true" hidden>
               <span class="activity-symbol" aria-hidden="true"></span><span id="activity-label"></span>
             </div>
@@ -183,6 +183,7 @@
     <div id="conversation-menu" class="menu" popover role="menu" aria-label="Conversation options">
       <button id="open-info" class="menu-item" type="button" role="menuitem">Info and settings</button>
       <button id="copy-last" class="menu-item" type="button" role="menuitem">Copy last message</button>
+      <button id="open-settings" class="menu-item" type="button" role="menuitem">Settings</button>
     </div>
     <div id="message-menu" class="menu" popover="manual" role="menu" aria-label="Message options">
       <button id="copy-message" class="menu-item" type="button" role="menuitem">Copy message</button>
@@ -203,18 +204,79 @@
         <h3 id="info-details-title" class="info-heading">Details</h3>
         <div id="conversation-subtitle">Choose a session or start something new.</div>
       </section>
-      <section id="pm-host" class="pm-host info-section" aria-label="Project manager machine" hidden>
+      <section id="pm-host" class="pm-host info-section" aria-label="Coordinator machine" hidden>
         <h3 class="info-heading">Machine</h3>
         <p class="pm-host-line"><span id="pm-host-dot" class="dot" aria-hidden="true"></span><span id="pm-host-label"></span></p>
-        <button id="move-pm" class="btn ghost small" type="button" aria-haspopup="dialog" hidden>Move PM…</button>
+        <button id="move-pm" class="btn ghost small" type="button" aria-haspopup="dialog" hidden>Move Coordinator…</button>
       </section>
-      <section id="pm-model-control" class="model-control info-section" aria-label="Project manager model" hidden>
-        <label for="pm-model">Project manager model · Claude</label>
+      <section id="pm-model-control" class="model-control info-section" aria-label="Coordinator model" hidden>
+        <label for="pm-model">Coordinator model · Claude</label>
         <select id="pm-model" aria-describedby="pm-model-hint" disabled><option value="">Provider default</option></select>
-        <p class="field-hint pm-model-help">Controls the PM’s replies and planning. Newly launched agents have their own model selection.</p>
-        <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn and are saved with the PM.</span>
+        <p class="field-hint pm-model-help">Controls the Coordinator’s replies and planning. Newly launched agents have their own model selection.</p>
+        <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn and are saved with the Coordinator.</span>
+      </section>
+      <!-- A Project Lead: its handoff and its workers (workers are not chats of their own). -->
+      <section id="lead-handoff" class="info-section" aria-labelledby="lead-handoff-title" hidden>
+        <h3 id="lead-handoff-title" class="info-heading">Latest handoff</h3>
+        <p id="lead-handoff-status" class="lead-handoff-status"></p>
+        <p id="lead-handoff-summary" class="lead-handoff-summary"></p>
+      </section>
+      <section id="lead-workers" class="info-section" aria-labelledby="lead-workers-title" hidden>
+        <h3 id="lead-workers-title" class="info-heading">Workers</h3>
+        <ul id="lead-worker-list" class="lead-worker-list"></ul>
+      </section>
+      <!-- The Coordinator: the role models and Bypass settings it launches with. -->
+      <section id="coordinator-settings" class="info-section" aria-labelledby="coordinator-settings-title" hidden>
+        <h3 id="coordinator-settings-title" class="info-heading">Leads, models and Bypass</h3>
+        <dl id="coordinator-settings-summary" class="header-metadata"></dl>
+        <button id="info-open-settings" class="btn ghost small" type="button" aria-haspopup="dialog">Settings…</button>
       </section>
       <p id="control-note" class="control-note info-section" role="status"></p>
+    </dialog>
+    <!-- Settings (hosted app; read-only in the local UI): role models and effort, the standing
+         Bypass grants for agent launches, and "ask me before each Bypass launch". -->
+    <dialog id="settings-dialog" class="info-dialog settings-dialog" aria-labelledby="settings-title">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">FOREMAN</p>
+          <h2 id="settings-title">Settings</h2>
+        </div>
+        <button id="close-settings" type="button" class="icon-btn" aria-label="Close settings">×</button>
+      </div>
+      <p id="settings-status" class="field-hint settings-status" role="status"></p>
+      <form id="settings-form" class="settings-form">
+        <fieldset id="settings-fields" class="settings-fields" disabled>
+          <section class="info-section" aria-labelledby="settings-models-title">
+            <h3 id="settings-models-title" class="info-heading">Models and effort</h3>
+            <label>Coordinator effort<select id="set-coordinator-effort" data-role="coordinator" data-field="effort"></select></label>
+            <p class="field-hint">The Coordinator’s model is on its info screen.</p>
+            <label>Lead model<select id="set-lead-model" data-role="lead" data-field="model"></select></label>
+            <label>Lead effort<select id="set-lead-effort" data-role="lead" data-field="effort"></select></label>
+            <label>Investigator model<select id="set-investigator-model" data-role="investigator" data-field="model"></select></label>
+            <label>Investigator effort<select id="set-investigator-effort" data-role="investigator" data-field="effort"></select></label>
+            <p class="field-hint">Applies to Leads and investigators started after the change.</p>
+          </section>
+          <section class="info-section" aria-labelledby="settings-bypass-title">
+            <h3 id="settings-bypass-title" class="info-heading">Bypass for agent launches</h3>
+            <p class="field-hint">While on, sessions that agents start run in ⚠ Bypass, with no permission prompts. Turned off, they run in Auto.</p>
+            <label class="check-row"><input id="grant-coordinator" type="checkbox" data-grant-role="coordinator" />Leads the Coordinator starts (all projects)</label>
+            <label class="check-row"><input id="grant-lead" type="checkbox" data-grant-role="lead" />Workers that Leads start (all projects)</label>
+            <div class="grant-overrides">
+              <p class="settings-subheading">Project overrides</p>
+              <ul id="grant-override-list" class="grant-override-list"></ul>
+              <div class="grant-add">
+                <label>Starts from<select id="grant-add-role"><option value="coordinator">Coordinator</option><option value="lead">Leads</option></select></label>
+                <label>Project name<input id="grant-add-project" maxlength="200" autocomplete="off" spellcheck="false" list="grant-projects" /></label>
+                <label>Bypass<select id="grant-add-allow"><option value="false">Off (Auto)</option><option value="true">On</option></select></label>
+                <button id="grant-add" class="btn ghost small" type="button">Add override</button>
+              </div>
+              <datalist id="grant-projects"></datalist>
+            </div>
+            <label class="check-row"><input id="bypass-ask" type="checkbox" />Ask me before each Bypass launch</label>
+            <p class="field-hint">You get a “Launch with Bypass” card for each launch instead.</p>
+          </section>
+        </fieldset>
+      </form>
     </dialog>
     <dialog id="new-dialog" aria-labelledby="new-title">
       <form id="new-form">
@@ -232,26 +294,19 @@
             ×
           </button>
         </div>
+        <section id="ask-coordinator-panel" class="ask-coordinator" aria-labelledby="ask-coordinator-title">
+          <h3 id="ask-coordinator-title" class="info-heading">Ask the Coordinator</h3>
+          <label for="ask-coordinator">Describe the work. The Coordinator starts a Lead for it and picks the setup.</label>
+          <textarea id="ask-coordinator" rows="3" maxlength="60000" placeholder="e.g. Triage the open bugs in app" aria-describedby="ask-coordinator-status"></textarea>
+          <button id="send-to-coordinator" class="btn" type="button">Ask the Coordinator</button>
+          <p id="ask-coordinator-status" class="field-hint" role="status"></p>
+        </section>
+        <fieldset id="session-fields">
+        <legend>Or start a session yourself</legend>
         <p class="dialog-intro">
           Give an agent a project and a clear first task. It runs on your
-          connected execution host. Review and confirm the setup before a session starts.
+          connected execution host.
         </p>
-        <section id="launch-brief-panel" aria-label="Describe the work">
-          <label for="launch-brief">What should the agent work on?</label>
-          <textarea id="launch-brief" rows="4" maxlength="60000" placeholder="Describe the task and name your project"></textarea>
-          <label for="launcher-model">Launcher model · Claude</label>
-          <select id="launcher-model"><option value="claude-sonnet-5">claude-sonnet-5 (default)</option></select>
-          <p id="launcher-model-hint" class="field-hint">Proposes the setup only. The session has its own model selection.</p>
-          <button id="propose-session" class="btn" type="button">Propose session</button>
-        </section>
-        <div class="launch-mode-actions">
-          <button id="start-manually" class="btn ghost" type="button">Start manually</button>
-          <button id="edit-brief" class="btn ghost" type="button" hidden>Edit brief</button>
-        </div>
-        <p id="launch-status" class="activity-status" role="status"><span class="activity-symbol" aria-hidden="true" hidden></span><span id="launch-status-label"></span></p>
-        <p id="launch-reason" class="field-hint" hidden></p>
-        <fieldset id="session-fields" hidden disabled>
-        <legend>Review and edit session</legend>
         <label
           >Agent<select id="new-provider" name="provider">
             <option value="claude">Claude</option>
@@ -320,20 +375,20 @@
       <form id="move-pm-form">
         <div class="dialog-heading">
           <div>
-            <p class="eyebrow">PROJECT MANAGER</p>
-            <h2 id="move-pm-title">Move PM</h2>
+            <p class="eyebrow">COORDINATOR</p>
+            <h2 id="move-pm-title">Move Coordinator</h2>
           </div>
-          <button id="close-move-pm" type="button" class="icon-btn" aria-label="Close move PM">×</button>
+          <button id="close-move-pm" type="button" class="icon-btn" aria-label="Close move Coordinator">×</button>
         </div>
-        <p id="move-pm-intro" class="dialog-intro">The PM starts a fresh conversation on the new machine with the same memory. A message still in progress will be reported as uncertain and not replayed.</p>
+        <p id="move-pm-intro" class="dialog-intro">The Coordinator starts a fresh conversation on the new machine with the same memory. A message still in progress will be reported as uncertain and not replayed.</p>
         <fieldset id="move-pm-machines" class="machine-choices">
-          <legend>Choose the machine to run the PM</legend>
+          <legend>Choose the machine to run the Coordinator</legend>
           <div id="move-pm-list" class="machine-list"></div>
         </fieldset>
         <p id="move-pm-error" class="form-error" role="alert" hidden></p>
         <div class="dialog-actions">
           <button type="button" class="btn ghost" id="cancel-move-pm">Cancel</button
-          ><button type="submit" class="btn" id="confirm-move-pm" disabled>Move PM</button>
+          ><button type="submit" class="btn" id="confirm-move-pm" disabled>Move Coordinator</button>
         </div>
       </form>
     </dialog>

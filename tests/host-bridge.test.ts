@@ -8,10 +8,11 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, chmodSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { HostBridge, PmRpcError } from '../server/host-bridge.ts';
+import { HostBridge, LEAD_RPC_MAX_PENDING, LeadRpcError, PmRpcError } from '../server/host-bridge.ts';
 import { MAX_BODY, MAX_RESPONSE, MAX_REQUEST_FRAME, MAX_RESPONSE_FRAME } from '../shared/relay.ts';
 import { notifyId, type NotifyFrame } from '../shared/notify.ts';
 import { MAX_PM_RESULT_FRAME, isHelloV2, parseHello, type PmAssignment } from '../shared/pm-state.ts';
+import { MAX_LEAD_RESULT_FRAME, defaultDevSettings, parseLeadRpc, type LeadRecord } from '../shared/roles.ts';
 
 const TOKEN = 'synthetic-test-host-credential'.repeat(2);
 class FakeSocket extends EventEmitter {
@@ -602,4 +603,108 @@ test('startHostBridge names why a configured relay could not start, without the 
   assert.deepEqual(run({ FOREMAN_RELAY_URL: 'http://foreman.invalid', FOREMAN_HOST_TOKEN: TOKEN }), { error: 'Relay URL must be an HTTPS origin', bridge: false });
   assert.deepEqual(run({ FOREMAN_RELAY_URL: 'https://foreman.invalid', FOREMAN_HOST_TOKEN: 'short' }), { error: 'Invalid host token', bridge: false });
   assert.deepEqual(run({ FOREMAN_RELAY_URL: 'https://foreman.invalid' }), { error: 'Set both FOREMAN_RELAY_URL and FOREMAN_HOST_TOKEN', bridge: false });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Epic #157 (CL-03): lead_rpc on any hello-v2 connection, not epoch-fenced.
+// ---------------------------------------------------------------------------------------------
+
+const leadRpcs = (socket: FakeSocket) => socket.sent.filter((entry) => entry.type === 'lead_rpc');
+const LEAD = 'fm:0b6f1f0e-3c7d-4a51-9e0b-1f2a3b4c5d6e';
+const leadRecord = (over: Partial<LeadRecord> = {}): LeadRecord => ({
+  v: 1, lead: LEAD, machine_id: MACHINE.machine_id, machine_name: MACHINE.name, name: 'lead-x', project: 'foreman', workstream: 'x', goal: 'Ship it',
+  model: 'opus[1m]', effort: 'medium', permission_mode: 'bypass', launched_by: 'coordinator', state: 'working', alive: true,
+  created_at: 1, updated_at: 2, pending_approvals: 0, workers: [], ...over,
+});
+const settingsView = () => ({ settings: defaultDevSettings(), versions: { roles: 0, bypass_grants: 0, bypass_ask: 0 }, updated_at: null });
+
+test('leadRpc correlates lead_rpc_result by id, validates results per op, and carries no epoch', async (t) => {
+  const f = v2(t), socket = f.sockets[0]!; socket.open(); socket.receive(assignmentFrame());
+  const a = f.instance.leadRpc('lead.upsert', { record: leadRecord() });
+  const b = f.instance.leadRpc('settings.get', {});
+  const [ra, rb] = leadRpcs(socket);
+  assert.ok(parseLeadRpc(ra).ok && parseLeadRpc(rb).ok, 'frames satisfy the shared contract');
+  assert.equal('epoch' in ra, false);
+  assert.notEqual(ra.id, rb.id);
+  socket.receive({ type: 'lead_rpc_result', id: rb.id, ok: true, result: settingsView() });
+  socket.receive({ type: 'lead_rpc_result', id: ra.id, ok: true, result: {} });
+  assert.deepEqual(await a, {});
+  assert.deepEqual((await b).settings, defaultDevSettings());
+  // Invalid args fail locally with the contract code; nothing is sent.
+  const sent = leadRpcs(socket).length;
+  await assert.rejects(f.instance.leadRpc('lead.handoff', { handoff: { bogus: true } } as any), (error: any) => error instanceof LeadRpcError && error.code === 'invalid');
+  assert.equal(leadRpcs(socket).length, sent);
+  // A lead_rpc_result never settles a pm_rpc with the same id: separate pending maps.
+  const pm = f.instance.rpc('memory.log', { text: 'pm note' });
+  const pmId = rpcs(socket).at(-1).id;
+  socket.receive({ type: 'lead_rpc_result', id: pmId, ok: true, result: {} });
+  socket.receive({ type: 'pm_rpc_result', id: pmId, ok: true, result: { seq: 3 } });
+  assert.deepEqual(await pm, { seq: 3 });
+  // Wrong result shape for the op → invalid_result; a DO error is redacted again.
+  const c = f.instance.leadRpc('lead.sync', { records: [leadRecord()] });
+  socket.receive({ type: 'lead_rpc_result', id: leadRpcs(socket).at(-1).id, ok: true, result: { stored: true } });
+  await assert.rejects(c, (error: any) => error.code === 'invalid_result' && error.op === 'lead.sync');
+  const d = f.instance.leadRpc('lead.get', { lead: LEAD, handoffs: 1 });
+  socket.receive({ type: 'lead_rpc_result', id: leadRpcs(socket).at(-1).id, ok: false, code: 'forbidden', message: `nope Authorization: Bearer ${TOKEN}` });
+  await assert.rejects(d, (error: any) => error instanceof LeadRpcError && error.code === 'forbidden' && !error.message.includes(TOKEN));
+  assert.ok(f.options[0].maxPayload >= MAX_LEAD_RESULT_FRAME, 'a v2 socket accepts 1 MiB lead results');
+});
+
+test('a standby host (not the active PM, or before any assignment) can still send lead_rpc', async (t) => {
+  const f = v2(t), socket = f.sockets[0]!; socket.open();
+  const early = f.instance.leadRpc('settings.get', {});
+  socket.receive({ type: 'lead_rpc_result', id: leadRpcs(socket)[0].id, ok: true, result: settingsView() });
+  assert.ok(await early, 'no assignment yet');
+  socket.receive(assignmentFrame({ active: false, epoch: 4, active_machine: { machine_id: OTHER.machine_id, host: OTHER.name } }));
+  const standby = f.instance.leadRpc('lead.handoff', { handoff: {
+    v: 1, lead: LEAD, seq: 1, at: '2026-09-25T00:00:00.000Z', kind: 'seed', project: 'foreman', workstream: 'x', goal: 'Ship it', status: 'in_progress',
+    summary: '', decisions: [], open_questions: [], next_steps: [], links: [], workers: [],
+  } });
+  socket.receive({ type: 'lead_rpc_result', id: leadRpcs(socket)[1].id, ok: true, result: { stored: false } });
+  assert.deepEqual(await standby, { stored: false });
+  // pm_rpc is unchanged: still sent with the (inactive) assignment's epoch for the DO to fence.
+  const pm = f.instance.rpc('memory.get', {});
+  assert.equal(rpcs(socket)[0].epoch, 4);
+  socket.receive({ type: 'pm_rpc_result', id: rpcs(socket)[0].id, ok: false, code: 'not_active', message: 'not the active PM host' });
+  await assert.rejects(pm, (error: any) => error instanceof PmRpcError && error.code === 'not_active');
+});
+
+test('leadRpc: timeout, disconnect, legacy bridge, oversized frames, and the pending bound', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  const f = v2(t), socket = f.sockets[0]!;
+  await assert.rejects(f.instance.leadRpc('settings.get', {}), (error: any) => error.code === 'disconnected', 'before open');
+  socket.open();
+  const slow = f.instance.leadRpc('settings.get', {}, { timeoutMs: 5_000 });
+  let settled = false; slow.then(() => { settled = true; }, () => { settled = true; });
+  t.mock.timers.tick(4_999); await Promise.resolve();
+  assert.equal(settled, false);
+  t.mock.timers.tick(1);
+  await assert.rejects(slow, (error: any) => error instanceof LeadRpcError && error.code === 'timeout' && error.op === 'settings.get');
+  assert.doesNotThrow(() => socket.receive({ type: 'lead_rpc_result', id: leadRpcs(socket)[0].id, ok: true, result: settingsView() }));
+  assert.equal(socket.closed, undefined, 'a stale reply is ignored');
+  const byDefault = f.instance.leadRpc('settings.get', {});
+  let defaultSettled = false; byDefault.then(() => { defaultSettled = true; }, () => { defaultSettled = true; });
+  t.mock.timers.tick(9_999); await Promise.resolve();
+  assert.equal(defaultSettled, false);
+  t.mock.timers.tick(1);
+  await assert.rejects(byDefault, (error: any) => error.code === 'timeout', 'default timeout is the bridge rpc timeout (10 s)');
+  // Oversized: ten near-max rows exceed the 64 KiB frame → too_large, nothing sent.
+  const big = Array.from({ length: 10 }, (_, i) => leadRecord({ lead: `fm:0b6f1f0e-3c7d-4a51-9e0b-1f2a3b4c5d${String(i).padStart(2, '0')}`, goal: 'g'.repeat(1000),
+    workers: Array.from({ length: 20 }, (_, w) => ({ session_key: `fm:w-${i}-${w}`, name: 'w'.repeat(200), state: 'working' as const, permission_mode: 'bypass' as const, needs_attention: false })) }));
+  const sentBefore = leadRpcs(socket).length;
+  await assert.rejects(f.instance.leadRpc('lead.sync', { records: big }), (error: any) => error.code === 'too_large');
+  assert.equal(leadRpcs(socket).length, sentBefore);
+  // Bounded pending.
+  const pending = Array.from({ length: LEAD_RPC_MAX_PENDING }, () => f.instance.leadRpc('settings.get', {}, { timeoutMs: 60_000 }));
+  for (const p of pending) p.catch(() => {});
+  await assert.rejects(f.instance.leadRpc('settings.get', {}), (error: any) => error.code === 'unavailable');
+  // A close fails every pending lead rpc with `disconnected`.
+  socket.close(1006, 'gone');
+  const results = await Promise.allSettled(pending);
+  assert.ok(results.every((r) => r.status === 'rejected' && (r.reason as LeadRpcError).code === 'disconnected'));
+  await assert.rejects(f.instance.leadRpc('settings.get', {}), (error: any) => error.code === 'disconnected');
+  // The legacy bridge (no identity) has no lead_rpc.
+  const legacy = bridge(t), legacySocket = legacy.sockets[0]!; legacySocket.open();
+  await assert.rejects(legacy.instance.leadRpc('settings.get', {}), (error: any) => error instanceof LeadRpcError && error.code === 'unavailable');
+  assert.equal(leadRpcs(legacySocket).length, 0);
 });

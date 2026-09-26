@@ -220,7 +220,7 @@ describe('two machines connected at once', () => {
 describe('routing to the active PM host only', () => {
   it('active-host routing: every relayed request reaches only the active host; the standby receives nothing', async () => {
     const { stub, a, b } = await pair();
-    const calls: [string, string, string?][] = [['GET', '/api/sessions'], ['GET', '/api/pm/history'], ['POST', '/api/pm/message', '{"text":"hi"}'], ['GET', '/api/projects'], ['POST', '/api/session/message', '{}'], ['GET', '/api/memory'], ['POST', '/api/launch/propose', '{}']];
+    const calls: [string, string, string?][] = [['GET', '/api/sessions'], ['GET', '/api/pm/history'], ['POST', '/api/pm/message', '{"text":"hi"}'], ['GET', '/api/projects'], ['POST', '/api/session/message', '{}'], ['GET', '/api/memory'], ['POST', '/api/session/interrupt', '{}']];
     for (const [method, path, body] of calls) {
       const before = requests(a).length;
       const response = stub.fetch(`${ORIGIN}${path}`, { method, body });
@@ -298,7 +298,7 @@ describe('reassignment (POST /api/pm/host)', () => {
     expect((await statusOf({ machine_id: b.machine_id, expected_epoch: 0 }))[0]).toBe(409);
     expect((await statusOf({ machine_id: b.machine_id, expected_epoch: 2 }))[0]).toBe(409);
     expect(await statusOf({ machine_id: crypto.randomUUID(), expected_epoch: 1 })).toEqual([404, { error: 'Unknown machine' }]);
-    expect(await statusOf({ machine_id: a.machine_id, expected_epoch: 1 })).toEqual([400, { error: 'The PM already runs on machine-a.' }]);
+    expect(await statusOf({ machine_id: a.machine_id, expected_epoch: 1 })).toEqual([400, { error: 'The Coordinator already runs on machine-a.' }]);
     const [offlineStatus, offlineBody] = await statusOf({ machine_id: c.machine_id, expected_epoch: 1 });
     expect(offlineStatus).toBe(409);
     expect(offlineBody.error).toContain('machine-c is offline');

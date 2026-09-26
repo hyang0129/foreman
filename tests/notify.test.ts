@@ -112,8 +112,8 @@ test('buildPushPayload renders each kind exactly as specified', () => {
     [frame('approval_requested') as unknown as NotifyFrame, { kind: 'approval_requested', host: 'hong-mbp', session_key: KEY, session_name: 'fix-login', tag: `session:${KEY}`, url: `/?session=${encodeURIComponent(KEY)}`, title: 'Approval needed', body: 'fix-login is waiting for your approval' }],
     [frame('question_asked') as unknown as NotifyFrame, { kind: 'question_asked', host: 'hong-mbp', session_key: KEY, session_name: 'fix-login', tag: `session:${KEY}`, url: `/?session=${encodeURIComponent(KEY)}`, title: 'Question from fix-login', body: 'fix-login has a question for you' }],
     [frame('session_failed') as unknown as NotifyFrame, { kind: 'session_failed', host: 'hong-mbp', session_key: KEY, session_name: 'fix-login', tag: `session:${KEY}`, url: `/?session=${encodeURIComponent(KEY)}`, title: 'Session failed', body: 'fix-login stopped with an error. Open Foreman for details.' }],
-    [frame('pm_failed') as unknown as NotifyFrame, { kind: 'pm_failed', host: 'hong-mbp', tag: 'pm', url: '/?view=pm', title: 'PM needs attention', body: 'The project manager hit an error. Open Foreman for details.' }],
-    [{ kind: 'host_offline', host: 'hong-mbp', at: AT }, { kind: 'host_offline', host: 'hong-mbp', tag: 'host', url: '/', title: 'Mac offline', body: 'hong-mbp has been disconnected for over 5 minutes.' }],
+    [frame('pm_failed') as unknown as NotifyFrame, { kind: 'pm_failed', host: 'hong-mbp', tag: 'pm', url: '/?view=pm', title: 'Coordinator needs attention', body: 'The Coordinator hit an error. Open Foreman for details.' }],
+    [{ kind: 'host_offline', host: 'hong-mbp', at: AT }, { kind: 'host_offline', host: 'hong-mbp', tag: 'host', url: '/', title: 'Machine offline', body: 'hong-mbp has been disconnected for over 5 minutes.' }],
     [{ kind: 'test', host: 'hong-mbp', at: AT }, { kind: 'test', host: 'hong-mbp', tag: 'test', url: '/', title: 'Foreman notifications are on', body: 'You will be notified when a session needs you.' }],
   ];
   for (const [event, expected] of cases) {
@@ -121,6 +121,25 @@ test('buildPushPayload renders each kind exactly as specified', () => {
     assert.deepEqual(payload, { v: 1, at: AT, ...expected }, expected.kind);
     assert.ok(pushUrlIsSafe(payload.url));
   }
+});
+
+test('#157 D8 / #144: push text says Coordinator and machine, never PM, project manager or Mac', () => {
+  const events = [
+    ...NOTIFY_KINDS.map((kind) => frame(kind) as unknown as NotifyFrame),
+    { kind: 'host_offline' as const, host: 'hong-mbp', at: AT },
+    { kind: 'host_offline' as const, host: '', at: AT },
+    { kind: 'test' as const, host: 'hong-mbp', at: AT },
+  ];
+  for (const event of events) {
+    const { title, body } = buildPushPayload(event);
+    assert.doesNotMatch(`${title} ${body}`, /\bPM\b|project manager|\bMac\b/i, event.kind);
+  }
+  const pm = buildPushPayload(frame('pm_failed') as unknown as NotifyFrame);
+  assert.equal(pm.title, 'Coordinator needs attention');
+  assert.match(pm.body, /^The Coordinator /);
+  // Presentation only: the kind, tag and deep link keep `pm`.
+  assert.deepEqual([pm.kind, pm.tag, pm.url], ['pm_failed', 'pm', '/?view=pm']);
+  assert.equal(buildPushPayload({ kind: 'host_offline', host: '', at: AT }).title, 'Machine offline');
 });
 
 test('buildPushPayload uses "A session" when the name is missing or blank', () => {
@@ -212,7 +231,7 @@ test('#126: the host is cleaned and bounded in every payload', () => {
   }
   assert.equal(buildPushPayload({ kind: 'host_offline', host: dirty, at: AT }).body, 'hong’s Macbook has been disconnected for over 5 minutes.');
   // A host that cleans to nothing (or is not a string) falls back to generic wording.
-  assert.equal(buildPushPayload({ kind: 'host_offline', host: '​⁦\u0000 ', at: AT }).body, 'Your Mac has been disconnected for over 5 minutes.');
+  assert.equal(buildPushPayload({ kind: 'host_offline', host: '​⁦\u0000 ', at: AT }).body, 'Your machine has been disconnected for over 5 minutes.');
   assert.equal(buildPushPayload({ kind: 'host_offline', host: 42 as unknown as string, at: AT }).host, '');
 });
 

@@ -1,9 +1,55 @@
-const POLICY_LABEL = { native: 'Native', bypass: '⚠ Bypass · no permission prompts' };
+const POLICY_LABEL = { native: 'Native', bypass: '⚠ Bypass · no permission prompts', auto: 'Auto · Claude decides routine permissions' };
 const POLICY_DESCRIPTION = {
   native: 'Use the provider’s normal permissions and approval prompts. Claude and Codex have different native boundaries. Foreman adds no credential deny list.',
   bypass: '⚠ Commands, network, credentials, and files outside the project without permission prompts. Foreman adds no sandbox or credential protection.',
 };
-const policyLabel = (session) => POLICY_LABEL[session.permission_mode] || (session.permission_mode ? `Legacy policy: ${session.permission_mode}` : 'Policy unknown');
+// Coordinator and Project Lead contracts (epic #157). Plain-JS mirror of shared/roles.ts; web/ is
+// static and cannot import it. `/api/pm/*`, `?view=pm` and the `foreman-pm` session name keep the
+// old wire names (D8): only what the developer reads says "Coordinator".
+const LAUNCH_APPROVAL_TOOL = "foreman.launch_bypass";
+const HELD_LAUNCH_REASON = "awaiting_bypass_approval";
+const LAUNCH_DENIED = "Bypass launch denied by developer; nothing ran";
+const LAUNCH_EXPIRED = "Launch approval expired; nothing was launched";
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const ROLE_DEFAULTS = { coordinator: { model: "opus[1m]", effort: "medium" }, lead: { model: "opus[1m]", effort: "medium" }, investigator: { model: "opus", effort: "low" } };
+const DEFAULT_BYPASS_GRANTS = [{ role: "coordinator", project: "*", allow: true }, { role: "lead", project: "*", allow: true }];
+const PM_SESSION_NAME = "foreman-pm";
+const roleOf = (s) => (["session", "lead", "worker"].includes(s?.role) ? s.role : "session");
+const launchedBy = (s) => (typeof s?.launched_by === "string" && s.launched_by ? s.launched_by : "developer");
+const agentLaunched = (s) => launchedBy(s) !== "developer";
+const sameKey = (a, b) => typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
+// `standing:<role>/<project|*>` or `approved:<approval id>`.
+function grantLabel(ref) {
+  if (typeof ref !== "string") return "";
+  if (ref.startsWith("approved:")) return "approved";
+  return ref.startsWith("standing:") ? "standing" : "";
+}
+function grantDescription(ref) {
+  if (typeof ref !== "string") return "";
+  if (ref.startsWith("approved:")) return "you approved this launch";
+  const m = /^standing:(coordinator|lead)\/(.+)$/.exec(ref);
+  if (!m) return "";
+  return `standing grant for ${m[1] === "coordinator" ? "the Coordinator" : "Leads"}${m[2] === "*" ? " on every project" : ` on ${m[2]}`}`;
+}
+// The short policy tag for a chat row: agent-launched sessions only (⚠ Bypass or Auto).
+function policyTag(s) {
+  if (!agentLaunched(s)) return "";
+  if (s.permission_mode === "bypass") { const grant = grantLabel(s.bypass_grant); return grant ? `⚠ Bypass · ${grant}` : "⚠ Bypass"; }
+  if (s.permission_mode === "auto") return "Auto";
+  return "";
+}
+const policyLabel = (session) => {
+  const label = POLICY_LABEL[session.permission_mode] || (session.permission_mode ? `Legacy policy: ${session.permission_mode}` : session.reason === HELD_LAUNCH_REASON ? "Waiting for your Bypass approval" : 'Policy unknown');
+  const grant = session.permission_mode === "bypass" ? grantDescription(session.bypass_grant) : "";
+  return grant ? `${label} · ${grant}` : label;
+};
+// A held Bypass launch that never ran: denied, or expired by a restart.
+function launchOutcome(s) {
+  const reason = String(s?.end_reason || "");
+  if (reason === LAUNCH_DENIED || /^Bypass launch denied/i.test(reason)) return "Bypass launch denied; nothing ran.";
+  if (reason === LAUNCH_EXPIRED || /^Launch approval expired/i.test(reason)) return "Launch approval expired; nothing was launched.";
+  return "";
+}
 // Authoritative JSON polling keeps authentication tokens out of URLs and reconnects simple.
 // Firebase browser-module setup: https://firebase.google.com/docs/web/alt-setup
 const $ = (selector) => document.querySelector(selector);
@@ -31,6 +77,7 @@ const ui = {
   newForm: $("#new-form"),
   moveDialog: $("#move-pm-dialog"),
   infoDialog: $("#info-dialog"),
+  settingsDialog: $("#settings-dialog"),
   menu: $("#conversation-menu"),
   messageMenu: $("#message-menu"),
 };
@@ -78,7 +125,7 @@ const unknownInitialLink = initialLink?.session === "pm" || (!initialLink && new
 let selected = initialLink?.session && initialLink.session !== "pm" ? initialLink.session : "pm";
 // A deep-linked session opens optimistically and is checked against the host's list once.
 let deepLinkPending = selected && selected !== "pm" ? selected : null, initialNoticeShown = false;
-const UNKNOWN_LINK_NOTICE = "That conversation isn’t available on the execution host. Showing the project manager.";
+const UNKNOWN_LINK_NOTICE = "That conversation isn’t available on the execution host. Showing the Coordinator.";
 let sessions = [],
   detail = null,
   host = { online: false },
@@ -108,7 +155,13 @@ let messageSignature = "",
   pmBusy = false;
 let pmModel = "", pmModelSaving = false, pmModelLoading = false, pmModelReady = false,
   pmModelLoaded = false, modelRevision = 0, newModelRequest = 0;
-let launchRevision = 0, launchJob = null, launchMode = "brief", launchBusy = false, launcherModelRequest = 0;
+// GET /api/leads (epic #157): the Lead registry, answered by the relay even while the host is
+// offline (host-local in the local UI). null until read, or when the route is not served.
+let leads = null, leadsMode = null, leadsRetryAt = 0;
+// GET /api/settings: the developer's role models, standing Bypass grants and "ask before each
+// Bypass launch", plus whether this app may change them (`writable`, false in the local UI).
+let settingsView = null, settingsError = "", settingsLoading = false, settingsBusy = false, settingsRequest = 0;
+let askBusy = false;
 let projectRows = [], projectResolution = null, projectSelection = null, projectRevision = 0, projectPending = false;
 const projectName = (s) => s.project_name || (s.cwd || "").split("/").filter(Boolean).at(-1) || "Project unavailable";
 const drafts = new Map(),
@@ -334,8 +387,13 @@ function post(path, body) {
 }
 
 function revokeAccess(message) {
-  cancelLauncher(); launcherModelRequest++;
   authEpoch++;
+  // Nothing the previous identity read or typed outlives sign-out: the Lead registry, the
+  // settings, and the text of an unsent "Ask the Coordinator".
+  leads = null; leadsMode = null; leadsRetryAt = 0;
+  settingsView = null; settingsError = ""; settingsLoading = false; settingsBusy = false; settingsRequest++;
+  askBusy = false; $("#ask-coordinator").value = ""; askStatus("");
+  $("#settings-dialog").close();
   authorized = false;
   pmModel = ""; pmModelLoaded = false; pmModelReady = false;
   sending = false; creating = false; pmModelSaving = false; pmModelLoading = false;
@@ -344,7 +402,7 @@ function revokeAccess(message) {
   $("#project-choices").replaceChildren(); $("#project-status").textContent = ""; $("#project-feedback").textContent = "";
   ui.interrupt.dataset.busy = "false";
   $("#create-session").textContent = "Start session";
-  $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved with the PM.";
+  $("#pm-model-hint").textContent = PM_MODEL_HINT;
   modelOptions($("#pm-model"), []);
   clearTimeout(pollTimer);
   sessions = [];
@@ -402,7 +460,7 @@ function setNav(open) {
   if (open) $("#close-nav").focus();
 }
 // History model (Android Back). The stack is at most [PM, conversation, drawer, dialog] (or
-// [PM, conversation, info, Move PM] for the info screen):
+// [PM, conversation, info, Move PM or Settings] for the info screen):
 // opening a conversation from the PM pushes an entry, switching conversations replaces it,
 // and the drawer and the new-session dialog each push an overlay entry. Back therefore closes
 // the dialog, then the drawer, then returns to the PM, then leaves the app. Every entry
@@ -474,7 +532,7 @@ function closeNav() {
 // steps (the stack holds at most two overlays); if it runs out, the entry is kept as a plain view.
 function deadOverlay(state) {
   return (state?.overlay === "nav" && !navOpen()) || (state?.overlay === "dialog" && !ui.dialog.open) || (state?.overlay === "move" && !ui.moveDialog.open)
-    || (state?.overlay === "info" && !ui.infoDialog.open);
+    || (state?.overlay === "info" && !ui.infoDialog.open) || (state?.overlay === "settings" && !ui.settingsDialog.open);
 }
 function dropDeadOverlay(budget = 3) {
   afterHistory(() => {
@@ -508,8 +566,9 @@ window.addEventListener("popstate", (event) => {
   // Back closes the top-most layer first: the dialog, then the drawer, then the conversation.
   if (ui.dialog.open && state.overlay !== "dialog") ui.dialog.close();
   if (ui.moveDialog.open && state.overlay !== "move") ui.moveDialog.close();
-  // Move PM opens on top of the info screen, so Back from it returns to the info screen.
-  if (ui.infoDialog.open && state.overlay !== "info" && state.overlay !== "move") ui.infoDialog.close();
+  if (ui.settingsDialog.open && state.overlay !== "settings") ui.settingsDialog.close();
+  // Move Coordinator and Settings open on top of the info screen, so Back from them returns to it.
+  if (ui.infoDialog.open && !["info", "move", "settings"].includes(state.overlay)) ui.infoDialog.close();
   closeMenus();
   if (navOpen() && !state.overlay) {
     setNav(false);
@@ -568,56 +627,96 @@ function renderConnectionBanner() {
   const saidByPmLine = selected === "pm" && !$("#pm-host-offline").hidden;
   banner.hidden = !!host.online || !hostChecked || (!hostError && saidByPmLine);
 }
+// The Lead a worker belongs to, or a Lead by its session key: its display name when known.
+function leadEntry(key) {
+  return Array.isArray(leads) ? leads.find((lead) => sameKey(lead.lead, key)) || null : null;
+}
+function leadName(key) {
+  if (typeof key !== "string" || !key) return "";
+  return sessions.find((s) => sameKey(s.session_key, key))?.name || leadEntry(key)?.name || key;
+}
+function requesterName(value) {
+  if (value === "coordinator") return "the Coordinator";
+  if (value === "developer" || !value) return "you";
+  return leadName(value);
+}
+// A superseded or ended Lead: kept readable under Archived.
+function archivedLead(s) {
+  return roleOf(s) === "lead" && (!!s.superseded_by || ["ended", "dead"].includes(s.state) || leadEntry(s.session_key)?.ended === true);
+}
+// Workers are not chats of their own: they are listed on their Lead's info screen, and surface in
+// the list only while they need you (or while one is open, or matches a search).
+function workerSurfaces(s, query) {
+  return s.state === "needs_input" || selected === s.session_key || !!query;
+}
+function rowSummary(s) {
+  if (s.state === "needs_input") return s.reason === HELD_LAUNCH_REASON ? "Launch with Bypass? Waiting for your approval" : s.reason || "Waiting for your response";
+  if (s.state === "working") return s.current_tool || "Working on your task";
+  return launchOutcome(s) || s.last_message || projectName(s);
+}
+let archivedOpen = false;
+function sessionRow(s) {
+  const known = new Set(GROUPS.map(([state]) => state));
+  const row = node("button", `session-row${selected === s.session_key ? " selected" : ""}`);
+  row.title = s.cwd || "";
+  const role = roleOf(s);
+  const via = role === "worker" && s.parent ? leadName(s.parent) : "";
+  const tag = policyTag(s);
+  row.setAttribute("aria-description", [role === "lead" ? "Project Lead" : role === "worker" ? "Worker" : "", projectName(s), LABEL[s.state] || "Unknown state", !host.online ? "Last known" : ""].filter(Boolean).join(" · "));
+  row.type = "button";
+  row.dataset.session = s.session_key;
+  row.dataset.state = s.state || "";
+  row.dataset.role = role;
+  row.setAttribute("aria-pressed", String(selected === s.session_key));
+  const dot = node("span", `dot ${known.has(s.state) ? s.state : "unknown"}`);
+  dot.setAttribute("aria-hidden", "true");
+  const name = node("span", "session-name", s.name || s.session_id?.slice(0, 8) || "Session");
+  if (via) name.append(node("span", "session-via", ` · via ${via}`));
+  // A space keeps the tags separate words for screen readers (and in the row's accessible name).
+  if (role === "lead") name.append(" ", node("span", "role-tag", "Lead"));
+  if (tag) name.append(" ", node("span", `policy-tag${s.permission_mode === "bypass" ? " is-bypass" : ""}`, tag));
+  row.append(dot, name, node("span", "session-age", ago(s.updated_at || s.started_at)));
+  row.append(node("span", "session-sub", rowSummary(s)));
+  if (s.state === "needs_input") row.append(node("span", "attention-badge", "Needs you"));
+  row.addEventListener("click", () => selectSession(s.session_key));
+  return row;
+}
 function renderRail() {
   const focusedKey = document.activeElement?.dataset?.session;
   const focusedClear = document.activeElement?.hasAttribute("data-clear-search");
+  const focusedArchive = document.activeElement?.hasAttribute("data-archived-summary");
   ui.list.replaceChildren();
   const query = ui.search.value.trim().toLowerCase();
   const visible = sessions.filter(
     (s) =>
-      s.name !== "foreman-pm" &&
+      s.name !== PM_SESSION_NAME &&
+      (roleOf(s) !== "worker" || workerSurfaces(s, query)) &&
       (!query ||
         `${s.name} ${s.cwd} ${s.project_name || ""} ${s.provider}`.toLowerCase().includes(query)),
   );
   $("#session-count").textContent = String(
-    sessions.filter((s) => s.name !== "foreman-pm").length,
+    sessions.filter((s) => s.name !== PM_SESSION_NAME).length,
   );
   $("#select-pm").classList.toggle("selected", selected === "pm");
   $("#select-pm").setAttribute("aria-pressed", String(selected === "pm"));
-  // A chat list: sessions that need you first, then the most recently active. Each row is the
-  // name, the time, a one-line preview, and a badge when the session needs you.
-  const known = new Set(GROUPS.map(([state]) => state));
-  const rows = [...visible].sort((a, b) =>
-    Number(b.state === "needs_input") - Number(a.state === "needs_input")
-    || String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
-  for (const s of rows) {
-    const row = node(
-      "button",
-      `session-row${selected === s.session_key ? " selected" : ""}`,
-    );
-    row.title = s.cwd || "";
-    row.setAttribute("aria-description", `${projectName(s)} · ${LABEL[s.state] || "Unknown state"}${!host.online ? " · Last known" : ""}`);
-    row.type = "button";
-    row.dataset.session = s.session_key;
-    row.dataset.state = s.state || "";
-    row.setAttribute("aria-pressed", String(selected === s.session_key));
-    const dot = node("span", `dot ${known.has(s.state) ? s.state : "unknown"}`);
-    dot.setAttribute("aria-hidden", "true");
-    row.append(
-      dot,
-      node("span", "session-name", s.name || s.session_id?.slice(0, 8) || "Session"),
-      node("span", "session-age", ago(s.updated_at || s.started_at)),
-    );
-    const summary =
-      s.state === "needs_input"
-        ? s.reason || "Waiting for your response"
-        : s.state === "working"
-          ? s.current_tool || "Working on your task"
-          : s.last_message || projectName(s);
-    row.append(node("span", "session-sub", summary));
-    if (s.state === "needs_input") row.append(node("span", "attention-badge", "Needs you"));
-    row.addEventListener("click", () => selectSession(s.session_key));
-    ui.list.append(row);
+  // A chat list: the Coordinator pinned above it, then Leads and your sessions, those that need
+  // you first, then the most recently active. Each row is the name, the time, a one-line preview,
+  // and a badge when the session needs you. Superseded and ended Leads go under Archived.
+  const recent = (a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || ""));
+  const archived = visible.filter(archivedLead).sort(recent);
+  const rows = visible.filter((s) => !archivedLead(s)).sort((a, b) =>
+    Number(b.state === "needs_input") - Number(a.state === "needs_input") || recent(a, b));
+  for (const s of rows) ui.list.append(sessionRow(s));
+  if (archived.length) {
+    const group = node("details", "archived-group");
+    // A search, or an open archived chat, shows the group open.
+    group.open = archivedOpen || !!query || archived.some((s) => s.session_key === selected);
+    const summary = node("summary", "archived-summary", `Archived · ${archived.length}`);
+    summary.dataset.archivedSummary = "true";
+    group.append(summary);
+    for (const s of archived) group.append(sessionRow(s));
+    group.addEventListener("toggle", () => { if (!query) archivedOpen = group.open; });
+    ui.list.append(group);
   }
   if (!visible.length) {
     const empty = node("div", "rail-empty");
@@ -636,6 +735,7 @@ function renderRail() {
     ui.list.append(empty);
   }
   if (focusedClear) ui.list.querySelector("[data-clear-search]")?.focus({ preventScroll: true });
+  if (focusedArchive) ui.list.querySelector("[data-archived-summary]")?.focus({ preventScroll: true });
   if (focusedKey)
     [...ui.list.querySelectorAll("button")]
       .find((button) => button.dataset.session === focusedKey)
@@ -652,11 +752,9 @@ function updateControls() {
   ui.messages.querySelectorAll("[data-new-session]").forEach((button) => {
     button.disabled = !authorized || !host.online;
   });
-  $("#create-session").disabled = !authorized || !host.online || creating || projectPending || !projectResolution || launchMode === "brief" || launchBusy;
-  $("#propose-session").disabled = !authorized || !host.online || launchBusy || !$("#launch-brief").value.trim();
-  $("#launch-brief").disabled = launchBusy;
-  $("#launcher-model").disabled = launchBusy;
-  if (launchBusy && !host.online) manualLaunch("Host is offline. Your brief is preserved; start manually when it reconnects.");
+  $("#create-session").disabled = !authorized || !host.online || creating || projectPending || !projectResolution;
+  $("#send-to-coordinator").disabled = !authorized || !host.online || askBusy || !$("#ask-coordinator").value.trim();
+  $("#send-to-coordinator").textContent = askBusy ? "Asking…" : "Ask the Coordinator";
   ui.input.disabled = !canMessage || sending;
   ui.send.disabled = !canMessage || sending || !ui.input.value.trim();
   ui.send.firstChild.textContent = sending ? "Sending… " : "Send ";
@@ -689,7 +787,7 @@ function updateControls() {
     : !host.online
       ? "Displayed activity may be out of date."
       : isPm
-        ? "Your project manager keeps track of the work and delegates to session agents."
+        ? "Your Coordinator keeps track of the work and delegates to session agents."
         : !canMessage
           ? session?.control_reason ||
             "Monitoring only. This session was started outside Foreman; use its original terminal to continue."
@@ -701,37 +799,163 @@ function updateControls() {
         !host.online || control.closest("form")?.dataset.busy === "true";
     });
 }
+const HANDOFF_STATUS = { in_progress: "In progress", blocked: "Blocked", waiting_on_developer: "Waiting on you", done: "Done", abandoned: "Abandoned" };
+const capitalize = (text) => (text ? text[0].toUpperCase() + text.slice(1) : text);
+function whenText(ms) {
+  const date = typeof ms === "number" ? new Date(ms) : new Date(Date.parse(ms));
+  return Number.isNaN(date.getTime()) ? "an unknown time" : date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+function agoText(value) {
+  const age = ago(typeof value === "number" ? new Date(value).toISOString() : value);
+  return !age ? "" : age === "now" ? "just now" : `${age} ago`;
+}
+// The machine a Lead runs on, from the Lead registry (GET /api/leads).
+function leadMachine(entry) {
+  if (!entry) return "";
+  return entry.machine_online ? `${entry.machine_name} · online`
+    : `${entry.machine_name} · machine offline · last known state at ${whenText(entry.reported_at)}`;
+}
+// A Lead's workers: the registry's list, plus any worker session on this host that names it.
+function leadWorkers(s, entry) {
+  const workers = new Map();
+  for (const w of Array.isArray(entry?.workers) ? entry.workers : []) {
+    if (typeof w?.session_key !== "string" || !w.session_key) continue;
+    workers.set(w.session_key.toLowerCase(), { key: w.session_key, name: typeof w.name === "string" && w.name ? w.name : w.session_key, state: w.state, permission_mode: w.permission_mode });
+  }
+  for (const row of sessions) {
+    if (roleOf(row) !== "worker" || typeof row.session_key !== "string" || !sameKey(row.parent, s.session_key)) continue;
+    workers.set(row.session_key.toLowerCase(), { key: row.session_key, name: row.name || row.session_key, state: row.state, permission_mode: row.permission_mode, row });
+  }
+  return [...workers.values()];
+}
+let leadInfoSignature = "";
+function renderLeadInfo(s) {
+  const lead = !!s && roleOf(s) === "lead";
+  $("#lead-handoff").hidden = !lead;
+  $("#lead-workers").hidden = !lead;
+  if (!lead) { leadInfoSignature = ""; return; }
+  const entry = leadEntry(s.session_key);
+  const handoff = entry?.last_handoff;
+  const workers = leadWorkers(s, entry);
+  const signature = JSON.stringify([s.session_key, handoff, workers.map(({ row, ...w }) => ({ ...w, listed: !!row })), leads === null, Math.floor(Date.now() / 60000)]);
+  if (signature === leadInfoSignature) return;
+  leadInfoSignature = signature;
+  $("#lead-handoff-status").textContent = handoff
+    ? [HANDOFF_STATUS[handoff.status] || handoff.status, handoff.kind === "final" ? "final" : "", agoText(handoff.at)].filter(Boolean).join(" · ")
+    : leads === null ? "Handoffs are unavailable here." : "No handoff yet.";
+  $("#lead-handoff-summary").textContent = handoff?.summary || "";
+  const list = $("#lead-worker-list");
+  const focused = list.contains(document.activeElement) ? document.activeElement.dataset.session : null;
+  list.replaceChildren();
+  for (const w of workers) {
+    const item = node("li", "lead-worker");
+    const label = `${w.name} · ${LABEL[w.state] || w.state || "Unknown state"}${w.permission_mode === "bypass" ? " · ⚠ Bypass" : w.permission_mode === "auto" ? " · Auto" : ""}`;
+    if (w.row) {
+      // Workers are not chats in the list, so their conversations open from here.
+      const open = node("button", "lead-worker-open", label);
+      open.type = "button";
+      open.dataset.session = w.key;
+      open.addEventListener("click", () => { ui.infoDialog.close(); void selectSession(w.key); });
+      item.append(open);
+    } else item.append(node("span", "", label));
+    list.append(item);
+  }
+  if (!workers.length) list.append(node("li", "field-hint", "No workers."));
+  if (focused) list.querySelector(`[data-session="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });
+}
+// The Coordinator's info screen summarizes the settings it launches with; Settings changes them.
+function roleSummary(settings, role) {
+  const config = settings?.roles?.[role] || {};
+  const model = role === "coordinator" ? null : config.model || `${ROLE_DEFAULTS[role].model} (default)`;
+  const effort = config.effort || `${ROLE_DEFAULTS[role].effort}${config.model || role === "coordinator" ? " (default)" : ""}`;
+  return model ? `${model} · ${effort}` : effort;
+}
+function grantSummary(settings, role) {
+  const grants = settings?.bypass_grants || DEFAULT_BYPASS_GRANTS;
+  const all = grants.find((g) => g.role === role && g.project === "*");
+  const overrides = grants.filter((g) => g.role === role && g.project !== "*");
+  const base = all?.allow ? "⚠ Bypass on every project" : "Auto (Bypass off)";
+  return overrides.length ? `${base} · ${overrides.length} project override${overrides.length === 1 ? "" : "s"}` : base;
+}
+function renderCoordinatorSettings() {
+  const section = $("#coordinator-settings");
+  section.hidden = selected !== "pm";
+  if (section.hidden) return;
+  const settings = settingsView?.settings || null;
+  const fields = [
+    ["Coordinator effort", roleSummary(settings, "coordinator")],
+    ["Leads", roleSummary(settings, "lead")],
+    ["Investigators", roleSummary(settings, "investigator")],
+    ["Leads it starts", grantSummary(settings, "coordinator")],
+    ["Workers Leads start", grantSummary(settings, "lead")],
+    ["Before each Bypass launch", settings?.bypass_ask ? "Ask me" : "Don’t ask"],
+  ];
+  if (!settingsView) fields.push(["Settings", settingsLoading ? "Loading…" : settingsError ? `Unavailable: ${settingsError}` : "Showing defaults"]);
+  const summary = $("#coordinator-settings-summary");
+  const signature = JSON.stringify(fields);
+  if (summary.dataset.signature === signature) return;
+  summary.dataset.signature = signature;
+  summary.replaceChildren(...fields.flatMap(([label, value]) => [node("dt", "", label), node("dd", "", value)]));
+}
+// The info screen carries the conversation's full name (and the Project field its full project).
+function setTitle(header, full) {
+  if (ui.title.textContent !== header) ui.title.textContent = header;
+  ui.title.title = header;
+  $("#info-title").textContent = full;
+}
+// The header names what the conversation is, on one row (#176): the agent for the Coordinator, the
+// project and role for a Lead or worker, and the chat's own name otherwise. There is no generic
+// title; while a chat loads, its name from the list is shown if known.
+function chatTitle(s) {
+  const role = roleOf(s);
+  if (role === "lead" || role === "worker") {
+    const project = s.project_name || (role === "lead" ? leadEntry(s.session_key)?.project : "") || projectName(s);
+    return `${project} · ${role === "lead" ? "Lead" : "Worker"}`;
+  }
+  return s.name || projectName(s);
+}
 function renderHeading() {
   const model = $("#header-model");
   const isPm = selected === "pm";
   const fields = [];
   let selectedModel = "";
   if (isPm) {
-    ui.title.textContent = "Claude · Project manager";
+    setTitle("Coordinator", "Claude · Coordinator");
     ui.provider.hidden = true;
     selectedModel = pmModelReady ? pmModel || "Provider default" : "Loading model…";
     fields.push(["Selected model", selectedModel]);
     if (pmModelReady && !pmModel) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
-    fields.push(["Applies to", "The PM’s replies and planning. Newly launched agents have their own model selection."]);
+    fields.push(["Applies to", "The Coordinator’s replies and planning. Newly launched agents have their own model selection."]);
     const machine = pmHost?.active;
     if (machine) fields.push(["Runs on", `${machine.name} · ${machine.online ? "online" : "offline"}${pmHost.mode === "local" ? " · this machine only (no cloud relay)" : ""}`]);
   } else if (detail?.session) {
     const s = detail.session;
-    ui.title.textContent = s.name || "Session";
+    const role = roleOf(s);
+    const entry = role === "lead" ? leadEntry(s.session_key) : null;
+    setTitle(chatTitle(s), s.name || chatTitle(s));
     ui.provider.hidden = false;
     ui.provider.textContent = s.provider === "codex" ? "Codex" : "Claude";
-    selectedModel = s.model || (s.managed ? "Provider default" : "Model not reported");
-    fields.push([s.managed ? "Selected model" : "Reported model", selectedModel]);
-    if (!s.model && s.managed) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
+    selectedModel = s.model || entry?.model || (s.managed ? "Provider default" : "Model not reported");
+    const effort = s.effort || entry?.effort;
+    fields.push([s.managed ? "Selected model" : "Reported model", effort ? `${selectedModel} · ${effort}` : selectedModel]);
+    if (!s.model && !entry?.model && s.managed) fields.push(["Model settings", "Provider settings determine the model; Foreman has not verified a concrete model."]);
+    if (role === "lead") fields.push(["Role", "Project Lead"]);
+    if (role === "worker") fields.push(["Role", s.parent ? `Worker · via ${leadName(s.parent)}` : "Worker"]);
+    if (s.workstream || entry?.workstream) fields.push(["Workstream", s.workstream || entry.workstream]);
+    if (agentLaunched(s)) fields.push(["Started by", capitalize(requesterName(launchedBy(s)))]);
     fields.push(["Project", projectName(s)], ["Directory", s.cwd || "Project unavailable"], ["Permissions", s.managed ? policyLabel(s) : "Monitoring only"]);
+    if (role === "lead") fields.push(["Machine", entry ? leadMachine(entry) : leads === null ? "Not reported here" : "Not in the Lead registry yet"]);
+    if (s.superseded_by) fields.push(["Replaced by", leadName(s.superseded_by)]);
+    const outcome = launchOutcome(s);
+    if (outcome) fields.push(["Launch", outcome]);
   } else {
-    ui.title.textContent = selected ? "Loading session…" : "Your session inbox";
+    const row = selected ? sessions.find((s) => sameKey(s.session_key, selected)) : null;
+    const title = row ? chatTitle(row) : selected ? "Loading…" : "Choose a chat";
+    setTitle(title, row?.name || title);
     ui.provider.hidden = true;
   }
-  // The info screen repeats the conversation's name, and says what it configures.
-  $("#info-title").textContent = ui.title.textContent;
-  $("#info-eyebrow").textContent = isPm ? "PROJECT MANAGER INFO" : "SESSION INFO";
-  $("#open-info").textContent = isPm ? "Project manager info and model" : "Session info";
+  $("#info-eyebrow").textContent = isPm ? "COORDINATOR INFO" : roleOf(detail?.session) === "lead" ? "PROJECT LEAD INFO" : "SESSION INFO";
+  $("#open-info").textContent = isPm ? "Coordinator info and model" : roleOf(detail?.session) === "lead" ? "Lead info" : "Session info";
   model.hidden = !selectedModel;
   model.textContent = selectedModel ? `Model · ${selectedModel}` : "";
   model.title = selectedModel;
@@ -742,6 +966,8 @@ function renderHeading() {
     for (const [label, value] of fields) metadata.append(node("dt", "", label), node("dd", "", value));
     ui.subtitle.replaceChildren(fields.length ? metadata : node("p", "", "Choose a session or start something new."));
   }
+  renderLeadInfo(isPm ? null : detail?.session);
+  renderCoordinatorSettings();
   renderActivity();
   updateControls();
 }
@@ -854,7 +1080,7 @@ function dayLabel(date, now) {
   yesterday.setDate(yesterday.getDate() - 1);
   return localDay(date) === localDay(yesterday) ? "Yesterday" : date.toLocaleDateString([], { dateStyle: "medium" });
 }
-const PM_MOVED_TEXT = /^(The PM now runs on |This machine is no longer the PM host)/;
+const PM_MOVED_TEXT = /^(The (PM|Coordinator) now runs on |This machine is no longer the (PM|Coordinator) host)/;
 function messageNode(entry, receipt, entryKey) {
   const role = ["user", "assistant", "tool", "system"].includes(entry.role)
     ? entry.role
@@ -865,18 +1091,18 @@ function messageNode(entry, receipt, entryKey) {
   const moved = role === "system" && !failed && selected === "pm" && PM_MOVED_TEXT.test(String(entry.text || ""));
   const article = node("article", `message ${role}${failed ? " error" : ""}${moved ? " pm-moved" : ""}`);
   if (failed) article.setAttribute("aria-label", failureLabel());
-  if (moved) article.setAttribute("aria-label", "The PM moved");
+  if (moved) article.setAttribute("aria-label", "The Coordinator moved");
   const sender = sourceLabel(entry.source);
   const label = node(
     "div",
     "message-label",
-    failed ? failureLabel() : moved ? "PM moved" : sender
+    failed ? failureLabel() : moved ? "Coordinator moved" : sender
       ? `From ${sender}`
       : role === "user"
         ? "You"
         : role === "assistant"
           ? selected === "pm"
-            ? "Project manager"
+            ? "Coordinator"
             : detail?.session?.provider === "codex"
               ? "Codex"
               : "Claude"
@@ -999,10 +1225,10 @@ function renderMessages(history = [], receipts = []) {
     const title = loading ? "Loading sessions…" : !host.online ? `${hostName("The execution host")} is offline`
       : selected === "pm" ? "New conversation."
       : selected ? (detail?.session?.capabilities?.message ? "Ready when you are." : "No readable history yet.")
-      : sessions.filter((s) => s.name !== "foreman-pm").length ? "Choose a conversation" : "No sessions yet";
+      : sessions.filter((s) => s.name !== PM_SESSION_NAME).length ? "Choose a conversation" : "No sessions yet";
     const text = loading ? "Checking your execution host for sessions."
       : !host.online ? `Reconnect ${hostName("the execution host")} to view sessions and continue work.`
-      : selected === "pm" ? "The PM remembers projects and decisions, not past chats."
+      : selected === "pm" ? "The Coordinator remembers projects, decisions and Leads, not past chats."
       : selected ? (detail?.session?.capabilities?.message ? "Send a task or a follow-up to begin the conversation." : "No readable conversation is available yet. Activity will appear as this session runs.")
       : "Choose an existing conversation or start a Claude or Codex session.";
     fragment.append(emptyState(title, text, !selected && !loading));
@@ -1022,7 +1248,8 @@ function renderMessages(history = [], receipts = []) {
   updateLatest();
 }
 function renderApprovals(approvals = []) {
-  const signature = JSON.stringify([selected, approvals]);
+  const outcome = selected !== "pm" ? launchOutcome(detail?.session) : "";
+  const signature = JSON.stringify([selected, approvals, outcome]);
   if (signature === approvalSignature) {
     updateControls();
     return;
@@ -1046,26 +1273,31 @@ function renderApprovals(approvals = []) {
   for (const approval of approvals) {
     const sessionKey = selected;
     const feedbackKey = JSON.stringify([sessionKey, approval.id]);
-    const form = node("form", "approval");
+    // A held agent launch (epic #157): nothing has run yet; approving launches it in Bypass.
+    const launch = approval.kind === "permission" && approval.tool === LAUNCH_APPROVAL_TOOL;
+    const form = node("form", `approval${launch ? " launch-approval" : ""}`);
     form.dataset.approvalKey = feedbackKey;
     form.append(
       node(
         "h3",
         "",
-        approval.kind === "question"
+        launch
+          ? "Launch with Bypass?"
+          : approval.kind === "question"
           ? "The agent has a question"
           : approval.kind === "unsupported"
             ? "This request needs attention"
             : `Permission requested · ${approval.tool || "Tool"}`,
       ),
     );
-    form.append(node("p", "approval-reason", approval.reason || (approval.kind === "question"
+    if (launch) form.append(launchDetails(approval.input || {}));
+    else form.append(node("p", "approval-reason", approval.reason || (approval.kind === "question"
       ? "Your answer is needed before the agent can continue."
       : approval.kind === "unsupported" ? "This interaction cannot be answered here."
       : `The agent is requesting permission to use ${approval.tool || "this tool"}.`)));
-    const context = approval.input?.command || approval.input?.file_path || approval.input?.path;
+    const context = launch ? null : approval.input?.command || approval.input?.file_path || approval.input?.path;
     if (typeof context === "string" && context) form.append(node("p", "approval-context", context.length > 180 ? `${context.slice(0, 180)}…` : context));
-    if (approval.input && Object.keys(approval.input).length) {
+    if (!launch && approval.input && Object.keys(approval.input).length) {
       const details = node("details");
       details.dataset.focusKey = `${feedbackKey}:details`;
       details.open = expanded.has(details.dataset.focusKey);
@@ -1110,11 +1342,8 @@ function renderApprovals(approvals = []) {
       answerInputs.push([question.id, input]);
     }
     const actions = node("div", "approval-actions");
-    const allow = node(
-      "button",
-      "btn",
-      approval.kind === "question" ? "Send answer" : "Allow once",
-    );
+    const allowLabel = launch ? "Launch with Bypass" : approval.kind === "question" ? "Send answer" : "Allow once";
+    const allow = node("button", launch ? "btn bypass-action" : "btn", allowLabel);
     allow.type = "submit";
     allow.dataset.focusKey = `${feedbackKey}:allow`;
     const deny = node(
@@ -1133,8 +1362,8 @@ function renderApprovals(approvals = []) {
       const state = approvalFeedback.get(feedbackKey);
       form.dataset.busy = String(!!state?.pending);
       allow.textContent = state?.pending === "allow"
-        ? (approval.kind === "question" ? "Sending answer…" : "Allowing…")
-        : (approval.kind === "question" ? "Send answer" : "Allow once");
+        ? (launch ? "Launching…" : approval.kind === "question" ? "Sending answer…" : "Allowing…")
+        : allowLabel;
       deny.textContent = state?.pending === "deny"
         ? (approval.kind === "question" ? "Declining…" : "Denying…")
         : (approval.kind === "question" ? "Decline" : "Deny");
@@ -1198,6 +1427,11 @@ function renderApprovals(approvals = []) {
     deny.addEventListener("click", () => respond("deny"));
     ui.approvals.append(form);
   }
+  if (outcome) {
+    const note = node("p", "launch-outcome", outcome);
+    note.setAttribute("role", "status");
+    ui.approvals.append(note);
+  }
   updateControls();
   if (focusKey) {
     const next = [...ui.approvals.querySelectorAll("[data-focus-key]")].find((el) => el.dataset.focusKey === focusKey);
@@ -1207,6 +1441,24 @@ function renderApprovals(approvals = []) {
   if (approvals.length && wasNearBottom)
     ui.timeline.scrollTop = ui.timeline.scrollHeight;
   updateLatest();
+}
+// The "Launch with Bypass" card: who asked, for what, and with which setup.
+function launchDetails(input) {
+  const text = (value) => (typeof value === "string" && value.trim() ? value : "");
+  const fields = [
+    ["Session", text(input.name) || "Unnamed session"],
+    ["Project", text(input.project) || "Unregistered directory"],
+    ["Directory", text(input.cwd)],
+    ["Agent", [input.provider === "codex" ? "Codex" : "Claude", text(input.model), text(input.effort)].filter(Boolean).join(" · ")],
+    ["Role", input.role === "lead" ? "Project Lead" : input.role === "worker" ? "Worker" : text(input.role)],
+    ["Requested by", capitalize(requesterName(input.requested_by))],
+  ].filter(([, value]) => value);
+  const box = node("div", "launch-details");
+  box.append(node("p", "approval-reason", "Nothing has run yet. Approving starts this session in ⚠ Bypass: commands, network, credentials and files outside the project, with no permission prompts."));
+  const list = node("dl", "header-metadata");
+  for (const [label, value] of fields) list.append(node("dt", "", label), node("dd", "", value));
+  box.append(list, node("p", "launch-task-label", "First task"), node("p", "launch-task", text(input.first_task) || "No first task given."));
+  return box;
 }
 // `record` is false when the history entry already exists (Back/Forward).
 async function selectSession(key, record = true) {
@@ -1307,7 +1559,7 @@ async function refreshSelected() {
 }
 // A persisted PM failure (history entry `{ role: "system", error: true }`).
 function failureLabel() {
-  return selected === "pm" ? "Project manager error" : "Error";
+  return selected === "pm" ? "Coordinator error" : "Error";
 }
 // Rail indicator for a PM failure, fed by the full history while the PM is
 // selected and by the lightweight summary read otherwise.
@@ -1320,7 +1572,7 @@ function setPmRailError(error) {
     alert = node("span", "pm-alert");
     const dot = node("span", "pm-alert-dot", "!");
     dot.setAttribute("aria-hidden", "true");
-    alert.append(dot, node("span", "sr-only", "Project manager has an error"));
+    alert.append(dot, node("span", "sr-only", "Coordinator has an error"));
     // Sit before the PINNED tag when the row has one; otherwise stay visible at the end.
     const pinned = row.querySelector(".pinned");
     if (pinned) pinned.before(alert);
@@ -1328,8 +1580,8 @@ function setPmRailError(error) {
   } else if (!pmRailError) alert?.remove();
   row.classList.toggle("has-error", !!pmRailError);
   if (pmRailError) {
-    row.setAttribute("aria-label", "Project manager, has an error");
-    row.title = `Project manager error: ${pmRailError}`;
+    row.setAttribute("aria-label", "Coordinator, has an error");
+    row.title = `Coordinator error: ${pmRailError}`;
   } else {
     row.removeAttribute("aria-label");
     row.removeAttribute("title");
@@ -1348,9 +1600,10 @@ async function refreshPmSummary(epoch) {
 }
 // PM machine (epic #26 PMM-06). Plain-JS mirror of PmHostResponse / PmHostMoveResponse in
 // shared/pm-state.ts; web/ is static and cannot import it.
+const PM_MODEL_HINT = "Changes apply to the next turn and are saved with the Coordinator.";
 const PLATFORM_LABEL = { darwin: "macOS", linux: "Linux", win32: "Windows", freebsd: "FreeBSD" };
 function pmHostOfflineMessage(name) {
-  return `Your PM's machine (${name}) is offline.`;
+  return `Your Coordinator's machine (${name}) is offline.`;
 }
 function readPmHostActive(raw) {
   if (!raw || typeof raw !== "object" || typeof raw.machine_id !== "string" || typeof raw.name !== "string") return null;
@@ -1390,9 +1643,9 @@ function readPmHostView(raw) {
     activeName: name(view.active_machine?.host), thisName: name(view.this_machine?.name) };
 }
 function pmHostViewLabel(view) {
-  const details = "PM host details are in the hosted app";
-  if (view.thisActive) return `PM on ${view.activeName || view.thisName || "this machine"} (this machine) · ${details}`;
-  if (view.connected && view.activeName) return `PM on ${view.activeName} · ${details}`;
+  const details = "Coordinator machine details are in the hosted app";
+  if (view.thisActive) return `Coordinator on ${view.activeName || view.thisName || "this machine"} (this machine) · ${details}`;
+  if (view.connected && view.activeName) return `Coordinator on ${view.activeName} · ${details}`;
   if (!view.connected) return `${view.thisName || "This machine"} isn’t connected to the cloud relay · ${details}`;
   return details;
 }
@@ -1403,8 +1656,8 @@ function renderPmHost() {
   bar.hidden = selected !== "pm" || !authorized || (pmHostChecked && !pmHost && !view);
   bar.setAttribute("aria-busy", String(!pmHostChecked));
   const offline = !!active && !active.online;
-  const label = !pmHostChecked ? "Checking which machine runs the PM…"
-    : pmHost ? (active ? `PM on ${active.name} · ${active.online ? "online" : "offline"}` : "No machine runs the PM yet")
+  const label = !pmHostChecked ? "Checking which machine runs the Coordinator…"
+    : pmHost ? (active ? `Coordinator on ${active.name} · ${active.online ? "online" : "offline"}` : "No machine runs the Coordinator yet")
     : view ? pmHostViewLabel(view) : "";
   if ($("#pm-host-label").textContent !== label) $("#pm-host-label").textContent = label;
   $("#pm-host-dot").className = `dot ${active?.online || view?.thisActive ? "online" : active ? "offline" : "unknown"}`;
@@ -1444,7 +1697,7 @@ function updateMoveControls() {
   const confirm = $("#confirm-move-pm");
   const valid = !!moveChoice && moveTargets().some((m) => m.machine_id === moveChoice);
   confirm.disabled = moveBusy || !valid || !authorized;
-  confirm.textContent = moveBusy ? "Moving…" : "Move PM";
+  confirm.textContent = moveBusy ? "Moving…" : "Move Coordinator";
   $("#move-pm-form").setAttribute("aria-busy", String(moveBusy));
 }
 function renderMoveList() {
@@ -1456,7 +1709,7 @@ function renderMoveList() {
   const rows = machines.map((m) => ({
     id: m.machine_id, name: m.name, active: m.active, online: m.online, enabled: selectable.has(m.machine_id),
     meta: [PLATFORM_LABEL[m.platform] || m.platform || "Unknown platform", m.online ? "Online" : "Offline", lastSeenText(m.last_seen)].join(" · "),
-    note: m.active ? "Runs the PM now" : !m.online ? "Offline machines can’t take the PM" : "",
+    note: m.active ? "Runs the Coordinator now" : !m.online ? "Offline machines can’t take the Coordinator" : "",
     seen: m.last_seen,
   }));
   moveEpoch = pmHost?.active?.epoch ?? 0;
@@ -1487,8 +1740,8 @@ function renderMoveList() {
     }
     if (!rows.length) list.append(node("p", "field-hint", "No machines have connected to the relay yet."));
     else if (!selectable.size) list.append(node("p", "field-hint", pmHost?.mode === "local"
-      ? "This Foreman runs without the cloud relay, so the PM stays on this machine."
-      : "No other machine is online. Start Foreman on another machine to move the PM there."));
+      ? "This Foreman runs without the cloud relay, so the Coordinator stays on this machine."
+      : "No other machine is online. Start Foreman on another machine to move the Coordinator there."));
     if (focused !== null) {
       const same = [...list.querySelectorAll("input")].find((input) => input.value === focused && !input.disabled);
       (same || list.querySelector("input:not(:disabled)") || $("#close-move-pm")).focus({ preventScroll: true });
@@ -1510,7 +1763,13 @@ function openMovePm(event) {
 $("#move-pm").addEventListener("click", openMovePm);
 for (const selector of ["#close-move-pm", "#cancel-move-pm"])
   $(selector).addEventListener("click", () => ui.moveDialog.close());
+// A dialog's close event is queued, not fired by close() itself, so a quick close and reopen
+// (Escape, then Enter on the still-focused Move button) can deliver the first close after the
+// second opening. That late event must not undo the new opening: pop its history entry, clear
+// its choice, or drop its opener (which sent focus to the info screen instead, #189). Each
+// dialog's close handler returns early while its dialog is open again.
 ui.moveDialog.addEventListener("close", () => {
+  if (ui.moveDialog.open) return;
   popOverlay("move");
   moveChoice = null;
   moveError();
@@ -1564,7 +1823,7 @@ $("#move-pm-form").addEventListener("submit", async (event) => {
     ui.moveDialog.close();
     renderPmHost();
     if (selected === "pm") renderHeading();
-    showNotice(`The PM now runs on ${active.name}. It starts a new conversation with the same memory.`);
+    showNotice(`The Coordinator now runs on ${active.name}. It starts a new conversation with the same memory.`);
     void poll();
   } catch (error) {
     if (epoch !== authEpoch || !authorized) return;
@@ -1602,10 +1861,13 @@ function openInfo(event) {
   ui.infoDialog.showModal();
   pushOverlay("info", () => ui.infoDialog.open);
   $("#close-info").focus();
+  // The Coordinator's info summarizes the settings it launches Leads with.
+  if (selected === "pm") void loadSettings();
 }
 $("#open-info").addEventListener("click", openInfo);
 $("#close-info").addEventListener("click", () => ui.infoDialog.close());
 ui.infoDialog.addEventListener("close", () => {
+  if (ui.infoDialog.open) return; // A late close event after a reopen (see the Move dialog's).
   popOverlay("info");
   if (!authorized) return;
   const opener = infoOpener;
@@ -1616,6 +1878,212 @@ ui.infoDialog.addEventListener("close", () => {
 // reader users reach the same screen through the overflow menu.
 $("#conversation-heading").addEventListener("click", (event) => { if (selected) openInfo(event); });
 
+// Settings (epic #157): GET /api/settings and POST /api/settings `{ key, value, version }`, one key
+// per change. The hosted app may write them (`writable: true`); the local UI shows them read-only.
+// Grants are only ever written from here, by the developer: no agent tool or host channel can.
+function readSettingsView(raw) {
+  if (!raw || typeof raw !== "object" || !raw.settings || typeof raw.settings !== "object") return null;
+  const settings = raw.settings;
+  const roles = settings.roles && typeof settings.roles === "object" ? settings.roles : {};
+  const grants = Array.isArray(settings.bypass_grants)
+    ? settings.bypass_grants.filter((g) => g && ["coordinator", "lead"].includes(g.role) && typeof g.project === "string" && typeof g.allow === "boolean")
+    : DEFAULT_BYPASS_GRANTS.map((g) => ({ ...g }));
+  const versions = raw.versions && typeof raw.versions === "object" ? raw.versions : {};
+  return {
+    settings: { roles, bypass_grants: grants, bypass_ask: settings.bypass_ask === true },
+    versions: { roles: versions.roles | 0, bypass_grants: versions.bypass_grants | 0, bypass_ask: versions.bypass_ask | 0 },
+    writable: raw.writable === true,
+  };
+}
+function settingsNotice(text, error = false) {
+  const status = $("#settings-status");
+  if (status.textContent !== text) status.textContent = text;
+  status.classList.toggle("error", error);
+}
+async function loadSettings() {
+  if (!authorized) return;
+  const request = ++settingsRequest, epoch = authEpoch;
+  settingsLoading = true;
+  renderSettings();
+  renderCoordinatorSettings();
+  try {
+    const view = readSettingsView(await api("/api/settings"));
+    if (request !== settingsRequest || epoch !== authEpoch || !authorized) return;
+    if (!view) throw new Error("The settings could not be read.");
+    settingsView = view;
+    settingsError = "";
+  } catch (error) {
+    if (request !== settingsRequest || epoch !== authEpoch || !authorized) return;
+    settingsError = error?.status === 404 ? "this host or relay doesn’t serve settings yet." : errorMessage(error);
+  } finally {
+    if (request === settingsRequest && epoch === authEpoch) {
+      settingsLoading = false;
+      renderSettings();
+      renderCoordinatorSettings();
+    }
+  }
+}
+let settingsModels = [], settingsModelsLoaded = false;
+async function loadSettingsModels() {
+  const epoch = authEpoch;
+  try {
+    const result = await api("/api/models?provider=claude");
+    if (epoch !== authEpoch || !authorized) return;
+    settingsModels = Array.isArray(result?.models) ? result.models : [];
+    settingsModelsLoaded = true;
+    renderSettings(true);
+  } catch { /* The selects keep the defaults and the saved values; reopening retries. */ }
+}
+function settingOptions(select, options, value) {
+  const signature = JSON.stringify([options, value]);
+  if (select.dataset.signature === signature) return;
+  select.dataset.signature = signature;
+  select.replaceChildren(...options.map(([optionValue, label]) => new Option(label, optionValue)));
+  if (value && !options.some(([optionValue]) => optionValue === value)) select.add(new Option(value, value));
+  select.value = value || "";
+}
+function renderSettings(force = false) {
+  const view = settingsView;
+  const writable = !!view?.writable;
+  $("#settings-fields").disabled = !view || !writable || settingsBusy || !authorized;
+  if (!ui.settingsDialog.open && !force) return;
+  if (!view) settingsNotice(settingsLoading ? "Loading settings…" : settingsError ? `Settings are unavailable: ${settingsError}` : "", !!settingsError && !settingsLoading);
+  else if (!writable) settingsNotice("Read-only here. Change settings from the hosted app.");
+  else if (settingsBusy) settingsNotice("Saving…");
+  // While a change saves, the controls keep what the developer just chose; the answer (or, on a
+  // failure, the re-read settings) is shown once it arrives.
+  if (settingsBusy) return;
+  const settings = view?.settings || { roles: {}, bypass_grants: DEFAULT_BYPASS_GRANTS, bypass_ask: false };
+  for (const select of ui.settingsDialog.querySelectorAll("select[data-role]")) {
+    const { role, field } = select.dataset;
+    const current = settings.roles?.[role]?.[field] || "";
+    const fallback = `Default (${ROLE_DEFAULTS[role][field]})`;
+    const options = field === "effort"
+      ? [["", fallback], ...EFFORTS.map((effort) => [effort, effort])]
+      : [["", fallback], ...settingsModels.filter((m) => typeof m?.value === "string").map((m) => [m.value, m.displayName || m.value])];
+    settingOptions(select, options, current);
+  }
+  const grants = settings.bypass_grants || [];
+  for (const box of ui.settingsDialog.querySelectorAll("input[data-grant-role]"))
+    box.checked = !!grants.find((g) => g.role === box.dataset.grantRole && g.project === "*")?.allow;
+  $("#bypass-ask").checked = settings.bypass_ask === true;
+  const list = $("#grant-override-list");
+  const overrides = grants.filter((g) => g.project !== "*");
+  const signature = JSON.stringify(overrides);
+  if (list.dataset.signature !== signature) {
+    list.dataset.signature = signature;
+    list.replaceChildren();
+    for (const grant of overrides) {
+      const item = node("li", "grant-override");
+      const who = grant.role === "coordinator" ? "Leads the Coordinator starts" : "Workers that Leads start";
+      item.append(node("span", "", `${grant.project} · ${who} · ${grant.allow ? "⚠ Bypass" : "Auto (Bypass off)"}`));
+      const remove = node("button", "btn ghost small", "Remove");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Remove the ${grant.project} override for ${who.toLowerCase()}`);
+      // Built from the settings as they are at click time, never from the list drawn earlier: a
+      // stale copy would re-post grants changed since (e.g. turn a role's Bypass back on).
+      const { role, project } = grant;
+      remove.addEventListener("click", () => {
+        const current = settingsView?.settings.bypass_grants || [];
+        void saveSetting("bypass_grants", current.filter((g) => !(g.role === role && g.project.toLowerCase() === project.toLowerCase())));
+      });
+      item.append(remove);
+      list.append(item);
+    }
+    if (!overrides.length) list.append(node("li", "field-hint", "None. Every project follows the settings above."));
+  }
+}
+async function saveSetting(key, value) {
+  if (!settingsView?.writable || settingsBusy || !authorized) return;
+  const epoch = authEpoch;
+  // A read still in flight predates this write; its answer must not replace the saved view.
+  settingsRequest++;
+  settingsLoading = false;
+  settingsBusy = true;
+  renderSettings();
+  let saved = false;
+  try {
+    const view = readSettingsView(await post("/api/settings", { key, value, version: settingsView.versions[key] }));
+    if (epoch !== authEpoch || !authorized) return;
+    if (view) settingsView = { ...view, writable: true };
+    saved = true;
+    settingsNotice("Saved.");
+  } catch (error) {
+    if (epoch !== authEpoch || !authorized) return;
+    const conflict = error?.status === 409;
+    settingsBusy = false;
+    await loadSettings();
+    settingsNotice(conflict ? "These settings changed somewhere else. The latest values are shown; make your change again." : `Could not save. ${errorMessage(error)}`, true);
+  } finally {
+    if (epoch === authEpoch) {
+      settingsBusy = false;
+      renderSettings();
+      if (saved) settingsNotice("Saved.");
+      renderCoordinatorSettings();
+    }
+  }
+}
+for (const select of ui.settingsDialog.querySelectorAll("select[data-role]"))
+  select.addEventListener("change", () => {
+    const { role, field } = select.dataset;
+    const roles = structuredClone(settingsView?.settings.roles || {});
+    const entry = { ...(roles[role] || {}) };
+    if (select.value) entry[field] = select.value;
+    else delete entry[field];
+    roles[role] = entry;
+    void saveSetting("roles", roles);
+  });
+for (const box of ui.settingsDialog.querySelectorAll("input[data-grant-role]"))
+  box.addEventListener("change", () => {
+    const grants = (settingsView?.settings.bypass_grants || []).filter((g) => !(g.role === box.dataset.grantRole && g.project === "*"));
+    grants.unshift({ role: box.dataset.grantRole, project: "*", allow: box.checked });
+    void saveSetting("bypass_grants", grants);
+  });
+$("#bypass-ask").addEventListener("change", () => void saveSetting("bypass_ask", $("#bypass-ask").checked));
+$("#grant-add").addEventListener("click", () => {
+  const project = $("#grant-add-project").value.trim();
+  const role = $("#grant-add-role").value, allow = $("#grant-add-allow").value === "true";
+  if (!project || project === "*") { settingsNotice("Enter a registered project name.", true); $("#grant-add-project").focus(); return; }
+  const grants = (settingsView?.settings.bypass_grants || []).filter((g) => !(g.role === role && g.project.toLowerCase() === project.toLowerCase()));
+  grants.push({ role, project, allow });
+  $("#grant-add-project").value = "";
+  void saveSetting("bypass_grants", grants);
+});
+async function loadGrantProjects() {
+  const epoch = authEpoch;
+  try {
+    const result = await api("/api/projects");
+    if (epoch !== authEpoch) return;
+    $("#grant-projects").replaceChildren(...(result.projects || []).filter((p) => typeof p?.name === "string").map((p) => new Option(p.name)));
+  } catch { /* Project names can still be typed. */ }
+}
+let settingsOpener = null;
+function openSettings(event) {
+  if (!authorized || ui.settingsDialog.open) return;
+  closeMenus();
+  const opener = event?.currentTarget;
+  settingsOpener = opener && opener !== $("#open-settings") ? opener : $("#conversation-menu-button");
+  settingsNotice("");
+  renderSettings(true);
+  ui.settingsDialog.showModal();
+  pushOverlay("settings", () => ui.settingsDialog.open);
+  $("#close-settings").focus();
+  void loadSettings();
+  if (!settingsModelsLoaded && host.online) void loadSettingsModels();
+  if (host.online) void loadGrantProjects();
+}
+$("#open-settings").addEventListener("click", openSettings);
+$("#info-open-settings").addEventListener("click", openSettings);
+$("#close-settings").addEventListener("click", () => ui.settingsDialog.close());
+$("#settings-form").addEventListener("submit", (event) => event.preventDefault());
+ui.settingsDialog.addEventListener("close", () => {
+  if (ui.settingsDialog.open) return; // A late close event after a reopen (see the Move dialog's).
+  popOverlay("settings");
+  if (!authorized) return;
+  const opener = settingsOpener;
+  settingsOpener = null;
+  if (opener?.isConnected && !opener.closest("[hidden], [inert]")) opener.focus({ preventScroll: true });
+});
 // Menus use the popover top layer; light dismiss and Escape come from the browser.
 function closeMenus() {
   for (const menu of [ui.menu, ui.messageMenu]) if (menu.matches(":popover-open")) menu.hidePopover();
@@ -1745,6 +2213,26 @@ ui.messages.addEventListener("keydown", (event) => {
   openMessageMenu(event.target);
 });
 
+// GET /api/leads: the Lead registry. A host or relay without the route answers 404; it is asked
+// again only once a minute, so an older host costs one request a minute, not one a poll.
+async function refreshLeads(epoch) {
+  if (Date.now() < leadsRetryAt) return;
+  try {
+    const result = await api("/api/leads");
+    if (!authorized || epoch !== authEpoch) return;
+    const next = Array.isArray(result?.leads) ? result.leads.filter((lead) => lead && typeof lead === "object" && typeof lead.lead === "string") : null;
+    const changed = JSON.stringify(next) !== JSON.stringify(leads);
+    leads = next;
+    leadsMode = result?.mode === "local" ? "local" : "relay";
+    if (changed) { renderRail(); renderHeading(); }
+  } catch (error) {
+    if (!authorized || epoch !== authEpoch) return;
+    if (error?.status === 404) {
+      leadsRetryAt = Date.now() + 60_000;
+      if (leads !== null) { leads = null; renderRail(); renderHeading(); }
+    }
+  }
+}
 async function poll() {
   clearTimeout(pollTimer);
   if (!authorized) return;
@@ -1758,7 +2246,7 @@ async function poll() {
   polling = true;
   pollAgain = false;
   const epoch = authEpoch;
-  let pmHostRead;
+  let pmHostRead, leadsRead;
   try {
     const nextHost = await api("/api/host");
     if (!authorized || epoch !== authEpoch) return;
@@ -1770,6 +2258,7 @@ async function poll() {
     // read on every poll, exactly once, whether or not the host is online. It is read alongside
     // the sessions, so a slow answer never holds up the session list.
     pmHostRead = refreshPmHost(epoch);
+    leadsRead = refreshLeads(epoch);
     if (host.online) {
       const rows = await api("/api/sessions");
       if (!authorized || epoch !== authEpoch) return;
@@ -1805,6 +2294,7 @@ async function poll() {
   } finally {
     // One PM machine read per poll: the next poll starts only after this one's answer.
     await pmHostRead?.catch(() => { /* Display only; the next poll reads it again. */ });
+    await leadsRead?.catch(() => { /* Display only; the next poll reads it again. */ });
     polling = false;
     if (!authorized) pollAgain = false;
     else if (pollAgain) void poll();
@@ -1946,10 +2436,10 @@ async function loadPmModels() {
     const result = await api("/api/models?provider=claude");
     if (epoch !== authEpoch || !authorized) return;
     modelOptions($("#pm-model"), result.models || [], pmModel);
-    $("#pm-model-hint").textContent = "Changes apply to the next turn and are saved with the PM.";
+    $("#pm-model-hint").textContent = PM_MODEL_HINT;
   } catch (error) {
     if (epoch !== authEpoch || !authorized) return;
-    $("#pm-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen the project manager to retry.`;
+    $("#pm-model-hint").textContent = `Models unavailable: ${errorMessage(error)} Reopen the Coordinator to retry.`;
   } finally { if (epoch === authEpoch) { pmModelLoading = false; updateControls(); } }
 }
 $("#pm-model").addEventListener("change", async () => {
@@ -2050,85 +2540,34 @@ async function changeProject(action) {
 $("#remember-project").addEventListener("click", () => changeProject("register"));
 $("#rename-project").addEventListener("click", () => changeProject("update"));
 $("#remove-project").addEventListener("click", () => changeProject("remove"));
-function launchStatus(text, busy = false) {
-  $("#launch-status-label").textContent = text;
-  $("#launch-status").classList.toggle("is-active", busy);
-  $("#launch-status .activity-symbol").hidden = !busy;
+// "Ask the Coordinator" (D7): the brief goes to the Coordinator as a message, and its chat opens.
+// The Coordinator decides whether to start a Lead and with which setup; nothing launches here.
+function askStatus(text, error = false) {
+  const status = $("#ask-coordinator-status");
+  if (status.textContent !== text) status.textContent = text;
+  status.classList.toggle("error", error);
 }
-function cancelLauncher() {
-  launchRevision++; launchBusy = false;
-  const id = launchJob; launchJob = null;
-  if (id && authorized) void post("/api/launch/cancel", { id }).catch(() => {});
-}
-function setLaunchMode(mode) {
-  launchMode = mode;
-  $("#launch-brief-panel").hidden = mode !== "brief";
-  $("#session-fields").hidden = mode === "brief";
-  $("#session-fields").disabled = mode === "brief";
-  $("#create-session").hidden = mode === "brief";
-  $("#create-session").textContent = mode === "proposal" ? "Confirm and start" : "Start session";
-  $("#edit-brief").hidden = mode === "brief";
-  $("#start-manually").hidden = mode === "manual";
-  $("#launch-reason").hidden = mode !== "proposal";
+$("#ask-coordinator").addEventListener("input", () => { askStatus(""); updateControls(); });
+$("#send-to-coordinator").addEventListener("click", async () => {
+  const text = $("#ask-coordinator").value.trim();
+  if (askBusy || !authorized || !host.online || !text) return;
+  const epoch = authEpoch;
+  askBusy = true;
+  askStatus("");
   updateControls();
-}
-function manualLaunch(message = "") {
-  cancelLauncher();
-  if (launchMode === "brief" || !$("#new-prompt").value.trim()) $("#new-prompt").value = $("#launch-brief").value;
-  setLaunchMode("manual"); launchStatus(message);
-  $("#new-name").focus();
-}
-async function loadLauncherModels() {
-  const request = ++launcherModelRequest, epoch = authEpoch, value = $("#launcher-model").value || "claude-sonnet-5";
   try {
-    const result = await api("/api/models?provider=claude");
-    if (epoch !== authEpoch || request !== launcherModelRequest || !ui.dialog.open) return;
-    const select = $("#launcher-model");
-    select.replaceChildren(new Option("claude-sonnet-5 (default)", "claude-sonnet-5"));
-    for (const model of result.models || []) if (model.value !== "claude-sonnet-5") select.add(new Option(model.displayName, model.value));
-    retainModel(select, value);
-    $("#launcher-model-hint").textContent = "Proposes the setup only. The session has its own model selection.";
+    await post("/api/pm/message", { text });
+    if (epoch !== authEpoch || !authorized) return;
+    askBusy = false;
+    $("#ask-coordinator").value = "";
+    ui.dialog.close();
+    setActionFeedback("pm", "send", "Message accepted.");
+    if (selected !== "pm") await selectSession("pm");
+    else await refreshSelected().catch(showRefreshError);
   } catch (error) {
-    if (epoch === authEpoch && request === launcherModelRequest) $("#launcher-model-hint").textContent = `Launcher models unavailable: ${errorMessage(error)} You can start manually.`;
-  }
-}
-$("#launch-brief").addEventListener("input", updateControls);
-$("#start-manually").addEventListener("click", () => manualLaunch());
-$("#edit-brief").addEventListener("click", () => {
-  cancelLauncher(); setLaunchMode("brief"); launchStatus(""); $("#launch-brief").focus();
-});
-$("#propose-session").addEventListener("click", async () => {
-  if (launchBusy || !authorized || !host.online || !$("#launch-brief").value.trim()) return;
-  cancelLauncher();
-  const revision = launchRevision, epoch = authEpoch, id = crypto.randomUUID();
-  launchJob = id; launchBusy = true;
-  $("#new-error").hidden = true;
-  launchStatus("Working… Proposing your session", true); updateControls();
-  const current = () => revision === launchRevision && epoch === authEpoch && authorized && ui.dialog.open;
-  try {
-    let job = await post("/api/launch/propose", { id, brief: $("#launch-brief").value.trim(), model: $("#launcher-model").value });
-    const deadline = Date.now() + 65_000;
-    while (current() && job.status === "working") {
-      if (Date.now() > deadline) throw new Error("Launcher took too long.");
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      if (!current()) return;
-      job = await api(`/api/launch?id=${encodeURIComponent(id)}`);
-    }
-    if (!current()) return;
-    if (job.status !== "ready" || !job.proposal) throw new Error(job.error || "Launcher was cancelled or returned no proposal.");
-    const proposal = job.proposal;
-    $("#new-name").value = proposal.name; $("#new-cwd").value = proposal.cwd;
-    $("#new-prompt").value = proposal.text; $("#new-provider").value = proposal.provider;
-    $("#launch-reason").textContent = proposal.reason;
-    await loadNewModels(proposal.model);
-    if (!current()) return;
-    await resolveNewProject();
-    if (!current()) return;
-    launchBusy = false; launchJob = null;
-    setLaunchMode("proposal"); launchStatus("Proposal ready. Edit any field, then confirm to start.");
-    $("#new-name").focus();
-  } catch (error) {
-    if (current()) manualLaunch(`${errorMessage(error)} Your brief is preserved below; review the manual form.`);
+    if (epoch === authEpoch && authorized) askStatus(`${errorMessage(error)} Your message is still here. Check the Coordinator’s conversation before sending again.`, true);
+  } finally {
+    if (epoch === authEpoch) { askBusy = false; updateControls(); }
   }
 });
 let dialogOpener;
@@ -2140,18 +2579,17 @@ function openNew(event) {
   $("#new-error").hidden = true;
   $("#new-policy").value = "native";
   updateNewPolicy();
+  askStatus("");
   ui.dialog.showModal();
   pushOverlay("dialog", () => ui.dialog.open);
-  setLaunchMode("brief"); launchStatus("");
-  void loadLauncherModels();
   void loadNewModels();
   void loadProjects(); void resolveNewProject();
-  $("#launch-brief").focus();
+  $("#ask-coordinator").focus();
 }
 ui.newButton.addEventListener("click", openNew);
 ui.dialog.addEventListener("close", () => {
+  if (ui.dialog.open) return; // A late close event after a reopen (see the Move dialog's).
   popOverlay("dialog");
-  cancelLauncher(); launcherModelRequest++;
   projectRevision++; projectPending = false; projectResolution = null; projectSelection = null;
   if (!authorized || creating) return;
   if (dialogOpener?.isConnected && !dialogOpener.closest("[inert]")) dialogOpener.focus({ preventScroll: true });
@@ -2160,7 +2598,7 @@ for (const selector of ["#close-dialog", "#cancel-new"])
   $(selector).addEventListener("click", () => ui.dialog.close());
 ui.newForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (launchMode === "brief" || launchBusy || creating || !host.online || projectPending || !projectResolution || projectResolution.reference !== $("#new-cwd").value.trim() || !ui.newForm.reportValidity()) return;
+  if (creating || !host.online || projectPending || !projectResolution || projectResolution.reference !== $("#new-cwd").value.trim() || !ui.newForm.reportValidity()) return;
   const values = {
     provider: $("#new-provider").value,
     permission_mode: $("#new-policy").value,
@@ -2190,7 +2628,7 @@ ui.newForm.addEventListener("submit", async (event) => {
     creationAttempt = undefined;
     ui.dialog.close();
     $("#new-name").value = "";
-    $("#new-prompt").value = ""; $("#launch-brief").value = "";
+    $("#new-prompt").value = "";
     await selectSession(session.session_key);
   } catch (error) {
     if (epoch !== authEpoch || !authorized) return;
@@ -2200,7 +2638,7 @@ ui.newForm.addEventListener("submit", async (event) => {
   } finally {
     if (epoch === authEpoch) {
       creating = false;
-      $("#create-session").textContent = launchMode === "proposal" ? "Confirm and start" : "Start session";
+      $("#create-session").textContent = "Start session";
       updateControls();
     }
   }
@@ -2215,7 +2653,7 @@ for (const selector of ["#close-nav", "#nav-backdrop"])
     $("#open-nav").focus();
   });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !ui.dialog.open && !ui.moveDialog.open && !ui.infoDialog.open && ui.app.classList.contains("nav-open")) {
+  if (event.key === "Escape" && !ui.dialog.open && !ui.moveDialog.open && !ui.infoDialog.open && !ui.settingsDialog.open && ui.app.classList.contains("nav-open")) {
     closeNav();
     $("#open-nav").focus();
   }
@@ -2521,6 +2959,7 @@ function openFromNotification(url) {
   const key = parseDeepLinkKey(target.search);
   if (ui.dialog.open) ui.dialog.close();
   if (ui.moveDialog.open) ui.moveDialog.close();
+  if (ui.settingsDialog.open) ui.settingsDialog.close();
   if (ui.infoDialog.open) ui.infoDialog.close();
   closeMenus();
   if (!key) {

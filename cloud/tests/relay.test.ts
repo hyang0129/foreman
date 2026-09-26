@@ -2,6 +2,7 @@ import { env, exports } from 'cloudflare:workers';
 import { runInDurableObject } from 'cloudflare:test';
 import { afterEach, describe, expect, it } from 'vitest';
 import { allowedRequest, MAX_BODY } from '../../shared/relay.ts';
+import { UNNAMED_HOST } from '../worker.ts';
 
 const sockets: WebSocket[] = [];
 afterEach(() => { for (const socket of sockets.splice(0)) { try { socket.close(1000, 'Test complete'); } catch {} } });
@@ -112,6 +113,12 @@ describe('Durable Object host relay with real WebSocket pairs', () => {
     expect((await stub.fetch('https://foreman.test/api/exec', { method: 'POST', body: '{}' })).status).toBe(404);
     expect((await stub.fetch('https://foreman.test/api/session/message', { method: 'POST', body: 'x'.repeat(MAX_BODY + 1) })).status).toBe(413);
   });
+  it(`#144: a host socket that has not said hello yet is named "${UNNAMED_HOST}", not "Mac"`, async () => {
+    const stub = relay(); await connect(stub);
+    const status = await (await stub.fetch('https://foreman.test/api/host')).json();
+    expect(status).toMatchObject({ online: true, host: UNNAMED_HOST });
+    expect(JSON.stringify(status)).not.toContain('Mac');
+  });
   it('stale host heartbeat reports offline', async () => {
     const stub = relay(); await connect(stub);
     await runInDurableObject(stub, (_instance, state) => {
@@ -141,11 +148,12 @@ describe('project registry relay contract', () => {
   });
 });
 
-// The launcher adds only these authenticated, narrowly allowlisted routes.
-it('permits launcher proposal/status/cancel but no arbitrary launch endpoints', () => {
-  expect(allowedRequest('GET', '/api/launch?id=123')).toBe(true);
-  expect(allowedRequest('POST', '/api/launch/propose')).toBe(true);
-  expect(allowedRequest('POST', '/api/launch/cancel')).toBe(true);
+// #157 D7: the launcher is removed, so no /api/launch* route is relayed.
+it('relays no launcher routes', () => {
+  expect(allowedRequest('GET', '/api/launch?id=123')).toBe(false);
+  expect(allowedRequest('GET', '/api/launch')).toBe(false);
+  expect(allowedRequest('POST', '/api/launch/propose')).toBe(false);
+  expect(allowedRequest('POST', '/api/launch/cancel')).toBe(false);
   expect(allowedRequest('POST', '/api/launch')).toBe(false);
   expect(allowedRequest('GET', '/api/launch/propose')).toBe(false);
   expect(allowedRequest('POST', '/api/launch/execute')).toBe(false);

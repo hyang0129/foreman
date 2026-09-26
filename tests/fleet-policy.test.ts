@@ -27,13 +27,27 @@ test('spawn_session accepts each managed preset and omission without native flag
   assert.equal((await spawn({ ...input, permission_mode: 'bypassPermissions' })).isError, true);
   assert.equal(launches.length, before);
 });
-test('PM may propose elevated settings but cannot approve its own elevated spawn', async () => {
+test('the Coordinator cannot spawn sessions at all (epic #157: it starts Leads; the Bypass deny moved to start_lead → launchAgent)', async () => {
   const pm = new ProjectManager({} as any);
   const guard = (pm as any).canUseTool;
-  for (const permission_mode of ['bypass', 'bypassPermissions']) {
+  for (const permission_mode of ['bypass', 'bypassPermissions', 'native', undefined]) {
     assert.equal((await guard('mcp__fleet__spawn_session', { permission_mode })).behavior, 'deny');
     const hook = await (pm as any).enforceToolBoundary({ hook_event_name: 'PreToolUse', tool_name: 'mcp__fleet__spawn_session', tool_input: { permission_mode } });
     assert.equal(hook.hookSpecificOutput.permissionDecision, 'deny');
   }
-  assert.equal((await guard('mcp__fleet__spawn_session', { permission_mode: 'native' })).behavior, 'allow');
+});
+
+test('the Coordinator fleet server (spawn: false) has no spawn_session; the default keeps it; sender reaches the peer binding', async () => {
+  const listed: string[] = [];
+  const service: any = { create: () => ({}), list: () => { listed.push('list'); return []; }, detail: () => { throw new Error('No such session'); }, send: () => ({}), receipt: () => undefined, activeSource: () => 'user' };
+  const fleet: any = { refresh: async () => {}, list: () => [] };
+  const coordinator = (makeFleetServer(fleet, service, undefined, undefined, { spawn: false, sender: 'coordinator' }).instance as any)._registeredTools;
+  assert.equal(coordinator.spawn_session, undefined);
+  for (const name of ['list_sessions', 'list_models', 'list_projects', 'resolve_project', 'register_project', 'session_tail', 'stop_session']) assert.ok(coordinator[name], name);
+  assert.equal((await coordinator.list_sessions.handler({})).isError, undefined);
+  assert.deepEqual(listed, ['list']);
+  assert.ok((makeFleetServer(fleet, service).instance as any)._registeredTools.spawn_session);
+  assert.ok((makeFleetServer(fleet, service, undefined, undefined, { sender: 'coordinator' }).instance as any)._registeredTools.spawn_session);
+  // An invalid sender identity is refused at construction, as bindPeerTools does.
+  assert.throws(() => makeFleetServer(fleet, service, undefined, undefined, { sender: '' }));
 });
