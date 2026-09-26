@@ -576,7 +576,7 @@ nothing happens, and Stop still works.
 | `sessions/<session_id>.json` | Hook records |
 | `events.jsonl` | Append-only hook log (rotated at 20 MB) |
 | `managed/` | Managed session snapshots, histories and receipts |
-| `projects.json` | Project registry: names, aliases and paths on this machine |
+| `projects.json` | Project registry: names, aliases and paths on this machine. Session directories are added automatically, except git worktrees, temp and `scratchpad` directories, `$HOME` and Foreman's own state directories. With the service stopped, `node scripts/prune-projects.ts` lists entries matching those rules or whose directory is gone, and `--apply` drops them after a timestamped backup |
 | `local-api-token` | Token for the loopback UI and API. Any process running as the user can read it, including a Bypass agent; see [the local API token caveat](SESSION_PERMISSIONS.md#the-local-api-token-caveat) |
 | `cloud.json` | Relay pairing (`url`, `token`), mode 0600. The same file on every paired machine; see [Cloud setup](CLOUD_SETUP.md#add-a-second-machine) |
 | `machine.json` | This machine's identity, `{ machine_id, name }`, mode 0600. Never copy it to another machine |
