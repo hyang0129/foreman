@@ -298,7 +298,7 @@ describe('reassignment (POST /api/pm/host)', () => {
     expect((await statusOf({ machine_id: b.machine_id, expected_epoch: 0 }))[0]).toBe(409);
     expect((await statusOf({ machine_id: b.machine_id, expected_epoch: 2 }))[0]).toBe(409);
     expect(await statusOf({ machine_id: crypto.randomUUID(), expected_epoch: 1 })).toEqual([404, { error: 'Unknown machine' }]);
-    expect(await statusOf({ machine_id: a.machine_id, expected_epoch: 1 })).toEqual([400, { error: 'The PM already runs on machine-a.' }]);
+    expect(await statusOf({ machine_id: a.machine_id, expected_epoch: 1 })).toEqual([400, { error: 'The Coordinator already runs on machine-a.' }]);
     const [offlineStatus, offlineBody] = await statusOf({ machine_id: c.machine_id, expected_epoch: 1 });
     expect(offlineStatus).toBe(409);
     expect(offlineBody.error).toContain('machine-c is offline');

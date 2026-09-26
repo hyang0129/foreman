@@ -80,7 +80,7 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService, pr
       prompt: z.string().min(20).describe("The full brief for the worker"),
       mode: z.enum(["managed", "bg", "tab"]).optional().describe("managed (default), bg, or tab"),
       provider: z.enum(["claude", "codex"]).optional().describe("Managed provider (default claude)"),
-      permission_mode: z.enum([...PERMISSION_MODES, "default", "acceptEdits", "bypassPermissions"]).optional().describe("Managed mode: native (default) or bypass. The PM cannot launch Bypass; the developer must choose it in New session. Legacy modes accept only default, acceptEdits, bypassPermissions."),
+      permission_mode: z.enum([...PERMISSION_MODES, "default", "acceptEdits", "bypassPermissions"]).optional().describe("Managed mode: native (default) or bypass. The Coordinator cannot launch Bypass; the developer must choose it in New session. Legacy modes accept only default, acceptEdits, bypassPermissions."),
       model: z.string().optional().describe("Optional model identifier from list_models for the selected provider; omit to use provider settings"),
     },
     async ({ name, cwd, prompt, mode, provider, permission_mode, model }) => {
