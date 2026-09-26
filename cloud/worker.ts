@@ -1,10 +1,15 @@
 import { DurableObject } from 'cloudflare:workers';
 import { verifyUser, validHostToken } from './auth.ts';
 import { allowedRequest, MAX_BODY, MAX_RESPONSE, MAX_RESPONSE_FRAME, type RelayResponse } from '../shared/relay.ts';
-import { buildPushPayload, cleanDisplayName, DEFAULT_PUSH_KINDS, isPushPreferenceKind, parseNotifyFrame, PUSH_KINDS, type PushEvent, type PushKind } from '../shared/notify.ts';
+import { buildPushPayload, cleanDisplayName, DEFAULT_PUSH_KINDS, isPushPreferenceKind, parseNotifyFrame, PUSH_KINDS, utf8Length, type PushEvent, type PushKind } from '../shared/notify.ts';
 import { fromB64u, loadVapidKeys, pushEndpointAllowed, sendPush, topicFor, validReceiverKeys, type PushTarget } from './push.ts';
-import { isHelloV2, parseHello, parsePmHostMoveRequest, parsePmRpc, pmHostOfflineMessage, pmRpcError, type HelloV2, type HostStatusResponse, type PmAssignment, type PmHostMoveResponse, type PmRpcResult } from '../shared/pm-state.ts';
+import { isHelloV2, isPmId, parseHello, parsePmHostMoveRequest, parsePmRpc, pmHostOfflineMessage, pmRpcError, type HelloV2, type HostStatusResponse, type PmAssignment, type PmHostMoveResponse, type PmRpcResult } from '../shared/pm-state.ts';
 import { PmState } from './pm-state.ts';
+import { LeadState } from './leads.ts';
+import {
+  LEADS_ROUTE, MAX_LEAD_FRAME, MAX_LEAD_LIST, MAX_LEAD_RESULT_FRAME, SETTINGS_ROUTE, leadRpcError, parseLeadRpc, parseSettingsPost,
+  type LeadRpcResult, type LeadsResponse, type SettingsPostResponse, type SettingsResponse,
+} from '../shared/roles.ts';
 
 export function json(data: unknown, status = 200) {
   return Response.json(data, { status, headers: { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } });
@@ -23,6 +28,8 @@ export const CHECK_INTERVAL = 60_000;
 const HOST_FRESH = 65_000;
 /** 503 text while no PM host is assigned and no legacy host is connected (#122: platform-neutral). */
 export const HOST_OFFLINE_MESSAGE = 'The execution host is offline. Open Foreman on it and reconnect.';
+/** #144: the name of a host socket that has not said hello yet (machine-neutral; was 'Mac'). */
+export const UNNAMED_HOST = 'execution host';
 
 function pushRoute(method: string, url: URL) {
   return method === 'POST' && !url.search && PUSH_ROUTES.includes(url.pathname);
@@ -33,6 +40,19 @@ export const PM_HOST_ROUTE = '/api/pm/host';
 export const MAX_PM_HOST_BODY = 1024;
 function pmHostRoute(method: string, url: URL) {
   return (method === 'GET' || method === 'POST') && !url.search && url.pathname === PM_HOST_ROUTE;
+}
+
+/**
+ * Worker/DO-terminated (#157 CL-02, H2): the Lead registry (GET only) and the developer settings
+ * (GET, and POST, the only writer of settings anywhere, including the #158 Bypass grants). Never on
+ * the host relay allowlist, never relayed to a host, and answered while every host is offline.
+ */
+export const MAX_SETTINGS_BODY = 64 * 1024;
+function leadsRoute(method: string, url: URL) {
+  return method === 'GET' && !url.search && url.pathname === LEADS_ROUTE;
+}
+function settingsRoute(method: string, url: URL) {
+  return (method === 'GET' || method === 'POST') && !url.search && url.pathname === SETTINGS_ROUTE;
 }
 
 export default {
@@ -68,9 +88,15 @@ export default {
       } else if (url.pathname === PM_HOST_ROUTE) {
         // The PM host record terminates in the Durable Object too, after the same identity and origin checks.
         if (!pmHostRoute(request.method, url)) return json({ error: 'Unknown API route' }, 404);
+      } else if (url.pathname === LEADS_ROUTE) {
+        // The Lead registry and developer settings terminate in the Durable Object too, after the
+        // same identity (Firebase bearer, allowed email) and same-origin checks as every hosted route.
+        if (!leadsRoute(request.method, url)) return json({ error: 'Unknown API route' }, 404);
+      } else if (url.pathname === SETTINGS_ROUTE) {
+        if (!settingsRoute(request.method, url)) return json({ error: 'Unknown API route' }, 404);
       } else if (!allowedRequest(request.method, url.pathname + url.search)) return json({ error: 'Unknown API route' }, 404);
     }
-    // This MVP has one explicitly allowlisted owner and one Mac.
+    // One explicitly allowlisted owner, one Durable Object (its machines are told apart inside it).
     return env.RELAY.get(env.RELAY.idFromName(env.ALLOWED_EMAIL)).fetch(request);
   },
 } satisfies ExportedHandler<Env>;
@@ -141,9 +167,11 @@ async function readJsonBody(request: Request, limit: number): Promise<Record<str
 export class HostRelay extends DurableObject<Env> {
   private pending = new Map<string, Pending>();
   private pm: PmState;
+  private leads: LeadState;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.pm = new PmState(ctx.storage);
+    this.leads = new LeadState(ctx.storage);
     // HostRelay is already a SQLite-backed class (migration v1), so these tables need no migration.
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS push_subscriptions (
         id TEXT PRIMARY KEY, endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL,
@@ -194,7 +222,7 @@ export class HostRelay extends DurableObject<Env> {
       // only that machine's older socket; a legacy hello keeps the old replace-all behavior.
       const [client, server] = Object.values(new WebSocketPair());
       this.ctx.acceptWebSocket(server!, ['host']);
-      server!.serializeAttachment({ host: 'Mac', lastSeen: Date.now() } satisfies Attachment);
+      server!.serializeAttachment({ host: UNNAMED_HOST, lastSeen: Date.now() } satisfies Attachment);
       // With no PM host assigned, a (re)connected host ends any outage; the next outage may notify
       // again. Once a PM host is assigned, only that machine's hello ends its outage.
       if (!this.pm.assignment()) { this.setState('outage_since', null); this.setState('offline_notified', null); }
@@ -205,6 +233,9 @@ export class HostRelay extends DurableObject<Env> {
     if (url.pathname.startsWith('/api/push/')) return this.pushRequest(request, url);
     // The PM host record is answered here, never relayed, and works while every host is offline.
     if (url.pathname === PM_HOST_ROUTE) return this.pmHostRequest(request, url);
+    // The Lead registry and developer settings likewise (#157 CL-02).
+    if (url.pathname === LEADS_ROUTE) return this.leadsRequest(request, url);
+    if (url.pathname === SETTINGS_ROUTE) return this.settingsRequest(request, url);
     const offline = () => {
       const assignment = this.pm.assignment();
       return json({ error: assignment ? pmHostOfflineMessage(this.pm.machineName(assignment.machine_id)) : HOST_OFFLINE_MESSAGE }, 503);
@@ -244,11 +275,13 @@ export class HostRelay extends DurableObject<Env> {
   }
   async webSocketMessage(socket: WebSocket, raw: string | ArrayBuffer) {
     if (typeof raw !== 'string' || raw.length > MAX_RESPONSE_FRAME) { socket.close(1009, 'Invalid frame'); this.failPending(socket); return; }
+    // An oversized lead_rpc is refused on its raw length before it is parsed.
+    if (this.refuseOversizedLeadRpc(socket, raw)) return;
     let message: any;
     try { message = JSON.parse(raw); } catch { socket.close(1003, 'Invalid JSON'); this.failPending(socket); return; }
     if (!message || typeof message !== 'object' || Array.isArray(message)) { socket.close(1003, 'Invalid message'); this.failPending(socket); return; }
     if (message.type === 'ping' || message.type === 'hello') {
-      const previous = HostRelay.attachment(socket) ?? { host: 'Mac', lastSeen: 0 };
+      const previous = HostRelay.attachment(socket) ?? { host: UNNAMED_HOST, lastSeen: 0 };
       const hello = message.type === 'hello' ? parseHello(message) : null;
       if (hello && !hello.ok) { socket.close(1008, 'Invalid hello'); this.failPending(socket); return; }
       if (hello?.ok && isHelloV2(hello.value)) {
@@ -279,6 +312,7 @@ export class HostRelay extends DurableObject<Env> {
     }
     if (message.type === 'notify') { try { this.acceptNotify(message); } catch {} return; }
     if (message.type === 'pm_rpc') { this.refreshHeartbeat(socket); this.acceptPmRpc(socket, message); return; }
+    if (message.type === 'lead_rpc') { this.refreshHeartbeat(socket); this.acceptLeadRpc(socket, message, raw); return; }
     if (message.type !== 'response') return;
     const reply = message as RelayResponse;
     const pending = this.pending.get(reply.id);
@@ -363,6 +397,66 @@ export class HostRelay extends DurableObject<Env> {
       } catch { result = pmRpcError(parsed.value.id, 'unavailable', 'PM state storage failed'); }
     }
     if (result) try { socket.send(JSON.stringify(result)); } catch {}
+  }
+
+  // ---- Leads and developer settings (#157 CL-02) --------------------------------------------------
+
+  /**
+   * A `lead_rpc` whose raw text is over MAX_LEAD_FRAME is answered `too_large` without being
+   * parsed. Recognized here: frames that open the way hosts serialize them
+   * (`{"type":"lead_rpc","id":"…"`); an oversized lead_rpc with any other key order is still refused
+   * on its raw byte length in acceptLeadRpc, before its arguments are validated.
+   */
+  private refuseOversizedLeadRpc(socket: WebSocket, raw: string): boolean {
+    if (raw.length <= MAX_LEAD_FRAME) return false; // UTF-16 length <= UTF-8 length: a cheap first test
+    const head = /^\s*\{\s*"type"\s*:\s*"lead_rpc"\s*(?:,\s*"id"\s*:\s*"([^"\\]{1,128})")?/.exec(raw.slice(0, 256));
+    if (!head || utf8Length(raw) <= MAX_LEAD_FRAME) return false;
+    this.refreshHeartbeat(socket);
+    const id = head[1];
+    if (id !== undefined && isPmId(id)) try { socket.send(JSON.stringify(leadRpcError(id, 'too_large', 'frame too large'))); } catch {}
+    return true;
+  }
+
+  // Accepted from any socket that sent a protocol-2 hello (not epoch-fenced like pm_rpc); a socket
+  // without one is refused `forbidden`. Answers are bounded by MAX_LEAD_RESULT_FRAME.
+  private acceptLeadRpc(socket: WebSocket, message: Record<string, unknown>, raw: string) {
+    const id = isPmId(message.id) ? message.id : null;
+    let result: LeadRpcResult | null;
+    if (utf8Length(raw) > MAX_LEAD_FRAME) result = id === null ? null : leadRpcError(id, 'too_large', 'frame too large');
+    else {
+      const parsed = parseLeadRpc(message);
+      if (!parsed.ok) result = parsed.id === null ? null : leadRpcError(parsed.id, parsed.code, parsed.error);
+      else {
+        const machineId = HostRelay.attachment(socket)?.machine_id;
+        try {
+          result = machineId
+            ? this.leads.execute(machineId, parsed.value, Date.now(), (m) => this.online(m), MAX_LEAD_RESULT_FRAME)
+            : leadRpcError(parsed.value.id, 'forbidden', 'Send a protocol 2 hello before Lead requests');
+        } catch { result = leadRpcError(parsed.value.id, 'unavailable', 'Lead storage failed'); }
+      }
+    }
+    if (result) try { socket.send(JSON.stringify(result)); } catch {}
+  }
+
+  private leadsRequest(request: Request, url: URL): Response {
+    if (!leadsRoute(request.method, url)) return json({ error: 'Unknown API route' }, 404);
+    // Ended Leads are included (the app's Archived group). Non-ended and newest come first, so the
+    // rows cut when the list would exceed MAX_LEAD_RESULT_FRAME are the oldest ended ones.
+    const envelope = utf8Length(JSON.stringify({ leads: [], mode: 'relay' } satisfies LeadsResponse)) - 2;
+    const leads = this.leads.list({ include_ended: true, limit: MAX_LEAD_LIST }, (m) => this.online(m), MAX_LEAD_RESULT_FRAME - envelope);
+    return json({ leads, mode: 'relay' } satisfies LeadsResponse);
+  }
+
+  private async settingsRequest(request: Request, url: URL): Promise<Response> {
+    if (!settingsRoute(request.method, url)) return json({ error: 'Unknown API route' }, 404);
+    if (request.method === 'GET') return json({ ...this.leads.settingsView(), writable: true } satisfies SettingsResponse);
+    const body = await readJsonBody(request, MAX_SETTINGS_BODY);
+    if (body instanceof Response) return body;
+    const parsed = parseSettingsPost(body);
+    if (!parsed.ok) return badRequest(`Invalid request: ${parsed.error}`);
+    const written = this.leads.writeSetting(parsed.value.key, parsed.value.value, parsed.value.version, Date.now());
+    if (!written.ok) return json({ error: 'This setting changed since the page loaded. Refresh and try again.', version: written.current }, 409);
+    return json({ ...written.view, writable: true } satisfies SettingsPostResponse);
   }
 
   private async pmHostRequest(request: Request, url: URL): Promise<Response> {
@@ -505,7 +599,7 @@ export class HostRelay extends DurableObject<Env> {
   private hostName() {
     const assignment = this.pm.assignment();
     if (assignment) return this.pm.machineName(assignment.machine_id);
-    return (this.hostSocket()?.deserializeAttachment() as Attachment | undefined)?.host ?? this.getState('host_name') ?? 'Mac';
+    return (this.hostSocket()?.deserializeAttachment() as Attachment | undefined)?.host ?? this.getState('host_name') ?? UNNAMED_HOST;
   }
 
   // Host -> relay notify frame. Validation, de-duplication and rate limiting are synchronous

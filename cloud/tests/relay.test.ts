@@ -2,6 +2,7 @@ import { env, exports } from 'cloudflare:workers';
 import { runInDurableObject } from 'cloudflare:test';
 import { afterEach, describe, expect, it } from 'vitest';
 import { allowedRequest, MAX_BODY } from '../../shared/relay.ts';
+import { UNNAMED_HOST } from '../worker.ts';
 
 const sockets: WebSocket[] = [];
 afterEach(() => { for (const socket of sockets.splice(0)) { try { socket.close(1000, 'Test complete'); } catch {} } });
@@ -111,6 +112,12 @@ describe('Durable Object host relay with real WebSocket pairs', () => {
     const stub = relay(); await connect(stub);
     expect((await stub.fetch('https://foreman.test/api/exec', { method: 'POST', body: '{}' })).status).toBe(404);
     expect((await stub.fetch('https://foreman.test/api/session/message', { method: 'POST', body: 'x'.repeat(MAX_BODY + 1) })).status).toBe(413);
+  });
+  it(`#144: a host socket that has not said hello yet is named "${UNNAMED_HOST}", not "Mac"`, async () => {
+    const stub = relay(); await connect(stub);
+    const status = await (await stub.fetch('https://foreman.test/api/host')).json();
+    expect(status).toMatchObject({ online: true, host: UNNAMED_HOST });
+    expect(JSON.stringify(status)).not.toContain('Mac');
   });
   it('stale host heartbeat reports offline', async () => {
     const stub = relay(); await connect(stub);
