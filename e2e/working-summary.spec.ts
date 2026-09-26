@@ -63,7 +63,9 @@ const tool = (name: string, summary: string, ago = 0) => ({ role: "tool", name, 
 
 // Nothing a developer should not need to read: tool names, JSON, paths, or the old Activity rows.
 const LEAKS = [/ToolSearch/, /mcp__/, /list_projects/, /spawn_session/, /tool-results/, /\/Users\//, /[{}]/, /\bActivity\b/, /\bRead\b/, /\bAgent\b/, /\bGrep\b/,
-  /commandExecution/, /fileChange/, /dynamicToolCall/, /\[tool/, /cross-session/i, /(^|\n)(investigator|agent):/, /\/bin\/zsh/];
+  /commandExecution/, /fileChange/, /dynamicToolCall/, /\[tool/, /cross-session/i, /(^|\n)(investigator|agent):/, /\/bin\/zsh/,
+  // Relative and Windows paths, URLs, and what stripped JSON leaves behind.
+  /\w\/\w/, /\w\\\w/, /\s:\w/];
 async function expectNoLeaks(...regions: Locator[]) {
   for (const region of regions) {
     const text = await region.innerText();
@@ -100,10 +102,12 @@ test("a Coordinator turn shows one plain-words status line while it runs, one se
   await expectNoLeaks(timeline, head);
 
   // The investigator is sent: one compact line stays in the conversation.
-  state.pmHistory.push(tool("Agent", "investigator: What happened on PR #156 in /Users/hong/code/foreman", 40_000));
+  // Absolute, relative and Windows paths and a JSON fragment in the description are all dropped.
+  state.pmHistory.push(tool("Agent", 'investigator: What happened on PR #156? Check web/app.js, src/app.js, C:\\Users\\x\\a.txt and /Users/hong/code/foreman {"scope":"all"}', 40_000));
   await pollNow(page);
-  await expect(status).toHaveText("Asking an investigator: What happened on PR #156 in…");
-  await expect(page.locator(".dispatch-line")).toHaveText("↗Sent an investigator: What happened on PR #156 in");
+  await expect(status).toHaveText("Asking an investigator: What happened on PR #156? Check and scope all…");
+  // The call is recorded before its permission check, so the line says what was asked.
+  await expect(page.locator(".dispatch-line")).toHaveText("↗Asked for an investigator: What happened on PR #156? Check and scope all");
   // Its results come back as tool-result files the Coordinator reads (three times, as reported),
   // and a Lead's cross-session note arrives: all hidden.
   for (const ago of [30_000, 25_000, 20_000]) state.pmHistory.push(tool("Read", JSON.stringify({ file_path: RESULTS }), ago));
@@ -140,6 +144,18 @@ test("a Coordinator turn shows one plain-words status line while it runs, one se
   await page.getByRole("menuitem", { name: "Hide steps" }).tap();
   await expect(page.locator(".step-line")).toHaveCount(0);
   await expectNoLeaks(timeline, head);
+  // Shown steps belong to one chat: switching away and back turns them off again.
+  await page.locator("#conversation-menu-button").tap();
+  await page.getByRole("menuitem", { name: "Show 6 steps" }).tap();
+  await expect(page.locator(".step-line")).toHaveCount(6);
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  await page.locator("#session-list").getByRole("button", { name: /Fix flaky tests/ }).tap();
+  await expect(page.locator("#conversation-title")).toContainText("Fix flaky tests");
+  await expect(page.locator(".step-line")).toHaveCount(0);
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  await page.locator("#select-pm").tap();
+  await expect(page.getByText(REPLY)).toBeVisible();
+  await expect(page.locator(".step-line")).toHaveCount(0);
 });
 
 test("starting a Lead is one compact line; peer messages are hidden; failures and the Coordinator-moved notice stay", async ({ page }) => {
@@ -155,7 +171,7 @@ test("starting a Lead is one compact line; peer messages are hidden; failures an
   );
   await page.goto("/");
   await expect(page.getByText("The triage Lead is running.")).toBeVisible();
-  await expect(page.locator(".dispatch-line")).toHaveText("↗Started Lead foreman · triage");
+  await expect(page.locator(".dispatch-line")).toHaveText("↗Asked to start Lead foreman · triage");
   await expect(page.locator(".message.system.error")).toContainText("provider stopped responding");
   await expect(page.locator(".message.system.pm-moved")).toContainText("now runs on machine-b");
   expect(await rowKinds(page)).toEqual(["assistant", "user", "dispatch", "assistant", "system", "system"]);
@@ -179,12 +195,14 @@ test("at 360×780 a turn with 10 tool calls takes no more height than its reply 
     tool("mcp__fleet__log_note", JSON.stringify({ note: "PR #156 landed" })),
   ];
   expect(steps).toHaveLength(10);
+  // One timestamp for every entry: a run near midnight must not put a date separator inside a turn.
+  const at = new Date().toISOString();
   state.pmHistory = [
-    { role: "user", text: "Question one", ts: iso(5 * 60_000) },
-    { role: "assistant", text: reply(1), ts: iso(4 * 60_000) },
-    { role: "user", text: "Question two", ts: iso(3 * 60_000) },
-    ...steps.map((step) => ({ ...step, ts: iso(2 * 60_000) })),
-    { role: "assistant", text: reply(2), ts: iso(60_000) },
+    { role: "user", text: "Question one", ts: at },
+    { role: "assistant", text: reply(1), ts: at },
+    { role: "user", text: "Question two", ts: at },
+    ...steps.map((step) => ({ ...step, ts: at })),
+    { role: "assistant", text: reply(2), ts: at },
   ];
   await page.goto("/");
   await expect(page.getByText(reply(2))).toBeVisible();
@@ -258,7 +276,7 @@ test("a Lead chat says what it is doing in plain words and shows starting a work
   await expect(page.getByText("I'll start a worker")).toBeVisible();
   await expect(page.locator("#activity-status")).toHaveText("Starting a worker…");
   await expectSpinning(page);
-  await expect(page.locator(".dispatch-line")).toHaveText("↗Started a worker");
+  await expect(page.locator(".dispatch-line")).toHaveText("↗Asked to start a worker");
   expect(await rowKinds(page)).toEqual(["user", "assistant", "dispatch"]);
   await expectNoLeaks(page.locator("#messages"), page.locator(".conversation-head"));
   // The session list's preview is in plain words too.

@@ -1139,11 +1139,14 @@ function baseToolName(name) {
 function plainWords(text, max = 80) {
   const words = String(text || "")
     .replace(/[{}[\]"`]/g, " ")
-    .replace(/(?:^|\s)(?:~|\.{1,2})?\/\S*/g, " ")
-    .replace(/\S*\/\S*\/\S*/g, " ")
+    // Any token with a slash or backslash: absolute, relative and Windows paths, and URLs.
+    .replace(/\S*[/\\]\S*/g, " ")
+    // What JSON leaves behind: punctuation-only tokens, and space before punctuation.
+    .replace(/(^|\s)[^\w\s#]+(?=\s|$)/g, " ")
+    .replace(/\s+([:;,.])/g, "$1")
     .replace(/\s+/g, " ")
     .trim()
-    .replace(/[\s.:;,…]+$/, "");
+    .replace(/^[\s.:;,]+|[\s.:;,…]+$/g, "");
   return words.length > max ? `${words.slice(0, max - 1).trimEnd()}…` : words;
 }
 // A tool entry as { name, detail }: Coordinator entries carry name and summary; Codex entries
@@ -1180,14 +1183,15 @@ function stepPhrase({ name, detail }) {
 function dispatchLine({ name, detail }) {
   if (SUBAGENT_TOOLS.has(name)) {
     const { who, description } = subagentParts(detail);
-    return `Sent ${who}${description ? `: ${description}` : ""}`;
+    // The call is recorded before its permission check, so say what was asked, not that it ran.
+    return `Asked for ${who}${description ? `: ${description}` : ""}`;
   }
   if (name === "start_lead") {
     // server/pm.ts summarizes start_lead as "<project> / <workstream>".
     const parts = String(detail).split(" / ").map((part) => plainWords(part, 40)).filter((part) => part && part !== "undefined");
-    return parts.length ? `Started Lead ${parts.join(" · ")}` : "Started a Lead";
+    return parts.length ? `Asked to start Lead ${parts.join(" · ")}` : "Asked to start a Lead";
   }
-  if (name === "spawn_session") return "Started a worker";
+  if (name === "spawn_session") return "Asked to start a worker";
   return null;
 }
 // What the agent is doing now: the latest tool step of the running turn, in plain words.
@@ -1644,6 +1648,7 @@ function launchDetails(input) {
 // `record` is false when the history entry already exists (Back/Forward).
 async function selectSession(key, record = true) {
   if (selected) setDraft(selected, ui.input.value);
+  if (key !== selected) showSteps = false; // the debug steps belong to one chat
   selected = key;
   deepLinkPending = null;
   hideNotice();
