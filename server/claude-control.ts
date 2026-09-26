@@ -31,6 +31,8 @@ class InputQueue {
 export class ClaudeControl extends EventEmitter {
   state: State = "idle";
   sessionId: string | null = null;
+  /** Why the controller stopped (set before the `closed`/`failed` state event), or null while running. */
+  lastError: string | null = null;
   private input = new InputQueue();
   private stream?: Query;
   private pending: Pending[] = [];
@@ -42,7 +44,7 @@ export class ClaudeControl extends EventEmitter {
   private readonly policy: PermissionMode;
   get permission_mode() { return this.policy; }
 
-  constructor(options: Pick<Options, "cwd" | "resume" | "model" | "maxBudgetUsd" | "maxTurns" | "tools" | "settingSources" | "settings" | "systemPrompt" | "persistSession" | "pathToClaudeCodeExecutable" | "mcpServers" | "allowedTools"> & { permission_mode?: PermissionMode },
+  constructor(options: Pick<Options, "cwd" | "resume" | "model" | "maxBudgetUsd" | "maxTurns" | "tools" | "settingSources" | "settings" | "systemPrompt" | "persistSession" | "pathToClaudeCodeExecutable" | "mcpServers" | "allowedTools" | "effort"> & { permission_mode?: PermissionMode },
     factory: QueryFactory = query) {
     super();
     this.policy = permissionMode(options.permission_mode);
@@ -55,7 +57,8 @@ export class ClaudeControl extends EventEmitter {
           ...providerOptions,
           permissionMode: claudePolicy(this.policy),
           allowDangerouslySkipPermissions: this.policy === 'bypass',
-          // Bypass explicitly disables the provider sandbox; Native inherits provider settings.
+          // Bypass explicitly disables the provider sandbox; Native and Auto inherit provider settings.
+          // Auto is verified like every mode: init must report `auto`, else the launch fails.
           ...(this.policy === 'bypass' ? { sandbox: { enabled: false } } : {}),
           includePartialMessages: true,
           canUseTool: (tool, input, context) => this.requestApproval(tool, input, context),
@@ -63,7 +66,10 @@ export class ClaudeControl extends EventEmitter {
         for await (const message of this.stream) {
           if (message.type === "system" && message.subtype === "init") {
             const expected = claudePolicy(this.policy);
-            if (message.permissionMode !== expected) throw new Error('Claude did not apply the requested launch policy');
+            if (message.permissionMode !== expected) {
+              const hint = expected === 'auto' ? '; this model may not support Auto' : '';
+              throw new Error(`Claude did not apply the requested launch policy: requested ${expected}, provider reported ${String(message.permissionMode)}${hint}`);
+            }
             this.sessionId = message.session_id;
           }
           this.emit("message", message);
@@ -86,7 +92,7 @@ export class ClaudeControl extends EventEmitter {
         }
         if (!this.isClosed()) this.stop("failed", "Claude process ended");
       } catch (error) {
-        if (!this.isClosed()) this.stop("failed", String(error));
+        if (!this.isClosed()) this.stop("failed", error instanceof Error ? error.message : String(error));
       }
     });
   }
@@ -172,6 +178,7 @@ export class ClaudeControl extends EventEmitter {
   close() { this.stop("closed", "Claude controller closed"); }
 
   private stop(state: "closed" | "failed", error: string) {
+    this.lastError ??= error;
     this.setState(state);
     for (const approval of [...this.approvals.values()]) approval.resolve({ behavior: "deny", message: error });
     for (const item of [...(this.active ? [this.active] : []), ...this.pending]) {

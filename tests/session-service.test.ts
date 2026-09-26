@@ -294,3 +294,96 @@ test('a retargeted canonical-equivalent seeded session path cannot launch a prov
   for (const cwd of [link, 'recent-link', one]) await assert.rejects(f.service.create({ ...f.input, cwd }), /changed its symlink target/);
   assert.equal(launches, 0); assert.equal(f.service.list().length, 0); assert.equal(restored.list().length, 1);
 });
+
+test('developer create(): auto launches Claude in Auto; Codex + auto is refused before anything is saved or launched', async (t) => {
+  let received: any;
+  const { service, input, home } = fixture(t, {
+    claudeFactory: (options: any) => { received = options; return new FakeClaude(); },
+    codexFactory: () => { throw new Error('codex must not launch'); },
+  });
+  const row = await service.create({ ...input, permission_mode: 'auto' }); await tick();
+  assert.equal(received.permission_mode, 'auto'); assert.equal(row.permission_mode, 'auto');
+  assert.equal('effort' in received, false, 'developer launches pass no effort');
+  assert.deepEqual([row.role, row.launched_by, row.policy_reason, row.bypass_grant], ['session', 'developer', undefined, undefined]);
+  await assert.rejects(service.create({ ...input, id: 'codex-auto', provider: 'codex', permission_mode: 'auto' }), /Auto is not supported for Codex/);
+  assert.equal(service.list().length, 1); assert.equal(readdirSync(join(home, 'managed')).filter((f) => f.endsWith('.json')).length, 1);
+});
+
+async function retireFixture(t: test.TestContext) {
+  const { Notifier } = await import('../server/notifier.ts');
+  const f = fixture(t);
+  const frames: any[] = [];
+  const notifier = new Notifier({ sessions: f.service, send: (frame) => frames.push(frame), host: 'test-host' }).start();
+  t.after(() => notifier.close());
+  const row = await f.service.create(f.input); await tick();
+  return { ...f, row, frames, kinds: () => frames.map((frame) => frame.kind) };
+}
+
+test('retire: an idle session closes its provider and ends (not unknown) with no session_failed push, and stays ended on restart', async (t) => {
+  const f = await retireFixture(t);
+  f.claude.complete(); await tick();
+  assert.equal(f.service.detail(f.row.session_key).session.state, 'turn_finished');
+  const successor = 'fm:0B6D3F1E-2C4A-4E8B-9F10-112233445566';
+  await f.service.retire(f.row.session_key, `superseded by ${successor}`);
+  const detail = f.service.detail(f.row.session_key);
+  assert.deepEqual([detail.session.state, detail.session.alive, detail.session.end_reason, detail.session.superseded_by, detail.session.capabilities.message],
+    ['ended', false, `superseded by ${successor}`, successor.toLowerCase(), false]);
+  assert.equal(f.claude.closed, true);
+  assert.deepEqual(detail.receipts.map((r) => r.status), ['completed']);
+  assert.deepEqual(f.kinds(), [], 'no session_failed for a deliberate retirement');
+  assert.throws(() => f.service.send(f.row.session_key, 'more', 'more'), /superseded by/);
+  await f.service.retire(f.row.session_key, 'again'); // no-op
+  assert.equal(f.service.detail(f.row.session_key).session.end_reason, `superseded by ${successor}`);
+  await assert.rejects(f.service.retire('fm:00000000-0000-4000-8000-000000000000', 'x'), /No such managed session/);
+  f.service.close();
+  const loaded = new SessionService({ home: f.home }); t.after(() => loaded.close());
+  const restored = loaded.detail(f.row.session_key).session;
+  assert.deepEqual([restored.state, restored.end_reason, restored.superseded_by], ['ended', `superseded by ${successor}`, successor.toLowerCase()]);
+});
+
+test('retire: an explicit superseded_by wins, and a restored (unknown) session can be retired without a push', async (t) => {
+  const f = await retireFixture(t);
+  f.claude.complete(); await tick();
+  await f.service.retire(f.row.session_key, 'replaced', { superseded_by: 'fm:11111111-2222-4333-8444-555555555555' });
+  assert.equal(f.service.detail(f.row.session_key).session.superseded_by, 'fm:11111111-2222-4333-8444-555555555555');
+  await assert.rejects(f.service.retire(f.row.session_key, 'x', { superseded_by: 'not a key' }), /superseded_by/);
+  const other = await f.service.create({ ...f.input, id: 'other' }); await tick();
+  f.service.close();
+  const { Notifier } = await import('../server/notifier.ts');
+  const loaded = new SessionService({ home: f.home }); t.after(() => loaded.close());
+  const frames: any[] = []; const n = new Notifier({ sessions: loaded, send: (frame) => frames.push(frame), host: 'h' }).start(); t.after(() => n.close());
+  assert.equal(loaded.detail(other.session_key).session.state, 'unknown');
+  await loaded.retire(other.session_key, 'restarted');
+  assert.deepEqual([loaded.detail(other.session_key).session.state, loaded.detail(other.session_key).session.end_reason], ['ended', 'restarted']);
+  assert.deepEqual(frames, []);
+});
+
+test('retire: a working session is refused without force; force interrupts, then retires with no session_failed', async (t) => {
+  const f = await retireFixture(t);
+  assert.equal(f.service.detail(f.row.session_key).session.state, 'working');
+  f.service.send(f.row.session_key, 'queued follow-up', 'follow');
+  await assert.rejects(f.service.retire(f.row.session_key, 'superseded'), /working.*force/);
+  assert.equal(f.claude.closed, false); assert.equal(f.service.detail(f.row.session_key).session.state, 'working');
+  await f.service.retire(f.row.session_key, 'superseded', { force: true });
+  assert.equal(f.claude.interrupted, 1); assert.equal(f.claude.closed, true);
+  const detail = f.service.detail(f.row.session_key);
+  assert.deepEqual([detail.session.state, detail.session.end_reason], ['ended', 'superseded']);
+  assert.deepEqual(detail.receipts.map((r) => r.status), ['failed', 'failed'], 'the interrupted turn failed; the queued follow-up never ran');
+  assert.equal(f.claude.sent.length, 1, 'nothing is dispatched after retirement');
+  assert.deepEqual(f.kinds(), []);
+});
+
+test('retire: a session still starting is refused without force, and with force never becomes ready', async (t) => {
+  let release!: (value: any) => void;
+  const { Notifier } = await import('../server/notifier.ts');
+  const f = fixture(t, { prepare: () => new Promise((resolve) => { release = resolve; }) });
+  const frames: any[] = []; const n = new Notifier({ sessions: f.service, send: (frame) => frames.push(frame), host: 'h' }).start(); t.after(() => n.close());
+  const row = await f.service.create(f.input); await tick();
+  await assert.rejects(f.service.retire(row.session_key, 'cancel'), /force/);
+  await f.service.retire(row.session_key, 'cancel', { force: true });
+  let cleaned = 0; release({ cleanup: () => { cleaned++; } }); await tick(); await tick();
+  const detail = f.service.detail(row.session_key);
+  assert.deepEqual([detail.session.state, detail.session.alive, detail.session.capabilities.message], ['ended', false, false]);
+  assert.deepEqual(detail.receipts.map((r) => r.status), ['failed']);
+  assert.equal(f.claude.sent.length, 0); assert.equal(cleaned, 1); assert.deepEqual(frames, []);
+});
