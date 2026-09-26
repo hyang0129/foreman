@@ -333,6 +333,30 @@ describe(`registry retention: at most ${MAX_LEAD_ROWS} Lead rows`, () => {
     expect(await sql(stub, 'SELECT * FROM lead_handoffs WHERE lead = ?', leads[0])).toEqual([]);
   });
 
+  it('#196: prunes the writing machine\'s own oldest ended rows before another machine\'s older ones; falls back to others\' when it has none', async () => {
+    const { stub, a, b } = await pair();
+    const half = MAX_LEAD_ROWS / 2;
+    const bLeads = await fill(b, half, (i) => i < 2);
+    const aLeads = await fill(a, half, (i) => i < 2);
+    // B's ended rows are the oldest of all (B is offline-ish and has not resynced for a while).
+    await sql(stub, 'UPDATE leads SET reported_at = 100 WHERE lead = ?', bLeads[0]);
+    await sql(stub, 'UPDATE leads SET reported_at = 200 WHERE lead = ?', bLeads[1]);
+    await sql(stub, 'UPDATE leads SET reported_at = 300 WHERE lead = ?', aLeads[1]);
+    await sql(stub, 'UPDATE leads SET reported_at = 400 WHERE lead = ?', aLeads[0]);
+    await ok(b, 'lead.handoff', { handoff: handoff(bLeads[0]!, 1) });
+    await ok(a, 'lead.sync', { records: [record(a), record(a)] });
+    const remaining = new Set((await sql<{ lead: string }>(stub, 'SELECT lead FROM leads')).map((r) => r.lead));
+    expect(remaining.size).toBe(MAX_LEAD_ROWS);
+    expect(remaining.has(aLeads[0]!) || remaining.has(aLeads[1]!)).toBe(false);
+    expect(remaining.has(bLeads[0]!) && remaining.has(bLeads[1]!)).toBe(true);
+    expect((await sql(stub, 'SELECT seq FROM lead_handoffs WHERE lead = ?', bLeads[0])).length).toBe(1);
+    // A has no ended rows left: B's oldest ended row makes room.
+    await ok(a, 'lead.upsert', { record: record(a) });
+    const after = new Set((await sql<{ lead: string }>(stub, 'SELECT lead FROM leads')).map((r) => r.lead));
+    expect(after.has(bLeads[0]!)).toBe(false);
+    expect(after.has(bLeads[1]!)).toBe(true);
+  });
+
   it('refuses new rows with too_large when no ended row can be pruned; updates still work', async () => {
     const { stub, a } = await pair();
     const leads = await fill(a, MAX_LEAD_ROWS, () => false);
@@ -415,6 +439,20 @@ describe('oversized lead_rpc frames', () => {
     const reordered = `{"id":"${id2}","type":"lead_rpc","op":"lead.upsert","args":${JSON.stringify({ record: { ...row, state: 'idle' } })}${' '.repeat(MAX_LEAD_FRAME)}}`;
     expect(await sendRaw(a, id2, reordered)).toMatchObject({ ok: false, code: 'too_large' });
     expect(JSON.parse((await sql<{ record: string }>(stub, 'SELECT record FROM leads'))[0]!.record).state).toBe('working');
+    expect(a.socket.readyState).toBe(1);
+  });
+
+  it('#196: an oversized lead_rpc that opens with "type" but carries its id later is answered too_large, not dropped', async () => {
+    const { stub, a } = await pair();
+    const row = record(a);
+    await ok(a, 'lead.upsert', { record: row });
+    const id = crypto.randomUUID();
+    const late = `{"type":"lead_rpc","op":"lead.upsert","id":"${id}","args":${JSON.stringify({ record: { ...row, state: 'idle' } })}${' '.repeat(MAX_LEAD_FRAME)}}`;
+    expect(await sendRaw(a, id, late)).toMatchObject({ ok: false, code: 'too_large' });
+    expect(JSON.parse((await sql<{ record: string }>(stub, 'SELECT record FROM leads'))[0]!.record).state).toBe('working');
+    // Unparseable with no leading id: nothing to answer, and the socket stays open.
+    a.socket.send(`{"type":"lead_rpc","op":"lead.upsert",${'x'.repeat(MAX_LEAD_FRAME)}`);
+    await flush(a);
     expect(a.socket.readyState).toBe(1);
   });
 

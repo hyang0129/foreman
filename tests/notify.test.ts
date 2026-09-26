@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   MAX_HOST, isIsoTimestamp, NOTIFY_KINDS, PUSH_KINDS, DEFAULT_PUSH_KINDS, MAX_NOTIFY_FRAME, MAX_PUSH_PAYLOAD,
   parseNotifyFrame, cleanDisplayName, notifyId, buildPushPayload, parseDeepLink, pushUrlIsSafe,
-  sessionUrl, utf8Length, type NotifyFrame, type NotifyKind, type PushPayload,
+  sessionUrl, UNNAMED_HOST, utf8Length, type NotifyFrame, type NotifyKind, type PushPayload,
 } from '../shared/notify.ts';
 
 const AT = '2026-09-24T12:34:56.789Z';
@@ -233,6 +233,13 @@ test('#126: the host is cleaned and bounded in every payload', () => {
   // A host that cleans to nothing (or is not a string) falls back to generic wording.
   assert.equal(buildPushPayload({ kind: 'host_offline', host: '​⁦\u0000 ', at: AT }).body, 'Your machine has been disconnected for over 5 minutes.');
   assert.equal(buildPushPayload({ kind: 'host_offline', host: 42 as unknown as string, at: AT }).host, '');
+});
+
+test('#196 host_offline for a host that never said its name reads "Your machine", never a lowercase placeholder', () => {
+  const payload = buildPushPayload({ kind: 'host_offline', host: UNNAMED_HOST, at: AT });
+  assert.equal(payload.body, 'Your machine has been disconnected for over 5 minutes.');
+  // A real (even lowercase) machine name is kept as the developer wrote it.
+  assert.equal(buildPushPayload({ kind: 'host_offline', host: 'linux-box', at: AT }).body, 'linux-box has been disconnected for over 5 minutes.');
 });
 
 test('#126: lone surrogates are stripped; valid pairs survive', () => {
