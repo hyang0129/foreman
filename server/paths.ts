@@ -18,6 +18,8 @@ export const LOCAL_API_TOKEN_FILE = join(FOREMAN_HOME, LOCAL_API_TOKEN_NAME);
 // Epic #26: this FOREMAN_HOME's machine identity, and the local-only PM state store.
 export const MACHINE_FILE = join(FOREMAN_HOME, "machine.json");
 export const PM_LOCAL_STATE_FILE = join(PM_DIR, "state.json");
+// Epic #157: Project Lead handoff logs (`<uuid>.jsonl`) and the DO outbox (`outbox.json`); dir 0700, files 0600.
+export const LEADS_DIR = join(FOREMAN_HOME, "leads");
 export const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 export const CLAUDE_REGISTRY_DIR = join(CLAUDE_CONFIG_DIR, "sessions");
 // #155: FOREMAN_CLAUDE_BIN, else the installed `claude` on this process's PATH (the service's explicit

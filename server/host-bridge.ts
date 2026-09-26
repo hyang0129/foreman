@@ -10,6 +10,10 @@ import {
   type HelloV2, type MachineIdentity, type PmAssignment, type PmErrorCode, type PmOp, type PmOpArgs, type PmOpResults,
 } from '../shared/pm-state.ts';
 import { redactSecrets } from '../shared/redact.ts';
+import {
+  MAX_LEAD_FRAME, MAX_LEAD_RESULT_FRAME, parseLeadOpArgs, parseLeadOpResult, parseLeadRpcResult,
+  type LeadErrorCode, type LeadOp, type LeadOpArgs, type LeadOpResults,
+} from '../shared/roles.ts';
 
 // Frames held while the relay socket is down: at most this many, none older than this. The relay
 // de-duplicates by frame id, so flushing a frame that also went out before a drop is harmless.
@@ -43,6 +47,26 @@ export class PmRpcError extends Error {
 
 export interface PmRpcOptions { epoch?: number; timeoutMs?: number }
 
+/** At most this many Lead rpcs outstanding at once (counted separately from PM rpcs). */
+export const LEAD_RPC_MAX_PENDING = 256;
+
+/**
+ * Why a Lead rpc failed: a DO error code, or a host-side cause (`disconnected`, `timeout`,
+ * `invalid_result`, as for `PmRpcFailure`). After `disconnected` or `timeout` the DO may or may not
+ * have applied the op.
+ */
+export type LeadRpcFailure = LeadErrorCode | 'disconnected' | 'timeout' | 'invalid_result';
+
+export class LeadRpcError extends Error {
+  readonly code: LeadRpcFailure;
+  readonly op: LeadOp;
+  constructor(code: LeadRpcFailure, op: LeadOp, message: string) {
+    super(message); this.name = 'LeadRpcError'; this.code = code; this.op = op;
+  }
+}
+
+export interface LeadRpcOptions { timeoutMs?: number }
+
 /**
  * #122: a relay close with this code is a policy refusal (e.g. "Too many machines", "Invalid hello"):
  * reconnecting at once would be refused again, so the bridge backs off from POLICY_BACKOFF_BASE_MS,
@@ -62,7 +86,7 @@ export interface HostBridgeOptions {
   identity?: MachineIdentity;
   /** Turn ids this host's PM still holds, sent as `pm_open_turns` in every v2 hello (called on each connect). */
   pmOpenTurns?: () => readonly string[];
-  /** Default per-call timeout for `rpc` (10 s). */
+  /** Default per-call timeout for `rpc` and `leadRpc` (10 s). */
   rpcTimeoutMs?: number;
   /** Defaults to process.platform. */
   platform?: string;
@@ -71,6 +95,11 @@ export interface HostBridgeOptions {
 interface PendingRpc {
   op: PmOp; epoch: number; socket: WebSocket; timer: NodeJS.Timeout;
   resolve: (value: any) => void; reject: (error: PmRpcError) => void;
+}
+
+interface PendingLeadRpc {
+  op: LeadOp; socket: WebSocket; timer: NodeJS.Timeout;
+  resolve: (value: any) => void; reject: (error: LeadRpcError) => void;
 }
 
 export interface BridgeConfig { url: string; token: string }
@@ -107,6 +136,7 @@ export class HostBridge {
   private pmOpenTurns?: () => readonly string[];
   private rpcTimeoutMs: number;
   private pending = new Map<string, PendingRpc>();
+  private leadPending = new Map<string, PendingLeadRpc>();
   private rpcSeq = 0;
   private helloSocket?: WebSocket;
   private assignment: PmAssignment | null = null;
@@ -144,9 +174,10 @@ export class HostBridge {
   private connect() {
     if (this.stopped) return;
     const url = new URL('/api/host/connect', this.config.url); url.protocol = 'wss:';
-    // A v2 socket also carries DO→host PM results (≤ MAX_PM_RESULT_FRAME, above MAX_REQUEST_FRAME).
-    // Relayed request frames keep MAX_REQUEST_FRAME, enforced in the message handler.
-    const maxPayload = this.identity ? Math.max(MAX_REQUEST_FRAME, MAX_PM_RESULT_FRAME) : MAX_REQUEST_FRAME;
+    // A v2 socket also carries DO→host PM and Lead results (≤ MAX_PM_RESULT_FRAME /
+    // MAX_LEAD_RESULT_FRAME, above MAX_REQUEST_FRAME). Relayed request frames keep
+    // MAX_REQUEST_FRAME, enforced in the message handler.
+    const maxPayload = this.identity ? Math.max(MAX_REQUEST_FRAME, MAX_PM_RESULT_FRAME, MAX_LEAD_RESULT_FRAME) : MAX_REQUEST_FRAME;
     const socket = this.socket = this.socketFactory(url, { headers: { authorization: `Bearer ${this.config.token}` }, maxPayload, handshakeTimeout: 15_000 });
     socket.on('open', () => {
       this.attempts = 0; this.lastPong = Date.now();
@@ -173,6 +204,7 @@ export class HostBridge {
         return;
       }
       if (message.type === 'pm_rpc_result') { this.handleRpcResult(message); return; }
+      if (message.type === 'lead_rpc_result') { this.handleLeadRpcResult(message); return; }
       if (message.type === 'pm_assignment' && socket === this.helloSocket) { this.accepted(socket); this.handleAssignment(message); }
     });
     socket.on('error', () => { /* close schedules reconnect; never log credentials/handshake headers */ });
@@ -303,6 +335,11 @@ export class HostBridge {
       this.pending.delete(id); clearTimeout(call.timer);
       call.reject(new PmRpcError('disconnected', call.op, call.epoch, 'The cloud relay connection closed before the PM state store answered.'));
     }
+    for (const [id, call] of this.leadPending) {
+      if (call.socket !== socket) continue;
+      this.leadPending.delete(id); clearTimeout(call.timer);
+      call.reject(new LeadRpcError('disconnected', call.op, 'The cloud relay connection closed before the Lead registry answered.'));
+    }
     if (this.helloSocket !== socket) return;
     this.helloSocket = undefined; this.assignment = null;
     this.emitConnection(false);
@@ -361,6 +398,57 @@ export class HostBridge {
       catch {
         this.pending.delete(id); clearTimeout(timer);
         reject(new PmRpcError('disconnected', op, epoch, 'Sending to the cloud relay failed.'));
+      }
+    });
+  }
+  // --- Coordinator and Project Leads (epic #157): lead_rpc ------------------------------------
+
+  private handleLeadRpcResult(raw: { id?: unknown }) {
+    const id = typeof raw.id === 'string' ? raw.id : undefined;
+    const call = id === undefined ? undefined : this.leadPending.get(id);
+    // A reply whose id is not pending (it timed out, or belongs to another socket) is ignored.
+    if (!call || id === undefined) return;
+    this.leadPending.delete(id); clearTimeout(call.timer);
+    const invalid = () => new LeadRpcError('invalid_result', call.op, `The relay's reply to ${call.op} was invalid.`);
+    const parsed = parseLeadRpcResult(raw);
+    if (!parsed.ok) { call.reject(invalid()); return; }
+    const result = parsed.value;
+    // The DO already redacts its messages; redact again here since the text can reach the user.
+    if (!result.ok) { call.reject(new LeadRpcError(result.code, call.op, redactSecrets(result.message))); return; }
+    const value = parseLeadOpResult(call.op, result.result);
+    if (!value.ok) { call.reject(invalid()); return; }
+    call.resolve(value.value);
+  }
+  /**
+   * Sends one `lead_rpc` and resolves with the op's validated result. Unlike `rpc`, it is not
+   * epoch-fenced and does not require this machine to be the active PM host: any hello-v2
+   * connection may carry it. Rejects with a `LeadRpcError`: the DO's error code; `disconnected` (no
+   * open socket, or it closed first); `timeout` (no reply in `timeoutMs`, default 10 s);
+   * `invalid`/`too_large` (args or frame fail the shared contract, and nothing is sent);
+   * `unavailable` (no machine identity, or too many outstanding); `invalid_result`. Never retried here.
+   */
+  leadRpc<O extends LeadOp>(op: O, args: LeadOpArgs[O], options: LeadRpcOptions = {}): Promise<LeadOpResults[O]> {
+    const fail = (code: LeadRpcFailure, message: string) => Promise.reject(new LeadRpcError(code, op, message));
+    if (!this.identity) return fail('unavailable', 'This host bridge was started without a machine identity.');
+    const checked = parseLeadOpArgs(op, args);
+    if (!checked.ok) return fail(checked.code, checked.error);
+    const socket = this.socket;
+    if (this.stopped || !socket || !this.connected) return fail('disconnected', 'The cloud relay is not connected.');
+    if (this.leadPending.size >= LEAD_RPC_MAX_PENDING) return fail('unavailable', 'Too many Lead registry requests are outstanding.');
+    const id = `lead-${Date.now().toString(36)}-${(++this.rpcSeq).toString(36)}`;
+    const raw = JSON.stringify({ type: 'lead_rpc', id, op, args: checked.value });
+    if (utf8Length(raw) > MAX_LEAD_FRAME) return fail('too_large', `${op} frame is too large`);
+    const timeoutMs = options.timeoutMs ?? this.rpcTimeoutMs;
+    return new Promise<LeadOpResults[O]>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.leadPending.delete(id)) return;
+        reject(new LeadRpcError('timeout', op, `The Lead registry did not answer ${op} within ${Math.ceil(timeoutMs / 1000)} s.`));
+      }, timeoutMs);
+      this.leadPending.set(id, { op, socket, timer, resolve, reject });
+      try { socket.send(raw); }
+      catch {
+        this.leadPending.delete(id); clearTimeout(timer);
+        reject(new LeadRpcError('disconnected', op, 'Sending to the cloud relay failed.'));
       }
     });
   }
