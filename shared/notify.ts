@@ -198,9 +198,9 @@ function render(kind: PushKind, host: string, key: string | undefined, name: str
     case 'session_failed':
       return { v: 1, kind, host, ...session, ...named, at, ...sessionTarget, title: 'Session failed', body: `${who} stopped with an error. Open Foreman for details.` };
     case 'pm_failed':
-      return { v: 1, kind, host, at, tag: 'pm', url: PM_URL, title: 'PM needs attention', body: 'The project manager hit an error. Open Foreman for details.' };
+      return { v: 1, kind, host, at, tag: 'pm', url: PM_URL, title: 'Coordinator needs attention', body: 'The Coordinator hit an error. Open Foreman for details.' };
     case 'host_offline':
-      return { v: 1, kind, host, at, tag: 'host', url: '/', title: 'Mac offline', body: `${host || 'Your Mac'} has been disconnected for over 5 minutes.` };
+      return { v: 1, kind, host, at, tag: 'host', url: '/', title: 'Machine offline', body: `${host || 'Your machine'} has been disconnected for over 5 minutes.` };
     case 'test':
       return { v: 1, kind: 'test', host, at, tag: 'test', url: '/', title: 'Foreman notifications are on', body: 'You will be notified when a session needs you.' };
   }

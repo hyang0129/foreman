@@ -460,7 +460,7 @@ describe('Mac offline alarm', () => {
     await backdate(stub);
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     expect(pushes).toHaveLength(1);
-    expect(pushes[0]!.payload).toMatchObject({ kind: 'host_offline', host: 'Studio Mac', tag: 'host', url: '/', title: 'Mac offline' });
+    expect(pushes[0]!.payload).toMatchObject({ kind: 'host_offline', host: 'Studio Mac', tag: 'host', url: '/', title: 'Machine offline' });
     // Notified: the alarm stops, and even a forced run sends nothing more.
     expect(await runDurableObjectAlarm(stub)).toBe(false);
     await runInDurableObject(stub, (_i: HostRelay, ctx) => ctx.storage.setAlarm(Date.now() + 1000));

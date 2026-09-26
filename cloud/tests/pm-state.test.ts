@@ -220,7 +220,7 @@ describe('two machines connected at once', () => {
 describe('routing to the active PM host only', () => {
   it('active-host routing: every relayed request reaches only the active host; the standby receives nothing', async () => {
     const { stub, a, b } = await pair();
-    const calls: [string, string, string?][] = [['GET', '/api/sessions'], ['GET', '/api/pm/history'], ['POST', '/api/pm/message', '{"text":"hi"}'], ['GET', '/api/projects'], ['POST', '/api/session/message', '{}'], ['GET', '/api/memory'], ['POST', '/api/launch/propose', '{}']];
+    const calls: [string, string, string?][] = [['GET', '/api/sessions'], ['GET', '/api/pm/history'], ['POST', '/api/pm/message', '{"text":"hi"}'], ['GET', '/api/projects'], ['POST', '/api/session/message', '{}'], ['GET', '/api/memory'], ['POST', '/api/session/interrupt', '{}']];
     for (const [method, path, body] of calls) {
       const before = requests(a).length;
       const response = stub.fetch(`${ORIGIN}${path}`, { method, body });
