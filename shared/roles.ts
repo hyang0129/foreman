@@ -273,8 +273,22 @@ export function isSessionName(value: unknown): value is string {
   return isLine(value, MAX_SESSION_NAME) && !looksLikeAbsolutePath(value);
 }
 
-/** Case/whitespace-insensitive project-name comparison used for grant matching. */
+/**
+ * Project-name comparison used for grant matching and project references: trimmed, case- and
+ * whitespace-insensitive, and a leading "the " is ignored, exactly like the registry's `key()` in
+ * server/projects.ts ("The Foreman" names the same project as "foreman").
+ */
 export function sameProject(a: string, b: string): boolean {
+  const key = (s: string) => s.trim().toLocaleLowerCase().replace(/^the\s+/, '').replace(/\s+/g, ' ');
+  return key(a) === key(b);
+}
+
+/**
+ * The pre-#197 comparison (no "the " stripping). Used only for the duplicate check on grant lists,
+ * so every list accepted before still parses (a list holding both "foreman" and "the foreman"
+ * stays valid; `matchBypassGrant` resolves that pair toward the lower privilege).
+ */
+function sameProjectLegacy(a: string, b: string): boolean {
   const key = (s: string) => s.trim().toLocaleLowerCase().replace(/\s+/g, ' ');
   return key(a) === key(b);
 }
@@ -377,7 +391,8 @@ export const AUTO_UNSUPPORTED = 'Auto permission mode is supported for Claude se
 
 /** Whether `provider` can run an agent session in `mode`. */
 export function agentModeSupported(provider: string, mode: AgentPermissionMode): boolean {
-  return mode === 'bypass' ? provider === 'claude' || provider === 'codex' : (AUTO_PROVIDERS as readonly string[]).includes(provider);
+  // Agent launches are Claude only (`AgentLaunchRequest.provider`), in either mode.
+  return mode === 'bypass' ? provider === 'claude' : (AUTO_PROVIDERS as readonly string[]).includes(provider);
 }
 
 /**
@@ -413,16 +428,22 @@ export interface AgentLaunchPolicy {
 /**
  * The grant entry that applies to (role, project): an entry for this exact project beats the
  * role's `'*'` entry; no matching entry → null (grant off). With `project === null`, only `'*'`
- * applies.
+ * applies. When several project entries name the same project (possible only for a list holding
+ * both "foreman" and "the foreman"), an `allow: false` entry wins: ambiguity never resolves
+ * toward Bypass.
  */
 export function matchBypassGrant(grants: readonly BypassGrant[], role: AgentRole, project: string | null): BypassGrant | null {
   let wildcard: BypassGrant | null = null;
+  let specific: BypassGrant | null = null;
   for (const grant of grants) {
     if (grant.role !== role) continue;
     if (grant.project === '*') { wildcard ??= grant; continue; }
-    if (project !== null && sameProject(grant.project, project)) return grant;
+    if (project !== null && sameProject(grant.project, project)) {
+      if (grant.allow !== true) return grant;
+      specific ??= grant;
+    }
   }
-  return wildcard;
+  return specific ?? wildcard;
 }
 
 /**
@@ -526,7 +547,7 @@ function parseBypassGrants(raw: unknown): Parsed<BypassGrant[]> {
     if (entry.project !== '*' && !isProjectName(entry.project)) return fail("bypass grant project must be a registered project name or '*'");
     if (typeof entry.allow !== 'boolean') return fail('bypass grant allow must be a boolean');
     const project = entry.project === '*' ? '*' : (entry.project as string).trim();
-    if (out.some((g) => g.role === entry.role && (g.project === '*' ? project === '*' : project !== '*' && sameProject(g.project, project)))) return fail('duplicate bypass grant for the same role and project');
+    if (out.some((g) => g.role === entry.role && (g.project === '*' ? project === '*' : project !== '*' && sameProjectLegacy(g.project, project)))) return fail('duplicate bypass grant for the same role and project');
     out.push({ role: entry.role, project, allow: entry.allow });
   }
   return { ok: true, value: out };

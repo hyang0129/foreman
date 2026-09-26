@@ -6,9 +6,13 @@
 // ordinary prose that follows a credential keyword in error text:
 // - a word from a short list of status/prose words ("Authorization: required", "Invalid bearer
 //   token", "Basic authentication is not supported"), and
-// - #122: a short plain word that a sentence visibly continues after ("token: pending approval",
+// - #122: a short plain word that a sentence visibly continues after ("Basic login failed",
 //   "password: reset. Log in again."). Only a value that cannot be secret-shaped qualifies: 2-7
 //   letters, lower case (one leading capital allowed), no digits or symbols; see `proseInContext`.
+//   #145: after a `key: `/`key=` separator only a sentence end qualifies ("password: reset. Log in
+//   again."), never a lower-case continuation: `password: hunter was rejected` is a value followed
+//   by prose, so it is redacted. `Bearer`/`Basic` keep the continuation form ("Expected Bearer but
+//   got Basic"), because there the scheme word is usually prose itself.
 // Any other value after a credential keyword (digits, symbols, mixed case, all caps, or plain
 // lower-case letters such as a dictionary-word password) is replaced with `[REDACTED]`.
 // #122: a value after `password`/`secret`/`api_key`-style keys (credentials people choose, which can
@@ -51,16 +55,16 @@ export function looksLikeCredential(value: string, minLength: number): boolean {
 }
 
 /**
- * #122: true when `value` (a match that starts at `offset` in `text` and is `length` characters
- * long) is a short plain word in a sentence that visibly continues: followed by whitespace and a
- * lower-case word, or ending in `.`/`!`/`?` followed by whitespace and a capitalised word. Never true
- * for anything secret-shaped: digits, symbols, mixed case beyond one leading capital, or 8+ letters.
+ * #122: true when `value` (a match that ends at `end` in `text`) is a short plain word in a sentence
+ * that visibly continues: ending in `.`/`!`/`?` followed by whitespace and a capitalised word, or
+ * (unless `continuation` is false) followed by whitespace and a lower-case word. Never true for
+ * anything secret-shaped: digits, symbols, mixed case beyond one leading capital, or 8+ letters.
  */
-export function proseInContext(value: string, text: string, end: number): boolean {
+export function proseInContext(value: string, text: string, end: number, { continuation = true }: { continuation?: boolean } = {}): boolean {
   if (typeof value !== 'string' || !SHORT_PLAIN_WORD.test(value)) return false;
   const rest = text.slice(end, end + 64);
   if (/[.!?]$/.test(value)) return /^\s+[A-Z][a-z]*\b/.test(rest);
-  return /[A-Za-z]$/.test(value) && /^\s+[a-z]+\b/.test(rest);
+  return continuation && /[A-Za-z]$/.test(value) && /^\s+[a-z]+\b/.test(rest);
 }
 // 2-7 letters, lower case or one leading capital, optionally one trailing sentence punctuation mark.
 const SHORT_PLAIN_WORD = /^[A-Za-z][a-z]{1,6}[.,;:!?]?$/;
@@ -92,7 +96,8 @@ export function redactSecrets(text: string): string {
     .replace(BASIC, (all: string, scheme: string, space: string, value: string, padding: string, offset: number, whole: string) =>
       looksLikeCredential(value, 1) && !proseInContext(value + padding, whole, offset + all.length) ? `${scheme}${space}${REDACTED}` : all)
     // A key's value of 8+ characters (punctuation included) was redacted by the pre-#26 rule, so the
-    // sentence-context exemption applies only below that length ("password: letmein. Try again").
+    // sentence-context exemption applies only below that length ("password: letmein. Try again"),
+    // and only to a sentence end (#145: "password: hunter was rejected" is redacted).
     .replace(KEY_VALUE, (all: string, key: string, sep: string, value: string, offset: number, whole: string) =>
-      looksLikeCredential(value, LONG_VALUE_KEY.test(key) ? 8 : 1) && (value.length >= 8 || !proseInContext(value, whole, offset + all.length)) ? `${key}${sep}${REDACTED}` : all);
+      looksLikeCredential(value, LONG_VALUE_KEY.test(key) ? 8 : 1) && (value.length >= 8 || !proseInContext(value, whole, offset + all.length, { continuation: false })) ? `${key}${sep}${REDACTED}` : all);
 }

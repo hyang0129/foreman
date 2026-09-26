@@ -159,8 +159,12 @@ for (const isolatedLogins of [false, true]) test(`actual startup (${isolatedLogi
   const relay = relayMock(commit, 3), auth = authMock();
   // Stray provider directories inherited by start never reach the checks or the
   // daemon: the host default (unset) or the dev home's own directories apply.
-  const saved = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, CODEX_HOME: process.env.CODEX_HOME };
-  Object.assign(process.env, { CLAUDE_CONFIG_DIR: join(f.dir, 'stray-claude'), CODEX_HOME: join(f.dir, 'stray-codex') });
+  // #164: an installed `claude` first on PATH is the binary the daemon will run (server/claude-bin.ts),
+  // so it is the one the auth preflight checks. It is never executed here (auth is mocked).
+  const installedDir = join(f.dir, 'installed-bin'), installed = join(installedDir, 'claude');
+  mkdirSync(installedDir); writeFileSync(installed, '#!/bin/sh\nexit 97\n'); chmodSync(installed, 0o755);
+  const saved = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, CODEX_HOME: process.env.CODEX_HOME, PATH: process.env.PATH };
+  Object.assign(process.env, { CLAUDE_CONFIG_DIR: join(f.dir, 'stray-claude'), CODEX_HOME: join(f.dir, 'stray-codex'), PATH: `${installedDir}:${process.env.PATH ?? ''}` });
   let output;
   try { ({ output } = await captureLog(() => start(f.home, { relayStatus: relay.fn, execute: auth.fn, port, ...(isolatedLogins ? { isolatedLogins } : {}) }))); }
   finally { for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value; }
@@ -173,6 +177,7 @@ for (const isolatedLogins of [false, true]) test(`actual startup (${isolatedLogi
   assert.deepEqual(relay.tokens, Array(4).fill(pair.token));
   // Claude (required) is checked before Codex (optional, notice only; #69).
   assert.deepEqual(auth.calls.map((c) => c.args), [['auth', 'status', '--json'], ['login', 'status']]);
+  assert.equal(auth.calls[0].binary, installed, 'the Claude preflight checks the binary the daemon runs');
   assert.equal(auth.calls[0].env.CLAUDE_CONFIG_DIR ?? null, claude);
   assert.equal(auth.calls[1].env.CODEX_HOME ?? null, codex);
   assert.equal(Object.hasOwn(auth.calls[0].env, 'CLAUDE_CONFIG_DIR'), isolatedLogins);

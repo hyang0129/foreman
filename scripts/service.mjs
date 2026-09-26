@@ -17,6 +17,16 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const MAX_MACHINE_NAME = 80;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
 
+// #197: the role and limit variables the daemon reads (shared/roles.ts ROLE_ENV, LEAD_LIMIT_ENV).
+// Mirrors isModel (MODEL_PATTERN), EFFORTS and leadLimits() there, for the same reason as above;
+// tests/service.test.mjs checks that the installer accepts exactly what the daemon would use.
+export const MODEL_ENV = ['FOREMAN_LEAD_MODEL', 'FOREMAN_INVESTIGATOR_MODEL'];
+export const EFFORT_ENV = ['FOREMAN_PM_EFFORT', 'FOREMAN_LEAD_EFFORT', 'FOREMAN_INVESTIGATOR_EFFORT'];
+export const LIMIT_ENV = ['FOREMAN_MAX_LEADS', 'FOREMAN_MAX_WORKERS_PER_LEAD'];
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const MODEL_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/\[\]-]{0,199}$/;
+const LIMIT_PATTERN = /^\s*[0-9]{1,6}\s*$/;
+
 /**
  * Settings the daemon reads at startup that the service carries over from the install-time
  * environment when set. Invalid values refuse the install instead of installing a service that
@@ -39,11 +49,33 @@ export function passThroughSettings(env) {
     }
     out.FOREMAN_PM_HUNG_MS = String(Number(hung));
   }
+  for (const key of MODEL_ENV) {
+    const value = env[key];
+    if (value === undefined || value === '') continue;
+    if (!MODEL_PATTERN.test(value.trim())) throw new Error(`${key} must be a model id (letters, digits and . _ : / [ ] -, at most 200 characters)`);
+    out[key] = value.trim();
+  }
+  for (const key of EFFORT_ENV) {
+    const value = env[key];
+    if (value === undefined || value === '') continue;
+    if (!EFFORTS.includes(value.trim())) throw new Error(`${key} must be one of ${EFFORTS.join(', ')}`);
+    out[key] = value.trim();
+  }
+  for (const key of LIMIT_ENV) {
+    const value = env[key];
+    if (value === undefined || value === '') continue;
+    if (!LIMIT_PATTERN.test(value) || Number(value.trim()) < 1) throw new Error(`${key} must be a positive integer (at most 6 digits)`);
+    out[key] = String(Number(value.trim()));
+  }
   return out;
 }
 
+/**
+ * `settings: false` skips the pass-through settings (and their validation): only `install` and
+ * `plist` write them, so a bad value there never blocks `status`, `uninstall` or `restart` (#145).
+ */
 export function config({ repo = ROOT, home = homedir(), node = process.execPath,
-  env = process.env, keepAwake = false } = {}) {
+  env = process.env, keepAwake = false, settings = true } = {}) {
   const port = Number(env.FOREMAN_PORT || 4177);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('FOREMAN_PORT must be an integer from 1 to 65535');
   for (const [name, value] of Object.entries({ repo, home, node })) {
@@ -65,7 +97,7 @@ export function config({ repo = ROOT, home = homedir(), node = process.execPath,
   }
   // FOREMAN_MACHINE_NAME is persisted to <FOREMAN_HOME>/machine.json by the daemon, so passing it
   // renames this machine on the service's next start; omitting it later keeps the stored name.
-  Object.assign(environment, passThroughSettings(env));
+  if (settings) Object.assign(environment, passThroughSettings(env));
   const args = [node, '--experimental-strip-types', join(repo, 'server/main.ts')];
   return {
     repo, home, port, state,
@@ -143,12 +175,17 @@ function jobStatus(target) {
   };
 }
 
+/** The `config()` options for one command: only `install` and `plist` read the pass-through settings. */
+export function commandOptions(command, args = []) {
+  return { keepAwake: args.includes('--keep-awake'), settings: command === 'install' || command === 'plist' };
+}
+
 export async function main(args = process.argv.slice(2)) {
   const command = args[0] || 'status';
   if (!['install', 'uninstall', 'status', 'restart', 'plist'].includes(command) || args.slice(1).some((arg) => arg !== '--keep-awake') || (args.includes('--keep-awake') && !['install', 'plist'].includes(command))) {
     throw new Error('Usage: node scripts/service.mjs [status|install [--keep-awake]|uninstall|restart|plist [--keep-awake]]');
   }
-  const conf = config({ keepAwake: args.includes('--keep-awake') });
+  const conf = config(commandOptions(command, args));
   if (command === 'plist') { process.stdout.write(renderPlist(conf.plist)); return; }
   if (process.platform !== 'darwin') throw new Error('Service management currently supports macOS launchd only');
   if (process.getuid() === 0) throw new Error('Run as your normal logged-in user, without sudo');
