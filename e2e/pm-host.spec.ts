@@ -33,6 +33,8 @@ async function fixture(page: Page, options: { machines?: Machine[]; active?: str
     pmHistory: [{ id: "hello", role: "assistant", text: "How can I help the fleet?" }] as any[],
     pmError: null as string | null,
     pmHostStatus: 200,
+    // A failing GET /api/host (the host or relay unreachable), when set.
+    hostStatus: 200,
     // The body of a non-200 GET /api/pm/host (a relay-mode daemon's own view, #119).
     pmHostBody: { error: "Not found" } as any,
     pmBusy: false,
@@ -76,7 +78,10 @@ async function fixture(page: Page, options: { machines?: Machine[]; active?: str
     let result: any = {},
       status = 200;
     if (path === "/api/config") result = { auth: { required: false } };
-    else if (path === "/api/host")
+    else if (path === "/api/host" && state.hostStatus !== 200) {
+      status = state.hostStatus;
+      result = { error: "The relay could not reach the execution host." };
+    } else if (path === "/api/host")
       result = {
         online: !!active?.online,
         host: active?.name ?? null,
@@ -111,6 +116,10 @@ async function fixture(page: Page, options: { machines?: Machine[]; active?: str
       status = 202;
       result = { ok: true };
     } else if (path === "/api/pm/interrupt" && method === "POST") result = { ok: true };
+    else if (path === "/api/session/message" && method === "POST") {
+      status = 202;
+      result = { ok: true };
+    }
     else if (path === "/api/models") result = { models: [{ value: "haiku", displayName: "Haiku" }] };
     else if (path === "/api/pm/history")
       result = url.searchParams.get("summary") === "1"
@@ -237,7 +246,7 @@ test("the dialog lists machines, allows only online standbys, and moves the PM",
   // Name, platform, online state and last seen for every machine.
   await expect(rows.filter({ hasText: "machine-a" })).toContainText("macOS · Offline · Last seen 5 min ago");
   await expect(rows.filter({ hasText: "machine-a" })).toContainText("Runs the Coordinator now");
-  await expect(rows.filter({ hasText: "machine-b" })).toContainText("Linux · Online · Last seen just now");
+  await expect(rows.filter({ hasText: "machine-b" }).locator(".machine-meta")).toHaveText("Linux · Online");
   await expect(rows.filter({ hasText: "machine-c" })).toContainText("Windows · Offline · Last seen 2 h ago");
   // Only the online, non-active machine can be chosen.
   await expect(machineRadio(page, "machine-a")).toBeDisabled();
@@ -721,6 +730,154 @@ test("Interrupt stays disabled until the PM send's 202 arrives", async ({ page }
   await expect.poll(() => state.calls.filter((c) => c.path === "/api/pm/interrupt").length).toBe(1);
 });
 
+// #144: the Interrupt re-enables at the send's 202, not after the refresh that follows it.
+test("Interrupt re-enables at the PM send's 202, before the conversation refreshes", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmBusy = true;
+  await openPm(page);
+  const interrupt = page.getByRole("button", { name: "Interrupt", exact: true });
+  await expect(interrupt).toBeEnabled();
+  const releaseSend = state.hold("POST /api/pm/message");
+  await page.getByRole("textbox", { name: "Message this session" }).fill("Also check the docs");
+  await page.getByRole("textbox", { name: "Message this session" }).press("Enter");
+  await expect.poll(() => state.calls.some((c) => c.method === "POST" && c.path === "/api/pm/message")).toBe(true);
+  await expect(interrupt).toBeDisabled();
+  // The refresh after the 202 is held: the 202 alone re-enables Interrupt and the composer.
+  const historyReads = () => state.calls.filter((c) => c.method === "GET" && c.path === "/api/pm/history").length;
+  const readsBefore = historyReads();
+  const releaseRefresh = state.hold("GET /api/pm/history");
+  releaseSend();
+  await expect.poll(historyReads).toBeGreaterThan(readsBefore);
+  await expect(page.locator("#send-feedback")).toHaveText("Message accepted.");
+  await expect(interrupt).toBeEnabled();
+  await expect(page.getByRole("textbox", { name: "Message this session" })).toBeEnabled();
+  await interrupt.click();
+  await expect.poll(() => state.calls.filter((c) => c.path === "/api/pm/interrupt").length).toBe(1);
+  releaseRefresh();
+});
+
+// #144: a send still pending in a session is that session's: the PM's composer and Interrupt stay
+// usable meanwhile.
+test("a pending session send does not disable the PM's composer or Interrupt", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmBusy = true;
+  await page.goto("/?session=managed%3Aalpha");
+  await expect(page.getByText("Working on it.")).toBeVisible();
+  const composer = page.getByRole("textbox", { name: "Message this session" });
+  const release = state.hold("POST /api/session/message");
+  await composer.fill("Run the tests");
+  await composer.press("Enter");
+  await expect.poll(() => state.calls.some((c) => c.method === "POST" && c.path === "/api/session/message")).toBe(true);
+  await expect(composer).toBeDisabled();
+  await page.locator("#select-pm").click();
+  await expect(page.getByText("How can I help the fleet?")).toBeVisible();
+  const interrupt = page.getByRole("button", { name: "Interrupt", exact: true });
+  await expect(interrupt).toBeEnabled();
+  await expect(composer).toBeEnabled();
+  await composer.fill("Status?");
+  await expect(page.locator("#send")).toBeEnabled();
+  // Back in the session its send is still pending, and finishes there.
+  await page.getByRole("button", { name: /Fix sign-in/ }).click();
+  await expect(page.getByText("Working on it.")).toBeVisible();
+  await expect(composer).toBeDisabled();
+  release();
+  await expect(page.locator("#send-feedback")).toHaveText("Message accepted.");
+  await expect(composer).toBeEnabled();
+});
+
+// #144: with /api/host failing from the first poll, the PM's machine line does not stay on
+// "Checking…": the relay's /api/pm/host answer is still read and shown.
+test("the machine line does not stay on Checking when /api/host fails from the first poll", async ({ page }) => {
+  const state = await fixture(page);
+  state.hostStatus = 502;
+  await page.goto("/?view=pm");
+  await expect(page.locator("#connection-banner")).toContainText("Cannot reach the execution host.");
+  await expect.poll(() => pmHostGets(state).length).toBeGreaterThan(0);
+  await openInfo(page);
+  await expect(label(page)).toHaveText("Coordinator on machine-a · online");
+  await expect(page.locator("#pm-host")).toHaveAttribute("aria-busy", "false");
+  // Still one /api/pm/host read per poll.
+  const hosts = () => state.calls.filter((c) => c.path === "/api/host").length;
+  const before = hosts();
+  await pollNow(page);
+  await expect.poll(hosts).toBeGreaterThan(before);
+  await pollNow(page);
+  await expect.poll(hosts).toBeGreaterThan(before + 1);
+  const windows: string[][] = [];
+  for (const call of state.calls) {
+    if (call.path === "/api/host") windows.push([]);
+    else if (windows.length) windows.at(-1)!.push(`${call.method} ${call.path}`);
+  }
+  for (const poll of windows.slice(0, -1)) expect(poll.filter((call) => call === "GET /api/pm/host")).toHaveLength(1);
+});
+
+test("with /api/host and /api/pm/host both failing, the machine line is not left on Checking", async ({ page }) => {
+  const state = await fixture(page);
+  state.hostStatus = 502;
+  state.pmHostStatus = 502;
+  state.pmHostBody = { error: "Relay unavailable" };
+  await page.goto("/?view=pm");
+  await expect(page.locator("#connection-banner")).toContainText("Cannot reach the execution host.");
+  await expect.poll(() => pmHostGets(state).length).toBeGreaterThan(0);
+  await openInfo(page);
+  await expect(page.locator("#pm-host")).toBeHidden();
+  await expect(page.getByText("Checking which machine runs the Coordinator…")).toHaveCount(0);
+});
+
+// #144: an online machine never reads "Last seen 1 min ago" (the relay writes last_seen at most
+// once a minute); an offline machine keeps its last seen time.
+test("an online machine shows no last-seen time, an offline one does", async ({ page }) => {
+  await fixture(page, {
+    machines: [
+      { machine_id: A, name: "machine-a", platform: "darwin", online: true, last_seen: Date.now() - 90_000 },
+      { machine_id: B, name: "machine-b", platform: "linux", online: true, last_seen: Date.now() - 100_000 },
+      { machine_id: C, name: "machine-c", platform: "win32", online: false, last_seen: Date.now() - 3 * 60_000 },
+    ],
+  });
+  await openPm(page);
+  await openInfo(page);
+  await moveButton(page).click();
+  const rows = dialog(page).locator(".machine-choice");
+  await expect(rows).toHaveCount(3);
+  await expect(rows.filter({ hasText: "machine-a" }).locator(".machine-meta")).toHaveText("macOS · Online");
+  await expect(rows.filter({ hasText: "machine-b" }).locator(".machine-meta")).toHaveText("Linux · Online");
+  await expect(rows.filter({ hasText: "machine-c" }).locator(".machine-meta")).toHaveText("Windows · Offline · Last seen 3 min ago");
+  await expect(dialog(page)).not.toContainText("1 min ago");
+});
+
+// #197: close, reopen and close again before either close event fires: two close events arrive
+// for one closed dialog, and focus still returns to Move Coordinator…, not to the info screen.
+test("close, reopen and close before either close event fires returns focus to Move", async ({ page }) => {
+  await fixture(page, {
+    machines: [
+      { machine_id: A, name: "machine-a", platform: "darwin", online: true, last_seen: Date.now() },
+      { machine_id: B, name: "machine-b", platform: "linux", online: true, last_seen: Date.now() },
+    ],
+  });
+  await openPm(page);
+  await openInfo(page);
+  await moveButton(page).click();
+  await expect(dialog(page)).toBeVisible();
+  await expect.poll(() => page.evaluate(() => history.state?.overlay)).toBe("move");
+  const events = await page.evaluate(() => {
+    const move = document.getElementById("move-pm-dialog") as HTMLDialogElement;
+    const w = window as any;
+    w.__closes = 0;
+    move.addEventListener("close", () => { w.__closes++; });
+    move.close();
+    (document.getElementById("move-pm") as HTMLButtonElement).click();
+    const reopened = move.open;
+    move.close();
+    return { reopened, closedAgain: !move.open, firedSoFar: w.__closes };
+  });
+  expect(events).toEqual({ reopened: true, closedAgain: true, firedSoFar: 0 });
+  await expect.poll(() => page.evaluate(() => (window as any).__closes)).toBe(2);
+  await expect(dialog(page)).toBeHidden();
+  await expect(page.locator("#info-dialog")).toBeVisible();
+  await expect(moveButton(page)).toBeFocused();
+  await expect.poll(() => page.evaluate(() => history.state?.overlay)).toBe("info");
+});
+
 test("the 'PM now runs on' entry stands out in the conversation", async ({ page }) => {
   const state = await fixture(page);
   state.pmHistory = [
@@ -740,4 +897,36 @@ test("the 'PM now runs on' entry stands out in the conversation", async ({ page 
     routine.evaluate((el) => getComputedStyle(el).backgroundColor),
   ]);
   expect(movedBackground).not.toBe(routineBackground);
+});
+
+// #144: the host marks the "Coordinator moved" entry with `marker: "pm_moved"` (PmEntry in
+// server/pm.ts). It is recognised by the marker whatever its wording, and by its text on older
+// hosts that send no marker; a marker added to an entry already shown restyles it.
+test("the Coordinator moved entry is recognised by its marker, and by its text from older hosts", async ({ page }) => {
+  const state = await fixture(page);
+  const at = new Date().toISOString();
+  state.pmHistory = [
+    { id: "a", role: "assistant", text: "How can I help the fleet?", at },
+    // A current host: the marker, with wording the text match does not know.
+    { id: "m1", role: "system", text: "Coordinator handed over to machine-b; send from there.", marker: "pm_moved", at },
+    // An older host: no marker, the known text.
+    { id: "m2", role: "system", text: "This machine is no longer the Coordinator host (machine-c runs it now).", at },
+    // Routine lines stay plain.
+    { id: "r1", role: "system", text: "A routine status line.", at },
+    { id: "r2", role: "system", text: "Handed over later.", at },
+  ];
+  await openPm(page);
+  const moved = page.getByRole("article", { name: "The Coordinator moved" });
+  await expect(moved).toHaveCount(2);
+  await expect(moved.nth(0)).toContainText("Coordinator handed over to machine-b");
+  await expect(moved.nth(0).locator(".message-label")).toHaveText(/^Coordinator moved/);
+  await expect(moved.nth(1)).toContainText("This machine is no longer the Coordinator host");
+  await expect(page.locator(".message.system").filter({ hasText: "A routine status line." })).not.toHaveClass(/pm-moved/);
+  const later = page.locator(".message.system").filter({ hasText: "Handed over later." });
+  await expect(later).not.toHaveClass(/pm-moved/);
+  // The same entry gains the marker on a later read.
+  state.pmHistory = state.pmHistory.map((entry) => (entry.id === "r2" ? { ...entry, marker: "pm_moved" } : entry));
+  await pollNow(page);
+  await expect(moved).toHaveCount(3);
+  await expect(later).toHaveClass(/pm-moved/);
 });

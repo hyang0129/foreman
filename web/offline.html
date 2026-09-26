@@ -44,7 +44,13 @@
     </main>
     <script>
       const button = document.getElementById("retry");
+      // Set once this screen starts leaving: a notification's navigation, or a retry. A probe that
+      // succeeds after a notification was tapped must not reload this URL, which would cancel the
+      // navigation to the notification's conversation.
+      let leaving = false;
       function retry() {
+        if (leaving) return;
+        leaving = true;
         button.disabled = true;
         button.textContent = "Retrying…";
         location.reload();
@@ -83,6 +89,7 @@
           const target = appUrl(event.data.url);
           if (!target) return;
           clearTimeout(probeTimer);
+          leaving = true;
           button.disabled = true;
           button.textContent = "Opening…";
           location.assign(target);

@@ -295,3 +295,34 @@ test("a Lead chat says what it is doing in plain words and shows starting a work
   await expect(page.locator("#activity-status")).toHaveText("Searching the code…");
   await expectNoLeaks(page.locator("#messages"), page.locator(".conversation-head"));
 });
+
+// #215 review: the phrase table is a plain object, so a tool named after an Object.prototype
+// member ("constructor", "toString", ...) must not read the prototype and render a function (or
+// an object) as the status line. Each such name reads as the generic phrase.
+test("a tool named after an Object.prototype member reads as the generic phrase", async ({ page }) => {
+  const state = await fixture(page);
+  state.sessions[0].current_tool = "toString";
+  await page.goto("/");
+  await expect(page.getByText("Coordinator here.")).toBeVisible();
+  const status = page.locator("#activity-status");
+  state.pmHistory.push({ role: "user", text: "Go", ts: iso(60_000) });
+  state.pmBusy = true;
+  for (const name of ["constructor", "toString", "hasOwnProperty", "__proto__", "valueOf", "mcp__fleet__constructor"]) {
+    state.pmHistory.push(tool(name, "{}", 50_000));
+    await pollNow(page);
+    await expect(status, name).toHaveText("Working…");
+  }
+  // Loading a tool with such a name names nothing either.
+  state.pmHistory.push(tool("ToolSearch", JSON.stringify({ query: "select:mcp__fleet__constructor" }), 40_000));
+  await pollNow(page);
+  await expect(status).toHaveText("Getting ready…");
+  await expectNoLeaks(page.locator(".conversation-head"));
+  // A session's current tool: the list preview and its own status line.
+  await page.getByRole("button", { name: "Open session navigation" }).tap();
+  const row = page.locator("#session-list").getByRole("button", { name: /Fix flaky tests/ });
+  await expect(row.locator(".session-sub")).toHaveText("Working…");
+  await row.tap();
+  await expect(status).toHaveText("Working…");
+  await expect(page.locator(".conversation-head")).not.toContainText("function");
+  await expect(page.locator(".conversation-head")).not.toContainText("[object");
+});

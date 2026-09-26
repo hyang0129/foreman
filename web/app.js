@@ -145,7 +145,9 @@ let sessions = [],
 let pollTimer,
   polling = false,
   pollAgain = false,
-  sending = false,
+  // Conversations with a send in flight. Per conversation: a pending session send must not
+  // disable the PM's composer or its Interrupt.
+  sending = new Set(),
   creating = false,
   authEpoch = 0,
   selectionEpoch = 0;
@@ -396,7 +398,7 @@ function revokeAccess(message) {
   $("#settings-dialog").close();
   authorized = false;
   pmModel = ""; pmModelLoaded = false; pmModelReady = false;
-  sending = false; creating = false; pmModelSaving = false; pmModelLoading = false;
+  sending.clear(); creating = false; pmModelSaving = false; pmModelLoading = false;
   newModelRequest++;
   projectRevision++; projectRows = []; projectResolution = null; projectSelection = null; projectPending = false;
   $("#project-choices").replaceChildren(); $("#project-status").textContent = ""; $("#project-feedback").textContent = "";
@@ -580,8 +582,15 @@ window.addEventListener("popstate", (event) => {
   const view = state.view || "pm";
   if (view === selected) return;
   // Forward onto a deep link that was rejected: the same neutral PM fallback, not the
-  // conversation's error, unless the host has since listed that session.
+  // conversation's error, unless the host has since listed that session. Before the first
+  // session list (right after a reload) that is not known yet, so the entry opens as a deep link
+  // does at load and the next list decides.
   if (view !== "pm" && state.rejected && !sessions.some((s) => s.session_key === view)) {
+    if (!sessionsLoaded) {
+      void selectSession(view, false);
+      deepLinkPending = view;
+      return;
+    }
     showInbox();
     showNotice(UNKNOWN_LINK_NOTICE);
     historyBack();
@@ -756,15 +765,16 @@ function updateControls() {
   $("#create-session").disabled = !authorized || !host.online || creating || projectPending || !projectResolution;
   $("#send-to-coordinator").disabled = !authorized || !host.online || askBusy || !$("#ask-coordinator").value.trim();
   $("#send-to-coordinator").textContent = askBusy ? "Asking…" : "Ask the Coordinator";
-  ui.input.disabled = !canMessage || sending;
-  ui.send.disabled = !canMessage || sending || !ui.input.value.trim();
-  ui.send.firstChild.textContent = sending ? "Sending… " : "Send ";
+  const sendingHere = sending.has(selected);
+  ui.input.disabled = !canMessage || sendingHere;
+  ui.send.disabled = !canMessage || sendingHere || !ui.input.value.trim();
+  ui.send.firstChild.textContent = sendingHere ? "Sending… " : "Send ";
   ui.interrupt.disabled =
     !authorized ||
     !host.online ||
     (isPm ? !pmBusy : !session?.capabilities?.interrupt) ||
     // Until a PM send's 202 arrives its turn is not dispatched yet, so Stop could not reach it.
-    (isPm && sending) ||
+    (isPm && sendingHere) ||
     ui.interrupt.dataset.busy === "true";
   ui.interrupt.textContent = ui.interrupt.dataset.busy === "true" ? "Interrupting…" : "Interrupt";
   // Interrupt shows only while a turn is running (or a request to stop one is in flight).
@@ -1130,6 +1140,9 @@ const STEP_PHRASES = {
   commandExecution: "Running a command…",
   fileChange: "Editing files…",
 };
+// A tool's phrase, or null. Own keys only: a tool named "constructor" or "toString" must not reach
+// Object.prototype and render a function as the status line.
+const stepPhraseFor = (name) => (typeof name === "string" && Object.hasOwn(STEP_PHRASES, name) ? STEP_PHRASES[name] : null);
 const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
 // "mcp__fleet__list_projects", "fleet.list_projects" and "list_projects" name the same tool.
 function baseToolName(name) {
@@ -1173,11 +1186,11 @@ function stepPhrase({ name, detail }) {
   if (name === "ToolSearch") {
     // Loading tools names what comes next: {"query":"select:mcp__fleet__list_projects,…"}.
     const next = baseToolName(/select:([^,"\s}]+)/.exec(detail)?.[1]);
-    if (next && next !== "ToolSearch" && STEP_PHRASES[next]) return STEP_PHRASES[next];
+    if (next && next !== "ToolSearch" && stepPhraseFor(next)) return stepPhraseFor(next);
   }
   if (name === "Read" && /tool-results/.test(detail)) return "Reading the results…";
   if (name === "commandExecution" && /\b(test|tests|vitest|jest|pytest|playwright|typecheck)\b/.test(detail)) return "Running tests…";
-  return STEP_PHRASES[name] || "Working…";
+  return stepPhraseFor(name) || "Working…";
 }
 // The one compact line for sending an investigator, a subagent, a Lead or a worker; null otherwise.
 function dispatchLine({ name, detail }) {
@@ -1262,7 +1275,10 @@ function stepNode(entry) {
   );
   return row;
 }
+// server/pm.ts marks the "Coordinator moved" entry with `marker: "pm_moved"`. Hosts from before the
+// marker are recognised by the entry's text.
 const PM_MOVED_TEXT = /^(The (PM|Coordinator) now runs on |This machine is no longer the (PM|Coordinator) host)/;
+const pmMovedEntry = (entry) => entry.marker === "pm_moved" || (entry.marker == null && PM_MOVED_TEXT.test(String(entry.text || "")));
 function messageNode(entry, receipt, entryKey) {
   if (entry.role === "dispatch") return dispatchNode(entry);
   if (entry.role === "step") return stepNode(entry);
@@ -1272,7 +1288,7 @@ function messageNode(entry, receipt, entryKey) {
   const failed = role === "system" && entry.error === true;
   // server/pm.ts records this when the PM moves away from this machine; it explains why sends
   // here are refused, so it stands out from routine system lines.
-  const moved = role === "system" && !failed && selected === "pm" && PM_MOVED_TEXT.test(String(entry.text || ""));
+  const moved = role === "system" && !failed && selected === "pm" && pmMovedEntry(entry);
   const article = node("article", `message ${role}${failed ? " error" : ""}${moved ? " pm-moved" : ""}`);
   if (failed) article.setAttribute("aria-label", failureLabel());
   if (moved) article.setAttribute("aria-label", "The Coordinator moved");
@@ -1310,6 +1326,9 @@ function messageNode(entry, receipt, entryKey) {
   article.copyText = String(entry.text || entry.summary || "");
   article.tabIndex = 0;
   article.setAttribute("aria-description", "Press Enter for message options");
+  // Its own click listener also marks it actionable to screen readers, so TalkBack's double-tap
+  // activates it (see messageClick).
+  article.addEventListener("click", messageClick);
   renderMessageReceipt(article, receipt);
   return article;
 }
@@ -1386,7 +1405,7 @@ function renderMessages(history = [], receipts = []) {
     const previous = item.previous;
     if (!firstRender && !wasNearBottom && (!previous || textOf(previous.entry) !== textOf(item.entry))) newMessages = true;
     item.key = previous?.key || ++nextEntryKey;
-    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source, item.entry.error === true]);
+    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source, item.entry.error === true, item.entry.marker]);
     const receiptSignature = JSON.stringify(item.receipt);
     item.element = previous?.contentSignature === contentSignature ? previous.element : messageNode(item.entry, item.receipt, item.key);
     if (item.element === previous?.element && previous.receiptSignature !== receiptSignature) renderMessageReceipt(item.element, item.receipt);
@@ -1679,7 +1698,8 @@ async function selectSession(key, record = true) {
     ui.title.tabIndex = -1;
     ui.title.focus({ preventScroll: true });
   }
-  if (!host.online) showConversationLoading(`Conversation unavailable while ${hostName("the execution host")} is offline. It will open when it reconnects.`, true);
+  // Before the first /api/host answer the host is not known to be offline: it is still opening.
+  if (hostChecked && !host.online) showConversationLoading(`Conversation unavailable while ${hostName("the execution host")} is offline. It will open when it reconnects.`, true);
   try {
     await refreshSelected();
   } catch (error) {
@@ -1696,12 +1716,32 @@ function showInbox() {
 function rejectDeepLink() {
   const key = selected;
   showInbox();
-  afterHistory(() => {
-    const state = history.state;
-    if (state?.foreman && state.view === key && !state.overlay) history.replaceState({ ...state, rejected: true }, "", location.href);
-  });
+  markRejected(key);
   recordView(null);
   showNotice(UNKNOWN_LINK_NOTICE);
+}
+// Marks the conversation's entry rejected, and any overlay entry (the drawer, a dialog) that was
+// open above it: Back steps off those first, so each is marked on the way down.
+function markRejected(key, budget = 3) {
+  afterHistory(() => {
+    const state = history.state;
+    if (!state?.foreman || state.view !== key) return;
+    if (!state.rejected) history.replaceState({ ...state, rejected: true }, "", location.href);
+    if (state.overlay && budget > 0) {
+      historyBack();
+      markRejected(key, budget - 1);
+    }
+  });
+}
+// A rejected link the host now lists: its entries open normally again.
+function clearRejected(key) {
+  afterHistory(() => {
+    const state = history.state;
+    if (state?.foreman && state.view === key && state.rejected) {
+      const { rejected, ...rest } = state;
+      history.replaceState(rest, "", location.href);
+    }
+  });
 }
 let polledPmError = null;
 async function refreshSelected() {
@@ -1895,7 +1935,9 @@ function renderMoveList() {
   if (moveChoice && !selectable.has(moveChoice)) moveChoice = null;
   const rows = machines.map((m) => ({
     id: m.machine_id, name: m.name, active: m.active, online: m.online, enabled: selectable.has(m.machine_id),
-    meta: [PLATFORM_LABEL[m.platform] || m.platform || "Unknown platform", m.online ? "Online" : "Offline", lastSeenText(m.last_seen)].join(" · "),
+    // The relay writes last_seen at most once a minute, so an online machine can read "Last seen
+    // 1 min ago". It is shown only for a machine that is offline, where it says something.
+    meta: [PLATFORM_LABEL[m.platform] || m.platform || "Unknown platform", m.online ? "Online" : "Offline", m.online ? "" : lastSeenText(m.last_seen)].filter(Boolean).join(" · "),
     note: m.active ? "Runs the Coordinator now" : !m.online ? "Offline machines can’t take the Coordinator" : "",
     seen: m.last_seen,
   }));
@@ -1919,7 +1961,7 @@ function renderMoveList() {
       dot.setAttribute("aria-hidden", "true");
       name.prepend(dot);
       const meta = node("span", "machine-meta", row.meta);
-      if (typeof row.seen === "number" && row.seen > 0) meta.title = new Date(row.seen).toLocaleString();
+      if (!row.online && typeof row.seen === "number" && row.seen > 0) meta.title = new Date(row.seen).toLocaleString();
       text.append(name, meta);
       if (row.note) text.append(node("span", "machine-note", row.note));
       label.append(input, text);
@@ -1943,7 +1985,7 @@ function openMovePm(event) {
   moveSignature = "";
   moveError();
   renderMoveList();
-  ui.moveDialog.showModal();
+  showDialog(ui.moveDialog);
   pushOverlay("move", () => ui.moveDialog.open);
   (ui.moveDialog.querySelector("#move-pm-list input:not(:disabled)") || $("#close-move-pm")).focus();
 }
@@ -1955,8 +1997,22 @@ for (const selector of ["#close-move-pm", "#cancel-move-pm"])
 // second opening. That late event must not undo the new opening: pop its history entry, clear
 // its choice, or drop its opener (which sent focus to the info screen instead, #189). Each
 // dialog's close handler returns early while its dialog is open again.
+// Close, reopen and close again before either event fires delivers two close events for one
+// closed dialog: only the first is handled, or the second finds the opener already used and
+// sends focus elsewhere (#197). `showDialog` arms one handling per opening.
+function showDialog(dialog) {
+  dialog.showModal();
+  dialog.closeHandled = false;
+}
+// True when this close event must be ignored: the dialog is open again, or this opening's close
+// was already handled.
+function staleClose(dialog) {
+  if (dialog.open || dialog.closeHandled) return true;
+  dialog.closeHandled = true;
+  return false;
+}
 ui.moveDialog.addEventListener("close", () => {
-  if (ui.moveDialog.open) return;
+  if (staleClose(ui.moveDialog)) return;
   popOverlay("move");
   moveChoice = null;
   moveError();
@@ -2045,7 +2101,7 @@ function openInfo(event) {
   const opener = event?.currentTarget;
   infoOpener = opener && opener !== $("#open-info") && opener.matches?.("button") ? opener : $("#conversation-menu-button");
   renderHeading();
-  ui.infoDialog.showModal();
+  showDialog(ui.infoDialog);
   pushOverlay("info", () => ui.infoDialog.open);
   $("#close-info").focus();
   // The Coordinator's info summarizes the settings it launches Leads with.
@@ -2054,7 +2110,7 @@ function openInfo(event) {
 $("#open-info").addEventListener("click", openInfo);
 $("#close-info").addEventListener("click", () => ui.infoDialog.close());
 ui.infoDialog.addEventListener("close", () => {
-  if (ui.infoDialog.open) return; // A late close event after a reopen (see the Move dialog's).
+  if (staleClose(ui.infoDialog)) return; // A late close event (see the Move dialog's).
   popOverlay("info");
   if (!authorized) return;
   const opener = infoOpener;
@@ -2252,7 +2308,7 @@ function openSettings(event) {
   settingsOpener = opener && opener !== $("#open-settings") ? opener : $("#conversation-menu-button");
   settingsNotice("");
   renderSettings(true);
-  ui.settingsDialog.showModal();
+  showDialog(ui.settingsDialog);
   pushOverlay("settings", () => ui.settingsDialog.open);
   $("#close-settings").focus();
   void loadSettings();
@@ -2264,7 +2320,7 @@ $("#info-open-settings").addEventListener("click", openSettings);
 $("#close-settings").addEventListener("click", () => ui.settingsDialog.close());
 $("#settings-form").addEventListener("submit", (event) => event.preventDefault());
 ui.settingsDialog.addEventListener("close", () => {
-  if (ui.settingsDialog.open) return; // A late close event after a reopen (see the Move dialog's).
+  if (staleClose(ui.settingsDialog)) return; // A late close event (see the Move dialog's).
   popOverlay("settings");
   if (!authorized) return;
   const opener = settingsOpener;
@@ -2407,6 +2463,21 @@ ui.messages.addEventListener("keydown", (event) => {
   event.preventDefault();
   openMessageMenu(event.target);
 });
+// TalkBack (#174): a double-tap activates the focused message with a click that no finger or
+// mouse press started; that click opens the message's options, as Enter does. A sighted tap or
+// click always starts with a press on the same message and stays for reading and scrolling. The
+// press is remembered by entry key, since a streaming message can re-render in between.
+let pressedEntry = null;
+document.addEventListener("pointerdown", (event) => {
+  pressedEntry = event.target.closest?.("#messages .message")?.dataset.entryKey ?? null;
+}, true);
+function messageClick(event) {
+  const article = event.currentTarget;
+  const pressed = pressedEntry !== null && pressedEntry === article.dataset.entryKey;
+  pressedEntry = null;
+  if (pressed || event.target.closest("a, button, pre, summary, input, select, textarea") || String(window.getSelection?.() || "")) return;
+  openMessageMenu(article);
+}
 
 // GET /api/leads: the Lead registry. A host or relay without the route answers 404; it is asked
 // again only once a minute, so an older host costs one request a minute, not one a poll.
@@ -2432,8 +2503,10 @@ async function poll() {
   clearTimeout(pollTimer);
   if (!authorized) return;
   // A poll asked for while one is in flight (the browser coming back online, a PM move, a
-  // sign-in) runs as soon as that one finishes: the in-flight poll may have read the state from
-  // before the change, so dropping the request would leave the view stale until the timer.
+  // sign-in) runs once that one has finished, which includes its /api/pm/host and /api/leads
+  // reads settling: the in-flight poll may have read the state from before the change, so
+  // dropping the request would leave the view stale until the timer. Many requests made during
+  // one poll still make a single follow-up poll.
   if (polling) {
     pollAgain = true;
     return;
@@ -2463,6 +2536,7 @@ async function poll() {
         const key = deepLinkPending;
         deepLinkPending = null;
         if (selected === key && !sessions.some((s) => s.session_key === key)) rejectDeepLink();
+        else if (selected === key) clearRejected(key);
       }
       renderRail();
       await refreshSelected().catch(showRefreshError);
@@ -2485,6 +2559,9 @@ async function poll() {
       renderRail();
       renderHeading();
       if (conversationLoading) showConversationLoading("Conversation unavailable while the execution host is unreachable. Retrying automatically.", true);
+      // The relay may still answer which machine runs the PM, and until something answers the
+      // PM view would say "Checking…" for as long as /api/host keeps failing. Still one read a poll.
+      pmHostRead ??= refreshPmHost(epoch);
     }
   } finally {
     // One PM machine read per poll: the next poll starts only after this one's answer.
@@ -2524,7 +2601,7 @@ $("#composer").addEventListener("submit", async (event) => {
   const attempt =
     previous?.text === text ? previous : { id: crypto.randomUUID(), text };
   sendAttempts.set(key, attempt);
-  sending = true;
+  sending.add(key);
   const epoch = authEpoch;
   setActionFeedback(key, "send", "");
   updateControls();
@@ -2545,7 +2622,13 @@ $("#composer").addEventListener("submit", async (event) => {
       ui.input.value = "";
       autosize();
     }
-    if (epoch === authEpoch && authorized) setActionFeedback(key, "send", "Message accepted.");
+    if (epoch === authEpoch && authorized) {
+      // The 202 means the turn is dispatched: Interrupt can reach it now, not only after the
+      // refresh below answers.
+      sending.delete(key);
+      setActionFeedback(key, "send", "Message accepted.");
+      updateControls();
+    }
     await refreshSelected();
   } catch (error) {
     if (epoch === authEpoch && authorized) setActionFeedback(key, "send",
@@ -2556,7 +2639,7 @@ $("#composer").addEventListener("submit", async (event) => {
     );
   } finally {
     if (epoch === authEpoch) {
-      sending = false;
+      sending.delete(key);
       updateControls();
       if (selected === key && !ui.input.disabled) ui.input.focus();
     }
@@ -2775,7 +2858,7 @@ function openNew(event) {
   $("#new-policy").value = "native";
   updateNewPolicy();
   askStatus("");
-  ui.dialog.showModal();
+  showDialog(ui.dialog);
   pushOverlay("dialog", () => ui.dialog.open);
   void loadNewModels();
   void loadProjects(); void resolveNewProject();
@@ -2783,7 +2866,7 @@ function openNew(event) {
 }
 ui.newButton.addEventListener("click", openNew);
 ui.dialog.addEventListener("close", () => {
-  if (ui.dialog.open) return; // A late close event after a reopen (see the Move dialog's).
+  if (staleClose(ui.dialog)) return; // A late close event (see the Move dialog's).
   popOverlay("dialog");
   projectRevision++; projectPending = false; projectResolution = null; projectSelection = null;
   if (!authorized || creating) return;
@@ -2861,6 +2944,8 @@ window.addEventListener("online", poll);
 // Sign-in waits for it: a sign-in completed during the wait would otherwise be undone by the
 // Firebase sign-out that follows.
 let signingOut = null;
+const SIGN_OUT_TIMEOUT = 10000, SIGN_OUT_STUCK = "Signing out is taking longer than expected. Continue with Google reloads Foreman to sign in again.";
+let signOutStuck = false;
 ui.signOut.addEventListener("click", () => {
   if (signingOut) return;
   // Capture the push subscription and token while still signed in; the server unsubscribe
@@ -2871,9 +2956,14 @@ ui.signOut.addEventListener("click", () => {
   signingOut = (async () => {
     await leaving;
     try {
-      await authSDK.signOut(firebaseAuth);
+      // Bounded: a Firebase sign-out that never settles must not leave "Continue with Google"
+      // disabled until a reload (#150). This app has already let go of the account above.
+      await withTimeout(authSDK.signOut(firebaseAuth), SIGN_OUT_TIMEOUT, SIGN_OUT_STUCK);
     } catch (error) {
       ui.authStatus.textContent = errorMessage(error);
+      // A sign-out still pending could land after a new sign-in and undo it: signing in again
+      // starts from a fresh page instead.
+      if (error?.message === SIGN_OUT_STUCK) signOutStuck = true;
     }
   })().finally(() => {
     signingOut = null;
@@ -2893,7 +2983,8 @@ const PUSH_STATUS = {
 };
 const PUSH_SUMMARY = { off: "Off", blocked: "Blocked", on: "On" };
 // On, but every kind unticked: the subscription stays, and nothing can fire until one is ticked.
-const PUSH_NONE_SUMMARY = "On — all notification types are off";
+// Short enough for the drawer's summary row on a narrow phone; the status line below says the rest.
+const PUSH_NONE_SUMMARY = "On · all types off";
 const PUSH_NONE_STATUS = "This device is subscribed, but every notification type is turned off, so Foreman sends nothing. Tick a type below to get notifications again.";
 const pushUi = {
   root: $("#notify-settings"),
@@ -3185,7 +3276,7 @@ ui.signIn.addEventListener("click", async () => {
     ui.signIn.disabled = true;
     await signingOut;
   }
-  if (!firebaseAuth || !authSDK) {
+  if (!firebaseAuth || !authSDK || signOutStuck) {
     location.reload();
     return;
   }
