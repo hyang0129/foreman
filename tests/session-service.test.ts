@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SessionService, claudeToolSummary } from '../server/session-service.ts';
+import { SessionService, claudeToolSummary, scrubCommandSecrets } from '../server/session-service.ts';
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 class FakeClaude extends EventEmitter {
@@ -407,7 +407,7 @@ test('a managed Claude session records its tool calls as short redacted tool ent
   claude.emit('message', toolResult('tu-spawn'));
   assert.equal(service.detail(key).session.current_tool, null);
   claude.emit('message', toolUse('m1', [{ type: 'tool_use', id: 'tu-spawn', name: 'mcp__lead__spawn_session', input: { name: 'fix-login', prompt } }]));
-  claude.emit('message', toolResult('tu-spawn'));
+  assert.equal(service.detail(key).session.current_tool, null, 'a redelivered call is not marked running again');
   assert.equal(service.detail(key).history.filter((entry) => entry.id === 'claude-tool:tu-spawn').length, 1);
   // Commands are redacted and bounded; a subagent's own tool calls are not recorded.
   claude.emit('message', toolUse('m2', [{ type: 'tool_use', id: 'tu-bash', name: 'Bash', input: { command: `curl -H "Authorization: Bearer ${'s3cr3t'.repeat(8)}" https://api.example.com/${'p'.repeat(400)}` } }]));
@@ -436,6 +436,39 @@ test('Claude tool summaries name the target, never the payload, in the Coordinat
   assert.equal(claudeToolSummary('ToolSearch', { query: 'select:mcp__lead__spawn_session' }), '{"query":"select:mcp__lead__spawn_session"}');
   const other = claudeToolSummary('mcp__custom__tool', { token: 'a'.repeat(50), data: 'y'.repeat(1000) });
   assert.match(other, /"token":"\[REDACTED\]"/); assert.equal(other.length, 160);
+});
+
+test('Claude tool summaries redact the credential shapes common in shell commands', () => {
+  const secrets = ['hunter2hunter2', 'abcdef123456', 'wJalrXUtnFEMIK7MDENGbPxRfiCY', 's3cretpw', 'zzz', 'S3cretPw', 'S3cretPw123', 'Zx9fakeKeyValue000', 'xoxb-private-value', 'q9Z'];
+  const commands = [
+    'GITHUB_TOKEN=hunter2hunter2 gh api /user',
+    'export OPENAI_API_KEY=abcdef123456',
+    'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCY aws s3 ls',
+    'PGPASSWORD=s3cretpw psql -h db',
+    'cat <<EOF > .env\nDB_PASSWORD=zzz\nEOF',
+    'mysql -uroot -pS3cretPw app',
+    'curl -u admin:S3cretPw https://api.example.com',
+    'git clone https://user:S3cretPw123@github.com/org/repo.git',
+    `stripe charges retrieve ch_1 ${['sk', 'live', 'Zx9fakeKeyValue000'].join('_')}`, // built at runtime: no key-shaped literal in the repo
+    'SLACK_PRIVATE_KEY="xoxb-private-value" node x.js',
+    'DB_PWD=q9Z ./run',
+    'psql --password S3cretPw --host db',
+    'vault login --api-key abcdef123456',
+  ];
+  for (const command of commands) {
+    const summary = claudeToolSummary('Bash', { command });
+    for (const secret of secrets) assert.equal(summary.includes(secret), false, `${command} → ${summary}`);
+    assert.match(summary, /\[REDACTED\]/, command);
+  }
+  assert.equal(scrubCommandSecrets('mkdir -p build && ls -la'), 'mkdir -p build && ls -la');
+  assert.equal(scrubCommandSecrets('curl -u admin:pw https://x'), 'curl -u [REDACTED] https://x');
+  // Bash prefers the tool's own description; other tools with a payload name none of it.
+  assert.equal(claudeToolSummary('Bash', { command: 'GITHUB_TOKEN=x gh pr list', description: 'List open PRs' }), 'List open PRs');
+  assert.equal(claudeToolSummary('ExitPlanMode', { plan: 'secret plan' }), '');
+  assert.equal(claudeToolSummary('AskUserQuestion', { questions: [{ question: 'private?' }] }), '');
+  assert.equal(claudeToolSummary('Skill', { skill: 'fix-issue', args: 'private args' }), 'fix-issue');
+  assert.equal(claudeToolSummary('Agent', { subagent_type: 'investigator' }), 'investigator:');
+  assert.equal(claudeToolSummary('Agent', {}), 'agent');
 });
 
 test('tool entries never push the conversation out of a managed session snapshot', async (t) => {

@@ -9,7 +9,7 @@ import { normalizeModel } from './models.ts';
 import { CodexControl } from './codex-control.ts';
 import { Fleet, transcriptTail, type Session } from './fleet.ts';
 import { CLAUDE_BIN, FOREMAN_HOME, HOST } from './paths.ts';
-import { redactSecrets } from '../shared/redact.ts';
+import { redactSecrets, REDACTED } from '../shared/redact.ts';
 import {
   approvedLaunchPolicy, isEffort, isLeadKey, isSessionKey, isSessionName, isWorkstream, launchedBy, leadLimits, normalizeLeadKey,
   parseDevSettingsView, parseLaunchApprovalInput, parseRequestedAgentMode, resolveAgentLaunchPolicy, roleOf, truncateFirstTask,
@@ -96,7 +96,25 @@ function bounded<T extends { text: string; role?: string }>(items: T[], bytes = 
 const MAX_TOOL_ENTRIES = 200;
 /** Longest tool summary, as the Coordinator's (server/pm.ts). */
 const TOOL_SUMMARY_CHARS = 160;
-const safe = (text: string, max: number) => redactSecrets(text).slice(0, max);
+/**
+ * Credential shapes common in shell commands that shared/redact.ts does not yet catch (#221 review; #226
+ * moves them there): env-style assignments whose name contains a credential word
+ * (`GITHUB_TOKEN=…`, `export OPENAI_API_KEY=…`, `PGPASSWORD=…`), URL userinfo (`https://user:pass@`),
+ * `-u`/`--user user:pass`, an attached `-p<value>` (mysql) and Stripe-style `sk_live_`/`sk_test_` keys.
+ * Fails closed: any value after such a name is replaced, even an ordinary word.
+ */
+const CREDENTIAL_NAME = /([A-Za-z0-9_-]*(?:TOKEN|SECRET|PASSW(?:OR)?D|PWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL)[A-Za-z0-9_-]*["']?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s"'&;|]+)/gi;
+export function scrubCommandSecrets(text: string): string {
+  return String(text)
+    .replace(CREDENTIAL_NAME, (_all: string, name: string, value: string) => /^["']/.test(value) ? `${name}${value[0]}${REDACTED}${value[0]}` : `${name}${REDACTED}`)
+    // A credential flag with a separate value: `--password hunter2`, `--api-key abc`.
+    .replace(/((?:^|\s)--?[A-Za-z0-9_-]*(?:TOKEN|SECRET|PASSW(?:OR)?D|PWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL)[A-Za-z0-9_-]*\s+)(?!-)(\S+)/gi, `$1${REDACTED}`)
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s\/@]+@/gi, `$1${REDACTED}@`)
+    .replace(/((?:^|\s)(?:-u|--user)(?:\s+|=)?)(["']?[^\s:"']*:[^\s"']+["']?)/g, `$1${REDACTED}`)
+    .replace(/((?:^|\s)-p)([^\s-][^\s]*)/g, `$1${REDACTED}`)
+    .replace(/\b((?:sk|rk)_(?:live|test)_)[A-Za-z0-9]+/g, `$1${REDACTED}`);
+}
+const safe = (text: string, max: number) => redactSecrets(scrubCommandSecrets(text)).slice(0, max);
 /**
  * A short, redacted one-line summary of a Claude tool call (#221), in the Coordinator's shape
  * (server/pm.ts): `<subagent_type>: <description>` for a subagent, `→ <to>` for SendMessage.
@@ -109,9 +127,13 @@ export function claudeToolSummary(name: string, input: unknown): string {
   const field = (...keys: string[]) => { for (const key of keys) if (typeof args[key] === 'string' && args[key]) return args[key] as string; return ''; };
   const base = String(name).replace(/^mcp__.+?__/, '');
   let summary: string;
-  if (name === 'Agent' || name === 'Task') summary = `${field('subagent_type') || 'agent'}: ${field('description')}`;
+  // A subagent without a description keeps the `<type>:` form the web parses ("an investigator").
+  if (name === 'Agent' || name === 'Task') summary = field('subagent_type') ? `${field('subagent_type')}: ${field('description')}` : field('description') ? `agent: ${field('description')}` : 'agent';
   else if (name === 'SendMessage') summary = `→ ${field('to')}${args.notify_when_idle ? ' (notify when idle)' : ''}`;
-  else if (name === 'Bash') summary = field('command');
+  // The tool's own short description first; the command only when there is none.
+  else if (name === 'Bash') summary = field('description') || field('command');
+  else if (name === 'Skill') summary = field('skill');
+  else if (name === 'ExitPlanMode' || name === 'AskUserQuestion') summary = '';
   else if (['Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(name)) summary = field('file_path', 'notebook_path');
   else if (['Grep', 'Glob'].includes(name)) summary = field('pattern');
   else if (name === 'WebFetch') summary = field('url');
@@ -528,12 +550,12 @@ export class SessionService extends EventEmitter implements AgentSessionService 
       for (const block of content) {
         if (block?.type !== 'tool_use' || typeof block.name !== 'string' || !block.name) continue;
         const name = block.name.slice(0, 200), id = String(block.id ?? randomUUID());
-        if (!data.history.some((entry) => entry.id === `claude-tool:${id}`)) {
-          const summary = claudeToolSummary(name, block.input);
-          data.history.push({ id: `claude-tool:${id}`, role: 'tool', name, summary, text: summary, at: now() });
-          this.trimHistory(data);
-        }
-        tools.delete(id); tools.set(id, name);
+        // A redelivered call (already recorded, perhaps already finished) is never marked running again.
+        if (data.history.some((entry) => entry.id === `claude-tool:${id}`)) continue;
+        const summary = claudeToolSummary(name, block.input);
+        data.history.push({ id: `claude-tool:${id}`, role: 'tool', name, summary, text: summary, at: now() });
+        this.trimHistory(data);
+        tools.set(id, name);
       }
     } else if (message.type === 'user') {
       for (const block of content) if (block?.type === 'tool_result') tools.delete(String(block.tool_use_id));
