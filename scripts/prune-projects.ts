@@ -25,6 +25,7 @@ if (!existsSync(file)) { console.log(`No registry at ${file}. Nothing to prune.`
 const registry = new ProjectRegistry(FOREMAN_HOME), total = registry.list().length;
 const dropped = registry.prune({ dryRun: true });
 for (const p of dropped) console.log(`drop  ${p.name}  ${p.path}${p.canonicalPath !== p.path ? ` -> ${p.canonicalPath}` : ''}`);
+console.log('Missing directories are dropped too, including ones on an unmounted volume or behind an unreadable parent. Check the list before --apply.');
 console.log(`${dropped.length} of ${total} entries in ${file} ${apply ? 'will be' : 'would be'} dropped; ${total - dropped.length} kept.`);
 if (!apply) { if (dropped.length) console.log('Dry run. Rerun with --apply to rewrite the registry.'); process.exit(0); }
 if (!dropped.length) process.exit(0);

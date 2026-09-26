@@ -120,20 +120,22 @@ function skipFixture(t: test.TestContext) {
   const repo = join(home, 'repo'), worktree = join(home, 'repo-wt');
   const git = (...args: string[]) => execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args]);
   mkdirSync(repo); git('init', '-q'); git('commit', '-q', '--allow-empty', '-m', 'init'); git('worktree', 'add', '-q', '-b', 'wt', worktree);
-  const dirs = { agent: join(home, 'code', '.claude', 'worktrees', 'agent-1'), scratch: join(home, 'x', 'scratchpad', 'qa-sandbox'), tmp: join(home, 'T', 'build'),
+  const dirs = { agent: join(home, 'code', '.claude', 'worktrees', 'agent-1'), scratch: join(home, 'T', 'scratchpad', 'qa-sandbox'), tmp: join(home, 'T', 'build'),
     user: join(home, 'user'), dev: join(home, 'user', '.foreman-dev'), state: join(home, 'state', 'sessions') };
   for (const dir of Object.values(dirs)) mkdirSync(dir, { recursive: true });
   const link = join(home, 'looks-normal'); symlinkSync(dirs.tmp, link); // canonical path is temp
   const roots = seedRoots({ tmp: [join(home, 'T')], home: dirs.user, state: [join(home, 'state')] });
   return { home, first, repo, worktree, dirs, link, roots };
 }
-test('seed skips git worktrees, temp dirs, HOME and Foreman state, and still seeds a normal repo', (t) => {
+test('seed skips worktrees of a registered repo, temp dirs, HOME and Foreman state, and still seeds a normal repo', (t) => {
   const { home, first, repo, worktree, dirs, link, roots } = skipFixture(t);
+  const outsideTmp = join(home, 'x', 'scratchpad', 'real-repo'); mkdirSync(outsideTmp, { recursive: true }); // a scratchpad name alone is not temp
   const registry = new ProjectRegistry(join(home, 'registry'), roots);
-  registry.seed([worktree, ...Object.values(dirs), link, repo, first].map((cwd) => ({ cwd })));
-  assert.deepEqual(registry.list().map((p) => p.path).sort(), [first, repo].sort());
-  for (const path of [worktree, ...Object.values(dirs), link]) assert.equal(notAProject(path, roots), true, path);
-  for (const path of [repo, first]) assert.equal(notAProject(path, roots), false, path);
+  registry.seed([repo, worktree, ...Object.values(dirs), link, first, outsideTmp].map((cwd) => ({ cwd })));
+  assert.deepEqual(registry.list().map((p) => p.path).sort(), [first, repo, outsideTmp].sort());
+  assert.equal(notAProject(worktree, roots, (p) => p === repo), true);
+  for (const path of [...Object.values(dirs), link]) assert.equal(notAProject(path, roots), true, path);
+  for (const path of [repo, first, worktree, outsideTmp]) assert.equal(notAProject(path, roots), false, path);
   // The real defaults: os.tmpdir() and $HOME are never seeded.
   const defaults = new ProjectRegistry(join(home, 'registry-defaults'));
   defaults.seed([{ cwd: first }, { cwd: tmpdir() }, { cwd: homedir() }]);
@@ -157,4 +159,18 @@ test('prune drops matching and missing entries, keeps real projects and leaves u
   assert.deepEqual(loaded.list().map((p) => p.name).sort(), ['first', 'repo']);
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).removed, removed);
   assert.deepEqual(loaded.prune(), []);
+});
+test('worktrees of an unregistered repo or of a bare repo are projects: seeded and kept by prune', (t) => {
+  const { home, repo, worktree, roots } = skipFixture(t);
+  const bare = join(home, 'bare.git'), main = join(home, 'bare-main'), feature = join(home, 'bare-feature');
+  const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args]);
+  git('clone', '-q', '--bare', repo, bare); // repo+main/+feature/ layout: every checkout is a worktree
+  git('-C', bare, 'worktree', 'add', '-q', '-b', 'b-main', main); git('-C', bare, 'worktree', 'add', '-q', '-b', 'b-feature', feature);
+  const registry = new ProjectRegistry(join(home, 'registry'), roots);
+  registry.register({ name: 'parent', path: home }); // the bare repo's parent is registered, but it is not a main checkout
+  registry.seed([main, feature, worktree].map((cwd) => ({ cwd }))); // `repo` itself is not registered
+  assert.deepEqual(registry.list().map((p) => p.path).sort(), [home, feature, main, worktree].sort());
+  assert.deepEqual(registry.prune(), []);
+  registry.seed([{ cwd: repo }]); // registering the main checkout makes its worktree prunable
+  assert.deepEqual(registry.prune().map((p) => p.path), [worktree]);
 });
