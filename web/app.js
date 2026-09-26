@@ -1762,7 +1762,13 @@ function openMovePm(event) {
 $("#move-pm").addEventListener("click", openMovePm);
 for (const selector of ["#close-move-pm", "#cancel-move-pm"])
   $(selector).addEventListener("click", () => ui.moveDialog.close());
+// A dialog's close event is queued, not fired by close() itself, so a quick close and reopen
+// (Escape, then Enter on the still-focused Move button) can deliver the first close after the
+// second opening. That late event must not undo the new opening: pop its history entry, clear
+// its choice, or drop its opener (which sent focus to the info screen instead, #189). Each
+// dialog's close handler returns early while its dialog is open again.
 ui.moveDialog.addEventListener("close", () => {
+  if (ui.moveDialog.open) return;
   popOverlay("move");
   moveChoice = null;
   moveError();
@@ -1860,6 +1866,7 @@ function openInfo(event) {
 $("#open-info").addEventListener("click", openInfo);
 $("#close-info").addEventListener("click", () => ui.infoDialog.close());
 ui.infoDialog.addEventListener("close", () => {
+  if (ui.infoDialog.open) return; // A late close event after a reopen (see the Move dialog's).
   popOverlay("info");
   if (!authorized) return;
   const opener = infoOpener;
@@ -2069,6 +2076,7 @@ $("#info-open-settings").addEventListener("click", openSettings);
 $("#close-settings").addEventListener("click", () => ui.settingsDialog.close());
 $("#settings-form").addEventListener("submit", (event) => event.preventDefault());
 ui.settingsDialog.addEventListener("close", () => {
+  if (ui.settingsDialog.open) return; // A late close event after a reopen (see the Move dialog's).
   popOverlay("settings");
   if (!authorized) return;
   const opener = settingsOpener;
@@ -2570,6 +2578,7 @@ function openNew(event) {
 }
 ui.newButton.addEventListener("click", openNew);
 ui.dialog.addEventListener("close", () => {
+  if (ui.dialog.open) return; // A late close event after a reopen (see the Move dialog's).
   popOverlay("dialog");
   projectRevision++; projectPending = false; projectResolution = null; projectSelection = null;
   if (!authorized || creating) return;
