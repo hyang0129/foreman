@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -125,6 +125,30 @@ test('the Claude hook, run under node --test with no FOREMAN_HOME, records nothi
   const result = spawnSync(file('hooks/foreman-hook').pathname, ['session-start'], { input: event, env: childEnv(home), encoding: 'utf8', timeout: 30_000 });
   assert.equal(result.status, 0);
   assert.equal(existsSync(join(home, '.foreman')), false, 'nothing written to the default home');
+});
+
+test('#145: the Claude hook, run under node --test with FOREMAN_HOME set to a real home, records nothing', (t) => {
+  const home = sandbox(t), real = join(home, '.foreman');
+  mkdirSync(real);
+  symlinkSync(real, join(home, 'alias'));
+  mkdirSync(join(home, 'sub'));
+  const hook = (env, cwd = home) => spawnSync(file('hooks/foreman-hook').pathname, ['session-start'], {
+    input: JSON.stringify({ session_id: 'sid-guard', cwd: home, source: 'startup' }), env, cwd, encoding: 'utf8', timeout: 30_000 });
+  // <HOME>/.foreman itself, inside it, through a symlink, through `..`, and relative to the cwd.
+  for (const [target, cwd] of [[real, home], [join(real, 'nested', 'deeper'), home], [join(home, 'alias'), home], [`${home}/x/../.foreman`, home], ['../.foreman', join(home, 'sub')], ['.foreman/', home]]) {
+    const result = hook(childEnv(home, { FOREMAN_HOME: target }), cwd);
+    assert.equal(result.status, 0, 'a hook never fails its session');
+    assert.deepEqual(readdirSync(real), [], `${target} (cwd ${cwd}): nothing written to the real home`);
+  }
+  // Control: an explicit temp home under node --test records, so the cases above prove the guard.
+  const state = join(home, 'state');
+  const ok = hook(childEnv(home, { FOREMAN_HOME: state }));
+  assert.equal(ok.status, 0);
+  assert.equal(existsSync(join(state, 'sessions', 'sid-guard.json')), true, 'the hook records into a temp home');
+  // Outside node --test the guard does not apply: <HOME>/.foreman is the normal default.
+  const prod = hook(childEnv(home, { FOREMAN_HOME: real }, { underTest: false }));
+  assert.equal(prod.status, 0);
+  assert.equal(existsSync(join(real, 'sessions', 'sid-guard.json')), true);
 });
 
 test('installing Codex hooks under node --test needs explicit, non-real homes', (t) => {

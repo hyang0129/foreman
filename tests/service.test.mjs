@@ -94,3 +94,76 @@ test('#118: the installer name rule agrees with shared/pm-state.ts isMachineName
     assert.equal(accepted, isMachineName(name.trim()), JSON.stringify(name));
   }
 });
+
+// #197: the role and limit variables the daemon reads reach the installed service.
+const ROLE_LIMIT_VARS = {
+  FOREMAN_MAX_LEADS: '5', FOREMAN_MAX_WORKERS_PER_LEAD: '2', FOREMAN_PM_EFFORT: 'high',
+  FOREMAN_LEAD_MODEL: 'sonnet', FOREMAN_LEAD_EFFORT: 'low', FOREMAN_INVESTIGATOR_MODEL: 'claude-haiku-4-5', FOREMAN_INVESTIGATOR_EFFORT: 'medium',
+};
+
+test('#197: role and limit variables set at install time reach the service environment', () => {
+  const vars = config({ ...options, env: { ...ROLE_LIMIT_VARS, FOREMAN_LEAD_MODEL: ' opus[1m] ', FOREMAN_MAX_LEADS: ' 07 ' } }).plist.EnvironmentVariables;
+  assert.deepEqual(Object.fromEntries(Object.keys(ROLE_LIMIT_VARS).map((key) => [key, vars[key]])),
+    { ...ROLE_LIMIT_VARS, FOREMAN_LEAD_MODEL: 'opus[1m]', FOREMAN_MAX_LEADS: '7' });
+  if (process.platform === 'darwin') {
+    const parsed = JSON.parse(execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'], { input: renderPlist(config({ ...options, env: ROLE_LIMIT_VARS }).plist), encoding: 'utf8' }));
+    for (const [key, value] of Object.entries(ROLE_LIMIT_VARS)) assert.equal(parsed.EnvironmentVariables[key], value, key);
+  }
+  const empty = config({ ...options, env: Object.fromEntries(Object.keys(ROLE_LIMIT_VARS).map((key) => [key, ''])) }).plist.EnvironmentVariables;
+  for (const key of Object.keys(ROLE_LIMIT_VARS)) assert.ok(!(key in empty), `${key} empty keeps the daemon default`);
+  const unset = config(options).plist.EnvironmentVariables;
+  for (const key of Object.keys(ROLE_LIMIT_VARS)) assert.ok(!(key in unset), `${key} unset keeps the daemon default`);
+});
+
+test('#197: invalid role and limit values refuse the install', () => {
+  const bad = { FOREMAN_MAX_LEADS: ['0', '-1', '1.5', 'three', '1234567'], FOREMAN_MAX_WORKERS_PER_LEAD: ['0', 'x'],
+    FOREMAN_PM_EFFORT: ['extreme', 'Low'], FOREMAN_LEAD_EFFORT: ['none'], FOREMAN_INVESTIGATOR_EFFORT: ['1'],
+    FOREMAN_LEAD_MODEL: ['bad model', '-opus', 'x'.repeat(201)], FOREMAN_INVESTIGATOR_MODEL: ['a;b'] };
+  for (const [key, values] of Object.entries(bad)) for (const value of values) {
+    assert.throws(() => config({ ...options, env: { [key]: value } }), new RegExp(key), `${key}=${value}`);
+  }
+});
+
+test('#197: the installer accepts exactly the role and limit values shared/roles.ts would use', async () => {
+  const { resolveRoleConfig, leadLimits, ROLE_ENV, LEAD_LIMIT_ENV, ROLE_DEFAULTS, LEAD_LIMITS, EFFORTS } = await import('../shared/roles.ts');
+  assert.deepEqual(service.EFFORTS, [...EFFORTS]);
+  const roleVars = Object.values(ROLE_ENV).flatMap((r) => [r.model, r.effort]).filter(Boolean).sort();
+  assert.deepEqual([...service.MODEL_ENV, ...service.EFFORT_ENV].sort(), roleVars);
+  assert.deepEqual([...service.LIMIT_ENV].sort(), Object.values(LEAD_LIMIT_ENV).sort());
+  // The installed value, or undefined when the installer refuses it.
+  const installed = (key, value) => { try { return service.passThroughSettings({ [key]: value })[key]; } catch { return undefined; } };
+  // The daemon uses a value when it resolves to something other than the default, or to the
+  // default because the value names it; anything else is ignored (falls back to the default).
+  const check = (key, value, daemon, fallback, same) => {
+    const used = daemon !== fallback || same;
+    assert.equal(installed(key, value) !== undefined, used, `${key}=${JSON.stringify(value)}`);
+    if (used) assert.equal(installed(key, value), String(daemon), `${key}=${JSON.stringify(value)}`);
+  };
+  const models = ['sonnet', 'opus[1m]', ' haiku ', 'claude-sonnet-4-5', 'a/b:c.d_e', 'bad model', '-x', '[x]', 'x'.repeat(200), 'x'.repeat(201), 'été'];
+  const efforts = [...EFFORTS, ' high ', 'HIGH', 'extreme', '0'];
+  const limits = ['1', '3', ' 12 ', '007', '999999', '1000000', '0', '-2', '1.0', '1e2', 'x'];
+  for (const [role, names] of Object.entries(ROLE_ENV)) {
+    if (names.model) for (const value of models) {
+      check(names.model, value, resolveRoleConfig(role, { env: { [names.model]: value } }).model, ROLE_DEFAULTS[role].model, value.trim() === ROLE_DEFAULTS[role].model);
+    }
+    for (const value of efforts) {
+      check(names.effort, value, resolveRoleConfig(role, { env: { [names.effort]: value } }).effort, ROLE_DEFAULTS[role].effort, value.trim() === ROLE_DEFAULTS[role].effort);
+    }
+  }
+  for (const [field, name] of Object.entries(LEAD_LIMIT_ENV)) for (const value of limits) {
+    check(name, value, leadLimits({ [name]: value })[field], LEAD_LIMITS[field], /^\s*[0-9]+\s*$/.test(value) && Number(value) === LEAD_LIMITS[field]);
+  }
+});
+
+test('#145: status, uninstall and restart ignore pass-through settings; install and plist still refuse bad ones', () => {
+  const env = { FOREMAN_MACHINE_NAME: 'bad\u0007name', FOREMAN_PM_HUNG_MS: 'abc', FOREMAN_MAX_LEADS: 'x' };
+  for (const command of ['status', 'uninstall', 'restart']) {
+    const conf = config({ ...options, env, ...service.commandOptions(command, []) });
+    assert.ok(conf.path.endsWith(`${LABEL}.plist`), command);
+    for (const key of Object.keys(env)) assert.ok(!(key in conf.plist.EnvironmentVariables), `${command}: ${key}`);
+  }
+  for (const command of ['install', 'plist']) {
+    assert.throws(() => config({ ...options, env, ...service.commandOptions(command, []) }), /must be/, command);
+    assert.equal(service.commandOptions(command, ['--keep-awake']).keepAwake, true);
+  }
+});

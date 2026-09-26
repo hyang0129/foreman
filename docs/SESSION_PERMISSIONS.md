@@ -134,10 +134,13 @@ The grant is a list of `{ role, project, allow }` entries (the `bypass_grants`
 developer setting). `role` is the **requester's** role: a `coordinator` entry
 covers Leads the Coordinator starts, and a `lead` entry covers workers that Leads
 start. `project` is a registered project name or `*`. For a launch, an entry for
-that exact project (matched case-insensitively) wins over the role's `*` entry
-(the most specific entry wins); a launch into a directory that is not a
-registered project matches only `*`. `allow: false` turns Bypass off for that
-scope, and those launches run Auto.
+that exact project wins over the role's `*` entry (the most specific entry
+wins). Project names match the way the project registry resolves them: trimmed,
+case- and whitespace-insensitive, ignoring a leading "the ". If two entries name
+the same project that way (for example `foreman` and `the foreman`), an
+`allow: false` entry wins. A launch into a directory that is not a registered
+project matches only `*`. `allow: false` turns Bypass off for that scope, and
+those launches run Auto.
 
 **The grant is on by default.** Until the developer changes it, the grant is
 `{ coordinator, *, allow: true }` and `{ lead, *, allow: true }`, and
@@ -183,8 +186,11 @@ the hosted Worker route writes it. It does **not** hold for what a Bypass agent
 can do on the machine. A Bypass session with a shell can read
 `~/.foreman/local-api-token` and call the local API as the developer, for
 example `POST /api/sessions` with `bypass`. So the invariant holds only for agents
-that do not run in Bypass. This is accepted, consistent with the rest of this
-page: Foreman adds no sandbox.
+that do not run in Bypass. For an Auto agent it rests entirely on Claude's own
+Auto-mode classifier declining to run such a command: Foreman adds no protection
+of its own there (the token file is readable by the user's processes, and no
+Foreman rule denies an Auto agent's shell access to it). This is accepted,
+consistent with the rest of this page: Foreman adds no sandbox.
 
 ## Managed Codex process lifetime
 
@@ -244,8 +250,13 @@ FOREMAN_LIVE=1 FOREMAN_LIVE_CLAUDE_KEYCHAIN=1 \
   node --experimental-strip-types --test --test-concurrency=1 tests/live/lifecycle.live.mjs
 ```
 
-The live suite starts a separate Foreman server on an assigned loopback port with
-the Coordinator (PM) disabled and disposable `FOREMAN_HOME`. It never restarts the installed service.
+`test:policy` and the lifecycle suite start a separate Foreman server on an
+assigned loopback port with the Coordinator (PM) disabled and a disposable
+`FOREMAN_HOME`. `test:leads` instead runs a real Coordinator in-process
+(`ProjectManager` with the Lead tools wired as `server/main.ts` wires them, a
+local-only Lead store, and a stub grant source with the default settings), with
+its own disposable `FOREMAN_HOME` and `CLAUDE_CONFIG_DIR`. No live suite
+restarts the installed service.
 Claude uses an isolated config directory bootstrapped from the macOS Keychain
 with explicit opt-in, no user/project settings, and no persistent transcript.
 It does not read or copy the real `.claude` directories. Codex uses a temporary

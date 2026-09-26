@@ -6,12 +6,14 @@ import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { assertTestHome } from '../server/home-guard.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const state = process.env.FOREMAN_HOME || join(homedir(), '.foreman');
-// Story #121: under node --test, never pair into (or write keys to) the default ~/.foreman. Inline
-// (not server/home-guard.mjs) because tests run a standalone copy of this script.
-if ((process.env.NODE_TEST_CONTEXT || process.execArgv.includes('--test')) && !process.env.FOREMAN_HOME) throw new Error('Refusing to use the real home (~/.foreman) under node --test: set FOREMAN_HOME to a temp dir (mkdtemp) first.');
+// Story #121 / #145: under node --test, never pair into (or write keys to) a real home: neither the
+// default ~/.foreman nor a FOREMAN_HOME set explicitly to (or inside) a real one. Tests that run a
+// standalone copy of this script copy server/home-guard.mjs beside it.
+assertTestHome(state, { explicit: Boolean(process.env.FOREMAN_HOME) });
 mkdirSync(state, { recursive: true, mode: 0o700 });
 const configPath = join(state, 'cloud.json');
 let previous;

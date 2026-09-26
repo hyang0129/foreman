@@ -127,8 +127,9 @@ start.
   `resolve_project`, `register_project`, `session_tail`, `stop_session`, and the memory tools),
   `peers` (the peer tools, sender `coordinator`), and `leads` (`start_lead`, `retire_lead`,
   `list_leads`, `read_handoff`; see [Leads and workers](#leads-and-workers)).
-- `Agent` is allowed only with `subagent_type: "investigator"`, in the foreground: `isolation` and
-  `mode` are refused and `run_in_background` is forced to `false`.
+- `Agent` is allowed only with `subagent_type: "investigator"`, in the foreground: `isolation`,
+  `mode` and `run_in_background: true` are refused, and an omitted (or `false`)
+  `run_in_background` is passed on as `false`.
 - The memory tools are the **only** way to reach memory (`server/memory-tools.ts`):
   - `memory_read`;
   - `memory_write` (replace a whole doc) and `memory_edit` (replace text that occurs exactly once),
@@ -246,8 +247,9 @@ Enforced by the host, not the prompt, and checked before and after the grant rea
 - at most **4 active workers per Lead** (`FOREMAN_MAX_WORKERS_PER_LEAD`).
 
 The overrides are positive integers; anything else keeps the default. They are read from the
-daemon's environment; the macOS service installer does not copy them into the installed service,
-and the dev preview scripts (`npm run dev:*`) refuse any inherited `FOREMAN_*` variable.
+daemon's environment. The macOS service installer copies them into the installed service when they
+are set at install time (and refuses to install an invalid one), and the dev preview scripts
+(`npm run dev:*`) refuse any inherited `FOREMAN_*` variable.
 Active means not `ended`, `dead` or `unknown`. Held Bypass launches count toward both limits. A Lead
 that the new launch supersedes is not counted, so superseding one of 3 Leads works with every slot
 in use. The refusal names the limit and its variable.
@@ -258,8 +260,9 @@ Starting a Lead on the same project and workstream, or with an explicit `superse
 old Lead:
 
 - The new Lead's first message carries the goal, the old Lead's latest handoff and its live workers.
-  When the old Lead is on this machine and has no `final` handoff, it also gets a warning to check
-  branches and PRs first, and the old Lead's last 10 messages. The `seed` handoff written to the registry holds only the goal and the predecessor's
+  When the old Lead has no `final` handoff (on this machine or another), it also gets a warning to
+  check branches and PRs first. When the old Lead is on this machine, it also gets the old Lead's
+  last 10 messages (another machine's transcript is not reachable from here). The `seed` handoff written to the registry holds only the goal and the predecessor's
   handoff content, never the first task or transcript text.
 - A **working** old Lead (working, or waiting on a real approval) is refused unless `force: true`,
   which interrupts and retires it. An idle, finished or dead one is retired.
@@ -305,6 +308,12 @@ model and effort, pending approvals (its own and its workers'), workers and late
   connected machine's rows are at most about 5 minutes old.
 - `lead_rpc` is accepted from any identified (hello v2) machine, not only the active Coordinator
   host, so Leads left on a standby keep syncing. A machine may write only its own rows.
+- Row ownership protects honest hosts only. A machine's `machine_id` is self-asserted in its hello:
+  the relay authenticates the connection with the host token, which every paired machine shares, and
+  takes the `machine_id` it is given. Any host holding that token can therefore claim any
+  `machine_id`, including another machine's, and write or end that machine's Lead rows. This is the
+  existing trust model (every paired machine is the developer's own); the ownership check guards
+  against bugs and stale hosts, not against a host that holds the token.
 - When the registry is read, the relay computes `machine_online` from its live sockets and returns
   `reported_at`. A Lead whose machine is offline shows its last known state ("machine offline · last
   known state at T"); handoffs written meanwhile arrive after the machine reconnects.
@@ -490,7 +499,9 @@ silently, and never modifies, renames or deletes a local file:
   Every local-only start of a machine with that marker logs that the relay's PM memory is not
   available in local-only mode and is not merged. It logs on every start, not once, because the
   daemon log is the only place this is shown and the memory stays apart for as long as the machine
-  runs local-only. Deleting `memory/.pm-mode.json` silences it.
+  runs local-only. Deleting `memory/.pm-mode.json` silences it. The marker is written only when
+  the machine becomes the active PM host, so a machine that was only ever a standby gets no marker
+  and no notice. It never used the relay's memory, so there is nothing it could be missing.
 
 ### Conversations are not kept
 
