@@ -519,6 +519,34 @@ select:focus-visible,
     Consolas,
     monospace;
 }
+/* #201: sending an investigator, a subagent or a Lead is one compact line; tool steps are hidden
+   unless shown from the conversation menu for debugging. */
+.dispatch-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  margin: -12px 0 0;
+  color: var(--secondary);
+  font-size: 0.75rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.dispatch-symbol { flex: none; color: var(--accent); }
+.step-line {
+  display: flex;
+  gap: 8px;
+  margin-top: -16px;
+  border-left: 2px solid var(--line);
+  padding-left: 12px;
+  color: var(--secondary);
+  font:
+    0.6875rem/1.65 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+}
+.step-kind { flex: none; color: var(--muted); }
+.step-text { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
 /* Persisted PM failure: colour plus a label and an icon, in both themes via tokens. */
 .message.system.error {
   border-left-color: var(--error);

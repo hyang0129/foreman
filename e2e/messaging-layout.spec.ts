@@ -168,7 +168,7 @@ test("the conversation view has no model or settings controls, no per-message ch
   await expect(main.getByRole("combobox")).toHaveCount(0);
   for (const selector of ["#control-note", "#header-model", "#provider", "#conversation-subtitle"])
     await expect(page.locator(selector)).toBeHidden();
-  await expect(page.locator("#activity-status")).toHaveText(/Working/);
+  await expect(page.locator("#activity-status")).toHaveText("Reading files…");
 });
 
 test("every control moved out of the conversation is reachable from the header's info screen", async ({ page, context }) => {

@@ -330,7 +330,7 @@ test("host disconnection disables mutations and preserves last conversation", as
     page.getByText("Dev Mac · offline", { exact: true }),
   ).toBeVisible();
   await expect(page.getByLabel("Message this session")).toBeDisabled();
-  await expect(page.locator("#activity-status")).toContainText("Last known · Working…");
+  await expect(page.locator("#activity-status")).toContainText("Last known · Reading files…");
   expect(await page.locator("#activity-status").evaluate((el) => el.getAnimations({ subtree: true }).some((animation) => animation.playState === "running"))).toBe(false);
   await expect(
     page.getByRole("button", { name: "New session", exact: true }),
@@ -667,8 +667,8 @@ test("activity transitions are stable across polls and queued messages are not r
   await openManaged(page);
   const status = page.locator("#activity-status");
   await expect(status).toHaveAttribute("role", "status");
-  await expect(status).toContainText("Working…");
-  await expect(status).toContainText("Read");
+  // #201: the working line names what the agent is doing in plain words, not the tool ("Read").
+  await expect(status).toHaveText("Reading files…");
   await page.evaluate(() => {
     (window as any).statusMutations = 0;
     new MutationObserver((records) => { (window as any).statusMutations += records.length; })
@@ -718,7 +718,7 @@ test("reduced motion keeps the working label and static activity symbol", async 
   await fixture(page);
   await openManaged(page);
   const status = page.locator("#activity-status");
-  await expect(status).toContainText("Working…");
+  await expect(status).toContainText("Reading files…");
   expect(await status.evaluate((el) => el.getAnimations({ subtree: true }).some((animation) => animation.playState === "running"))).toBe(false);
 });
 
@@ -1357,7 +1357,7 @@ test("worker header separates identity state project and full model details with
   Object.assign(state.sessions[0], { permission_mode: "native", project_name: "app", model: "provider-model-with-a-very-long-identifier-".repeat(5) });
   await openManaged(page);
   await expect(page.locator("#provider")).toHaveText("Claude");
-  await expect(page.locator("#activity-label")).toContainText("Working");
+  await expect(page.locator("#activity-label")).toContainText("Reading files");
   await expect(page.locator("#header-model")).toContainText((state.sessions[0] as any).model);
   await openInfo(page);
   const details = page.locator("#close-info");
