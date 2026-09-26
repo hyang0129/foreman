@@ -141,11 +141,12 @@ describe('project registry relay contract', () => {
   });
 });
 
-// The launcher adds only these authenticated, narrowly allowlisted routes.
-it('permits launcher proposal/status/cancel but no arbitrary launch endpoints', () => {
-  expect(allowedRequest('GET', '/api/launch?id=123')).toBe(true);
-  expect(allowedRequest('POST', '/api/launch/propose')).toBe(true);
-  expect(allowedRequest('POST', '/api/launch/cancel')).toBe(true);
+// #157 D7: the launcher is removed, so no /api/launch* route is relayed.
+it('relays no launcher routes', () => {
+  expect(allowedRequest('GET', '/api/launch?id=123')).toBe(false);
+  expect(allowedRequest('GET', '/api/launch')).toBe(false);
+  expect(allowedRequest('POST', '/api/launch/propose')).toBe(false);
+  expect(allowedRequest('POST', '/api/launch/cancel')).toBe(false);
   expect(allowedRequest('POST', '/api/launch')).toBe(false);
   expect(allowedRequest('GET', '/api/launch/propose')).toBe(false);
   expect(allowedRequest('POST', '/api/launch/execute')).toBe(false);
