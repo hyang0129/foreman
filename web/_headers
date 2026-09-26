@@ -8,3 +8,22 @@
 
 /sw.js
   Cache-Control: no-cache
+
+# The page and its code must always come from the same deploy. With only must-revalidate, Chrome
+# on Android restored a stale app.js/style.css from its cache under a fresh index.html (the
+# service worker fetches navigations network-first), and the mixed versions broke the app.
+# no-store keeps any of them out of the browser cache, so every load gets one deploy's files.
+/
+  Cache-Control: no-store
+
+/index.html
+  Cache-Control: no-store
+
+/app.js
+  Cache-Control: no-store
+
+/style.css
+  Cache-Control: no-store
+
+/appearance.js
+  Cache-Control: no-store
