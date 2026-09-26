@@ -65,11 +65,11 @@ export function memoryToolError(action: string, error: unknown): ToolResult {
     // `not_active` only says this machine is not the PM host right now: it may never have been
     // (e.g. a new relay connection whose assignment has not arrived), so it claims no move.
     case "not_active":
-      return fail(`not_active: ${action} was not saved because this machine is not the active PM host right now. Nothing was saved — tell the developer the memory update did not happen.${said}`);
+      return fail(`not_active: ${action} was not saved because this machine is not the active Coordinator host right now. Nothing was saved — tell the developer the memory update did not happen.${said}`);
     case "stale_epoch":
-      return fail(`stale_epoch: ${action} was not saved because this machine is no longer the active PM host (the PM was moved). Nothing was saved — tell the developer the memory update did not happen.${said}`);
+      return fail(`stale_epoch: ${action} was not saved because this machine is no longer the active Coordinator host (the Coordinator was moved). Nothing was saved — tell the developer the memory update did not happen.${said}`);
     case "unavailable":
-      return fail(`unavailable: ${action} failed because PM memory is unreachable right now. Nothing was saved — tell the developer the memory update did not happen; try again later.${said}`);
+      return fail(`unavailable: ${action} failed because Coordinator memory is unreachable right now. Nothing was saved — tell the developer the memory update did not happen; try again later.${said}`);
     case "already_initialized":
       return fail(`already_initialized: ${action} was refused by the memory store. Nothing was saved — call memory_read and retry against the current memory.${said}`);
     case null:
@@ -116,7 +116,7 @@ export function makeMemoryTools(memory: PmMemory): SdkMcpToolDefinition<any>[] {
 
   const memory_read = tool(
     "memory_read",
-    `Read your portable PM memory: the projects and preferences docs with their current versions, and the newest log entries (default ${MEMORY_READ_DEFAULT_LOG}, at most ${MAX_LOG_READ}, oldest first). Use the versions as expected_version for memory_write and memory_edit.`,
+    `Read your portable Coordinator memory: the projects and preferences docs with their current versions, and the newest log entries (default ${MEMORY_READ_DEFAULT_LOG}, at most ${MAX_LOG_READ}, oldest first). Use the versions as expected_version for memory_write and memory_edit.`,
     { log_limit: z.number().int().min(1).max(MAX_LOG_READ).optional().describe(`Newest log entries to return (1-${MAX_LOG_READ}, default ${MEMORY_READ_DEFAULT_LOG})`) },
     async ({ log_limit }) => {
       const limit = log_limit === undefined ? MEMORY_READ_DEFAULT_LOG : log_limit;
@@ -185,7 +185,7 @@ export function makeMemoryTools(memory: PmMemory): SdkMcpToolDefinition<any>[] {
 
   const log_note = tool(
     "log_note",
-    `Append one terse line to the portable PM log (decisions, outcomes). ${MIN_LOG_ENTRY}-${MAX_LOG_ENTRY} characters after whitespace is collapsed. Use memory_write/memory_edit on the projects doc for project status.`,
+    `Append one terse line to the portable Coordinator log (decisions, outcomes). ${MIN_LOG_ENTRY}-${MAX_LOG_ENTRY} characters after whitespace is collapsed. Use memory_write/memory_edit on the projects doc for project status.`,
     { note: z.string().describe(`One line, ${MIN_LOG_ENTRY}-${MAX_LOG_ENTRY} characters`) },
     async ({ note }) => {
       if (typeof note !== "string") return fail("invalid: note must be a string.");
