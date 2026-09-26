@@ -119,6 +119,23 @@ test('the Coordinator session: memory tools, Lead tools, no spawn_session, code 
   assert.equal(COORDINATOR_SENDER, 'coordinator');
 });
 
+test('#233: every Coordinator MCP tool is always loaded (ToolSearch is denied) and every allowed mcp__ name is a registered tool', async (t) => {
+  const service: any = { list: () => [], detail: () => { throw new Error('none'); }, receipt: () => { throw new Error('none'); }, activeSource: () => 'user', send: () => { throw new Error('no'); }, create: () => { throw new Error('no'); }, interrupt: () => {} };
+  const { options, pm } = await startCoordinator(t, { sessions: service, leads: { store: null, tools: { server: () => makeLeadTools({ sessions: {} as any, store: {} as any, projects: { list: () => [], require: () => { throw new Error('x'); } }, machine: MACHINE }).server } } });
+  // The CLI defers MCP tools behind ToolSearch, which the Coordinator may not call.
+  assert.equal((await (pm as any).canUseTool('ToolSearch', { query: 'select:mcp__fleet__memory_read' })).behavior, 'deny');
+  const registered = new Set<string>();
+  assert.deepEqual(Object.keys(options.mcpServers).sort(), ['fleet', 'leads', 'peers']);
+  for (const [server, config] of Object.entries<any>(options.mcpServers)) {
+    for (const [name, tool] of Object.entries<any>(config.instance._registeredTools)) {
+      assert.equal(tool._meta?.['anthropic/alwaysLoad'], true, `mcp__${server}__${name} must not be deferred`);
+      registered.add(`mcp__${server}__${name}`);
+    }
+  }
+  const allowed = options.allowedTools.filter((name: string) => name.startsWith('mcp__'));
+  for (const name of [...allowed, ...PM_MEMORY_TOOLS]) assert.ok(registered.has(name), `${name} is allowed but not registered`);
+});
+
 test('the peer sender is coordinator (was foreman-pm)', async (t) => {
   const sent: any[] = [];
   const target = { session_key: 'fm:00000000-0000-4000-8000-000000000001', managed: true, capabilities: { message: true }, name: 'lead-x', state: 'idle' };
