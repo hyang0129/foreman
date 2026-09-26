@@ -191,8 +191,51 @@ test('memory block lists the Leads from the registry: status, latest handoff, ma
   assert.doesNotMatch(section, /lead-old|lead-superseded/, 'archived Leads are omitted');
   assert.equal((section.match(/^- lead-/gm) ?? []).length, 20, 'capped at 20');
   assert.match(section, /\(7 more; use list_leads\)/);
-  assert.deepEqual(lists, [{ include_ended: false }]);
+  assert.deepEqual(lists, [{ include_ended: true }]);
   assert.doesNotMatch(section, /\/Users\/|\/home\/|\/tmp\//, 'no filesystem paths');
+});
+
+test('memory block lists restarted, not-yet-superseded Leads separately so the Coordinator offers successors; the cap stays 20', async (t) => {
+  const entry = (over: any) => ({
+    v: 1, lead: `fm:${randomUUID()}`, machine_id: MACHINE.machine_id, machine_name: MACHINE.name, name: 'lead-x', project: 'foreman', workstream: 'triage',
+    goal: 'g', model: 'opus[1m]', effort: 'medium', permission_mode: 'bypass', launched_by: 'coordinator', state: 'idle', alive: true,
+    created_at: 1, updated_at: 1_700_000_000_000, pending_approvals: 0, workers: [], machine_online: true, reported_at: 1_700_000_000_000, ended: false, ...over,
+  });
+  const restartedLead = (over: any) => entry({ state: 'dead', alive: false, ended: true, end_reason: 'restarted', ...over });
+  const leads = [
+    restartedLead({ name: 'lead-restarted', workstream: 'docs', last_handoff: { seq: 4, at: '2026-09-25T10:00:00.000Z', kind: 'checkpoint', status: 'in_progress', summary: 'PR #30 is open CANARY_RESTART' } }),
+    restartedLead({ name: 'lead-restarted-replaced', superseded_by: `fm:${randomUUID()}` }),
+    entry({ name: 'lead-retired', state: 'ended', alive: false, ended: true, end_reason: 'retired by the Coordinator' }),
+    entry({ name: 'lead-dead-crash', state: 'dead', alive: false, ended: true, end_reason: 'provider exited' }),
+    ...Array.from({ length: 6 }, (_, i) => restartedLead({ name: `lead-rs-${i}`, workstream: `r${i}`, updated_at: 1_600_000_000_000 + i })),
+    ...Array.from({ length: 25 }, (_, i) => entry({ name: `lead-many-${i}`, workstream: `w${i}`, updated_at: 1_600_000_000_000 + i })),
+  ];
+  const lists: any[] = [];
+  const store = { mode: 'relay', devSettings: async () => null, list: async (opts: any) => { lists.push(opts); return opts?.include_ended ? leads : leads.filter((l) => !l.ended); } };
+  const { options } = await startCoordinator(t, { leads: { store, machineId: MACHINE.machine_id } });
+  const section: string = options.systemPrompt.append.slice(options.systemPrompt.append.indexOf('## leads'));
+  assert.deepEqual(lists, [{ include_ended: true }]);
+  const restartedAt = section.indexOf('Restarted Leads (offer successors');
+  assert.ok(restartedAt > 0, 'a separate restarted sub-list');
+  const restartedPart = section.slice(restartedAt);
+  assert.match(restartedPart, /- lead-restarted \(fm:[0-9a-f-]+\): project foreman, workstream docs, ended \(restarted\), on this machine/);
+  assert.match(restartedPart, /latest handoff: seq 4 checkpoint, in_progress, 2026-09-25T10:00:00.000Z: PR #30 is open CANARY_RESTART/);
+  assert.doesNotMatch(section, /lead-restarted-replaced|lead-retired|lead-dead-crash/, 'superseded and other ended Leads stay hidden');
+  assert.equal((section.match(/^- lead-/gm) ?? []).length, 20, 'capped at 20 in total');
+  assert.equal((restartedPart.match(/^- lead-/gm) ?? []).length, 5, 'at most 5 restarted');
+  assert.match(restartedPart, /\(2 more restarted; use list_leads\)/);
+  assert.match(section.slice(0, restartedAt), /\(10 more; use list_leads\)/);
+});
+
+test('memory block with only restarted Leads still offers successors', async (t) => {
+  const lead = { v: 1, lead: `fm:${randomUUID()}`, machine_id: MACHINE.machine_id, machine_name: MACHINE.name, name: 'lead-only', project: 'foreman', workstream: 'solo',
+    goal: 'g', model: 'opus[1m]', effort: 'medium', permission_mode: 'bypass', launched_by: 'coordinator', state: 'dead', alive: false, created_at: 1, updated_at: 2,
+    pending_approvals: 0, workers: [], machine_online: true, reported_at: 2, ended: true, end_reason: 'restarted' };
+  const store = { mode: 'relay', devSettings: async () => null, list: async () => [lead] };
+  const { options } = await startCoordinator(t, { leads: { store, machineId: MACHINE.machine_id } });
+  const section: string = options.systemPrompt.append.slice(options.systemPrompt.append.indexOf('## leads'));
+  assert.match(section, /\(no active Leads\)\nRestarted Leads \(offer successors[^\n]*\n- lead-only .*ended \(restarted\)/);
+  assert.match(section, /latest handoff: none/);
 });
 
 test('a Coordinator on machine B lists the same Leads from the shared registry (acceptance 9)', async (t) => {

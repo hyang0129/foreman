@@ -333,7 +333,8 @@ test('retire_lead, list_leads and read_handoff', async () => {
     assert.match(listed.leads[1].note, /on linux-box, not reachable from here/);
     assert.match(listed.leads[1].note, /last known state at 1970-01-01T00:00:00.000Z; machine offline/);
     assert.equal(listed.leads[1].machine_online, false);
-    assert.deepEqual(f.store.listCalls.at(-1), { include_ended: false });
+    // The default view reads ended rows too (restarted Leads awaiting a successor) and filters.
+    assert.deepEqual(f.store.listCalls.at(-1), { include_ended: true });
     await f.tools.call('list_leads', { include_ended: true });
     assert.deepEqual(f.store.listCalls.at(-1), { include_ended: true });
     await f.store.appendHandoff(checkpoint(local));
@@ -629,5 +630,62 @@ test('list_leads reports a stale unknown, not-alive registry row as ended; list_
     const dead = every.workers.find((w: any) => w.name === 'fix-restarted');
     assert.equal(dead.state, 'dead');
     assert.equal(dead.end_reason, RESTARTED_END_REASON);
+  } finally { f.cleanup(); }
+});
+
+test('list_leads shows a restarted, not-yet-superseded Lead by default (ended, with a successor hint); other ended Leads stay hidden', async () => {
+  const f = setup();
+  try {
+    const restarted = leadKey(), replaced = leadKey(), retired = leadKey(), live = leadKey();
+    f.store.entries.push(entry({ lead: restarted, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-restarted', state: 'dead', alive: false, ended: true, end_reason: RESTARTED_END_REASON,
+      last_handoff: { seq: 3, at: iso(), kind: 'checkpoint', status: 'in_progress', summary: 'PR 12 open' } }));
+    f.store.entries.push(entry({ lead: replaced, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-replaced', state: 'ended', alive: false, ended: true, end_reason: RESTARTED_END_REASON, superseded_by: live }));
+    f.store.entries.push(entry({ lead: retired, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-retired', state: 'ended', alive: false, ended: true, end_reason: 'retired by the Coordinator' }));
+    f.store.entries.push(entry({ lead: live, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-live' }));
+    const active = await f.tools.call('list_leads', {});
+    assert.deepEqual(active.leads.map((l: any) => l.name).sort(), ['lead-live', 'lead-restarted']);
+    const row = active.leads.find((l: any) => l.name === 'lead-restarted');
+    assert.equal(row.ended, true);
+    assert.equal(row.state, 'dead');
+    assert.equal(row.end_reason, RESTARTED_END_REASON);
+    assert.match(row.hint, /restarted; start a successor with start_lead to continue from its last handoff/);
+    assert.equal(row.last_handoff.seq, 3);
+    assert.equal(active.leads.find((l: any) => l.name === 'lead-live').hint, undefined);
+    const all = await f.tools.call('list_leads', { include_ended: true });
+    assert.deepEqual(all.leads.map((l: any) => l.name).sort(), ['lead-live', 'lead-replaced', 'lead-restarted', 'lead-retired']);
+    assert.equal(all.leads.find((l: any) => l.name === 'lead-replaced').hint, undefined);
+  } finally { f.cleanup(); }
+});
+
+test('superseding a Lead on another machine seeds only its live workers: an unknown worker counts as dead', async () => {
+  const f = setup();
+  try {
+    const remote = leadKey();
+    f.store.entries.push(entry({ lead: remote, machine_id: randomUUID(), machine_name: 'linux-box', name: 'lead-remote', workers: [
+      { session_key: leadKey(), name: 'fix-unknown', state: 'unknown', permission_mode: 'bypass', needs_attention: false },
+      { session_key: leadKey(), name: 'fix-dead', state: 'dead', permission_mode: 'bypass', needs_attention: false },
+      { session_key: leadKey(), name: 'fix-working', state: 'working', permission_mode: 'bypass', needs_attention: false },
+    ] }));
+    const out = await f.tools.call('start_lead', { ...start, supersedes: remote });
+    const text = f.sessions.launches[0].text;
+    assert.ok(text.includes('fix-working'));
+    assert.ok(!text.includes('fix-unknown'), 'an unknown remote worker is not seeded as live');
+    assert.ok(!text.includes('fix-dead'));
+    assert.equal(out.superseded.live_workers, 1);
+  } finally { f.cleanup(); }
+});
+
+test('list_workers needs_attention follows the reported state: needs_input yes, a restarted (unknown) worker no', async () => {
+  const f = setup();
+  try {
+    const lead = oldLead(f);
+    const bound = f.tools.bindLead(lead);
+    f.sessions.rows.push({ session_key: leadKey(), name: 'fix-asking', role: 'worker', parent: lead, state: 'needs_input', alive: true, updated_at: iso() });
+    f.sessions.rows.push({ session_key: leadKey(), name: 'fix-restarted', role: 'worker', parent: lead, state: 'unknown', alive: false, control_reason: RESTART_REASON, updated_at: iso() });
+    const every = await bound.call('list_workers', { include_ended: true });
+    const by = new Map(every.workers.map((w: any) => [w.name, w]));
+    assert.equal((by.get('fix-asking') as any).needs_attention, true);
+    assert.equal((by.get('fix-restarted') as any).needs_attention, false);
+    assert.equal((by.get('fix-restarted') as any).state, 'dead');
   } finally { f.cleanup(); }
 });

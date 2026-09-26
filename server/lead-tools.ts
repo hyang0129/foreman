@@ -120,6 +120,11 @@ export function reportedEndReason(row: any): string | undefined {
   return undefined;
 }
 
+/** A registry Lead ended by a Foreman restart and not yet superseded: the Coordinator should offer a successor. */
+export const awaitsSuccessor = (e: { ended?: boolean; end_reason?: string; superseded_by?: string }) =>
+  e.ended === true && e.end_reason === RESTARTED_END_REASON && !e.superseded_by;
+const RESTARTED_HINT = 'ended: restarted; start a successor with start_lead to continue from its last handoff';
+
 /** Worker/listing view: a dead, ended or unavailable (e.g. restarted) session is no longer live. */
 const isEnded = (row: any) => ENDED_STATES.includes(reportedState(row));
 /**
@@ -317,7 +322,7 @@ type LeadTool = keyof typeof leadSchemas;
 const descriptions: Record<CoordinatorTool, string> = {
   start_lead: 'Start a Project Lead: a managed Claude session that owns one workstream of one registered project on this machine and delegates implementation to its own worker sessions. `project` is a registered project name (never a path); `workstream` a kebab-case key; `goal` ≤1000 chars; `first_task` the Lead\'s first brief. A Lead already on the same project/workstream (or the one named in `supersedes`) is superseded: the new Lead is seeded with its latest handoff and live workers, and it is retired (if the new Lead is held for the developer\'s approval, only once they approve). A working Lead is refused unless `force: true`. The result field `seeded_from` ({ lead, seq, kind } or null) names the predecessor handoff the new Lead was seeded from; `own_seed_seq` is the seq of the new Lead\'s own seed handoff. A Lead that is dead or ended (e.g. `end_reason: restarted` after a Foreman restart; nothing respawns it) is superseded the same way. `permission_mode` is bypass or auto (omit for the developer\'s standing policy; native is not available). `model`/`effort` override the Lead role config. The host enforces the Lead limit.',
   retire_lead: 'Retire (end) a Lead on this machine by session key or name. An idle, finished or dead Lead ends now; a working Lead is refused unless force: true. Its workers keep running and its chat stays readable.',
-  list_leads: 'List Leads from the registry (all machines): project, workstream, goal, state, permission mode, pending approvals (including workers), workers, latest handoff, and whether the Lead\'s machine is online or reachable from here. A Lead left unavailable by a Foreman restart is ended: state dead, end_reason restarted.',
+  list_leads: 'List Leads from the registry (all machines): project, workstream, goal, state, permission mode, pending approvals (including workers), workers, latest handoff, and whether the Lead\'s machine is online or reachable from here. A Lead left unavailable by a Foreman restart is ended: state dead, end_reason restarted. Ended Leads are hidden unless include_ended, except a restarted Lead not yet superseded: it is listed (ended, with a hint) so you can offer the developer a successor via start_lead, seeded from its last handoff.',
   read_handoff: 'Read the newest handoffs (1-5, newest first) of a Lead by session key or name, from the registry.',
 };
 const leadDescriptions: Record<LeadTool, string> = {
@@ -481,7 +486,8 @@ export function makeLeadTools(deps: LeadToolsDeps) {
       return rowsOf(sessions).filter((w) => roleOf(w) === 'worker' && parentOf(w) === pred.key && !isEnded(w))
         .map((w) => ({ session_key: String(w.session_key), name: String(w.name), state: reportedState(w) }));
     }
-    return (pred.entry?.workers ?? []).filter((w) => !ENDED_STATES.includes(w.state)).map((w) => ({ session_key: w.session_key, name: w.name, state: w.state }));
+    // A registry worker row is reported as-is; an `unknown` one on another machine is treated as dead.
+    return (pred.entry?.workers ?? []).filter((w) => w.state !== 'unknown' && !ENDED_STATES.includes(w.state)).map((w) => ({ session_key: w.session_key, name: w.name, state: w.state }));
   }
 
   function composeSeed(args: { project: string; workstream: string; goal: string; first_task: string; name: string }, pred: Predecessor | null, handoff: LeadHandoff | null, workers: { session_key: string; name: string; state: string }[], tail: string[]): string {
@@ -611,17 +617,22 @@ export function makeLeadTools(deps: LeadToolsDeps) {
     }
 
     if (name === 'list_leads') {
-      const entries = await store.list({ include_ended: args.include_ended === true });
+      // The default view still reads ended rows: a Lead ended by a Foreman restart and not yet
+      // superseded is shown (labelled ended) so the Coordinator can offer a successor (#170).
+      const all = args.include_ended === true;
+      const entries = await store.list({ include_ended: true });
       return {
         machine: machine.name, store: store.mode,
-        leads: entries.filter((raw) => args.include_ended === true || !isUnavailable(raw)).map((raw) => {
+        leads: entries.filter((raw) => all || (!raw.ended && !isUnavailable(raw)) || awaitsSuccessor(raw)).map((raw) => {
           // A row synced before #170 (or by an older host) may still say `unknown` for a Lead that
           // is not alive: report it as ended, like buildLeadRecords does now.
           const e: LeadListEntry = isUnavailable(raw) ? { ...raw, state: 'dead', ended: true, end_reason: raw.end_reason ?? UNAVAILABLE_END_REASON } : raw;
           const notes: string[] = [];
           if (!isThisMachine(e.machine_id)) notes.push(`on ${e.machine_name}, not reachable from here`);
           if (!e.machine_online) notes.push(`last known state at ${new Date(e.reported_at).toISOString()}; machine offline; newer handoffs may exist there`);
+          const restarted = awaitsSuccessor(e);
           return {
+            ...(restarted ? { hint: RESTARTED_HINT } : {}),
             lead: e.lead, name: e.name, project: e.project, workstream: e.workstream, goal: e.goal, state: e.state, alive: e.alive, ended: e.ended,
             machine: e.machine_name, machine_online: e.machine_online, permission_mode: e.permission_mode,
             ...(e.bypass_grant ? { bypass_grant: e.bypass_grant } : {}), ...(e.policy_reason ? { policy_reason: e.policy_reason } : {}),
@@ -711,7 +722,7 @@ export function makeLeadTools(deps: LeadToolsDeps) {
           const count = approvalsCount(sessions, String(w.session_key));
           return {
             session_key: w.session_key, name: w.name, state: reportedState(w), permission_mode: modeOf(w), pending_approvals: count,
-            needs_attention: w.state === 'needs_input' || count > 0, updated_at: w.updated_at ?? null,
+            needs_attention: reportedState(w) === 'needs_input' || count > 0, updated_at: w.updated_at ?? null,
             ...(isUnavailable(w) || w.state === 'dead' ? { end_reason: reportedEndReason(w) } : {}),
             ...(w.last_message ? { last_message: String(w.last_message).slice(0, 400) } : {}), ...(w.last_error ? { last_error: String(w.last_error).slice(0, 400) } : {}),
           };
