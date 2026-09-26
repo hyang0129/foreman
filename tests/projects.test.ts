@@ -4,15 +4,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { ProjectRegistry } from '../server/projects.ts';
+import { homedir, tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { ProjectRegistry, notAProject, seedRoots } from '../server/projects.ts';
 import { makeFleetServer } from '../server/tools.ts';
+// Fixtures live under os.tmpdir(), which seed() otherwise skips (#234).
+const roots = seedRoots({ tmp: [] });
 function fixture(t: test.TestContext) {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-projects-')));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const first = join(home, 'personal', 'foreman'), second = join(home, 'work', 'foreman');
   mkdirSync(first, { recursive: true }); mkdirSync(second, { recursive: true });
-  return { home, first, second, registry: new ProjectRegistry(home) };
+  return { home, first, second, registry: new ProjectRegistry(home, roots) };
 }
 test('registry seeds recent sessions, persists names/aliases/order, deduplicates and keeps removals across restart', (t) => {
   const { home, first, second, registry } = fixture(t);
@@ -21,13 +24,13 @@ test('registry seeds recent sessions, persists names/aliases/order, deduplicates
   assert.equal(registry.list().length, 2); assert.equal(registry.list()[0].path, second);
   const project = registry.register({ name: 'personal', path: first, aliases: ['the personal repo'] });
   registry.update(project.id, 'My Foreman');
-  const loaded = new ProjectRegistry(home);
+  const loaded = new ProjectRegistry(home, roots);
   assert.equal(loaded.require('the personal repo').path, first);
   assert.equal(loaded.require('my foreman').project?.name, 'My Foreman');
   assert.equal(loaded.list().find((p) => p.id === project.id)?.lastUsed, '2026-09-02T00:00:00.000Z');
   assert.equal(statSync(join(home, 'projects.json')).mode & 0o777, 0o600);
   loaded.remove(project.id);
-  const removed = new ProjectRegistry(home); removed.seed([{ cwd: first }, { cwd: alias }]);
+  const removed = new ProjectRegistry(home, roots); removed.seed([{ cwd: first }, { cwd: alias }]);
   assert.equal(removed.list().length, 1); assert.equal(removed.resolve('personal').status, 'not_found');
   assert.equal(JSON.parse(readFileSync(join(home, 'projects.json'), 'utf8')).version, 1);
 });
@@ -61,7 +64,7 @@ test('registration accepts symlinked parents and pins all registered lexical pat
   registry.register({ name: 'alternate', path: first });
   assert.equal(registry.list().length, 1);
   rmSync(parent); symlinkSync(join(home, 'work'), parent);
-  const loaded = new ProjectRegistry(home);
+  const loaded = new ProjectRegistry(home, roots);
   for (const ref of ['foreman-home', 'alternate', linked, first]) assert.throws(() => loaded.require(ref), /changed its symlink target/);
   assert.throws(() => loaded.register({ name: 'repin', path: linked }), /changed its symlink target/);
   assert.equal(loaded.list()[0].canonicalPath, first);
@@ -103,10 +106,71 @@ test('seeding retains canonical-equivalent recent path names and pins them acros
   assert.equal(registry.require('personal-link').path, first);
   assert.ok(registry.list()[0].registeredPaths?.includes(link));
   rmSync(link); symlinkSync(second, link);
-  const restored = new ProjectRegistry(home);
+  const restored = new ProjectRegistry(home, roots);
   for (const reference of [link, first, 'personal-link']) assert.throws(() => restored.require(reference), /changed its symlink target/);
   restored.seed([{ cwd: first }, { cwd: link }]);
   assert.equal(restored.list().length, 1);
   assert.equal(restored.list()[0].canonicalPath, first);
   assert.throws(() => restored.require(link), /changed its symlink target/);
+});
+
+// #234: seed() auto-registers only real project roots; prune() drops what it would not seed.
+function skipFixture(t: test.TestContext) {
+  const { home, first } = fixture(t);
+  const repo = join(home, 'repo'), worktree = join(home, 'repo-wt');
+  const git = (...args: string[]) => execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args]);
+  mkdirSync(repo); git('init', '-q'); git('commit', '-q', '--allow-empty', '-m', 'init'); git('worktree', 'add', '-q', '-b', 'wt', worktree);
+  const dirs = { agent: join(home, 'code', '.claude', 'worktrees', 'agent-1'), scratch: join(home, 'T', 'scratchpad', 'qa-sandbox'), tmp: join(home, 'T', 'build'),
+    user: join(home, 'user'), dev: join(home, 'user', '.foreman-dev'), state: join(home, 'state', 'sessions') };
+  for (const dir of Object.values(dirs)) mkdirSync(dir, { recursive: true });
+  const link = join(home, 'looks-normal'); symlinkSync(dirs.tmp, link); // canonical path is temp
+  const roots = seedRoots({ tmp: [join(home, 'T')], home: dirs.user, state: [join(home, 'state')] });
+  return { home, first, repo, worktree, dirs, link, roots };
+}
+test('seed skips worktrees of a registered repo, temp dirs, HOME and Foreman state, and still seeds a normal repo', (t) => {
+  const { home, first, repo, worktree, dirs, link, roots } = skipFixture(t);
+  const outsideTmp = join(home, 'x', 'scratchpad', 'real-repo'); mkdirSync(outsideTmp, { recursive: true }); // a scratchpad name alone is not temp
+  const registry = new ProjectRegistry(join(home, 'registry'), roots);
+  registry.seed([repo, worktree, ...Object.values(dirs), link, first, outsideTmp].map((cwd) => ({ cwd })));
+  assert.deepEqual(registry.list().map((p) => p.path).sort(), [first, repo, outsideTmp].sort());
+  assert.equal(notAProject(worktree, roots, (p) => p === repo), true);
+  for (const path of [...Object.values(dirs), link]) assert.equal(notAProject(path, roots), true, path);
+  for (const path of [repo, first, worktree, outsideTmp]) assert.equal(notAProject(path, roots), false, path);
+  // The real defaults: os.tmpdir() and $HOME are never seeded.
+  const defaults = new ProjectRegistry(join(home, 'registry-defaults'));
+  defaults.seed([{ cwd: first }, { cwd: tmpdir() }, { cwd: homedir() }]);
+  assert.deepEqual(defaults.list(), []);
+  assert.equal(notAProject(homedir()), true); assert.equal(notAProject(join(homedir(), '.foreman-dev')), true);
+});
+test('prune drops matching and missing entries, keeps real projects and leaves user removals alone', (t) => {
+  const { home, first, repo, worktree, dirs, roots } = skipFixture(t);
+  const registry = new ProjectRegistry(join(home, 'registry'), roots), file = join(home, 'registry', 'projects.json');
+  const gone = join(home, 'gone'), dropped = join(home, 'dropped'); mkdirSync(gone); mkdirSync(dropped);
+  for (const [name, path] of Object.entries({ first, repo, worktree, gone, dropped, ...dirs })) registry.register({ name, path });
+  registry.remove(registry.require('dropped').project!.id);
+  const removed = JSON.parse(readFileSync(file, 'utf8')).removed;
+  assert.ok(removed.includes(dropped));
+  rmSync(gone, { recursive: true });
+  const before = readFileSync(file, 'utf8'), expected = ['worktree', 'gone', ...Object.keys(dirs)].sort();
+  assert.deepEqual(registry.prune({ dryRun: true }).map((p) => p.name).sort(), expected);
+  assert.equal(readFileSync(file, 'utf8'), before);
+  assert.deepEqual(registry.prune().map((p) => p.name).sort(), expected);
+  const loaded = new ProjectRegistry(join(home, 'registry'), roots);
+  assert.deepEqual(loaded.list().map((p) => p.name).sort(), ['first', 'repo']);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).removed, removed);
+  assert.deepEqual(loaded.prune(), []);
+});
+test('worktrees of an unregistered repo or of a bare repo are projects: seeded and kept by prune', (t) => {
+  const { home, repo, worktree, roots } = skipFixture(t);
+  const bare = join(home, 'bare.git'), main = join(home, 'bare-main'), feature = join(home, 'bare-feature');
+  const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args]);
+  git('clone', '-q', '--bare', repo, bare); // repo+main/+feature/ layout: every checkout is a worktree
+  git('-C', bare, 'worktree', 'add', '-q', '-b', 'b-main', main); git('-C', bare, 'worktree', 'add', '-q', '-b', 'b-feature', feature);
+  const registry = new ProjectRegistry(join(home, 'registry'), roots);
+  registry.register({ name: 'parent', path: home }); // the bare repo's parent is registered, but it is not a main checkout
+  registry.seed([main, feature, worktree].map((cwd) => ({ cwd }))); // `repo` itself is not registered
+  assert.deepEqual(registry.list().map((p) => p.path).sort(), [home, feature, main, worktree].sort());
+  assert.deepEqual(registry.prune(), []);
+  registry.seed([{ cwd: repo }]); // registering the main checkout makes its worktree prunable
+  assert.deepEqual(registry.prune().map((p) => p.path), [worktree]);
 });
