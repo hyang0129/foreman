@@ -116,7 +116,8 @@ test('approval requires explicit matching one-time response and stale requests a
   assert.throws(() => client.respond('approval-1', { decision:'accept' }), /no longer pending/);
 });
 
-test('timeouts expose uncertain delivery without retrying mutations', async (t) => {
+// Real-time bound: with setTimeout mocked, a request that never reaches the server would otherwise hang.
+test('timeouts expose uncertain delivery without retrying mutations', { timeout:10_000 }, async (t) => {
   const { client, sent, received } = await fixture(t);
   t.mock.timers.enable({ apis:['setTimeout'] });
   await assert.rejects(timeOut(t, received('fixture/hang'), client.request('fixture/hang')), /delivery is unknown/);
@@ -125,7 +126,7 @@ test('timeouts expose uncertain delivery without retrying mutations', async (t) 
 
 // #106: a timeout or error from account/read keeps its old behavior (the
 // check passes and the launch continues) but leaves a diagnostic on stderr.
-test('requireSignedIn logs a diagnostic when account/read times out or errors, and still continues', async (t) => {
+test('requireSignedIn logs a diagnostic when account/read times out or errors, and still continues', { timeout:10_000 }, async (t) => {
   t.after(() => { accountRead = 'ok'; });
   const errors = t.mock.method(console, 'error', () => {});
   for (const [mode, detail] of [['hang', /Codex account\/read timed out/], ['error', /Codex: account store unavailable/]] as const) {

@@ -13,7 +13,10 @@ import { ProcessTree, processTable, type ProcessEntry } from '../server/process-
 // Supervisors inherit this env: keep their compiled helper cache (#104) in a temp dir.
 const helperCache = mkdtempSync(join(tmpdir(), 'foreman-lifecycle-helper-'));
 process.env.FOREMAN_PROCESS_HELPER_DIR = helperCache;
-test.after(() => rmSync(helperCache, { recursive: true, force: true }));
+// A test that timed out still runs its `finally` in the background; its supervisor needs the helper
+// to clean up, so the cache is removed only after every supervisor the tests killed has exited.
+const teardowns = new Set<Promise<unknown>>();
+test.after(async () => { await Promise.all(teardowns); rmSync(helperCache, { recursive: true, force: true }); });
 const fixture = fileURLToPath(new URL('./fixtures/process-provider.mjs', import.meta.url));
 // Polls a process-table condition that has no event to wait on (a process exiting or being reaped
 // outside this test's control). No budget of its own: it ends when the test's timeout aborts `signal`.
@@ -24,6 +27,8 @@ async function until<T>(check: () => T | false, signal: AbortSignal) {
     await delay(50);
   }
 }
+// Supervisor cleanup is bounded by its own escalation deadline (server/process-supervisor.ts), so it exits.
+function alive(pid: number) { try { process.kill(pid, 0); return true; } catch { return false; } }
 function row(pid: number, ppid: number, pgid: number, started = 'one'): ProcessEntry { return {pid,ppid,pgid,started,stat:'S'}; }
 test('ownership follows detached descendants and retains groups after leaders exit, but rejects reused PIDs', () => {
   const tree = new ProcessTree(100);
@@ -39,7 +44,7 @@ for (const action of ['close', 'provider-crash', 'provider-kill', 'owner-kill'] 
     if (action === 'owner-kill') {
       child = spawn(process.execPath, ['--experimental-strip-types','--input-type=module','-e',
         `import {spawnOwnedProcess} from ${JSON.stringify(new URL('../server/owned-process.ts',import.meta.url).href)};
-         const child = spawnOwnedProcess(process.execPath, [${JSON.stringify(fixture)}]); child.stdout.pipe(process.stdout); child.stderr.pipe(process.stderr);`],
+         const child = spawnOwnedProcess(process.execPath, [${JSON.stringify(fixture)}]); process.stderr.write('supervisor:' + child.pid + '\\n'); child.stdout.pipe(process.stdout); child.stderr.pipe(process.stderr);`],
         {detached:true,stdio:['pipe','pipe','pipe']});
     } else child = spawnOwnedProcess(process.execPath, [fixture]);
     let output = '', stderr = ''; child.stdout!.on('data',(chunk) => { output += chunk; });
@@ -51,6 +56,8 @@ for (const action of ['close', 'provider-crash', 'provider-kill', 'owner-kill'] 
     const reported = new Promise<{provider:number;shell:number;sleep:number}>((resolve, reject) => {
       child.stdout!.on('data', () => { if (output.includes('\n')) resolve(JSON.parse(output.trim())); });
       void exited.then(([code, signal]) => reject(new Error(`owned process exited (${signal ?? code}) before the provider reported: ${stderr}`)));
+      // On the test's timeout, stop waiting so `finally` still tears the processes down.
+      t.signal.addEventListener('abort', () => reject(new Error(`the provider never reported its process ids: ${stderr}`)), { once:true });
     });
     let pids: {provider:number;shell:number;sleep:number} | undefined;
     try {
@@ -70,6 +77,10 @@ for (const action of ['close', 'provider-crash', 'provider-kill', 'owner-kill'] 
       assert.ok(processTable().some((r) => r.pid === sentinel.pid));
     } finally {
       child.kill('SIGTERM'); sentinel.kill('SIGKILL');
+      // The supervisor's exit ends its cleanup. For owner-kill that is the owner's child, not `child`.
+      const supervisor = action === 'owner-kill' ? Number(/supervisor:(\d+)/.exec(stderr)?.[1]) : 0;
+      const teardown = exited.then(async () => { while (supervisor && alive(supervisor)) await delay(50); });
+      teardowns.add(teardown); await teardown;
       if (pids) for (const pid of [pids.provider,pids.shell]) { try { process.kill(-pid,'SIGKILL'); } catch {} }
     }
   });

@@ -148,7 +148,10 @@ test('POST /api/pm/message answers 503 with the cause and dispatches nothing whe
   // The send launched the CLI before recording failed (#115). Wait for the real event that shows
   // its stdin is being recorded (the SDK's initialize request reached it) rather than for a fixed
   // time, then check that nothing but control requests ever reached it.
-  while (!cli.lines().some((m) => m.type === 'control_request' && m.request?.subtype === 'initialize')) await delay(20);
+  while (!cli.lines().some((m) => m.type === 'control_request' && m.request?.subtype === 'initialize')) {
+    if (t.signal.aborted) throw new Error('the CLI never received initialize');
+    await delay(20);
+  }
   const history = await fetch(`${origin}/api/pm/history`, { headers }).then((r) => r.json());
   assert.deepEqual(cli.lines().filter((m) => m.type !== 'control_request'), [], 'no input reached the CLI');
   assert.equal(cli.entries().filter((e) => 'launched' in e).length, 1, 'the send launched the CLI once');
