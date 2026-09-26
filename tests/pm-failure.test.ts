@@ -1060,12 +1060,16 @@ test('real SDK: the input uuid reaches the CLI and the echoed result settles tha
   t.mock.method(process, 'emitWarning', () => {});
   const diagnostics: any[] = []; t.mock.method(console, 'error', (...args: any[]) => diagnostics.push(args));
   (pm as any).queryFactory = (args: any) => query({ ...args, options: { ...args.options, pathToClaudeCodeExecutable: cli.path } });
+  // Wait for the turn's end, not for a fixed poll budget: a real CLI subprocess round trip has no
+  // upper bound under load (#180). turn_end is emitted after the result recorded the assistant
+  // text and settled the input (endTurn). If the provider run ends first, fail on that instead.
+  const turnEnded = new Promise<void>((resolve) => pm.on('event', (e: any) => { if (e.type === 'turn_end') resolve(); }));
   const running = pm.start();
   t.after(async () => { pm.close(); await running; });
   await pm.send('new input');
   const [turnId] = pm.outstandingTurnIds();
-  await settle(() => pm.history().some((e) => e.role === 'assistant'));
-  await settle(() => ends.length === 1);
+  const ended = await Promise.race([turnEnded.then(() => 'turn_end'), running.then(() => 'provider run ended')]);
+  assert.equal(ended, 'turn_end', JSON.stringify(pm.history()));
   assert.deepEqual(cli.entries(), [{ argv: [] }, { input: 'new input', uuid: turnId }]);
   assert.deepEqual(ends, [[turnId, 'completed']]);
   assert.equal(pm.history().find((e) => e.role === 'assistant')!.text, 'echo: new input');
