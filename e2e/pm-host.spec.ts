@@ -640,7 +640,7 @@ test("the machine line and the footer name the machine, and the offline copy is 
   await expect(page.locator("#host-status")).toHaveText("build-box · offline");
   // The machine line already says it; the connection banner does not repeat it in the PM view.
   await expect(page.locator("#connection-banner")).toBeHidden();
-  // (The notification kind named "Mac offline" belongs to the notifications settings, not this copy.)
+  // (The notification kind named "Machine offline" belongs to the notifications settings, not this copy.)
   const noMac = async () => {
     expect(await page.locator("main").innerText()).not.toMatch(/\bMac\b/);
     expect(await page.locator("main textarea").getAttribute("placeholder")).not.toMatch(/\bMac\b/);

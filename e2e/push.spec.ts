@@ -246,7 +246,7 @@ test.describe("notification settings", () => {
       subscription: { endpoint }, device_label: "Android · Chrome", kinds: ["session_failed", "pm_failed", "host_offline"],
     });
     await expect(page.locator("#notify-feedback")).toHaveText("Saved.");
-    await page.getByLabel("Mac offline").tap();
+    await page.getByLabel("Machine offline").tap();
     await expect.poll(() => pushCalls(state, "/api/push/subscribe").length).toBe(3);
     expect(pushCalls(state, "/api/push/subscribe")[2].body.kinds).toEqual(["session_failed", "pm_failed"]);
     // No new browser subscription: the same one is re-posted.
@@ -258,7 +258,7 @@ test.describe("notification settings", () => {
     await signedIn(page);
     await openSettings(page);
     await expect(page.getByLabel("Approvals and questions")).not.toBeChecked();
-    await expect(page.getByLabel("Mac offline")).not.toBeChecked();
+    await expect(page.getByLabel("Machine offline")).not.toBeChecked();
     await expect(page.getByLabel("A session failed")).toBeChecked();
   });
 
@@ -285,7 +285,7 @@ test.describe("notification settings", () => {
     await signedIn(page);
     await openSettings(page);
     await expect(page.locator("#notify-summary")).toHaveText("On — all notification types are off");
-    await page.getByLabel("Mac offline").tap();
+    await page.getByLabel("Machine offline").tap();
     await expect(page.locator("#notify-feedback")).toHaveText("Saved.");
     await expect(page.locator("#notify-summary")).toHaveText("On");
     await expect(page.locator("#notify-status")).toHaveText(/^This device gets Foreman notifications/);
