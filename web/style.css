@@ -519,6 +519,34 @@ select:focus-visible,
     Consolas,
     monospace;
 }
+/* #201: sending an investigator, a subagent or a Lead is one compact line; tool steps are hidden
+   unless shown from the conversation menu for debugging. */
+.dispatch-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  margin: -12px 0 0;
+  color: var(--secondary);
+  font-size: 0.75rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.dispatch-symbol { flex: none; color: var(--accent); }
+.step-line {
+  display: flex;
+  gap: 8px;
+  margin-top: -16px;
+  border-left: 2px solid var(--line);
+  padding-left: 12px;
+  color: var(--secondary);
+  font:
+    0.6875rem/1.65 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+}
+.step-kind { flex: none; color: var(--muted); }
+.step-text { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
 /* Persisted PM failure: colour plus a label and an icon, in both themes via tokens. */
 .message.system.error {
   border-left-color: var(--error);
@@ -1110,8 +1138,10 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 
 /* Notifications settings (rail footer). Scrolls within itself so the session list keeps room. */
 .notify-settings { margin: 0 0 .5rem; }
-.notify-settings > summary { display: flex; align-items: center; justify-content: space-between; gap: .75rem; font-weight: 600; color: var(--ink); }
-.notify-summary { font-weight: 400; color: var(--muted); }
+/* The label and its value never break mid-word (the footer allows that for long text); a value too
+   long for the row moves under the label as a whole, on the right (#150). */
+.notify-settings > summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; column-gap: .75rem; font-weight: 600; color: var(--ink); overflow-wrap: normal; }
+.notify-summary { margin-left: auto; font-weight: 400; color: var(--muted); white-space: nowrap; }
 .notify-settings[data-state="on"] .notify-summary { color: var(--accent); }
 .notify-settings[data-state="blocked"] .notify-summary { color: var(--warning); }
 .notify-panel { max-height: min(22rem, 45dvh); overflow-y: auto; padding-bottom: .25rem; }

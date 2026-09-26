@@ -186,9 +186,27 @@ test('effectiveDevSettings applies defaults (grant on for both roles, ask off) a
   d.bypass_grants.push({ role: 'lead', project: 'x', allow: false });
   assert.equal(effectiveDevSettings({}).bypass_grants.length, 2, 'defaults are fresh copies');
   assert.deepEqual(effectiveDevSettings({ bypass_ask: true, bypass_grants: [], roles: { lead: { effort: 'high' } } }), { roles: { lead: { effort: 'high' } }, bypass_grants: [], bypass_ask: true });
-  // Corrupt stored values: grants → off, ask → on, roles → none.
-  assert.deepEqual(effectiveDevSettings({ bypass_grants: 'yes', bypass_ask: 'no', roles: 5 }), { roles: {}, bypass_grants: [], bypass_ask: true });
+  // Corrupt stored values: grants → off, roles → none, and a corrupt ask turns the grants off (ask → off).
+  assert.deepEqual(effectiveDevSettings({ bypass_grants: 'yes', bypass_ask: 'no', roles: 5 }), { roles: {}, bypass_grants: [], bypass_ask: false });
   assert.equal(resolveAgentLaunchPolicy({ requesterRole: 'lead', project: 'x', settings: effectiveDevSettings({ bypass_grants: [{ role: 'lead', project: '/etc', allow: true }] }) }).decision, 'auto');
+});
+
+test('#197: a corrupt stored bypass_ask turns the grants off (Auto, no held launch), even beside valid grants', () => {
+  const grants = [{ role: 'lead', project: '*', allow: true }, { role: 'coordinator', project: 'foreman', allow: true }];
+  for (const bad of ['yes', 'false', 1, 0, null, {}, [true]]) {
+    const eff = effectiveDevSettings({ bypass_grants: grants, bypass_ask: bad, roles: { lead: { effort: 'high' } } });
+    assert.deepEqual(eff, { roles: { lead: { effort: 'high' } }, bypass_grants: [], bypass_ask: false }, JSON.stringify(bad));
+    // Never written grants (the standing default) are turned off too.
+    assert.deepEqual(effectiveDevSettings({ bypass_ask: bad }).bypass_grants, [], JSON.stringify(bad));
+    for (const requesterRole of ['coordinator', 'lead'] as const) {
+      assert.deepEqual(resolveAgentLaunchPolicy({ requesterRole, project: 'foreman', settings: eff }), { decision: 'auto', policy_reason: 'grant_off' });
+    }
+  }
+  // Every shape that parsed before still parses to the same value (no change for valid stored values).
+  for (const ask of [true, false]) {
+    assert.deepEqual(effectiveDevSettings({ bypass_grants: grants, bypass_ask: ask }), { roles: {}, bypass_grants: grants, bypass_ask: ask });
+    assert.deepEqual(effectiveDevSettings({ bypass_ask: ask }).bypass_grants, [...DEFAULT_BYPASS_GRANTS]);
+  }
 });
 
 test('parseDevSetting validates each key strictly and drops unknown nested fields', () => {
@@ -210,6 +228,36 @@ test('parseDevSetting validates each key strictly and drops unknown nested field
     ...PATHS.map((project) => [{ role: 'lead', project, allow: true }]),
   ]) assert.equal(parseDevSetting('bypass_grants', bad).ok, false, JSON.stringify(bad));
   assert.equal(parseDevSetting('nope' as never, true).ok, false);
+});
+
+test('#197: sameProject ignores a leading "the " like the registry key(); ambiguous grants resolve to off', () => {
+  const s = (bypass_grants: unknown) => effectiveDevSettings({ bypass_grants });
+  // "The Foreman" grant applies to the registered project "foreman" (and the reverse).
+  const on = { requesterRole: 'coordinator' as const, settings: s([{ role: 'coordinator', project: 'The Foreman', allow: true }]) };
+  assert.deepEqual(resolveAgentLaunchPolicy({ ...on, project: 'foreman' }), { decision: 'bypass', bypass_grant: 'standing:coordinator/The Foreman', policy_reason: 'standing_grant' });
+  const off = s([{ role: 'coordinator', project: '*', allow: true }, { role: 'coordinator', project: 'foreman', allow: false }]);
+  assert.equal(resolveAgentLaunchPolicy({ requesterRole: 'coordinator', project: 'the  Foreman', settings: off }).decision, 'auto');
+  // Only a leading "the " followed by whitespace is ignored.
+  assert.equal(matchBypassGrant([{ role: 'lead', project: 'theforeman', allow: true }], 'lead', 'foreman'), null);
+  assert.equal(matchBypassGrant([{ role: 'lead', project: 'foreman the', allow: true }], 'lead', 'foreman'), null);
+  // Backward compatible: a stored list holding both spellings still parses (it did before #197)…
+  const both = [{ role: 'lead', project: 'the foreman', allow: true }, { role: 'lead', project: 'foreman', allow: false }];
+  assert.equal(parseDevSetting('bypass_grants', both).ok, true);
+  assert.equal(parseDevSetting('bypass_grants', [...both].reverse()).ok, true);
+  // …and whichever order, the off entry wins for either spelling: ambiguity never grants Bypass.
+  for (const grants of [both, [...both].reverse()]) for (const project of ['foreman', 'The Foreman']) {
+    assert.deepEqual(resolveAgentLaunchPolicy({ requesterRole: 'lead', project, settings: s(grants) }), { decision: 'auto', policy_reason: 'grant_off' }, `${JSON.stringify(grants)} ${project}`);
+  }
+  // Two "on" spellings: the first applies (Bypass either way).
+  assert.equal(matchBypassGrant([{ role: 'lead', project: 'the foreman', allow: true }, { role: 'lead', project: 'foreman', allow: true }], 'lead', 'foreman')?.project, 'the foreman');
+});
+
+test('#197: agentModeSupported is Claude only in both modes (agent launches are Claude only)', () => {
+  assert.equal(agentModeSupported('codex', 'bypass'), false);
+  assert.equal(agentModeSupported('codex', 'auto'), false);
+  assert.equal(agentModeSupported('claude', 'bypass'), true);
+  assert.equal(agentModeSupported('claude', 'auto'), true);
+  assert.equal(agentModeSupported('other', 'bypass'), false);
 });
 
 test('parseSettingsPost and parseDevSettingsView', () => {

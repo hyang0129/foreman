@@ -116,3 +116,44 @@ test('the PM passes the chosen Claude binary to the SDK', async (t) => {
   assert.ok(options, 'the PM must start a provider');
   assert.equal(options.pathToClaudeCodeExecutable, PM_FAKE_BIN);
 });
+
+// #164: scripts/claude-bin.mjs is the plain-JS twin used by scripts/dev-environment.mjs. It must
+// choose exactly what server/claude-bin.ts chooses, for every source, on real fixture files.
+test('#164: the .mjs twin resolves the Claude binary exactly as server/claude-bin.ts does', async () => {
+  const twin = await import('../scripts/claude-bin.mjs');
+  const installed = fakeClaude(join(root, 't-installed'));
+  const later = fakeClaude(join(root, 't-later'));
+  const notExecutable = fakeClaude(join(root, 't-noexec'), '1.0.0', 0o644);
+  const bundled = fakeClaude(join(root, 't-bundled'));
+  const missing = join(root, 't-missing', 'claude');
+  const emptyDir = join(root, 't-empty'); mkdirSync(emptyDir);
+  mkdirSync(join(root, 't-dir', 'claude'), { recursive: true });
+  const paths = [undefined, '', emptyDir, dirname(installed), [dirname(later), dirname(installed)].join(delimiter),
+    [dirname(notExecutable), 'relative/bin', join(root, 't-dir'), dirname(installed)].join(delimiter), [emptyDir, dirname(notExecutable)].join(delimiter)];
+  let cases = 0;
+  for (const PATH of paths) for (const override of [undefined, '', '/opt/custom/claude']) for (const b of [bundled, missing]) {
+    const env: NodeJS.ProcessEnv = { ...(PATH === undefined ? {} : { PATH }), ...(override === undefined ? {} : { FOREMAN_CLAUDE_BIN: override }) };
+    assert.deepEqual(twin.resolveClaudeBin({ env, bundled: b }), resolveClaudeBin({ env, bundled: b }), JSON.stringify({ env, b }));
+    cases++;
+  }
+  for (const PATH of paths) assert.equal(twin.findInstalledClaude(PATH), findInstalledClaude(PATH), String(PATH));
+  // Every source is reached, so agreement is not vacuous.
+  const sources = new Set(paths.flatMap((PATH) => [bundled, missing].map((b) => twin.resolveClaudeBin({ env: PATH === undefined ? {} : { PATH }, bundled: b }).source)));
+  assert.deepEqual([...sources].sort(), ['bundled', 'installed', 'unresolved']);
+  assert.equal(twin.resolveClaudeBin({ env: { FOREMAN_CLAUDE_BIN: '/x/claude' }, bundled }).source, 'override');
+  assert.equal(cases, paths.length * 6);
+});
+
+test('#164: the dev auth preflight binary follows the daemon order (installed on PATH, then the snapshot bundle)', async () => {
+  // Untyped plain-JS module: imported through a string so the typecheck treats it as `any`.
+  const devEnvironment: string = '../scripts/dev-environment.mjs';
+  const { devClaudeBinary } = await import(devEnvironment);
+  const snapshot = join(root, 'dev-snapshot');
+  const bundled = fakeClaude(join(snapshot, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`));
+  const installed = fakeClaude(join(root, 'dev-installed'));
+  const emptyDir = join(root, 'dev-empty'); mkdirSync(emptyDir);
+  assert.equal(devClaudeBinary(snapshot, { PATH: [emptyDir, dirname(installed)].join(delimiter) }), installed);
+  assert.equal(devClaudeBinary(snapshot, { PATH: emptyDir }), bundled);
+  assert.equal(devClaudeBinary(snapshot, { PATH: dirname(installed), FOREMAN_CLAUDE_BIN: '/opt/custom/claude' }), '/opt/custom/claude');
+  assert.equal(devClaudeBinary(join(root, 'dev-no-snapshot'), { PATH: emptyDir }), 'claude');
+});

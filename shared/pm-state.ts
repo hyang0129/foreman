@@ -581,6 +581,22 @@ export interface PmHostErrorResponse { error: string }
 
 export const PM_HOST_LOCAL_ONLY_ERROR = 'Reassignment needs the cloud relay';
 
+/**
+ * #119: the `view` in a relay-mode host's local 404 answer to GET /api/pm/host (the relay alone
+ * answers a PmHostResponse): this machine's own view of the assignment. #144 adds `relay_refusal`
+ * (additive): the relay's latest policy refusal of this machine (a 1008 close, e.g. "Too many
+ * machines") and when the host retries, or null once a connection is accepted. Times are epoch ms.
+ */
+export interface PmHostLocalView {
+  mode: 'relay';
+  connected: boolean;
+  this_machine_active: boolean;
+  epoch: number | null;
+  active_machine: { machine_id: string; host: string } | null;
+  this_machine: { machine_id: string; name: string } | null;
+  relay_refusal: { code: number; reason: string; at: number; retry_at: number } | null;
+}
+
 /** 503 body text for a relayed request while the active PM host is offline. */
 export function pmHostOfflineMessage(name: string): string {
   return `Your Coordinator's machine (${name}) is offline.`;

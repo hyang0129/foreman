@@ -11,6 +11,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { assertTestHome } from '../server/home-guard.mjs';
+import { resolveClaudeBin } from './claude-bin.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const TARGET = Object.freeze({ worker: 'foreman-dev', url: 'https://foreman-dev.hooong-yang.workers.dev', account: 'b107d26298de0cc01f30edf0db8e92b1', port: 4178 });
@@ -442,6 +443,13 @@ function withConfig(env, key, configDir) {
   if (configDir) out[key] = configDir; else delete out[key];
   return out;
 }
+// #164: the Claude binary the dev daemon will run, chosen as server/claude-bin.ts chooses it in the
+// daemon (FOREMAN_CLAUDE_BIN, then `claude` on PATH, then the snapshot's SDK-bundled binary). The
+// daemon inherits this process's environment (daemonEnvironment), so the auth preflight checks the
+// same binary the daemon starts.
+export function devClaudeBinary(snapshot, env = process.env, deps = {}) {
+  return resolveClaudeBin({ env, bundled: join(snapshot, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude'), ...deps }).path;
+}
 export function requireClaudeAuth(binary, configDir, env = process.env, execute = run) {
   if (env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_OAUTH_TOKEN) return;
   try {
@@ -560,7 +568,7 @@ export async function start(home, { relayStatus = remote, checkPort, execute = r
   }
   const claudeDir = isolatedLogins ? join(home, 'claude') : null, codexDir = isolatedLogins ? join(home, 'codex') : null;
   // Claude is required; Codex is optional and only reported.
-  requireClaudeAuth(join(snapshot, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude'), claudeDir, process.env, execute);
+  requireClaudeAuth(devClaudeBinary(snapshot, process.env), claudeDir, process.env, execute);
   const codexNotice = codexLoginNotice('codex', codexDir, process.env, execute);
   if (codexNotice) console.warn(codexNotice);
   const entry = join(home, 'run.mjs');

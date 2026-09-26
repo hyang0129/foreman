@@ -236,6 +236,9 @@ test('two machines: A answers from imported memory, a move closes A (sends name 
   assert.equal(A.uncertain().length, 0);
   assert.equal(A.answers().length, 1, 'the closed provider reports nothing after the move');
   assert.match(A.pm.history().at(-1)!.text!, /now runs on machine-b/);
+  // #144: the "moved" entry carries a structured marker (its text is unchanged for older clients).
+  assert.equal(A.pm.history().at(-1)!.marker, 'pm_moved');
+  assert.deepEqual(A.pm.history().filter((e) => e.marker).map((e) => e.text), [A.pm.history().at(-1)!.text], 'only that entry is marked');
 
   // B: an empty conversation plus exactly one uncertain entry, acknowledged.
   await until(() => !relay.turns.has(inFlight), 'B acknowledged the uncertain turn');
@@ -243,6 +246,7 @@ test('two machines: A answers from imported memory, a move closes A (sends name 
   assert.equal(history.length, 1);
   assert.match(history[0]!.text!, /^Your message sent at \d{4}-\d\d-\d\d \d\d:\d\d UTC to the Coordinator on machine-a could not be confirmed \(the Coordinator was moved\)\. It was not replayed\.$/);
   assert.equal(history[0]!.error, true);
+  assert.equal(history[0]!.marker, undefined, 'an uncertain entry is not a "moved" entry');
   assert.equal(B.pm.lastError, history[0]!.text);
   assert.deepEqual(B.launches[0]!.consumed, [], 'nothing is replayed on B');
   assert.equal('resume' in B.launches[0]!.options, false);
@@ -453,7 +457,7 @@ function spyEnds(h: ReturnType<typeof daemon>) {
   return ends;
 }
 
-test('#115: a send whose epoch changes across beginTurn (A→B→A) is not dispatched, and the relay\'s "moved" entry stands', { timeout: 20_000 }, async (t) => {
+test('#115/#143: a send whose epoch changes across beginTurn (A→B→A) is not dispatched, and A does not also call it "could not be confirmed"', { timeout: 20_000 }, async (t) => {
   t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
   const relay = new FakeRelay();
   const A = daemon(t, relay, home('machine-a', '## p\nx\n'), 'machine-a');
@@ -482,9 +486,11 @@ test('#115: a send whose epoch changes across beginTurn (A→B→A) is not dispa
   for (const launch of A.launches) assert.ok(!launch.consumed.includes('must not be dispatched'), 'never dispatched');
   assert.deepEqual(A.pm.outstandingTurnIds(), []);
   assert.equal(A.pm.history().some((e) => e.role === 'user'), false, 'not recorded as sent');
-  // The relay reported it as reassigned; A shows exactly that entry, and never ends it as completed.
-  assert.equal(A.uncertain().length, 1);
-  assert.match(A.uncertain()[0]!, /could not be confirmed \(the Coordinator was moved\)\. It was not replayed\./);
+  // The relay reported it as reassigned to A (epoch 3). #143: the developer was told it was not
+  // delivered, so A does not also show "could not be confirmed" for it; it still acknowledges it,
+  // and never ends it as completed.
+  assert.equal(A.pm.history().some((e) => e.text?.includes('could not be confirmed')), false, 'no contradicting entry on A');
+  assert.equal(A.pm.lastError, null);
   assert.equal(ends.some(([id, outcome]) => id === turnId && outcome === 'completed'), false);
   await until(() => !relay.turns.has(turnId), 'A acknowledged the uncertain turn');
   // The PM keeps working at the new epoch.
@@ -648,6 +654,37 @@ test('#122: the model is known before the first PM start, read from the store wi
   await until(() => B.answers().length === 1);
   assert.equal(await B.pm.displayModel(), 'claude-default-from-env');
   assert.equal(B.launches[0]!.options.model, 'claude-default-from-env');
+});
+
+test('#145: while relay memory stays uninitialized (the import failed), polling the model does not read memory every time', { timeout: 20_000 }, async (t) => {
+  t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const previous = process.env.FOREMAN_PM_MODEL;
+  t.after(() => { if (previous === undefined) delete process.env.FOREMAN_PM_MODEL; else process.env.FOREMAN_PM_MODEL = previous; });
+  process.env.FOREMAN_PM_MODEL = 'claude-default-from-env';
+  const relay = new FakeRelay();
+  const dirA = home('machine-a', '## p\nx\n');
+  writeFileSync(join(dirA, 'pm/settings.json'), '{"model":"claude-sonnet-4-5"}');
+  const A = daemon(t, relay, dirA, 'machine-a', { autoStart: false });
+  // The relay refuses the import (as the DO does for an oversized frame): memory stays uninitialized.
+  relay.swallow = (frame) => {
+    if (frame.op !== 'memory.import') return false;
+    queueMicrotask(() => A.sockets.at(-1)!.receive(pmRpcError(frame.id, 'too_large', 'memory.import frame is too large')));
+    return true;
+  };
+  await A.connect();
+  await until(() => relay.frames.some((f) => f.frame.op === 'memory.import'), 'the activation tried the import');
+  await tick();
+  const gets = () => relay.frames.filter((f) => f.frame.op === 'memory.get').length;
+  assert.equal(await A.pm.displayModel(), 'claude-default-from-env');
+  const afterFirst = gets();
+  for (let i = 0; i < 5; i++) assert.equal(await A.pm.displayModel(), 'claude-default-from-env');
+  assert.equal(gets(), afterFirst, 'no memory.get per poll while nothing changed');
+  // A later import attempt may bring a model: the next poll reads memory again (no provider start).
+  relay.swallow = null;
+  assert.equal(await A.store.ensureImported(), 'imported');
+  assert.equal(await A.pm.displayModel(), 'claude-sonnet-4-5', 'the imported model');
+  assert.equal(gets(), afterFirst + 2, 'the import reads memory once, then one read for the poll');
+  assert.equal(A.launches.length, 0);
 });
 
 test('#122: while the relay refuses this machine by policy, sends name the refusal and when it retries', { timeout: 20_000 }, async (t) => {

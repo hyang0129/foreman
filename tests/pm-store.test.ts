@@ -6,11 +6,11 @@ import { EventEmitter } from 'node:events';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { HostBridge } from '../server/host-bridge.ts';
+import { HostBridge, PM_RPC_TIMEOUT_MS } from '../server/host-bridge.ts';
 import { loadMachineIdentity } from '../server/machine.ts';
 import {
   ALREADY_INITIALIZED_MESSAGE, IMPORT_REPLY_LOST_MESSAGE, LocalPmStore, PmStoreError, RELAY_MEMORY_NOT_MERGED_NOTICE, RelayPmStore, createPmStore, fitImportFrame, importFrameBytes,
-  parseLogLines, readImportPayload, truncateAtLine,
+  parseLogLines, readImportPayload, relayHostView, truncateAtLine,
 } from '../server/pm-store.ts';
 import { utf8Length } from '../shared/notify.ts';
 import {
@@ -509,6 +509,76 @@ test('#116: retries back off (no hot loop) and stop on disconnect and on close',
   assert.equal(ends(), atClose, 'no retries after close');
 });
 
+test('#143: an acknowledgement the relay refuses (not retryable) stays recorded: not reported again after a restart, and sent again', async (t) => {
+  const relay = new FakeRelay();
+  const dir = tempHome(t);
+  const first = relayHost(t, relay, dir, 'machine-a');
+  relay.assignment = { machine_id: first.identity.machine_id, epoch: 1 };
+  relay.machines.set(first.identity.machine_id, { name: 'machine-a', socket: null });
+  relay.turns.set('turn-u', { machine_id: first.identity.machine_id, epoch: 1, accepted_at: AT, state: 'uncertain', reason: 'restarted' });
+  await first.connect();
+  assert.deepEqual(first.store.uncertainTurns().map((u) => u.turn_id), ['turn-u'], 'reported to this process');
+  // The relay refuses the ack with an error that is not retried (e.g. a storage failure).
+  relay.swallow = (frame) => {
+    if (frame.op !== 'turn.ack_uncertain') return false;
+    queueMicrotask(() => first.sockets.at(-1)!.receive(pmRpcError(frame.id, 'unavailable', 'PM state storage failed')));
+    return true;
+  };
+  await first.store.ackUncertain(['turn-u']);
+  await settle();
+  assert.ok(first.logs.some((l) => /rejected by the relay \(unavailable\); the acknowledgement is kept/.test(l)), first.logs.join('\n'));
+  assert.equal(relay.turns.get('turn-u')?.state, 'uncertain', 'the DO still holds it');
+  kill(first);
+  relay.swallow = null;
+  const before = relay.rpcs().length;
+  const second = relayHost(t, relay, dir, 'machine-a');
+  await second.connect();
+  assert.deepEqual(second.store.uncertainTurns(), [], 'not reported again after the restart');
+  assert.equal(relay.turns.has('turn-u'), false, 'acknowledged on activation');
+  assert.deepEqual(relay.rpcs().slice(before).filter((f) => f.op === 'turn.ack_uncertain').map((f) => f.args.turn_ids), [['turn-u']]);
+});
+
+test('#143: a pending retry timer is cleared when the Coordinator moves away', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const relay = new FakeRelay();
+  const a = relayHost(t, relay, tempHome(t), 'machine-a', { retryBaseMs: 1000 });
+  const b = relayHost(t, relay, tempHome(t), 'machine-b');
+  await a.connect(); await b.connect();
+  await a.store.beginTurn('turn-1', AT);
+  relay.swallow = (frame) => frame.op === 'turn.end'; // the end is lost: it times out while connected
+  void a.store.endTurn('turn-1', 'completed');
+  for (let i = 0; i < 50 && !relay.rpcs().some((f) => f.op === 'turn.end'); i++) await settle();
+  t.mock.timers.tick(PM_RPC_TIMEOUT_MS);
+  await settle();
+  const pending = () => (a.store as any).retryTimer;
+  assert.notEqual(pending(), null, 'a retry is scheduled after the timeout');
+  relay.reassign(b.identity.machine_id);
+  await settle();
+  assert.equal(a.store.assignment().active, false);
+  assert.equal(pending(), null, 'the move away cleared the retry timer');
+  assert.equal((a.store as any).retryAttempts, 0, 'and its backoff');
+});
+
+test('#143: a pending retry timer is cleared when the relay fences this store (stale epoch)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const relay = new FakeRelay();
+  const a = relayHost(t, relay, tempHome(t), 'machine-a', { retryBaseMs: 1000 });
+  const b = relayHost(t, relay, tempHome(t), 'machine-b');
+  await a.connect(); await b.connect();
+  await a.store.beginTurn('turn-1', AT);
+  relay.swallow = (frame) => frame.op === 'turn.end';
+  void a.store.endTurn('turn-1', 'completed');
+  for (let i = 0; i < 50 && !relay.rpcs().some((f) => f.op === 'turn.end'); i++) await settle();
+  t.mock.timers.tick(PM_RPC_TIMEOUT_MS);
+  await settle();
+  assert.notEqual((a.store as any).retryTimer, null);
+  relay.swallow = null;
+  relay.reassign(b.identity.machine_id, a.identity.machine_id); // A never hears about it
+  await assert.rejects(a.store.log('after the move'), code('not_active')); // the DO fences A
+  assert.equal(a.store.assignment().active, false);
+  assert.equal((a.store as any).retryTimer, null, 'the fence cleared the retry timer');
+});
+
 test('turn.begin: a repeated begin of an open turn is acked again; a 65th open turn is unavailable (as the DO)', async (t) => {
   const relay = new FakeRelay();
   const h = relayHost(t, relay, tempHome(t), 'machine-a');
@@ -724,6 +794,48 @@ test('createPmStore: local without a bridge; a corrupt pm/state.json fails close
   assert.equal(readFileSync(join(dir, 'pm/state.json'), 'utf8'), '{"version":1, broken');
 });
 
+test('#145: a symlinked pm/state.json is refused by the local store (never followed) and left alone', (t) => {
+  const dir = tempHome(t);
+  const target = join(dir, 'elsewhere.json');
+  // A valid state file, reachable only through the symlink.
+  new LocalPmStore({ identity: IDENTITY, home: dir, log: () => {} }).close();
+  writeFileSync(target, readFileSync(join(dir, 'pm/state.json')));
+  rmSync(join(dir, 'pm/state.json'));
+  symlinkSync(target, join(dir, 'pm/state.json'));
+  const before = readFileSync(target, 'utf8');
+  assert.throws(() => new LocalPmStore({ identity: IDENTITY, home: dir, log: () => {} }), /pm\/state\.json is not a regular file/);
+  assert.ok(lstatSync(join(dir, 'pm/state.json')).isSymbolicLink(), 'the symlink is left in place');
+  assert.equal(readFileSync(target, 'utf8'), before, 'its target is untouched');
+});
+
+test('#145: a pm/state.json that is not a regular file is refused by the local store', (t) => {
+  const dir = tempHome(t);
+  mkdirSync(join(dir, 'pm/state.json'), { recursive: true });
+  assert.throws(() => new LocalPmStore({ identity: IDENTITY, home: dir, log: () => {} }), /pm\/state\.json is not a regular file/);
+});
+
+test('#144: the relay-mode local view carries the relay\'s 1008 refusal ("Too many machines") until a connection is accepted', async (t) => {
+  const relay = new FakeRelay();
+  const h = relayHost(t, relay, tempHome(t), 'machine-a');
+  t.mock.method(console, 'error', () => {});
+  const socket = h.sockets.at(-1)!;
+  socket.readyState = 3; socket.emit('close', 1008, Buffer.from('Too many machines'));
+  clearTimeout((h.bridge as any).reconnect);
+  const view = relayHostView(h.store, h.bridge, h.identity);
+  assert.equal(view.connected, false);
+  assert.equal(view.relay_refusal?.code, 1008);
+  assert.equal(view.relay_refusal?.reason, 'Too many machines');
+  assert.equal(view.relay_refusal?.retry_at, h.bridge.refusal()!.retry_at);
+  assert.ok(view.relay_refusal!.retry_at > view.relay_refusal!.at);
+  assert.deepEqual(view.this_machine, { machine_id: h.identity.machine_id, name: 'machine-a' });
+  // Accepted again: the refusal is gone from the view.
+  await h.reconnect();
+  const accepted = relayHostView(h.store, h.bridge, h.identity);
+  assert.equal(accepted.relay_refusal, null);
+  assert.equal(accepted.connected, true);
+  assert.equal(accepted.this_machine_active, true);
+});
+
 // ---------------------------------------------------------------------------------------------
 // #117: local-only ↔ relay transitions
 // ---------------------------------------------------------------------------------------------
@@ -880,28 +992,72 @@ test('#117 a machine that never used relay memory logs no relay notice in local-
   assert.ok(!logs.some((l) => l.includes('cloud relay')), logs.join('\n'));
 });
 
-test('#122: an import whose reply was lost is not later logged as "local memory not imported"', async (t) => {
-  const dir = tempHome(t);
-  seed(dir, { projects: '# Mine\n' });
-  const relay = new FakeRelay();
-  const h = relayHost(t, relay, dir, 'machine-a', { rpcTimeoutMs: 30 });
+/**
+ * #209: a memory.import whose reply is lost, timed out deterministically. The bridge's rpc timeout
+ * runs on mocked timers: the test waits for the real condition (the relay swallowed the import
+ * frame, after applying it) and only then fires the timeout, so no wall-clock budget can race it.
+ */
+async function lostImportReply(t: test.TestContext, dir: string, relay: FakeRelay) {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = relayHost(t, relay, dir, 'machine-a');
   // The relay applies the import, but its reply is lost in transit.
   relay.swallow = (frame) => {
     if (frame.op !== 'memory.import') return false;
     relay.swallow = null;
     relay.imports.push(frame.args); relay.memory.initialized = true;
-    relay.memory.projects = { content: frame.args.projects, version: 1, updated_at: AT };
+    if (frame.args.projects) relay.memory.projects = { content: frame.args.projects, version: 1, updated_at: AT };
+    relay.memory.log = frame.args.log.map((text: string, i: number) => ({ seq: i + 1, at: AT, text })); relay.memory.seq = frame.args.log.length;
+    relay.memory.model = frame.args.model;
     return true;
   };
-  await h.connect();
-  await assert.rejects(h.store.ensureImported(), code('timeout'));
-  // The retry finds the relay initialized (by that very import).
+  await h.connect(); // activation starts the import
+  for (let i = 0; i < 50 && relay.imports.length === 0; i++) await settle();
+  assert.equal(relay.imports.length, 1, 'the import frame reached the relay and was applied');
+  const attempt = h.store.ensureImported(); // joins the activation's import, still awaiting its reply
+  t.mock.timers.tick(PM_RPC_TIMEOUT_MS);
+  await assert.rejects(attempt, code('timeout'));
+  return h;
+}
+
+test('#122/#209: an import whose reply was lost is not later logged as "local memory not imported"', async (t) => {
+  const dir = tempHome(t);
+  seed(dir, { projects: '# Mine\n' });
+  const relay = new FakeRelay();
+  const h = await lostImportReply(t, dir, relay);
+  // The retry finds the relay initialized by that very import (#145: it completes it).
+  assert.equal(await h.store.ensureImported(), 'imported');
+  assert.ok(!h.logs.some((l) => l.includes(ALREADY_INITIALIZED_MESSAGE)), 'never "local memory not imported"');
+  assert.ok(h.logs.some((l) => /imported local PM memory into the relay .*an earlier attempt whose reply was lost/.test(l)), h.logs.join('\n'));
+  assert.equal(relay.imports.length, 1, 'not imported twice');
+  assert.equal(relay.memory.projects.content, '# Mine\n');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'memory/.imported.json'), 'utf8')).target, 'relay', 'the import is recorded');
+});
+
+test('#145: after a lost memory.import reply, the preferences doc from pm/state.json is still sent', async (t) => {
+  const { dir } = await localOnlyHome(t);
+  const relay = new FakeRelay();
+  const h = await lostImportReply(t, dir, relay);
+  assert.equal(relay.memory.preferences.content, '', 'nothing sent yet: the import reply was lost');
+  assert.equal(await h.store.ensureImported(), 'imported');
+  assert.deepEqual(relay.memory.preferences, { content: 'terse answers', version: 1, updated_at: relay.memory.preferences.updated_at });
+  assert.equal(relay.imports.length, 1, 'the import is not sent again');
+  assert.ok(h.logs.some((l) => /pm\/state\.json.*13 bytes of preferences\).*reply was lost/.test(l)), h.logs.join('\n'));
+  assert.ok(!h.logs.some((l) => l.includes(IMPORT_REPLY_LOST_MESSAGE)));
+});
+
+test('#122/#145: after a lost import reply, relay memory that no longer matches that import gets nothing more', async (t) => {
+  const { dir } = await localOnlyHome(t);
+  const relay = new FakeRelay();
+  const h = await lostImportReply(t, dir, relay);
+  // Something else changed the relay's memory before the retry: it is not known to be this import.
+  relay.memory.log.push({ seq: ++relay.memory.seq, at: AT, text: 'written elsewhere' });
   assert.equal(await h.store.ensureImported(), 'already_initialized');
   const line = h.logs.find((l) => l.includes('already initialized'));
   assert.equal(line, `foreman: ${IMPORT_REPLY_LOST_MESSAGE}`, h.logs.join('\n'));
   assert.ok(!h.logs.some((l) => l.includes(ALREADY_INITIALIZED_MESSAGE)), 'never "local memory not imported"');
-  assert.equal(relay.imports.length, 1, 'not imported twice');
-  assert.equal(relay.memory.projects.content, '# Mine\n');
+  assert.equal(relay.memory.preferences.content, '', 'no preferences sent');
+  assert.equal(relay.rpcs().filter((f) => f.op === 'memory.put').length, 0);
+  assert.equal(relay.imports.length, 1);
 });
 
 test('#122: a relay initialized by another machine is still logged as "local memory not imported"', async (t) => {

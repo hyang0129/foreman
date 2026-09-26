@@ -8,6 +8,35 @@ EVENT="${1:-unknown}"
 # Story #121: a hook fired by a process under `node --test` (NODE_TEST_CONTEXT is inherited) records
 # only into an explicit FOREMAN_HOME, never the default ~/.foreman.
 [ -n "${NODE_TEST_CONTEXT:-}" ] && [ -z "${FOREMAN_HOME:-}" ] && exit 0
+# #145: nor into an explicit FOREMAN_HOME that is (or is inside) a real home, as
+# server/home-guard.mjs refuses: ~/.foreman under $HOME and the account's home, and the account's
+# ~/.foreman-dev. Paths compare after resolving symlinks in the longest existing prefix.
+if [ -n "${NODE_TEST_CONTEXT:-}" ]; then
+  canonical() {
+    local path="$1" rest="" part
+    case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
+    while [ ! -d "$path" ]; do
+      part="${path##*/}"
+      # An unresolvable `..`/`.` in a not-yet-existing part cannot be compared safely: treat as real.
+      case "$part" in ..|.) return 1 ;; esac
+      [ -n "$part" ] && rest="/$part$rest"
+      path="${path%/*}"
+      [ -n "$path" ] || path="/"
+    done
+    printf '%s%s' "$(cd -P "$path" 2>/dev/null && pwd -P)" "$rest"
+  }
+  TARGET="$(canonical "$FOREMAN_HOME")" || exit 0
+  [ -n "$TARGET" ] || exit 0
+  ACCOUNT="$(id -un 2>/dev/null)"
+  ACCOUNT_HOME=""
+  case "$ACCOUNT" in ''|*[!A-Za-z0-9._-]*) ;; *) ACCOUNT_HOME="$(eval "printf '%s' ~$ACCOUNT")" ;; esac
+  for REAL in "${HOME:+$HOME/.foreman}" "${ACCOUNT_HOME:+$ACCOUNT_HOME/.foreman}" "${ACCOUNT_HOME:+$ACCOUNT_HOME/.foreman-dev}"; do
+    [ -n "$REAL" ] || continue
+    REAL="$(canonical "$REAL")" || continue
+    [ -n "$REAL" ] || continue
+    case "$TARGET" in "$REAL"|"$REAL"/*) exit 0 ;; esac
+  done
+fi
 ROOT="${FOREMAN_HOME:-$HOME/.foreman}"
 DIR="$ROOT/sessions"
 mkdir -p "$DIR" 2>/dev/null || exit 0

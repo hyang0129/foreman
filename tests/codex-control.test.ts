@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,17 +10,25 @@ import { CodexControl } from '../server/codex-control.ts';
 
 // How the fixture answers account/read; set per test and reset after it.
 let accountRead: 'ok' | 'hang' | 'error' | 'signed-out' = 'ok';
+const TIMEOUT_MS = 1000;
 async function fixture(t: test.TestContext, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'foreman-rpc-test-'));
   const socket = join(dir, 'rpc.sock');
   const server = createServer();
   const ws = new WebSocketServer({ server, perMessageDeflate:false });
   const sent: any[] = [];
+  const arrivals = new EventEmitter();
+  // Resolves once the fixture server has received a request for `method`: the real event a test
+  // waits on, instead of assuming a fixed time is enough for delivery.
+  const received = (method: string) => new Promise<void>((resolve) => {
+    const check = () => { if (sent.some((m) => m.method === method)) { arrivals.off('message', check); resolve(); } };
+    arrivals.on('message', check); check();
+  });
   ws.on('connection', (peer, request) => {
     assert.equal(request.headers['sec-websocket-extensions'], undefined);
     let initialized = false;
     peer.on('message', (raw) => {
-      const msg = JSON.parse(raw.toString()); sent.push(msg);
+      const msg = JSON.parse(raw.toString()); sent.push(msg); arrivals.emit('message');
       if (!msg.method) return;
       const reply = (result: unknown) => peer.send(JSON.stringify({ id:msg.id, result }));
       if (msg.method === 'initialize') { initialized = true; reply({}); return; }
@@ -59,14 +67,24 @@ async function fixture(t: test.TestContext, options = {}) {
     });
   });
   server.listen(socket); await once(server, 'listening');
-  const client = new CodexControl({ socket, timeoutMs:1000, ...options });
+  const client = new CodexControl({ socket, timeoutMs:TIMEOUT_MS, ...options });
   t.after(async () => {
     client.close(); for (const peer of ws.clients) peer.terminate();
     ws.close(); await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(dir, { recursive:true, force:true });
   });
   await client.connect();
-  return { client, sent, dir };
+  return { client, sent, dir, received };
+}
+
+// A request timeout is a timer, so tests of it drive that timer instead of shrinking the client's
+// timeoutMs: the client uses the same budget for the WebSocket handshake and initialize, which a
+// loaded machine can miss (#184). Enable only after connect(), so the connection is real.
+async function timeOut(t: test.TestContext, received: Promise<void>, pending: Promise<unknown>) {
+  await received; // the request reached the server before its timer fires
+  t.mock.timers.tick(TIMEOUT_MS);
+  t.mock.timers.reset();
+  return pending;
 }
 
 test('attaches to live sessions but never implicitly resumes a disk-only thread', async (t) => {
@@ -98,21 +116,27 @@ test('approval requires explicit matching one-time response and stale requests a
   assert.throws(() => client.respond('approval-1', { decision:'accept' }), /no longer pending/);
 });
 
-test('timeouts expose uncertain delivery without retrying mutations', async (t) => {
-  const { client, sent } = await fixture(t, { timeoutMs:100 });
-  await assert.rejects(client.request('fixture/hang'), /delivery is unknown/);
+// Real-time bound: with setTimeout mocked, a request that never reaches the server would otherwise hang.
+test('timeouts expose uncertain delivery without retrying mutations', { timeout:10_000 }, async (t) => {
+  const { client, sent, received } = await fixture(t);
+  t.mock.timers.enable({ apis:['setTimeout'] });
+  await assert.rejects(timeOut(t, received('fixture/hang'), client.request('fixture/hang')), /delivery is unknown/);
   assert.equal(sent.filter((m) => m.method === 'fixture/hang').length, 1);
 });
 
 // #106: a timeout or error from account/read keeps its old behavior (the
 // check passes and the launch continues) but leaves a diagnostic on stderr.
-test('requireSignedIn logs a diagnostic when account/read times out or errors, and still continues', async (t) => {
+test('requireSignedIn logs a diagnostic when account/read times out or errors, and still continues', { timeout:10_000 }, async (t) => {
   t.after(() => { accountRead = 'ok'; });
   const errors = t.mock.method(console, 'error', () => {});
   for (const [mode, detail] of [['hang', /Codex account\/read timed out/], ['error', /Codex: account store unavailable/]] as const) {
     accountRead = mode; errors.mock.resetCalls();
-    const { client, sent } = await fixture(t, { timeoutMs:100 });
-    await client.requireSignedIn();
+    const { client, sent, received } = await fixture(t);
+    // Mocked from here, the request timer fires only when a test ticks it, so an error reply
+    // cannot lose a race with it and a hang times out exactly once.
+    t.mock.timers.enable({ apis:['setTimeout'] });
+    if (mode === 'hang') await timeOut(t, received('account/read'), client.requireSignedIn());
+    else { await client.requireSignedIn(); t.mock.timers.reset(); }
     assert.equal(sent.filter((m) => m.method === 'account/read').length, 1);
     assert.equal(errors.mock.callCount(), 1);
     const [prefix, message] = errors.mock.calls[0].arguments;

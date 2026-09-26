@@ -4,7 +4,7 @@
 // injected deployer.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, rmSync, statSync, chmodSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, rmSync, statSync, chmodSync, realpathSync, existsSync, readdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -34,18 +34,19 @@ function productionFixture(t) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-vapid-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const root = join(dir, 'repo'), state = join(dir, 'state'), log = join(dir, 'wrangler.log');
-  mkdirSync(join(root, 'scripts'), { recursive: true }); mkdirSync(join(root, 'node_modules/wrangler/bin'), { recursive: true });
+  mkdirSync(join(root, 'scripts'), { recursive: true }); mkdirSync(join(root, 'server'), { recursive: true }); mkdirSync(join(root, 'node_modules/wrangler/bin'), { recursive: true });
   copyFileSync('scripts/deploy-cloud.mjs', join(root, 'scripts/deploy-cloud.mjs'));
+  copyFileSync('server/home-guard.mjs', join(root, 'server/home-guard.mjs'));
   writeFileSync(join(root, 'node_modules/wrangler/bin/wrangler.js'), fakeWrangler);
   writeFileSync(join(root, 'package.json'), '{"type":"module"}');
-  const run = () => {
+  const run = (extra = {}) => {
     const env = {};
     for (const [key, value] of Object.entries(process.env)) if (!/^(FOREMAN_|CLOUDFLARE_|CF_|WRANGLER_|NODE_OPTIONS$|NODE_TEST_CONTEXT$)/.test(key)) env[key] = value;
-    const result = spawnSync(process.execPath, [join(root, 'scripts/deploy-cloud.mjs')], { env: { ...env, FOREMAN_HOME: state, FAKE_WRANGLER_LOG: log }, encoding: 'utf8' });
+    const result = spawnSync(process.execPath, [join(root, 'scripts/deploy-cloud.mjs')], { env: { ...env, FOREMAN_HOME: state, FAKE_WRANGLER_LOG: log, ...extra }, encoding: 'utf8' });
     const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : [];
     return { ...result, calls };
   };
-  return { state, run };
+  return { dir, state, run };
 }
 
 test('deploy-cloud generates a 0600 VAPID key once, reuses it, and passes it only through the secrets file', async (t) => {
@@ -86,6 +87,26 @@ test('deploy-cloud refuses an unsafe or invalid vapid.json before deploying', (t
   assert.notEqual(result.status, 0); assert.match(result.stderr, /Invalid vapid\.json/);
   assert.equal(result.calls.length, 0);
   assert.equal(existsSync(join(f.state, 'cloud.json')), false);
+});
+
+test('#145: under node --test, deploy-cloud refuses the default home and an explicit real one', (t) => {
+  const f = productionFixture(t);
+  // HOME is the fixture dir, so <dir>/.foreman is "the real home" for this child.
+  const real = join(f.dir, '.foreman');
+  mkdirSync(real, { mode: 0o700 });
+  symlinkSync(real, join(f.dir, 'alias'));
+  const underTest = { HOME: f.dir, NODE_TEST_CONTEXT: 'child-v8' };
+  for (const target of ['', real, join(real, 'nested'), join(f.dir, 'alias'), `${f.dir}/x/../.foreman`]) {
+    const result = f.run({ ...underTest, FOREMAN_HOME: target });
+    assert.notEqual(result.status, 0, `${JSON.stringify(target)} must be refused`);
+    assert.match(result.stderr, /Refusing to use the real home .* under node --test: set FOREMAN_HOME to a temp dir/);
+    assert.equal(result.calls.length, 0, 'nothing deployed');
+  }
+  assert.deepEqual(readdirSync(real), [], 'nothing written to the real home');
+  // A temp FOREMAN_HOME under node --test still deploys (the fake Wrangler records it).
+  const ok = f.run(underTest);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(ok.calls.length, 1);
 });
 
 // ---- dev: scripts/dev-environment.mjs ----------------------------------------------------------

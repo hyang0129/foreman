@@ -278,18 +278,68 @@ test.describe("notification settings", () => {
       if (index < labels.length - 1) await expect(page.locator("#notify-summary")).toHaveText("On");
     }
     expect(pushCalls(state, "/api/push/subscribe").at(-1)!.body.kinds).toEqual([]);
-    await expect(page.locator("#notify-summary")).toHaveText("On — all notification types are off");
+    await expect(page.locator("#notify-summary")).toHaveText("On · all types off");
     await expect(page.locator("#notify-status")).toHaveText(/every notification type is turned off, so Foreman sends nothing/);
     // Read back the same way after a reload.
     await page.reload();
     await signedIn(page);
     await openSettings(page);
-    await expect(page.locator("#notify-summary")).toHaveText("On — all notification types are off");
+    await expect(page.locator("#notify-summary")).toHaveText("On · all types off");
     await page.getByLabel("Machine offline").tap();
     await expect(page.locator("#notify-feedback")).toHaveText("Saved.");
     await expect(page.locator("#notify-summary")).toHaveText("On");
     await expect(page.locator("#notify-status")).toHaveText(/^This device gets Foreman notifications/);
   });
+
+  // #150: the all-types-off summary sits on the drawer's summary row next to "Notifications". On a
+  // narrow phone (320 CSS px: the drawer is 88% of it) the row stays one line, inside the drawer.
+  for (const width of [320, 360]) {
+    test(`the all-types-off summary stays on one line in a ${width} px wide drawer`, async ({ page, context }) => {
+      await page.setViewportSize({ width, height: 700 });
+      await stubPush(page, context);
+      const state = await fixture(page);
+      await page.goto("/");
+      await signedIn(page);
+      await enable(page, state);
+      for (const name of ["Approvals and questions", "A session failed", "Coordinator errors", "Machine offline"]) {
+        const before = pushCalls(state, "/api/push/subscribe").length;
+        await page.getByLabel(name).tap();
+        await expect.poll(() => pushCalls(state, "/api/push/subscribe").length).toBe(before + 1);
+        await expect(page.locator("#notify-feedback")).toHaveText("Saved.");
+      }
+      await expect(page.locator("#notify-status")).toHaveText(/every notification type is turned off, so Foreman sends nothing/);
+      const measure = () => page.locator("#notify-settings > summary").evaluate((summary) => {
+        const label = document.createRange();
+        label.setStart(summary.firstChild!, 0);
+        label.setEnd(summary.firstChild!, "Notifications".length);
+        const value = summary.querySelector("#notify-summary")!;
+        const lineHeight = parseFloat(getComputedStyle(value).lineHeight);
+        const box = value.getBoundingClientRect(), footer = summary.closest(".rail-footer")!.getBoundingClientRect();
+        return {
+          labelLines: label.getClientRects().length,
+          labelTop: label.getBoundingClientRect().top,
+          valueTop: box.top,
+          valueHeight: box.height,
+          lineHeight,
+          inside: box.left >= footer.left && box.right <= footer.right,
+        };
+      });
+      const row = await measure();
+      expect(row.labelLines).toBe(1);
+      expect(row.valueHeight).toBeLessThan(row.lineHeight * 1.5);
+      expect(Math.abs(row.valueTop - row.labelTop)).toBeLessThan(row.lineHeight / 2);
+      expect(row.inside).toBe(true);
+      await expect(page.locator("#notify-summary")).toHaveText(/^On\b/);
+      // With a large system font the value may move under the label, but neither breaks mid-word
+      // and the value stays inside the drawer.
+      await page.evaluate(() => { document.documentElement.style.fontSize = "150%"; });
+      const large = await measure();
+      expect(large.lineHeight).toBeGreaterThan(row.lineHeight);
+      expect(large.labelLines).toBe(1);
+      expect(large.valueHeight).toBeLessThan(large.lineHeight * 1.5);
+      expect(large.inside).toBe(true);
+    });
+  }
 
   test("Send test notification calls /api/push/test for this device and shows errors", async ({ page, context }) => {
     await stubPush(page, context);
@@ -407,6 +457,42 @@ test.describe("sign-out", () => {
     await page.waitForTimeout(500);
     await expect(page.locator("#app")).toBeVisible();
     expect(state.events).toEqual(["unsubscribe", "signOut", "signIn"]);
+  });
+
+  // #150: a Firebase sign-out that never settles must not leave the sign-in button disabled until
+  // a reload. The page clock is paused, so only the sign-out's own bound can release it.
+  test("a sign-out that never settles re-enables sign-in after its bound, and sign-in starts fresh", async ({ page }) => {
+    await fixture(page, { push: null });
+    await page.route("https://www.gstatic.com/firebasejs/**/firebase-auth.js", (route) => route.fulfill({ contentType: "application/javascript", body: `
+      const user = {email:'owner@example.com',getIdToken:async()=> 'fixture-id-token'};
+      export const getAuth = () => ({currentUser:user});
+      export const onAuthStateChanged = (auth,fn) => { queueMicrotask(()=>fn(auth.currentUser)); };
+      export class GoogleAuthProvider { setCustomParameters() {} }
+      export const signInWithPopup = async (auth) => ({ user });
+      export const signOut = () => { window.__signOutCalls = (window.__signOutCalls || 0) + 1; return new Promise(() => {}); };
+    ` }));
+    await page.clock.install({ time: new Date("2026-09-25T10:00:00Z") });
+    await page.clock.pauseAt(new Date("2026-09-25T10:00:01Z"));
+    await page.goto("/");
+    await signedIn(page);
+    await page.getByRole("button", { name: "Open session navigation" }).tap();
+    await page.getByRole("button", { name: "Sign out" }).tap();
+    await expect(page.locator("#app")).toBeHidden();
+    await expect.poll(() => page.evaluate(() => (window as any).__signOutCalls)).toBe(1);
+    const signIn = page.getByRole("button", { name: "Continue with Google" });
+    await expect(signIn).toBeVisible();
+    await expect(signIn).toBeDisabled();
+    await page.clock.runFor(9000);
+    await expect(signIn).toBeDisabled();
+    await page.clock.runFor(1000);
+    await expect(signIn).toBeEnabled();
+    await expect(page.locator("#auth-status")).toHaveText("Signing out is taking longer than expected. Continue with Google reloads Foreman to sign in again.");
+    // The stuck sign-out could still land after a new sign-in, so signing in starts from a fresh page.
+    await page.evaluate(() => { (window as any).__before = true; });
+    await signIn.tap();
+    await expect.poll(async () => {
+      try { return await page.evaluate(() => (window as any).__before ?? false); } catch { return "navigating"; }
+    }).toBe(false);
   });
 
   test("a failing unsubscribe does not block sign-out", async ({ page, context }) => {

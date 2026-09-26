@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 const home = mkdtempSync(join(tmpdir(), 'foreman-pm-failure-'));
 process.env.FOREMAN_HOME = home;
 delete process.env.FOREMAN_PM_MODEL;
-const { ProjectManager } = await import('../server/pm.ts');
+const { ProjectManager, NOTHING_OWED_NEXT } = await import('../server/pm.ts');
 const { LocalPmStore } = await import('../server/pm-store.ts');
 const { ensureDirs } = await import('../server/paths.ts');
 ensureDirs();
@@ -103,6 +103,32 @@ test('synchronous query startup failure is logged and reported', async (t) => {
   await pm.start();
   assert.equal(logs.length, 1); assert.match(pm.history()[0]!.text!, /spawn ENOENT/);
   assert.equal(pm.modelBusy, false);
+});
+
+test('#191: a provider that fails with no input owed does not say "Your message was not completed"; one that owed input does', { timeout: 10_000 }, async (t) => {
+  const idle = newPm();
+  t.mock.method(console, 'error', () => {});
+  (idle as any).queryFactory = () => ({ close() {}, async *[Symbol.asyncIterator]() {
+    yield { type: 'system', subtype: 'init', session_id: 'idle', tools: [] };
+    throw new Error('Claude Code process exited with code 9');
+  } });
+  await idle.start();
+  const entry = idle.history().at(-1)!;
+  assert.equal(entry.text, `Coordinator failed: Claude Code process exited with code 9. ${NOTHING_OWED_NEXT}`);
+  assert.equal(idle.lastError, entry.text);
+  assert.doesNotMatch(entry.text!, /Your message was not completed/);
+
+  const busy = newPm();
+  let release!: () => void; const opened = new Promise<void>((r) => { release = r; });
+  (busy as any).queryFactory = ({ prompt }: any) => ({ close() {}, async *[Symbol.asyncIterator]() {
+    yield { type: 'system', subtype: 'init', session_id: 'busy', tools: [] };
+    await prompt.next(); await opened;
+    throw new Error('Claude Code process exited with code 1');
+  } });
+  const running = busy.start();
+  await busy.send('in flight');
+  release(); await running;
+  assert.match(busy.history().at(-1)!.text!, /^Coordinator failed: Claude Code process exited with code 1\. Your message was not completed;/);
 });
 
 test('nonstreamed assistant text is recorded and a successful result clears the current error', async (t) => {
@@ -1060,12 +1086,16 @@ test('real SDK: the input uuid reaches the CLI and the echoed result settles tha
   t.mock.method(process, 'emitWarning', () => {});
   const diagnostics: any[] = []; t.mock.method(console, 'error', (...args: any[]) => diagnostics.push(args));
   (pm as any).queryFactory = (args: any) => query({ ...args, options: { ...args.options, pathToClaudeCodeExecutable: cli.path } });
+  // Wait for the turn's end, not for a fixed poll budget: a real CLI subprocess round trip has no
+  // upper bound under load (#180). turn_end is emitted after the result recorded the assistant
+  // text and settled the input (endTurn). If the provider run ends first, fail on that instead.
+  const turnEnded = new Promise<void>((resolve) => pm.on('event', (e: any) => { if (e.type === 'turn_end') resolve(); }));
   const running = pm.start();
   t.after(async () => { pm.close(); await running; });
   await pm.send('new input');
   const [turnId] = pm.outstandingTurnIds();
-  await settle(() => pm.history().some((e) => e.role === 'assistant'));
-  await settle(() => ends.length === 1);
+  const ended = await Promise.race([turnEnded.then(() => 'turn_end'), running.then(() => 'provider run ended')]);
+  assert.equal(ended, 'turn_end', JSON.stringify(pm.history()));
   assert.deepEqual(cli.entries(), [{ argv: [] }, { input: 'new input', uuid: turnId }]);
   assert.deepEqual(ends, [[turnId, 'completed']]);
   assert.equal(pm.history().find((e) => e.role === 'assistant')!.text, 'echo: new input');

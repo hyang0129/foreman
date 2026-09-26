@@ -207,4 +207,59 @@ describe('PM move during a relayed request body read', () => {
     await flush(a);
     expect(requests(a)).toEqual([]);
   });
+
+  // #143: the host re-picked after the body read can itself be offline by then.
+  it('POST whose body finishes after a move to a host that then went offline gets 503 (that host is offline), never the old host', async () => {
+    const stub = relay();
+    const a = await host(stub, 'machine-a');
+    const b = await host(stub, 'machine-b');
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let pulled = false;
+    const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; }, pull() { pulled = true; } });
+    const response = stub.fetch('https://foreman.test/api/sessions', { method: 'POST', body, duplex: 'half' } as RequestInit);
+    await until(() => pulled, 'the body read started');
+    await new Promise((r) => setTimeout(r, 50));
+    const moved = await stub.fetch('https://foreman.test/api/pm/host', { method: 'POST', body: JSON.stringify({ machine_id: b.machine_id, expected_epoch: 1 }) });
+    expect(moved.status).toBe(200);
+    b.socket.close(1000, 'Network lost');
+    let offline = false;
+    for (let waited = 0; waited < 3000 && !offline; waited += 10) {
+      const status = await (await stub.fetch('https://foreman.test/api/pm/host')).json() as any;
+      offline = status.machines.find((m: any) => m.machine_id === b.machine_id)?.online === false;
+      if (!offline) await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(offline, 'machine-b offline').toBe(true);
+    controller.enqueue(new TextEncoder().encode('{"name":"after-the-move"}'));
+    controller.close();
+    const answer = await response;
+    expect(answer.status).toBe(503);
+    expect(((await answer.json()) as any).error).toContain('machine-b');
+    await flush(a);
+    expect(requests(a)).toEqual([]);
+  });
+
+  // #143: the 64-pending busy check runs again once the body is read.
+  it('a POST whose body finishes after the pending table filled up gets 429 and is not sent', async () => {
+    const stub = relay();
+    const a = await host(stub, 'machine-a');
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let pulled = false;
+    const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; }, pull() { pulled = true; } });
+    const response = stub.fetch('https://foreman.test/api/sessions', { method: 'POST', body, duplex: 'half' } as RequestInit);
+    await until(() => pulled, 'the body read started');
+    await new Promise((r) => setTimeout(r, 50));
+    // 64 other requests reach the host and stay pending (the host never answers them).
+    const others = Array.from({ length: 64 }, () => stub.fetch('https://foreman.test/api/sessions'));
+    await until(() => requests(a).length === 64, '64 pending requests');
+    controller.enqueue(new TextEncoder().encode('{"name":"late-body"}'));
+    controller.close();
+    const answer = await response;
+    expect(answer.status).toBe(429);
+    await flush(a);
+    expect(requests(a).length).toBe(64);
+    expect(requests(a).some((r) => r.method === 'POST')).toBe(false);
+    // Answer the pending ones so nothing waits on the 45 s timeout.
+    for (const r of requests(a)) a.socket.send(JSON.stringify({ type: 'response', id: r.id, status: 200, body: '[]' }));
+    for (const other of await Promise.all(others)) expect(other.status).toBe(200);
+  });
 });

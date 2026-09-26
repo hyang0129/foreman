@@ -145,7 +145,9 @@ let sessions = [],
 let pollTimer,
   polling = false,
   pollAgain = false,
-  sending = false,
+  // Conversations with a send in flight. Per conversation: a pending session send must not
+  // disable the PM's composer or its Interrupt.
+  sending = new Set(),
   creating = false,
   authEpoch = 0,
   selectionEpoch = 0;
@@ -396,7 +398,7 @@ function revokeAccess(message) {
   $("#settings-dialog").close();
   authorized = false;
   pmModel = ""; pmModelLoaded = false; pmModelReady = false;
-  sending = false; creating = false; pmModelSaving = false; pmModelLoading = false;
+  sending.clear(); creating = false; pmModelSaving = false; pmModelLoading = false;
   newModelRequest++;
   projectRevision++; projectRows = []; projectResolution = null; projectSelection = null; projectPending = false;
   $("#project-choices").replaceChildren(); $("#project-status").textContent = ""; $("#project-feedback").textContent = "";
@@ -419,6 +421,7 @@ function revokeAccess(message) {
   copyStatus("");
   messageMenuText = "";
   messageMenuTarget = null;
+  shownHistory = []; shownReceipts = []; hiddenSteps = 0; showSteps = false;
   clearDrafts();
   // A PM failure seen by the previous identity is not shown to the next one.
   polledPmError = null;
@@ -579,8 +582,15 @@ window.addEventListener("popstate", (event) => {
   const view = state.view || "pm";
   if (view === selected) return;
   // Forward onto a deep link that was rejected: the same neutral PM fallback, not the
-  // conversation's error, unless the host has since listed that session.
+  // conversation's error, unless the host has since listed that session. Before the first
+  // session list (right after a reload) that is not known yet, so the entry opens as a deep link
+  // does at load and the next list decides.
   if (view !== "pm" && state.rejected && !sessions.some((s) => s.session_key === view)) {
+    if (!sessionsLoaded) {
+      void selectSession(view, false);
+      deepLinkPending = view;
+      return;
+    }
     showInbox();
     showNotice(UNKNOWN_LINK_NOTICE);
     historyBack();
@@ -616,7 +626,7 @@ function renderHost() {
     : hostName("") ? `${hostName("")} · offline` : "Execution host offline";
   renderConnectionBanner();
   updateControls();
-  if (ui.messages.querySelector(".empty-state") && !conversationLoading) renderMessages();
+  if (ui.messages.querySelector(".empty-state") && !conversationLoading) renderMessages(shownHistory, shownReceipts);
 }
 function renderConnectionBanner() {
   const banner = $("#connection-banner");
@@ -651,7 +661,7 @@ function workerSurfaces(s, query) {
 }
 function rowSummary(s) {
   if (s.state === "needs_input") return s.reason === HELD_LAUNCH_REASON ? "Launch with Bypass? Waiting for your approval" : s.reason || "Waiting for your response";
-  if (s.state === "working") return s.current_tool || "Working on your task";
+  if (s.state === "working") return s.current_tool ? stepPhrase({ name: baseToolName(s.current_tool), detail: "" }) : "Working on your task";
   return launchOutcome(s) || s.last_message || projectName(s);
 }
 let archivedOpen = false;
@@ -755,15 +765,16 @@ function updateControls() {
   $("#create-session").disabled = !authorized || !host.online || creating || projectPending || !projectResolution;
   $("#send-to-coordinator").disabled = !authorized || !host.online || askBusy || !$("#ask-coordinator").value.trim();
   $("#send-to-coordinator").textContent = askBusy ? "Asking…" : "Ask the Coordinator";
-  ui.input.disabled = !canMessage || sending;
-  ui.send.disabled = !canMessage || sending || !ui.input.value.trim();
-  ui.send.firstChild.textContent = sending ? "Sending… " : "Send ";
+  const sendingHere = sending.has(selected);
+  ui.input.disabled = !canMessage || sendingHere;
+  ui.send.disabled = !canMessage || sendingHere || !ui.input.value.trim();
+  ui.send.firstChild.textContent = sendingHere ? "Sending… " : "Send ";
   ui.interrupt.disabled =
     !authorized ||
     !host.online ||
     (isPm ? !pmBusy : !session?.capabilities?.interrupt) ||
     // Until a PM send's 202 arrives its turn is not dispatched yet, so Stop could not reach it.
-    (isPm && sending) ||
+    (isPm && sendingHere) ||
     ui.interrupt.dataset.busy === "true";
   ui.interrupt.textContent = ui.interrupt.dataset.busy === "true" ? "Interrupting…" : "Interrupt";
   // Interrupt shows only while a turn is running (or a request to stop one is in flight).
@@ -975,8 +986,9 @@ function renderActivity() {
   const status = $("#activity-status"), label = $("#activity-label");
   const state = selected === "pm" ? (pmModelReady ? (pmBusy ? "working" : "turn_finished") : null) : detail?.session?.state;
   const working = state === "working";
-  const tool = working && selected !== "pm" ? detail?.session?.current_tool : null;
-  const text = state ? `${host.online ? "" : "Last known · "}${working ? "Working…" : LABEL[state] || state}${tool ? ` · ${tool}` : ""}` : "";
+  // One line in plain words for the running turn (#201): never a tool name, JSON or a path.
+  const doing = working ? workingPhrase(shownHistory, selected !== "pm" ? detail?.session?.current_tool : null) : "";
+  const text = state ? `${host.online ? "" : "Last known · "}${working ? doing : LABEL[state] || state}` : "";
   status.hidden = !text;
   // Keep the live region and symbol mounted; only announce actual transitions.
   if (label.textContent !== text) label.textContent = text;
@@ -1080,15 +1092,203 @@ function dayLabel(date, now) {
   yesterday.setDate(yesterday.getDate() - 1);
   return localDay(date) === localDay(yesterday) ? "Yesterday" : date.toLocaleDateString([], { dateStyle: "medium" });
 }
+// #201: conversations read as the user's messages, the agent's prose, approvals and receipts.
+// Tool calls, tool results and subagent/peer chatter are hidden; while a turn runs, the header's
+// one status line says in plain words what the agent is doing, derived here from the tool entries
+// the history already carries (Coordinator: { role: "tool", name, summary }; Codex sessions:
+// { role: "tool", text: "<itemType>: <command or tool> (<status>)" }) or from a session's
+// current_tool. Sending an investigator, a subagent or a Lead stays visible as one compact line.
+const STEP_PHRASES = {
+  ToolSearch: "Getting ready…",
+  Read: "Reading files…",
+  Glob: "Searching the code…",
+  Grep: "Searching the code…",
+  LS: "Looking through files…",
+  Bash: "Running a command…",
+  BashOutput: "Checking a command…",
+  Edit: "Editing files…",
+  MultiEdit: "Editing files…",
+  Write: "Editing files…",
+  NotebookEdit: "Editing files…",
+  WebFetch: "Reading a web page…",
+  WebSearch: "Searching the web…",
+  TodoWrite: "Planning the work…",
+  ListAgents: "Checking running agents…",
+  SendMessage: "Sending a message…",
+  list_projects: "Checking your projects…",
+  resolve_project: "Finding the project…",
+  register_project: "Registering a project…",
+  list_sessions: "Checking sessions…",
+  list_models: "Checking available models…",
+  session_tail: "Reading a session…",
+  session_state: "Checking a session…",
+  spawn_session: "Starting a worker…",
+  stop_session: "Stopping a session…",
+  memory_read: "Reading its memory…",
+  memory_write: "Updating its memory…",
+  memory_edit: "Updating its memory…",
+  log_note: "Noting a decision…",
+  send_message: "Sending a message…",
+  request_update: "Asking for an update…",
+  message_status: "Checking a message…",
+  start_lead: "Starting a Lead…",
+  retire_lead: "Retiring a Lead…",
+  list_leads: "Checking the Leads…",
+  read_handoff: "Reading a Lead's handoff…",
+  write_handoff: "Writing a handoff…",
+  list_workers: "Checking workers…",
+  commandExecution: "Running a command…",
+  fileChange: "Editing files…",
+};
+// A tool's phrase, or null. Own keys only: a tool named "constructor" or "toString" must not reach
+// Object.prototype and render a function as the status line.
+const stepPhraseFor = (name) => (typeof name === "string" && Object.hasOwn(STEP_PHRASES, name) ? STEP_PHRASES[name] : null);
+const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+// "mcp__fleet__list_projects", "fleet.list_projects" and "list_projects" name the same tool.
+function baseToolName(name) {
+  return String(name || "").trim().replace(/^mcp__.+?__/, "").replace(/^(fleet|leads|lead|peers)\./, "");
+}
+// Model-written text shown to the developer never carries paths or JSON.
+function plainWords(text, max = 80) {
+  const words = String(text || "")
+    .replace(/[{}[\]"`]/g, " ")
+    // Any token with a slash or backslash: absolute, relative and Windows paths, and URLs.
+    .replace(/\S*[/\\]\S*/g, " ")
+    // What JSON leaves behind: punctuation-only tokens, and space before punctuation.
+    .replace(/(^|\s)[^\w\s#]+(?=\s|$)/g, " ")
+    .replace(/\s+([:;,.])/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[\s.:;,]+|[\s.:;,…]+$/g, "");
+  return words.length > max ? `${words.slice(0, max - 1).trimEnd()}…` : words;
+}
+// A tool entry as { name, detail }: Coordinator entries carry name and summary; Codex entries
+// carry "<itemType>: <command or tool> (<status>)" as text.
+function toolStep(entry) {
+  if (entry.name) return { name: baseToolName(entry.name), detail: String(entry.summary ?? entry.text ?? "") };
+  const text = String(entry.text || entry.summary || "");
+  const match = /^(\w+):\s*([\s\S]*?)\s*(?:\((\w+)\))?$/.exec(text);
+  if (!match) return { name: "", detail: text };
+  if (["mcpToolCall", "dynamicToolCall"].includes(match[1])) return { name: baseToolName(match[2]), detail: "" };
+  return { name: match[1], detail: match[2] };
+}
+function subagentParts(detail) {
+  // server/pm.ts summarizes an Agent call as "<subagent_type>: <description>".
+  const match = /^([\w-]+):\s*([\s\S]*)$/.exec(String(detail || ""));
+  const type = match ? match[1] : "";
+  return { who: type === "investigator" ? "an investigator" : "a subagent", description: plainWords(match ? match[2] : "") };
+}
+function stepPhrase({ name, detail }) {
+  if (SUBAGENT_TOOLS.has(name)) {
+    const { who, description } = subagentParts(detail);
+    return description ? `Asking ${who}: ${description}…` : `Asking ${who}…`;
+  }
+  if (name === "ToolSearch") {
+    // Loading tools names what comes next: {"query":"select:mcp__fleet__list_projects,…"}.
+    const next = baseToolName(/select:([^,"\s}]+)/.exec(detail)?.[1]);
+    if (next && next !== "ToolSearch" && stepPhraseFor(next)) return stepPhraseFor(next);
+  }
+  if (name === "Read" && /tool-results/.test(detail)) return "Reading the results…";
+  if (name === "commandExecution" && /\b(test|tests|vitest|jest|pytest|playwright|typecheck)\b/.test(detail)) return "Running tests…";
+  return stepPhraseFor(name) || "Working…";
+}
+// The one compact line for sending an investigator, a subagent, a Lead or a worker; null otherwise.
+function dispatchLine({ name, detail }) {
+  if (SUBAGENT_TOOLS.has(name)) {
+    const { who, description } = subagentParts(detail);
+    // The call is recorded before its permission check, so say what was asked, not that it ran.
+    return `Asked for ${who}${description ? `: ${description}` : ""}`;
+  }
+  if (name === "start_lead") {
+    // server/pm.ts summarizes start_lead as "<project> / <workstream>".
+    const parts = String(detail).split(" / ").map((part) => plainWords(part, 40)).filter((part) => part && part !== "undefined");
+    return parts.length ? `Asked to start Lead ${parts.join(" · ")}` : "Asked to start a Lead";
+  }
+  if (name === "spawn_session") return "Asked to start a worker";
+  return null;
+}
+// What the agent is doing now: the latest tool step of the running turn, in plain words.
+function workingPhrase(history, currentTool) {
+  if (currentTool) return stepPhrase({ name: baseToolName(currentTool), detail: "" });
+  for (let i = history.length - 1; i >= 0; i--) {
+    const entry = history[i];
+    if (entry.role === "user" || entry.role === "peer") break;
+    if (entry.role === "tool") return stepPhrase(toolStep(entry));
+  }
+  return "Working…";
+}
+// Observed transcripts arrive as one "role (time): text" blob with [tool …] markers. Keep the
+// prose; the markers become hidden steps. Other formats pass through unchanged.
+const TOOL_MARKER = /\[tool result\]|\[tool [^\]\n]*\]/g;
+function splitObservedTail(entry) {
+  const steps = [];
+  const records = String(entry.text || "")
+    .split(/\n\n(?=(?:user|assistant) \([^)\n]*\): )/)
+    .flatMap((record) => {
+      const match = record.match(/^((user|assistant) \([^)\n]*\): )([\s\S]*)$/);
+      const markers = match?.[3].match(TOOL_MARKER);
+      if (!markers) return [record];
+      steps.push({ id: `observed-step-${steps.length}`, role: "tool", text: `${match[2]} ${markers.join(" ")}`, at: entry.at });
+      const prose = match[3].replace(TOOL_MARKER, "").replace(/[ \t]{2,}/g, " ").trim();
+      return prose ? [match[1] + prose] : [];
+    });
+  return { entry: records.length ? { ...entry, text: records.join("\n\n") } : null, steps };
+}
+// Steps are a debugging aid: off by default, shown from the conversation menu. No per-turn chrome.
+let showSteps = false, hiddenSteps = 0, shownHistory = [], shownReceipts = [];
+function conversationEntries(history) {
+  const out = [];
+  let steps = 0;
+  const step = (entry) => {
+    steps++;
+    if (showSteps) out.push({ ...entry, role: "step", stepRole: entry.role });
+  };
+  for (const entry of history) {
+    if (entry.role === "system" && entry.id === "observed-tail") {
+      const split = splitObservedTail(entry);
+      if (split.entry) out.push(split.entry);
+      split.steps.forEach(step);
+    } else if (entry.role === "tool") {
+      const line = dispatchLine(toolStep(entry));
+      if (line) out.push({ ...entry, role: "dispatch", text: line, summary: undefined });
+      else step(entry);
+    } else if (entry.role === "peer") step(entry);
+    else if (entry.role === "assistant" && !String(entry.text || "").trim()) continue;
+    else out.push(entry);
+  }
+  hiddenSteps = steps;
+  return out;
+}
+function dispatchNode(entry) {
+  const line = node("p", "dispatch-line");
+  const symbol = node("span", "dispatch-symbol", "↗");
+  symbol.setAttribute("aria-hidden", "true");
+  line.append(symbol, node("span", "dispatch-text", entry.text));
+  return line;
+}
+function stepNode(entry) {
+  const row = node("div", "step-line");
+  const text = [entry.name, entry.text || entry.summary].filter(Boolean).join(" · ");
+  row.append(
+    node("span", "step-kind", entry.stepRole === "peer" ? "Message" : "Step"),
+    node("span", "step-text", text.length > 600 ? `${text.slice(0, 600)}…` : text),
+  );
+  return row;
+}
+// server/pm.ts marks the "Coordinator moved" entry with `marker: "pm_moved"`. Hosts from before the
+// marker are recognised by the entry's text.
 const PM_MOVED_TEXT = /^(The (PM|Coordinator) now runs on |This machine is no longer the (PM|Coordinator) host)/;
+const pmMovedEntry = (entry) => entry.marker === "pm_moved" || (entry.marker == null && PM_MOVED_TEXT.test(String(entry.text || "")));
 function messageNode(entry, receipt, entryKey) {
+  if (entry.role === "dispatch") return dispatchNode(entry);
+  if (entry.role === "step") return stepNode(entry);
   const role = ["user", "assistant", "tool", "system"].includes(entry.role)
     ? entry.role
     : "system";
   const failed = role === "system" && entry.error === true;
   // server/pm.ts records this when the PM moves away from this machine; it explains why sends
   // here are refused, so it stands out from routine system lines.
-  const moved = role === "system" && !failed && selected === "pm" && PM_MOVED_TEXT.test(String(entry.text || ""));
+  const moved = role === "system" && !failed && selected === "pm" && pmMovedEntry(entry);
   const article = node("article", `message ${role}${failed ? " error" : ""}${moved ? " pm-moved" : ""}`);
   if (failed) article.setAttribute("aria-label", failureLabel());
   if (moved) article.setAttribute("aria-label", "The Coordinator moved");
@@ -1126,6 +1326,9 @@ function messageNode(entry, receipt, entryKey) {
   article.copyText = String(entry.text || entry.summary || "");
   article.tabIndex = 0;
   article.setAttribute("aria-description", "Press Enter for message options");
+  // Its own click listener also marks it actionable to screen readers, so TalkBack's double-tap
+  // activates it (see messageClick).
+  article.addEventListener("click", messageClick);
   renderMessageReceipt(article, receipt);
   return article;
 }
@@ -1154,8 +1357,9 @@ function renderMessages(history = [], receipts = []) {
   // Match the exact host-owned shape so actual provider/message text is never hidden.
   if (detail?.session?.managed === false && history.length === 1 && history[0].id === "observed-tail" && history[0].role === "system"
     && ["(no transcript available)", "(transcript unavailable)", "(no transcript on disk)", "(no message records found)"].includes(history[0].text)) history = [];
+  shownHistory = history; shownReceipts = receipts;
   const now = new Date();
-  const signature = JSON.stringify([selected, history, receipts, localDay(now), hostChecked, host.online, sessionsLoaded, sessions.length, detail?.session?.capabilities?.message]);
+  const signature = JSON.stringify([selected, history, receipts, localDay(now), hostChecked, host.online, sessionsLoaded, sessions.length, detail?.session?.capabilities?.message, showSteps]);
   if (signature === messageSignature) return;
   const wasNearBottom = stillPinned();
   const firstRender = !messageSignature;
@@ -1169,7 +1373,7 @@ function renderMessages(history = [], receipts = []) {
     .filter((item) => item.bottom > 0);
   messageSignature = signature;
   const fragment = document.createDocumentFragment(), used = new Set(), entries = [];
-  for (const entry of history) {
+  for (const entry of conversationEntries(history)) {
     const receipt = entry.role === "user"
       ? receipts.find((r) => !used.has(r.id) && (r.id === entry.id || r.text === entry.text)) : null;
     if (receipt) used.add(receipt.id);
@@ -1201,7 +1405,7 @@ function renderMessages(history = [], receipts = []) {
     const previous = item.previous;
     if (!firstRender && !wasNearBottom && (!previous || textOf(previous.entry) !== textOf(item.entry))) newMessages = true;
     item.key = previous?.key || ++nextEntryKey;
-    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source, item.entry.error === true]);
+    const contentSignature = JSON.stringify([item.entry.role, item.entry.text, item.entry.summary, item.entry.at, item.entry.ts, item.entry.source, item.entry.error === true, item.entry.marker]);
     const receiptSignature = JSON.stringify(item.receipt);
     item.element = previous?.contentSignature === contentSignature ? previous.element : messageNode(item.entry, item.receipt, item.key);
     if (item.element === previous?.element && previous.receiptSignature !== receiptSignature) renderMessageReceipt(item.element, item.receipt);
@@ -1220,7 +1424,7 @@ function renderMessages(history = [], receipts = []) {
     fragment.append(item.element);
   }
   timelineEntries = entries;
-  if (!history.length && !receipts.length) {
+  if (!entries.length) {
     const loading = !hostChecked || (host.online && !sessionsLoaded && !selected);
     const title = loading ? "Loading sessions…" : !host.online ? `${hostName("The execution host")} is offline`
       : selected === "pm" ? "New conversation."
@@ -1463,6 +1667,7 @@ function launchDetails(input) {
 // `record` is false when the history entry already exists (Back/Forward).
 async function selectSession(key, record = true) {
   if (selected) setDraft(selected, ui.input.value);
+  if (key !== selected) showSteps = false; // the debug steps belong to one chat
   selected = key;
   deepLinkPending = null;
   hideNotice();
@@ -1474,6 +1679,7 @@ async function selectSession(key, record = true) {
   pmBusy = false;
   pmModelReady = false;
   messageSignature = "";
+  shownHistory = []; shownReceipts = []; hiddenSteps = 0;
   resetLatest();
   approvalSignature = "";
   ui.input.value = drafts.get(key) || "";
@@ -1492,7 +1698,8 @@ async function selectSession(key, record = true) {
     ui.title.tabIndex = -1;
     ui.title.focus({ preventScroll: true });
   }
-  if (!host.online) showConversationLoading(`Conversation unavailable while ${hostName("the execution host")} is offline. It will open when it reconnects.`, true);
+  // Before the first /api/host answer the host is not known to be offline: it is still opening.
+  if (hostChecked && !host.online) showConversationLoading(`Conversation unavailable while ${hostName("the execution host")} is offline. It will open when it reconnects.`, true);
   try {
     await refreshSelected();
   } catch (error) {
@@ -1509,12 +1716,32 @@ function showInbox() {
 function rejectDeepLink() {
   const key = selected;
   showInbox();
-  afterHistory(() => {
-    const state = history.state;
-    if (state?.foreman && state.view === key && !state.overlay) history.replaceState({ ...state, rejected: true }, "", location.href);
-  });
+  markRejected(key);
   recordView(null);
   showNotice(UNKNOWN_LINK_NOTICE);
+}
+// Marks the conversation's entry rejected, and any overlay entry (the drawer, a dialog) that was
+// open above it: Back steps off those first, so each is marked on the way down.
+function markRejected(key, budget = 3) {
+  afterHistory(() => {
+    const state = history.state;
+    if (!state?.foreman || state.view !== key) return;
+    if (!state.rejected) history.replaceState({ ...state, rejected: true }, "", location.href);
+    if (state.overlay && budget > 0) {
+      historyBack();
+      markRejected(key, budget - 1);
+    }
+  });
+}
+// A rejected link the host now lists: its entries open normally again.
+function clearRejected(key) {
+  afterHistory(() => {
+    const state = history.state;
+    if (state?.foreman && state.view === key && state.rejected) {
+      const { rejected, ...rest } = state;
+      history.replaceState(rest, "", location.href);
+    }
+  });
 }
 let polledPmError = null;
 async function refreshSelected() {
@@ -1708,7 +1935,9 @@ function renderMoveList() {
   if (moveChoice && !selectable.has(moveChoice)) moveChoice = null;
   const rows = machines.map((m) => ({
     id: m.machine_id, name: m.name, active: m.active, online: m.online, enabled: selectable.has(m.machine_id),
-    meta: [PLATFORM_LABEL[m.platform] || m.platform || "Unknown platform", m.online ? "Online" : "Offline", lastSeenText(m.last_seen)].join(" · "),
+    // The relay writes last_seen at most once a minute, so an online machine can read "Last seen
+    // 1 min ago". It is shown only for a machine that is offline, where it says something.
+    meta: [PLATFORM_LABEL[m.platform] || m.platform || "Unknown platform", m.online ? "Online" : "Offline", m.online ? "" : lastSeenText(m.last_seen)].filter(Boolean).join(" · "),
     note: m.active ? "Runs the Coordinator now" : !m.online ? "Offline machines can’t take the Coordinator" : "",
     seen: m.last_seen,
   }));
@@ -1732,7 +1961,7 @@ function renderMoveList() {
       dot.setAttribute("aria-hidden", "true");
       name.prepend(dot);
       const meta = node("span", "machine-meta", row.meta);
-      if (typeof row.seen === "number" && row.seen > 0) meta.title = new Date(row.seen).toLocaleString();
+      if (!row.online && typeof row.seen === "number" && row.seen > 0) meta.title = new Date(row.seen).toLocaleString();
       text.append(name, meta);
       if (row.note) text.append(node("span", "machine-note", row.note));
       label.append(input, text);
@@ -1756,7 +1985,7 @@ function openMovePm(event) {
   moveSignature = "";
   moveError();
   renderMoveList();
-  ui.moveDialog.showModal();
+  showDialog(ui.moveDialog);
   pushOverlay("move", () => ui.moveDialog.open);
   (ui.moveDialog.querySelector("#move-pm-list input:not(:disabled)") || $("#close-move-pm")).focus();
 }
@@ -1768,8 +1997,22 @@ for (const selector of ["#close-move-pm", "#cancel-move-pm"])
 // second opening. That late event must not undo the new opening: pop its history entry, clear
 // its choice, or drop its opener (which sent focus to the info screen instead, #189). Each
 // dialog's close handler returns early while its dialog is open again.
+// Close, reopen and close again before either event fires delivers two close events for one
+// closed dialog: only the first is handled, or the second finds the opener already used and
+// sends focus elsewhere (#197). `showDialog` arms one handling per opening.
+function showDialog(dialog) {
+  dialog.showModal();
+  dialog.closeHandled = false;
+}
+// True when this close event must be ignored: the dialog is open again, or this opening's close
+// was already handled.
+function staleClose(dialog) {
+  if (dialog.open || dialog.closeHandled) return true;
+  dialog.closeHandled = true;
+  return false;
+}
 ui.moveDialog.addEventListener("close", () => {
-  if (ui.moveDialog.open) return;
+  if (staleClose(ui.moveDialog)) return;
   popOverlay("move");
   moveChoice = null;
   moveError();
@@ -1858,7 +2101,7 @@ function openInfo(event) {
   const opener = event?.currentTarget;
   infoOpener = opener && opener !== $("#open-info") && opener.matches?.("button") ? opener : $("#conversation-menu-button");
   renderHeading();
-  ui.infoDialog.showModal();
+  showDialog(ui.infoDialog);
   pushOverlay("info", () => ui.infoDialog.open);
   $("#close-info").focus();
   // The Coordinator's info summarizes the settings it launches Leads with.
@@ -1867,7 +2110,7 @@ function openInfo(event) {
 $("#open-info").addEventListener("click", openInfo);
 $("#close-info").addEventListener("click", () => ui.infoDialog.close());
 ui.infoDialog.addEventListener("close", () => {
-  if (ui.infoDialog.open) return; // A late close event after a reopen (see the Move dialog's).
+  if (staleClose(ui.infoDialog)) return; // A late close event (see the Move dialog's).
   popOverlay("info");
   if (!authorized) return;
   const opener = infoOpener;
@@ -2065,7 +2308,7 @@ function openSettings(event) {
   settingsOpener = opener && opener !== $("#open-settings") ? opener : $("#conversation-menu-button");
   settingsNotice("");
   renderSettings(true);
-  ui.settingsDialog.showModal();
+  showDialog(ui.settingsDialog);
   pushOverlay("settings", () => ui.settingsDialog.open);
   $("#close-settings").focus();
   void loadSettings();
@@ -2077,7 +2320,7 @@ $("#info-open-settings").addEventListener("click", openSettings);
 $("#close-settings").addEventListener("click", () => ui.settingsDialog.close());
 $("#settings-form").addEventListener("submit", (event) => event.preventDefault());
 ui.settingsDialog.addEventListener("close", () => {
-  if (ui.settingsDialog.open) return; // A late close event after a reopen (see the Move dialog's).
+  if (staleClose(ui.settingsDialog)) return; // A late close event (see the Move dialog's).
   popOverlay("settings");
   if (!authorized) return;
   const opener = settingsOpener;
@@ -2126,7 +2369,15 @@ ui.menu.addEventListener("beforetoggle", (event) => {
   if (event.newState !== "open") return;
   $("#open-info").hidden = !selected;
   $("#copy-last").hidden = typeof lastMessage()?.copyText !== "string";
+  const steps = $("#toggle-steps");
+  steps.hidden = !selected || !hiddenSteps;
+  steps.textContent = showSteps ? "Hide steps" : `Show ${hiddenSteps} ${hiddenSteps === 1 ? "step" : "steps"}`;
   placeMenu(ui.menu, $("#conversation-menu-button").getBoundingClientRect());
+});
+$("#toggle-steps").addEventListener("click", () => {
+  ui.menu.hidePopover();
+  showSteps = !showSteps;
+  renderMessages(shownHistory, shownReceipts);
 });
 let copyStatusTimer;
 function copyStatus(text, error = false) {
@@ -2212,6 +2463,21 @@ ui.messages.addEventListener("keydown", (event) => {
   event.preventDefault();
   openMessageMenu(event.target);
 });
+// TalkBack (#174): a double-tap activates the focused message with a click that no finger or
+// mouse press started; that click opens the message's options, as Enter does. A sighted tap or
+// click always starts with a press on the same message and stays for reading and scrolling. The
+// press is remembered by entry key, since a streaming message can re-render in between.
+let pressedEntry = null;
+document.addEventListener("pointerdown", (event) => {
+  pressedEntry = event.target.closest?.("#messages .message")?.dataset.entryKey ?? null;
+}, true);
+function messageClick(event) {
+  const article = event.currentTarget;
+  const pressed = pressedEntry !== null && pressedEntry === article.dataset.entryKey;
+  pressedEntry = null;
+  if (pressed || event.target.closest("a, button, pre, summary, input, select, textarea") || String(window.getSelection?.() || "")) return;
+  openMessageMenu(article);
+}
 
 // GET /api/leads: the Lead registry. A host or relay without the route answers 404; it is asked
 // again only once a minute, so an older host costs one request a minute, not one a poll.
@@ -2237,8 +2503,10 @@ async function poll() {
   clearTimeout(pollTimer);
   if (!authorized) return;
   // A poll asked for while one is in flight (the browser coming back online, a PM move, a
-  // sign-in) runs as soon as that one finishes: the in-flight poll may have read the state from
-  // before the change, so dropping the request would leave the view stale until the timer.
+  // sign-in) runs once that one has finished, which includes its /api/pm/host and /api/leads
+  // reads settling: the in-flight poll may have read the state from before the change, so
+  // dropping the request would leave the view stale until the timer. Many requests made during
+  // one poll still make a single follow-up poll.
   if (polling) {
     pollAgain = true;
     return;
@@ -2268,6 +2536,7 @@ async function poll() {
         const key = deepLinkPending;
         deepLinkPending = null;
         if (selected === key && !sessions.some((s) => s.session_key === key)) rejectDeepLink();
+        else if (selected === key) clearRejected(key);
       }
       renderRail();
       await refreshSelected().catch(showRefreshError);
@@ -2290,6 +2559,9 @@ async function poll() {
       renderRail();
       renderHeading();
       if (conversationLoading) showConversationLoading("Conversation unavailable while the execution host is unreachable. Retrying automatically.", true);
+      // The relay may still answer which machine runs the PM, and until something answers the
+      // PM view would say "Checking…" for as long as /api/host keeps failing. Still one read a poll.
+      pmHostRead ??= refreshPmHost(epoch);
     }
   } finally {
     // One PM machine read per poll: the next poll starts only after this one's answer.
@@ -2329,7 +2601,7 @@ $("#composer").addEventListener("submit", async (event) => {
   const attempt =
     previous?.text === text ? previous : { id: crypto.randomUUID(), text };
   sendAttempts.set(key, attempt);
-  sending = true;
+  sending.add(key);
   const epoch = authEpoch;
   setActionFeedback(key, "send", "");
   updateControls();
@@ -2350,7 +2622,13 @@ $("#composer").addEventListener("submit", async (event) => {
       ui.input.value = "";
       autosize();
     }
-    if (epoch === authEpoch && authorized) setActionFeedback(key, "send", "Message accepted.");
+    if (epoch === authEpoch && authorized) {
+      // The 202 means the turn is dispatched: Interrupt can reach it now, not only after the
+      // refresh below answers.
+      sending.delete(key);
+      setActionFeedback(key, "send", "Message accepted.");
+      updateControls();
+    }
     await refreshSelected();
   } catch (error) {
     if (epoch === authEpoch && authorized) setActionFeedback(key, "send",
@@ -2361,7 +2639,7 @@ $("#composer").addEventListener("submit", async (event) => {
     );
   } finally {
     if (epoch === authEpoch) {
-      sending = false;
+      sending.delete(key);
       updateControls();
       if (selected === key && !ui.input.disabled) ui.input.focus();
     }
@@ -2580,7 +2858,7 @@ function openNew(event) {
   $("#new-policy").value = "native";
   updateNewPolicy();
   askStatus("");
-  ui.dialog.showModal();
+  showDialog(ui.dialog);
   pushOverlay("dialog", () => ui.dialog.open);
   void loadNewModels();
   void loadProjects(); void resolveNewProject();
@@ -2588,7 +2866,7 @@ function openNew(event) {
 }
 ui.newButton.addEventListener("click", openNew);
 ui.dialog.addEventListener("close", () => {
-  if (ui.dialog.open) return; // A late close event after a reopen (see the Move dialog's).
+  if (staleClose(ui.dialog)) return; // A late close event (see the Move dialog's).
   popOverlay("dialog");
   projectRevision++; projectPending = false; projectResolution = null; projectSelection = null;
   if (!authorized || creating) return;
@@ -2666,6 +2944,8 @@ window.addEventListener("online", poll);
 // Sign-in waits for it: a sign-in completed during the wait would otherwise be undone by the
 // Firebase sign-out that follows.
 let signingOut = null;
+const SIGN_OUT_TIMEOUT = 10000, SIGN_OUT_STUCK = "Signing out is taking longer than expected. Continue with Google reloads Foreman to sign in again.";
+let signOutStuck = false;
 ui.signOut.addEventListener("click", () => {
   if (signingOut) return;
   // Capture the push subscription and token while still signed in; the server unsubscribe
@@ -2676,9 +2956,14 @@ ui.signOut.addEventListener("click", () => {
   signingOut = (async () => {
     await leaving;
     try {
-      await authSDK.signOut(firebaseAuth);
+      // Bounded: a Firebase sign-out that never settles must not leave "Continue with Google"
+      // disabled until a reload (#150). This app has already let go of the account above.
+      await withTimeout(authSDK.signOut(firebaseAuth), SIGN_OUT_TIMEOUT, SIGN_OUT_STUCK);
     } catch (error) {
       ui.authStatus.textContent = errorMessage(error);
+      // A sign-out still pending could land after a new sign-in and undo it: signing in again
+      // starts from a fresh page instead.
+      if (error?.message === SIGN_OUT_STUCK) signOutStuck = true;
     }
   })().finally(() => {
     signingOut = null;
@@ -2698,7 +2983,8 @@ const PUSH_STATUS = {
 };
 const PUSH_SUMMARY = { off: "Off", blocked: "Blocked", on: "On" };
 // On, but every kind unticked: the subscription stays, and nothing can fire until one is ticked.
-const PUSH_NONE_SUMMARY = "On — all notification types are off";
+// Short enough for the drawer's summary row on a narrow phone; the status line below says the rest.
+const PUSH_NONE_SUMMARY = "On · all types off";
 const PUSH_NONE_STATUS = "This device is subscribed, but every notification type is turned off, so Foreman sends nothing. Tick a type below to get notifications again.";
 const pushUi = {
   root: $("#notify-settings"),
@@ -2990,7 +3276,7 @@ ui.signIn.addEventListener("click", async () => {
     ui.signIn.disabled = true;
     await signingOut;
   }
-  if (!firebaseAuth || !authSDK) {
+  if (!firebaseAuth || !authSDK || signOutStuck) {
     location.reload();
     return;
   }

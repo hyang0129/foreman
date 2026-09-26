@@ -168,7 +168,7 @@ test("the conversation view has no model or settings controls, no per-message ch
   await expect(main.getByRole("combobox")).toHaveCount(0);
   for (const selector of ["#control-note", "#header-model", "#provider", "#conversation-subtitle"])
     await expect(page.locator(selector)).toBeHidden();
-  await expect(page.locator("#activity-status")).toHaveText(/Working/);
+  await expect(page.locator("#activity-status")).toHaveText("Reading files…");
 });
 
 test("every control moved out of the conversation is reachable from the header's info screen", async ({ page, context }) => {
@@ -287,6 +287,38 @@ test("a message menu copies the text the message had when it opened, while the m
   await page.keyboard.press("Escape");
   await expect(page.getByRole("menu", { name: "Message options" })).toBeHidden();
   await expect(page.locator(".message").last()).toBeFocused();
+});
+
+// #174: TalkBack's double-tap activates the message it has focused with a click that no finger
+// press started (Chrome's accessibility click, which element.click() reproduces). That click opens
+// the message's options, so any message can be copied, not only the last one. Sighted taps and
+// clicks are unchanged: they open nothing.
+test("a screen reader's activation of a message opens its options; sighted taps and clicks do not", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await fixture(page);
+  await openPm(page);
+  const menu = page.getByRole("menu", { name: "Message options" });
+  const older = page.locator(".message").filter({ hasText: "Reply 7:" });
+  // Sighted: a tap and a mouse click on the message open nothing.
+  await older.tap();
+  await page.waitForTimeout(600);
+  await expect(menu).toBeHidden();
+  await older.click();
+  await page.waitForTimeout(300);
+  await expect(menu).toBeHidden();
+  // The screen reader's activation of an older message: its menu, with Copy message focused.
+  await older.evaluate((article: HTMLElement) => article.click());
+  await expect(menu).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Copy message" })).toBeFocused();
+  await page.getByRole("menuitem", { name: "Copy message" }).evaluate((item: HTMLElement) => item.click());
+  await expect(menu).toBeHidden();
+  await expect(page.locator("#copy-status")).toHaveText("Copied");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("Reply 7: I delegated the task to a session and will report back.");
+  await expect(older).toBeFocused();
+  // After that, a sighted tap is still only a tap.
+  await older.tap();
+  await page.waitForTimeout(600);
+  await expect(menu).toBeHidden();
 });
 
 test("focus stays in the conversation when Interrupt goes away after the turn ends", async ({ page }) => {

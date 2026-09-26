@@ -117,7 +117,9 @@ export class LeadState {
   /**
    * Upserts `records` for `machineId`, all or nothing. Every record must name `machineId`, and no
    * existing row may belong to another machine (`forbidden`). New rows beyond MAX_LEAD_ROWS first
-   * prune the oldest ended rows (and their handoffs); if that is not enough, `too_large`.
+   * prune the oldest ended rows (and their handoffs), the writing machine's own before any other
+   * machine's (#196: one machine's new Leads do not erase another machine's history while its own
+   * can make room); if that is not enough, `too_large`.
    */
   private writeRecords(machineId: string, records: readonly LeadRecord[], now: number) {
     this.storage.transactionSync(() => {
@@ -133,7 +135,7 @@ export class LeadState {
         const count = this.rows<{ n: number }>('SELECT COUNT(*) AS n FROM leads')[0]!.n;
         const excess = count + fresh - MAX_LEAD_ROWS;
         if (excess > 0) {
-          const prunable = this.rows<{ lead: string }>('SELECT lead FROM leads WHERE ended = 1 ORDER BY reported_at ASC, lead ASC')
+          const prunable = this.rows<{ lead: string }>('SELECT lead FROM leads WHERE ended = 1 ORDER BY (machine_id = ?) DESC, reported_at ASC, lead ASC', machineId)
             .filter((row) => !leads.has(row.lead)).slice(0, excess);
           if (prunable.length < excess) throw new Refusal('too_large', `The relay keeps at most ${MAX_LEAD_ROWS} Leads`);
           for (const { lead } of prunable) {

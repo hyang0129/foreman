@@ -134,6 +134,29 @@ test('#122: an unlisted short plain word in a continuing sentence is not redacte
   for (const [label, input] of KEEPS_122) assert.equal(redactSecrets(input), input, label);
 });
 
+// #145: a short lower-case value after a chosen-credential key, followed by prose, is a password
+// followed by prose: it is redacted. The Bearer/Basic prose case and a sentence end are unchanged.
+test('#145: a short plain password followed by lower-case prose is redacted', () => {
+  const redacts: [string, string][] = [
+    ['password: hunter was rejected', 'password: [REDACTED] was rejected'],
+    ['password=hunter was rejected', 'password=[REDACTED] was rejected'],
+    ['Password: Hunter was rejected', 'Password: [REDACTED] was rejected'],
+    ['secret: swordfish is wrong', 'secret: [REDACTED] is wrong'],
+    ['secret: fish is wrong', 'secret: [REDACTED] is wrong'],
+    ['api_key: abc for this account', 'api_key: [REDACTED] for this account'],
+    ['{"password": "hunter"} was sent', '{"password": "[REDACTED]"} was sent'],
+    ['passwd=letmein and retry', 'passwd=[REDACTED] and retry'],
+  ];
+  for (const [input, expected] of redacts) {
+    assert.equal(redactSecrets(input), expected, input);
+    assert.equal(redactSecrets(expected), expected, `idempotent: ${input}`);
+  }
+  // Unchanged: Bearer/Basic followed by a short plain word in prose, a sentence end, prose words,
+  // and short token values (8-character minimum).
+  for (const input of ['Expected Bearer but got Basic', 'Basic login failed', 'password: reset. Log in again.', 'password: is required', 'token: pending approval', 'password: not-provided'])
+    assert.equal(redactSecrets(input), input, input);
+});
+
 test('redacted output leaks none of the secret material', () => {
   const secrets = ['AbCdEf_0123456789', 'SECRETSECRET', 'eyJhbGciOiJIUzI1NiJ9', 'ya29a0AfH6SMBx9secretvalue', 'dXNlcjpwYXNz', 'YWRtaW46c2VjcmV0MTIz'];
   const joined = REDACTS.map(([, input]) => redactSecrets(input)).join('\n');

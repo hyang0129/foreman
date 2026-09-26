@@ -29,7 +29,10 @@
 // same-origin URL that passes the deep-link safety check (see safeAppUrl).
 
 const CACHE_PREFIX = "foreman-shell-";
-const CACHE = `${CACHE_PREFIX}v1`;
+// Bump the version with every change to a precached file: an installed worker keeps serving its
+// cached copy until sw.js itself changes (tests/web-headers.test.mjs holds the files' hashes).
+// v2: offline.html's retry no longer cancels a notification's navigation (#150).
+const CACHE = `${CACHE_PREFIX}v2`;
 const OFFLINE_URL = "/offline.html";
 const PRECACHE = [OFFLINE_URL, "/icons/icon-192.png", "/icons/icon-512.png", "/icons/maskable-512.png"];
 

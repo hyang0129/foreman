@@ -23,16 +23,28 @@ const managed = {
 const second = { ...managed, session_key: "managed:beta", session_id: "native-beta", name: "Write docs" };
 
 async function fixture(page: Page | BrowserContext, options: { auth?: any } = {}) {
-  const state = { calls: [] as { path: string; search: string }[] };
+  const state = {
+    calls: [] as { path: string; search: string }[],
+    sessions: [managed, second] as any[],
+    // Held reads ("/api/path"): each waits until its release is called.
+    gates: new Map<string, Promise<void>>(),
+    hold(path: string) {
+      let release!: () => void;
+      state.gates.set(path, new Promise<void>((resolve) => { release = resolve; }));
+      return () => { state.gates.delete(path); release(); };
+    },
+  };
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url()), path = url.pathname;
     state.calls.push({ path, search: url.search });
+    const gate = state.gates.get(path);
+    if (gate) await gate;
     let result: any = {}, status = 200;
     if (path === "/api/config") result = { auth: options.auth ?? { required: false } };
     else if (path === "/api/host") result = { online: true, host: "Dev Mac" };
-    else if (path === "/api/sessions") result = [managed, second];
+    else if (path === "/api/sessions") result = state.sessions;
     else if (path === "/api/session") {
-      const session = [managed, second].find((s) => s.session_key === url.searchParams.get("id"));
+      const session = state.sessions.find((s) => s.session_key === url.searchParams.get("id"));
       if (!session) { status = 404; result = { error: "Unknown session" }; }
       else result = { session, history: [{ id: `h-${session.session_id}`, role: "assistant", text: `History of ${session.name}` }], receipts: [], approvals: [] };
     } else if (path === "/api/pm/history") result = { history: [{ role: "assistant", text: "How can I help the fleet?" }], error: null, busy: false, model: null };
@@ -218,10 +230,10 @@ test.describe("service worker", () => {
       return entries.sort();
     });
     expect(cached).toEqual([
-      "foreman-shell-v1 /icons/icon-192.png",
-      "foreman-shell-v1 /icons/icon-512.png",
-      "foreman-shell-v1 /icons/maskable-512.png",
-      "foreman-shell-v1 /offline.html",
+      "foreman-shell-v2 /icons/icon-192.png",
+      "foreman-shell-v2 /icons/icon-512.png",
+      "foreman-shell-v2 /icons/maskable-512.png",
+      "foreman-shell-v2 /offline.html",
     ]);
   });
 
@@ -277,6 +289,65 @@ test.describe("service worker", () => {
     await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
     await page.getByRole("button", { name: "Retry" }).tap();
     await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
+  });
+
+  // #150: the offline screen follows only a message its service worker posts (a notification tap):
+  // the same message from anything else (another window, a frame, a script) is ignored.
+  test("the offline screen follows a foreman:open message only from its service worker", async ({ page, context }) => {
+    await fixture(page);
+    await page.goto("/");
+    await controlled(page);
+    await context.setOffline(true);
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "You’re offline" })).toBeVisible();
+    // Connectivity probes never answer, so only a followed message can leave this screen.
+    await page.evaluate(() => { window.fetch = (() => new Promise(() => {})) as typeof fetch; });
+    await context.setOffline(false);
+    const send =(source: "window" | "none" | "worker") => page.evaluate((source) => {
+      const data = { type: "foreman:open", url: "/?session=managed%3Abeta" };
+      const init: MessageEventInit = { data };
+      if (source === "window") init.source = window;
+      if (source === "worker") init.source = navigator.serviceWorker.controller;
+      navigator.serviceWorker.dispatchEvent(new MessageEvent("message", init));
+    }, source);
+    for (const source of ["window", "none"] as const) {
+      await send(source);
+      await expect(page.getByRole("button", { name: "Retry" })).toHaveText("Retry");
+      expect(page.url()).toBe("http://127.0.0.1:4188/");
+    }
+    // A control: the same message from the service worker is followed.
+    await send("worker");
+    await expect(page.getByText("History of Write docs")).toBeVisible();
+    expect(page.url()).toBe("http://127.0.0.1:4188/?session=managed%3Abeta");
+  });
+
+  // #150: a connectivity probe that succeeds while a notification's navigation is under way must
+  // not reload the offline screen's own URL, which would cancel the navigation to the session.
+  test("an automatic retry does not cancel a notification's navigation from the offline screen", async ({ page, context }) => {
+    await fixture(page);
+    await page.goto("/");
+    await controlled(page);
+    await context.setOffline(true);
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "You’re offline" })).toBeVisible();
+    // The probe's request is held, so a probe is in flight when the notification arrives.
+    await page.evaluate(() => {
+      const w = window as any;
+      w.__probes = [];
+      window.fetch = (() => new Promise((resolve) => w.__probes.push(resolve))) as typeof fetch;
+    });
+    await context.setOffline(false);
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await expect.poll(() => page.evaluate(() => (window as any).__probes.length)).toBeGreaterThan(0);
+    // In one task: the notification's message starts the navigation, then the probe succeeds.
+    await page.evaluate(() => {
+      navigator.serviceWorker.dispatchEvent(new MessageEvent("message", {
+        source: navigator.serviceWorker.controller, data: { type: "foreman:open", url: "/?session=managed%3Abeta" },
+      }));
+      for (const resolve of (window as any).__probes) resolve(new Response("{}", { status: 200 }));
+    });
+    await expect(page.getByText("History of Write docs")).toBeVisible();
+    expect(page.url()).toBe("http://127.0.0.1:4188/?session=managed%3Abeta");
   });
 
   test("a deploy reaches the controlled app on the next load", async ({ page, context }) => {
@@ -400,6 +471,63 @@ test.describe("deep links", () => {
     await expect(page.getByText("History of Write docs")).toBeVisible();
     await page.goBack();
     await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
+  });
+
+  // #150: the drawer is open when the host's session list rejects the link. The drawer's own
+  // entry sits above the conversation's, and both are marked, so Forward repeats the neutral
+  // fallback instead of asking the host for the session.
+  test("a link rejected while the drawer is open is still marked rejected for Forward", async ({ page }) => {
+    const state = await fixture(page);
+    const release = state.hold("/api/sessions");
+    await page.goto("/?session=fm:not-on-this-mac");
+    await expect.poll(() => state.calls.filter((c) => c.path === "/api/sessions").length).toBe(1);
+    await page.getByRole("button", { name: "Open session navigation" }).tap();
+    await expect.poll(() => page.evaluate(() => history.state?.overlay)).toBe("nav");
+    release();
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing the Coordinator.");
+    await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
+    await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
+    await expect.poll(() => page.evaluate(() => history.state?.view ?? null)).toBeNull();
+    await page.locator("#app-notice").evaluate((notice: HTMLElement) => { notice.hidden = true; });
+    await page.goForward();
+    await expect(page.locator("#app-notice")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
+    await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
+    await page.waitForTimeout(300);
+    await expect(page.locator("#error-banner")).toBeHidden();
+    expect(state.calls.filter((c) => c.path === "/api/session")).toEqual([]);
+  });
+
+  // #150: right after a reload, before the first session list, Forward onto a rejected link that
+  // the host now lists opens it; it is not treated as rejected before the host has answered.
+  test("Forward onto a rejected link before the first poll waits for the host's list", async ({ page }) => {
+    const state = await fixture(page);
+    const later = { ...managed, session_key: "fm:added-later", session_id: "native-later", name: "Added later" };
+    await page.goto(`/?session=${encodeURIComponent(later.session_key)}`);
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing the Coordinator.");
+    await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/");
+    await expect.poll(() => page.evaluate(() => history.state?.view ?? null)).toBeNull();
+    // The host now lists the session. Reload, and hold the first poll at its host read.
+    state.sessions = [managed, second, later];
+    const hostReads = state.calls.filter((c) => c.path === "/api/host").length;
+    const release = state.hold("/api/host");
+    await page.reload();
+    await expect.poll(() => state.calls.filter((c) => c.path === "/api/host").length).toBeGreaterThan(hostReads);
+    await page.goForward();
+    await expect.poll(() => page.url()).toBe("http://127.0.0.1:4188/?session=fm%3Aadded-later");
+    await page.waitForTimeout(300);
+    await expect(page.locator("#app-notice")).toBeHidden();
+    expect(page.url()).toBe("http://127.0.0.1:4188/?session=fm%3Aadded-later");
+    release();
+    await expect(page.getByText("History of Added later")).toBeVisible();
+    await expect(page.locator("#app-notice")).toBeHidden();
+    expect(page.url()).toBe("http://127.0.0.1:4188/?session=fm%3Aadded-later");
+    // The entry is no longer marked: Back and Forward return to the conversation.
+    await expect.poll(() => page.evaluate(() => history.state?.rejected ?? false)).toBe(false);
+    await page.goBack();
+    await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
+    await page.goForward();
+    await expect(page.getByText("History of Added later")).toBeVisible();
   });
 
   test("selecting conversations updates the URL and reload keeps the view", async ({ page }) => {
