@@ -13,7 +13,9 @@
 //   in order (per Lead): a `{ stored: false }` answer (duplicate `(lead, seq)`) counts as delivered;
 //   a transient failure (disconnected, timeout, unavailable, invalid result) keeps the entry for the
 //   next hello or resync tick; `not_found` (the Lead's row is not in the DO yet) holds that Lead's
-//   entries for the next pass; `forbidden` / `invalid` / `too_large` drop the entry with a logged
+//   entries until a `lead.upsert` / `lead.sync` carrying its row succeeds (which triggers a flush at
+//   once) or the next hello or tick, and drops an entry held that way once it is older than
+//   `LEAD_OUTBOX_MAX_AGE_MS` (logged); `forbidden` / `invalid` / `too_large` drop the entry with a logged
 //   diagnostic, so nothing is ever retried in a loop.
 // - Registry. `upsert` sends a row at once and coalesces further edges for the same Lead into one
 //   send per 30 s (latest row wins). `track(source)` registers this machine's rows; all of them are
@@ -52,6 +54,8 @@ export const LEAD_OUTBOX_FILE = 'outbox.json';
 /** Outbox bounds: the DO keeps only the newest 20 handoffs per Lead, so older queued ones are dropped first. */
 export const MAX_OUTBOX_PER_LEAD = MAX_HANDOFFS_KEPT;
 export const MAX_OUTBOX_TOTAL = 400;
+/** A handoff still refused `not_found` (its Lead's row never reached the DO) after this long is dropped from the outbox. */
+export const LEAD_OUTBOX_MAX_AGE_MS = 24 * 60 * 60_000;
 
 /** The input of `appendHandoff` (the host assigns `v`, `seq`, `at` and `workers`). */
 export type LeadHandoffInput = Parameters<LeadStore['appendHandoff']>[0];
@@ -369,6 +373,8 @@ export class RelayLeadStore extends BaseLeadStore {
   private outbox: LeadHandoff[];
   private flushing: Promise<void> | null = null;
   private flushAgain = false;
+  /** Leads whose handoffs were last refused `not_found`: a successful upsert/sync of their row flushes at once. */
+  private awaitingRow = new Set<string>();
   private syncing: Promise<void> | null = null;
   private syncAgain = false;
   private resyncTimer: ReturnType<typeof setInterval> | null = null;
@@ -505,7 +511,7 @@ export class RelayLeadStore extends BaseLeadStore {
     this.upsertSentAt.set(row.lead, Date.now());
     // Disconnected: the next hello's resync carries it.
     if (!this.readable()) return;
-    this.bridge.leadRpc('lead.upsert', { record: row }).catch((error) => {
+    this.bridge.leadRpc('lead.upsert', { record: row }).then(() => this.rowDelivered([row.lead]), (error) => {
       const code = failureCode(error);
       if (!TRANSIENT.has(code)) this.logger(`foreman: the relay refused a Lead row (${code}); not retried`);
       // Transient: the next resync carries the row.
@@ -517,8 +523,10 @@ export class RelayLeadStore extends BaseLeadStore {
     const records = this.records();
     for (const chunk of chunkSyncRecords(records)) {
       if (!this.readable()) return;
-      try { await this.bridge.leadRpc('lead.sync', { records: chunk }); }
-      catch (error) {
+      try {
+        await this.bridge.leadRpc('lead.sync', { records: chunk });
+        this.rowDelivered(chunk.map((r) => r.lead));
+      } catch (error) {
         const code = failureCode(error);
         if (TRANSIENT.has(code)) return; // retried on the next hello or tick
         this.logger(`foreman: the relay refused a Lead resync chunk of ${chunk.length} row${chunk.length === 1 ? '' : 's'} (${code}); not retried`);
@@ -526,23 +534,49 @@ export class RelayLeadStore extends BaseLeadStore {
     }
   }
 
+  /**
+   * Rows now in the DO: flush once (coalesced with a pass in progress) when one of these Leads has
+   * handoffs held `not_found`, or queued while a pass is running (its answer may still be in flight).
+   */
+  private rowDelivered(leads: readonly string[]): void {
+    if (!this.readable()) return;
+    let due = false;
+    for (const lead of leads) {
+      if (this.awaitingRow.delete(lead)) due = true;
+      else if (this.flushing && this.outbox.some((h) => h.lead === lead)) due = true;
+    }
+    if (due) void this.flush();
+  }
+
+  private queued(handoff: LeadHandoff): boolean {
+    return this.outbox.some((h) => h.lead === handoff.lead && h.seq === handoff.seq);
+  }
+
   private async flushOnce(): Promise<void> {
     const held = new Set<string>();
-    let index = 0;
-    while (index < this.outbox.length) {
+    // A snapshot, in order: `boundOutbox()` may drop entries at the front of the live outbox while
+    // an RPC is in flight, so walking it by index could skip one. Dropped entries are skipped here;
+    // entries appended during the pass are picked up by the next pass (`stored` → `flush`).
+    for (const handoff of [...this.outbox]) {
       if (!this.readable()) return;
-      const handoff = this.outbox[index]!;
-      if (held.has(handoff.lead)) { index++; continue; }
+      if (held.has(handoff.lead) || !this.queued(handoff)) continue;
       try {
         await this.bridge.leadRpc('lead.handoff', { handoff });
         // `stored: false` is a duplicate (lead, seq): the DO already has it, so it is delivered too.
         this.remove(handoff);
+        this.awaitingRow.delete(handoff.lead);
       } catch (error) {
         const code = failureCode(error);
         if (TRANSIENT.has(code)) return; // kept at the head: retried on the next hello or tick
         if (code === 'not_found') {
-          // The Lead's row has not reached the DO yet: hold this Lead's handoffs (in order) for the next pass.
-          held.add(handoff.lead); index++; continue;
+          const age = this.now().getTime() - Date.parse(handoff.at);
+          if (age > LEAD_OUTBOX_MAX_AGE_MS) {
+            this.remove(handoff);
+            this.logger(`foreman: handoff ${handoff.seq} of ${handoff.lead} waited over 24 h for its Lead row to reach the relay; dropped from the outbox, kept in the local log`);
+            continue;
+          }
+          // The Lead's row has not reached the DO yet: hold this Lead's handoffs (in order) until it does.
+          held.add(handoff.lead); this.awaitingRow.add(handoff.lead); continue;
         }
         this.remove(handoff);
         this.logger(`foreman: the relay refused handoff ${handoff.seq} of ${handoff.lead} (${code}); dropped from the outbox, kept in the local log`);

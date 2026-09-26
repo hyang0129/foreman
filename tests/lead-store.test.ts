@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HostBridge, LeadRpcError } from '../server/host-bridge.ts';
 import {
-  LEAD_RESYNC_INTERVAL_MS, LEAD_UPSERT_DEBOUNCE_MS, LeadStoreError, LocalLeadStore, RelayLeadStore, chunkSyncRecords, createLeadStore,
+  LEAD_OUTBOX_MAX_AGE_MS, LEAD_RESYNC_INTERVAL_MS, LEAD_UPSERT_DEBOUNCE_MS, LeadStoreError, MAX_OUTBOX_PER_LEAD, LocalLeadStore, RelayLeadStore, chunkSyncRecords, createLeadStore,
 } from '../server/lead-store.ts';
 import { utf8Length } from '../shared/notify.ts';
 import {
@@ -261,6 +261,86 @@ test('not_found (row not in the DO yet) holds only that Lead; others still flush
   bridge.setConnected(false); bridge.setConnected(true); await settle();
   assert.deepEqual(store.pendingHandoffs(), []);
   assert.deepEqual([...bridge.handoffs.keys()], [`${b}#1`, `${a}#1`, `${a}#2`]);
+});
+
+test('a handoff held not_found is delivered as soon as its row\'s upsert or sync succeeds, not at the next 4-min tick', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  const { bridge, store } = relay(t);
+  const a = newLead(), b = newLead();
+  bridge.respond = (op, args) => {
+    if (op === 'lead.handoff' && !bridge.rows.has(args.handoff.lead)) throw new LeadRpcError('not_found', op, 'unknown Lead');
+    return bridge.fakeDo(op, args);
+  };
+  bridge.setConnected(true); await settle();
+  // The seed handoff is written before the new Lead's row reaches the DO.
+  await store.appendHandoff(input(a)); await settle();
+  assert.equal(bridge.ops('lead.handoff').length, 1);
+  assert.equal(store.pendingHandoffs().length, 1, 'held: the row is not in the DO yet');
+  store.upsert(record(a)); await settle();
+  assert.deepEqual(store.pendingHandoffs(), [], 'flushed right after the upsert succeeded, no timer advanced');
+  assert.deepEqual([...bridge.handoffs.keys()], [`${a}#1`]);
+  // Same through lead.sync (track() after hello resyncs at once).
+  await store.appendHandoff(input(b)); await settle();
+  assert.equal(store.pendingHandoffs().length, 1);
+  store.track(() => [record(a), record(b)]); await settle();
+  assert.deepEqual(store.pendingHandoffs(), []);
+  assert.deepEqual([...bridge.handoffs.keys()], [`${a}#1`, `${b}#1`]);
+  // A later upsert with nothing held sends no extra handoff pass.
+  const sent = bridge.ops('lead.handoff').length;
+  t.mock.timers.tick(LEAD_UPSERT_DEBOUNCE_MS);
+  store.upsert(record(a, { updated_at: 3_000 })); await settle();
+  assert.equal(bridge.ops('lead.handoff').length, sent);
+});
+
+test('flush order holds when the outbox bound drops a held entry at the front while an RPC is in flight', async (t) => {
+  const { bridge, store, logs } = relay(t);
+  const a = newLead(), b = newLead();
+  let releaseB1!: () => void;
+  bridge.respond = (op, args) => {
+    if (op !== 'lead.handoff') return bridge.fakeDo(op, args);
+    if (args.handoff.lead === a) throw new LeadRpcError('not_found', op, 'unknown Lead');
+    if (args.handoff.seq === 1 && !bridge.handoffs.has(`${b}#1`)) return new Promise((resolve) => { releaseB1 = () => resolve(bridge.fakeDo(op, args)); });
+    return bridge.fakeDo(op, args);
+  };
+  // Outbox: [A1 (held), B1, B2, B3, A2..A20] — Lead a at the per-Lead cap.
+  await store.appendHandoff(input(a));
+  for (let i = 0; i < 3; i++) await store.appendHandoff(input(b));
+  for (let i = 1; i < MAX_OUTBOX_PER_LEAD; i++) await store.appendHandoff(input(a));
+  bridge.setConnected(true); await settle();
+  assert.deepEqual(bridge.ops('lead.handoff').map((c) => [c.args.handoff.lead, c.args.handoff.seq]), [[a, 1], [b, 1]], 'B1 in flight');
+  // A21 arrives while B1 is in flight: the bound drops A1 from the front of the outbox.
+  await store.appendHandoff(input(a));
+  assert.equal(store.pendingHandoffs()[0]!.lead, b, 'A1 was dropped from the front');
+  assert.ok(logs.some((l) => /dropped the 1 oldest undelivered handoff/.test(l)));
+  releaseB1(); await settle();
+  assert.deepEqual(bridge.ops('lead.handoff').filter((c) => c.args.handoff.lead === b).map((c) => c.args.handoff.seq), [1, 2, 3], 'B2 is not skipped past');
+  assert.deepEqual([...bridge.handoffs.keys()], [`${b}#1`, `${b}#2`, `${b}#3`]);
+  assert.equal(store.pendingHandoffs().length, MAX_OUTBOX_PER_LEAD, "only Lead a's held entries remain");
+});
+
+test('a handoff refused not_found for longer than the max age is dropped from the outbox, logged, kept locally', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  const dir = home(t);
+  const { bridge, store, logs } = relay(t, { home: dir });
+  const a = newLead();
+  bridge.respond = (op, args) => {
+    if (op === 'lead.handoff') throw new LeadRpcError('not_found', op, 'unknown Lead');
+    return bridge.fakeDo(op, args);
+  };
+  bridge.setConnected(true); await settle();
+  await store.appendHandoff(input(a)); await settle();
+  t.mock.timers.setTime(100_000 + LEAD_OUTBOX_MAX_AGE_MS - LEAD_RESYNC_INTERVAL_MS);
+  t.mock.timers.tick(LEAD_RESYNC_INTERVAL_MS); await settle();
+  assert.equal(store.pendingHandoffs().length, 1, 'still held at exactly the max age');
+  const tries = bridge.ops('lead.handoff').length;
+  t.mock.timers.tick(LEAD_RESYNC_INTERVAL_MS); await settle();
+  assert.equal(bridge.ops('lead.handoff').length, tries + 1);
+  assert.deepEqual(store.pendingHandoffs(), [], 'dropped once past the max age');
+  assert.ok(logs.some((l) => /handoff 1 of fm:.* waited over 24 h .*dropped from the outbox/.test(l)));
+  assert.equal(existsSync(join(dir, 'leads', 'outbox.json')), false);
+  assert.equal(readFileSync(join(dir, 'leads', `${a.slice(3)}.jsonl`), 'utf8').trim().split('\n').length, 1, 'kept in the local log');
+  t.mock.timers.tick(LEAD_RESYNC_INTERVAL_MS * 2); await settle();
+  assert.equal(bridge.ops('lead.handoff').length, tries + 1, 'never retried');
 });
 
 // ---------------------------------------------------------------------------------------------
