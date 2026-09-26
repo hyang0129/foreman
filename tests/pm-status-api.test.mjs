@@ -143,7 +143,7 @@ test('an invalid cloud.json runs no PM: sends answer 503 naming the cause, and n
     mkdirSync(join(dir, 'memory'), { recursive:true });
     writeFileSync(join(dir, 'memory', 'PROJECTS.md'), '# Projects\n\n## zebra-project\n');
   });
-  const cause = /cloud\.json is invalid \(Invalid cloud\.json\); the PM is unavailable on this machine/;
+  const cause = /cloud\.json is invalid \(Invalid cloud\.json\); the Coordinator is unavailable on this machine/;
   const history = await fetch(`${origin}/api/pm/history?summary=1`, { headers }).then((r) => r.json());
   assert.match(history.error, cause);
   const res = await fetch(`${origin}/api/pm/message`, { method:'POST', headers:{ ...headers, 'content-type':'application/json' }, body:JSON.stringify({ text:'hello' }) });

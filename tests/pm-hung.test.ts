@@ -66,7 +66,7 @@ function harness(t: any, options: { frameWhileHung?: boolean } = {}) {
 }
 const tick = () => new Promise((r) => setTimeout(r, 10));
 async function until(check: () => boolean) { for (let i = 0; i < 200 && !check(); i++) await tick(); assert.ok(check(), 'condition not reached'); }
-const hungEntries = (pm: any) => pm.history().filter((e: any) => /could not be confirmed \(the PM stopped responding\)/.test(e.text ?? ''));
+const hungEntries = (pm: any) => pm.history().filter((e: any) => /could not be confirmed \(the Coordinator stopped responding\)/.test(e.text ?? ''));
 
 test('before the threshold (threshold − 1 ms) a send queues behind the silent provider', async (t) => {
   const h = harness(t);
@@ -94,7 +94,7 @@ test('at the threshold the next send marks every outstanding input uncertain, re
   await until(() => h.pm.history().some((e) => e.text === 'answer: C'));
   const entries = hungEntries(h.pm);
   assert.equal(entries.length, 2, 'one entry per outstanding input');
-  assert.match(entries[0].text, /^Your message sent at 2026-09-24 12:00 UTC to the PM on machine-b could not be confirmed \(the PM stopped responding\)\. It was not replayed\.$/);
+  assert.match(entries[0].text, /^Your message sent at 2026-09-24 12:00 UTC to the Coordinator on machine-b could not be confirmed \(the Coordinator stopped responding\)\. It was not replayed\.$/);
   assert.match(entries[1].text, /sent at 2026-09-24 12:00 UTC/);
   assert.ok(entries.every((e: any) => e.error === true));
   assert.deepEqual(h.ends.slice(0, 2), [[owed[0], 'uncertain'], [owed[1], 'uncertain']]);
@@ -105,7 +105,7 @@ test('at the threshold the next send marks every outstanding input uncertain, re
   // The conversation is kept, with the hung entries, the fresh-session notice, then the new exchange.
   const texts = h.pm.history().map((e) => e.text);
   assert.deepEqual(texts.slice(0, 2), ['A', 'B']);
-  assert.ok(texts.indexOf('Started a fresh PM session. It answers from memory, not from the messages above.') < texts.indexOf('C'));
+  assert.ok(texts.indexOf('Started a fresh Coordinator session. It answers from memory, not from the messages above.') < texts.indexOf('C'));
   assert.equal(h.pm.lastError, null, 'the fresh session answered');
 });
 

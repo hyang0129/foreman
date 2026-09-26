@@ -219,7 +219,7 @@ test('two machines: A answers from imported memory, a move closes A (sends name 
   await B.connect();
   await tick();
   assert.equal(B.launches.length, 0);
-  await assert.rejects(B.pm.send('hello?'), /^Error: The PM runs on machine-a\.$/);
+  await assert.rejects(B.pm.send('hello?'), /^Error: The Coordinator runs on machine-a\.$/);
 
   // A has a turn in flight when the developer moves the PM.
   await A.pm.send('HOLD: a long request');
@@ -231,7 +231,7 @@ test('two machines: A answers from imported memory, a move closes A (sends name 
   await until(() => B.launches.length === 1, 'B started a fresh PM');
 
   // A: the PM is closed, sends are refused naming B, and the in-flight turn is not reported here.
-  await assert.rejects(A.pm.send('still here?'), /The PM runs on machine-b\./);
+  await assert.rejects(A.pm.send('still here?'), /The Coordinator runs on machine-b\./);
   A.release(); await tick();
   assert.equal(A.uncertain().length, 0);
   assert.equal(A.answers().length, 1, 'the closed provider reports nothing after the move');
@@ -241,7 +241,7 @@ test('two machines: A answers from imported memory, a move closes A (sends name 
   await until(() => !relay.turns.has(inFlight), 'B acknowledged the uncertain turn');
   const history = B.pm.history();
   assert.equal(history.length, 1);
-  assert.match(history[0]!.text!, /^Your message sent at \d{4}-\d\d-\d\d \d\d:\d\d UTC to the PM on machine-a could not be confirmed \(the PM was moved\)\. It was not replayed\.$/);
+  assert.match(history[0]!.text!, /^Your message sent at \d{4}-\d\d-\d\d \d\d:\d\d UTC to the Coordinator on machine-a could not be confirmed \(the Coordinator was moved\)\. It was not replayed\.$/);
   assert.equal(history[0]!.error, true);
   assert.equal(B.pm.lastError, history[0]!.text);
   assert.deepEqual(B.launches[0]!.consumed, [], 'nothing is replayed on B');
@@ -269,7 +269,7 @@ test('two machines: A answers from imported memory, a move closes A (sends name 
   assert.deepEqual(A.pm.history(), [], 'nothing was in flight on B, so A starts empty');
   assert.equal(A.pm.lastError, null);
   assert.match(A.launches[1]!.prompt, /CANARY_WRITTEN_ON_A/);
-  await assert.rejects(B.pm.send('still B?'), /The PM runs on machine-a\./);
+  await assert.rejects(B.pm.send('still B?'), /The Coordinator runs on machine-a\./);
 
   // Neither home got a transcript or a session file.
   for (const dir of [homeA, homeB]) assert.deepEqual(readdirSync(join(dir, 'pm')).filter((f) => f !== 'settings.json'), []);
@@ -288,7 +288,7 @@ test('a machine lost mid-turn: the move reports host_lost once on the new host',
   await until(() => B.launches.length === 1);
   await until(() => relay.turns.size === 0);
   assert.equal(B.uncertain().length, 1);
-  assert.match(B.uncertain()[0]!, /to the PM on machine-a could not be confirmed \(machine went offline\)\. It was not replayed\./);
+  assert.match(B.uncertain()[0]!, /to the Coordinator on machine-a could not be confirmed \(machine went offline\)\. It was not replayed\./);
 });
 
 test('a restart of B with an open turn: one "Foreman restarted" entry after the restart, and no replay', { timeout: 20_000 }, async (t) => {
@@ -306,7 +306,7 @@ test('a restart of B with an open turn: one "Foreman restarted" entry after the 
   await until(() => B2.launches.length === 1);
   await until(() => !relay.turns.has(turn), 'acknowledged');
   assert.deepEqual(B2.uncertain(), [B2.pm.history()[0]!.text]);
-  assert.match(B2.uncertain()[0]!, /to the PM on machine-b could not be confirmed \(Foreman restarted\)\. It was not replayed\./);
+  assert.match(B2.uncertain()[0]!, /to the Coordinator on machine-b could not be confirmed \(Foreman restarted\)\. It was not replayed\./);
   await tick(); await tick();
   assert.deepEqual(B2.launches[0]!.consumed, [], 'not replayed');
   // A second restart shows nothing: the entry was acknowledged.
@@ -325,7 +325,7 @@ test('a socket blip on B mid-turn: sends are refused while disconnected, the tur
   const turn = B.pm.outstandingTurnIds()[0]!;
   B.drop();
   await tick();
-  await assert.rejects(B.pm.send('while offline'), /^Error: The cloud relay is unreachable; the PM is unavailable on this machine\.$/);
+  await assert.rejects(B.pm.send('while offline'), /^Error: The cloud relay is unreachable; the Coordinator is unavailable on this machine\.$/);
   // The running turn finishes while the socket is down; its end is queued.
   B.release();
   await until(() => B.answers().length === 1);
@@ -436,7 +436,7 @@ test('local-only mode: a restart mid-turn reports one uncertain entry, with no r
   const second = run(store);
   const uncertain = second.pm.history().filter((e) => e.error);
   assert.equal(uncertain.length, 1);
-  assert.match(uncertain[0]!.text!, /to the PM on laptop could not be confirmed \(Foreman restarted\)\. It was not replayed\./);
+  assert.match(uncertain[0]!.text!, /to the Coordinator on laptop could not be confirmed \(Foreman restarted\)\. It was not replayed\./);
   await tick(); await tick();
   assert.deepEqual(second.consumed, []);
   assert.deepEqual(store.uncertainTurns(), [], 'acknowledged');
@@ -476,7 +476,7 @@ test('#115: a send whose epoch changes across beginTurn (A→B→A) is not dispa
     setTimeout(() => A.sockets.at(-1)!.receive(ack), 50);
     return true;
   };
-  await assert.rejects(A.pm.send('must not be dispatched'), /^Error: The PM was moved while your message was being sent\. It was not delivered; send it again\.$/);
+  await assert.rejects(A.pm.send('must not be dispatched'), /^Error: The Coordinator was moved while your message was being sent\. It was not delivered; send it again\.$/);
   await until(() => A.launches.length === 2, 'A restarted its PM at epoch 3');
   await tick(); await tick();
   for (const launch of A.launches) assert.ok(!launch.consumed.includes('must not be dispatched'), 'never dispatched');
@@ -484,7 +484,7 @@ test('#115: a send whose epoch changes across beginTurn (A→B→A) is not dispa
   assert.equal(A.pm.history().some((e) => e.role === 'user'), false, 'not recorded as sent');
   // The relay reported it as reassigned; A shows exactly that entry, and never ends it as completed.
   assert.equal(A.uncertain().length, 1);
-  assert.match(A.uncertain()[0]!, /could not be confirmed \(the PM was moved\)\. It was not replayed\./);
+  assert.match(A.uncertain()[0]!, /could not be confirmed \(the Coordinator was moved\)\. It was not replayed\./);
   assert.equal(ends.some(([id, outcome]) => id === turnId && outcome === 'completed'), false);
   await until(() => !relay.turns.has(turnId), 'A acknowledged the uncertain turn');
   // The PM keeps working at the new epoch.
@@ -510,7 +510,7 @@ test('#115: a move while the provider is being launched for a send: nothing is r
     if (armed && frame.op === 'memory.get') { armed = false; relay.reassign(B.identity.machine_id); }
     return false;
   };
-  await assert.rejects(A.pm.send('sent during the move'), /^Error: The PM was moved to machine-b while your message was being sent\. It was not delivered; send it again there\.$/);
+  await assert.rejects(A.pm.send('sent during the move'), /^Error: The Coordinator was moved to machine-b while your message was being sent\. It was not delivered; send it again there\.$/);
   assert.equal(armed, false, 'the move happened during the launch');
   await until(() => B.launches.length === 1, 'B started its PM');
   await tick(); await tick();
@@ -539,7 +539,7 @@ test('#115: deactivation never ends an in-flight input as completed; the relay r
   assert.equal(relay.frames.some((f) => f.machine_id === A.identity.machine_id && f.frame.op === 'turn.end'), false);
   assert.deepEqual(A.pm.outstandingTurnIds(), []);
   await until(() => B.uncertain().length === 1, 'B reports the reassigned turn');
-  assert.match(B.uncertain()[0]!, /could not be confirmed \(the PM was moved\)/);
+  assert.match(B.uncertain()[0]!, /could not be confirmed \(the Coordinator was moved\)/);
   await until(() => !relay.turns.has(inFlight), 'B acknowledged it');
 });
 
@@ -551,7 +551,7 @@ test('store selection: absent relay config is local; configured-but-invalid is n
   assert.deepEqual(choosePmStore(() => null, false, noEnv), { mode: 'local' }, 'no cloud.json: local store');
   assert.deepEqual(choosePmStore(() => ({ url: 'wss://relay', token: TOKEN }), true, noEnv), { mode: 'relay' });
   const invalid = choosePmStore(() => { throw new Error('Invalid cloud.json'); }, false, noEnv);
-  assert.deepEqual(invalid, { mode: 'unavailable', reason: 'cloud.json is invalid (Invalid cloud.json); the PM is unavailable on this machine' });
+  assert.deepEqual(invalid, { mode: 'unavailable', reason: 'cloud.json is invalid (Invalid cloud.json); the Coordinator is unavailable on this machine' });
   const badMode = choosePmStore(() => { throw new Error('cloud.json must be an owned regular file with mode 0600'); }, false, noEnv);
   assert.equal(badMode.mode, 'unavailable');
   const badEnv = choosePmStore(() => { throw new Error('Set both FOREMAN_RELAY_URL and FOREMAN_HOST_TOKEN'); }, false, { FOREMAN_RELAY_URL: 'wss://relay' });
@@ -566,7 +566,7 @@ test('store selection: absent relay config is local; configured-but-invalid is n
   const pm = new ProjectManager({} as any, { machineName: 'laptop' });
   t.after(() => pm.close());
   pm.failUnavailable((invalid as { reason: string }).reason);
-  await assert.rejects(pm.send('hello'), /cloud\.json is invalid \(Invalid cloud\.json\); the PM is unavailable on this machine/);
+  await assert.rejects(pm.send('hello'), /cloud\.json is invalid \(Invalid cloud\.json\); the Coordinator is unavailable on this machine/);
   assert.match(pm.lastError!, /cloud\.json is invalid/);
   assert.equal(pm.history().filter((e) => e.role === 'user').length, 0, 'nothing was accepted');
 });
@@ -587,11 +587,11 @@ test('#122: a failed one-time import is reported as an import failure, not as "m
   };
   await A.connect();
   await until(() => A.pm.lastError !== null, 'the launch failure is reported');
-  assert.match(A.pm.lastError!, /the one-time import of this machine's PM memory into the cloud relay failed, so the PM did not start \(it is retried at the next start\): memory\.import frame is too large/);
+  assert.match(A.pm.lastError!, /the one-time import of this machine's Coordinator memory into the cloud relay failed, so the Coordinator did not start \(it is retried at the next start\): memory\.import frame is too large/);
   assert.doesNotMatch(A.pm.lastError!, /could not be read/);
   assert.equal(A.launches.length, 0, 'no provider started');
   // A send retries the import and rejects with the same specific cause; nothing is dispatched.
-  await assert.rejects(A.pm.send('hello'), /one-time import of this machine's PM memory into the cloud relay failed/);
+  await assert.rejects(A.pm.send('hello'), /one-time import of this machine's Coordinator memory into the cloud relay failed/);
   assert.equal(A.launches.length, 0);
   // Once the relay accepts it, the next send imports and starts the PM.
   relay.swallow = null;
@@ -614,7 +614,7 @@ test('#122: a memory read failure after a good import keeps its own wording', { 
   };
   await A.connect();
   await until(() => A.pm.lastError !== null, 'the launch failure is reported');
-  assert.match(A.pm.lastError!, /PM memory could not be read, so the PM did not start: PM state storage failed/);
+  assert.match(A.pm.lastError!, /Coordinator memory could not be read, so the Coordinator did not start: PM state storage failed/);
   assert.doesNotMatch(A.pm.lastError!, /import/);
 });
 
@@ -660,19 +660,19 @@ test('#122: while the relay refuses this machine by policy, sends name the refus
   clearTimeout((A.bridge as any).reconnect);
   const expected = new Date(retryAt).toISOString().slice(0, 16).replace('T', ' ');
   await assert.rejects(A.pm.send('hello'), (error: Error) => {
-    assert.equal(error.message, `The cloud relay is unreachable; the PM is unavailable on this machine. The relay refused this machine: Too many machines. It retries at ${expected} UTC.`);
+    assert.equal(error.message, `The cloud relay is unreachable; the Coordinator is unavailable on this machine. The relay refused this machine: Too many machines. It retries at ${expected} UTC.`);
     return true;
   });
   // An ordinary outage keeps the ordinary message.
   const B = daemon(t, relay, home('machine-b'), 'machine-b');
-  await assert.rejects(B.pm.send('hello'), /^Error: The cloud relay is unreachable; the PM is unavailable on this machine\.$/);
+  await assert.rejects(B.pm.send('hello'), /^Error: The cloud relay is unreachable; the Coordinator is unavailable on this machine\.$/);
 });
 
 test('#122: store selection names the bridge\'s own reason for a configured relay that did not start', () => {
   const config = () => ({ url: 'http://relay', token: TOKEN });
   assert.deepEqual(choosePmStore(config, false, {}, 'Relay URL must be an HTTPS origin'),
-    { mode: 'unavailable', reason: 'cloud.json is invalid (Relay URL must be an HTTPS origin); the PM is unavailable on this machine' });
+    { mode: 'unavailable', reason: 'cloud.json is invalid (Relay URL must be an HTTPS origin); the Coordinator is unavailable on this machine' });
   assert.deepEqual(choosePmStore(config, false, { FOREMAN_RELAY_URL: 'http://relay', FOREMAN_HOST_TOKEN: 'short' }, 'Invalid host token'),
-    { mode: 'unavailable', reason: 'the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN) is invalid (Invalid host token); the PM is unavailable on this machine' });
+    { mode: 'unavailable', reason: 'the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN) is invalid (Invalid host token); the Coordinator is unavailable on this machine' });
   assert.equal(choosePmStore(config, true, {}, 'ignored').mode, 'relay');
 });

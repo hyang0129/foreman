@@ -2,152 +2,142 @@
 import './fixtures/temp-foreman-home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, symlinkSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { setTimeout as delay } from 'node:timers/promises';
-import { Launcher, DEFAULT_LAUNCHER_MODEL } from '../server/launcher.ts';
-import { ProjectRegistry } from '../server/projects.ts';
+import { Launcher, relayLaunchDecision, launchDecisionMessageId, FOREMAN_SENDER } from '../server/launcher.ts';
+import { SessionService, LAUNCH_DECISION_EVENT, type LaunchDecisionEvent } from '../server/session-service.ts';
+import { effectiveDevSettings } from '../shared/roles.ts';
 
-function setup(t: any) {
+// Epic #157 D7: the propose flow is gone. What remains keeps the old launcher's native session
+// identities hidden from the fleet (launcher-sessions.json), across restarts.
+
+test('launcher-sessions.json keeps old launcher-owned native Claude rows hidden; nothing else is owned', (t) => {
   const home = mkdtempSync(join(tmpdir(), 'foreman-launch-test-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  const path = join(home, 'project'); mkdirSync(path);
-  const projects = new ProjectRegistry(home), project = projects.register({ name: 'personal', path });
-  const value = { project: project.id, provider: 'codex', model: 'codex-model', name: 'fix-sign-in', text: 'Repair sign-in and verify tests.', reason: 'Suited to implementation.' };
-  const catalog = { list: async (provider: string) => [{ value: `${provider}-model`, displayName: provider }] };
-  return { home, path, project, projects, value, catalog };
-}
-async function settled(launcher: Launcher, id: string) {
-  for (let i = 0; i < 100; i++) { const job = launcher.get(id); if (job.status !== 'working') return job; await delay(5); }
-  throw new Error('Launcher never settled');
-}
-const stream = (value: unknown) => Object.assign((async function* () { yield { type: 'result', subtype: 'success', is_error: false, result: typeof value === 'string' ? value : JSON.stringify(value) } as any; })(), { close() {} });
-test('launcher runs exact default with no capabilities and validates canonical proposal without creating work', async (t) => {
-  const f = setup(t); let calls = 0, cwd = '';
-  const launcher = new Launcher(f.projects, { catalog: f.catalog, query: ({ options, prompt }) => {
-    calls++; cwd = options.cwd!;
-    assert.equal(options.model, DEFAULT_LAUNCHER_MODEL); assert.equal(options.model, 'claude-sonnet-5');
-    assert.deepEqual(options.tools, []); assert.deepEqual(options.mcpServers, {}); assert.equal(options.strictMcpConfig, true);
-    assert.deepEqual(options.settingSources, []); assert.deepEqual(options.skills, []); assert.deepEqual(options.plugins, []);
-    assert.equal(options.persistSession, false); assert.equal(options.env?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1');
-    assert.equal(options.canUseTool, undefined); assert.equal(options.hooks, undefined); assert.equal(options.permissionMode, undefined);
-    assert.notEqual(cwd, f.path); assert.ok(existsSync(cwd));
-    assert.equal(JSON.parse(prompt).projects[0].id, f.project.id);
-    return stream(f.value);
-  } });
-  const id = randomUUID(), request = { id, brief: 'Fix sign-in in personal' };
-  launcher.start(request); launcher.start(request);
-  const result = await settled(launcher, id);
-  assert.equal(result.status, 'ready'); assert.equal(result.proposal?.cwd, f.projects.require('personal').path);
-  assert.equal(result.proposal?.model, 'codex-model'); assert.equal(result.proposal?.project, 'personal'); assert.equal(calls, 1);
-  assert.equal(existsSync(cwd), false); assert.equal(existsSync(join(f.home, 'sessions')), false);
-  assert.throws(() => launcher.start({ ...request, brief: 'different' }), /different brief/);
-  launcher.close();
-});
-for (const [label, change, match] of [
-  ['policy injection', { permission_mode: 'bypass' }, /unsupported/],
-  ['tool injection', { command: 'touch marker' }, /unsupported/],
-  ['unregistered path', { project: '/tmp' }, /registered project/],
-  ['unknown model', { model: 'invented' }, /unavailable provider or model/],
-  ['unknown provider', { provider: 'invented' }, /unavailable provider or model/],
-  ['invalid name', { name: 'Not Kebab' }, /kebab-case/],
-  ['empty task', { text: '' }, /first task/],
-] as const) test(`launcher rejects ${label}`, async (t) => {
-  const f = setup(t), launcher = new Launcher(f.projects, { catalog: f.catalog, query: () => stream({ ...f.value, ...change }) });
-  const { id } = launcher.start({ id: randomUUID(), brief: 'fixture' });
-  const result = await settled(launcher, id); assert.equal(result.status, 'failed'); assert.match(result.error!, match); assert.equal(result.proposal, undefined); launcher.close();
-});
-for (const [text, message] of [['not json', /unusable/], [JSON.stringify({ question: 'Which personal project do you mean?' }), /Which personal/], ['x'.repeat(100_001), /too much/]] as const) test(`launcher recovers from ${message}`, async (t) => {
-  const f = setup(t), launcher = new Launcher(f.projects, { catalog: f.catalog, query: () => stream(text) });
-  const result = await settled(launcher, launcher.start({ id: randomUUID(), brief: 'fixture' }).id);
-  assert.equal(result.status, 'failed'); assert.match(result.error!, message); launcher.close();
-});
-test('explicit model changes only launcher query and unavailable default never silently substitutes', async (t) => {
-  const f = setup(t), models: string[] = [];
-  const launcher = new Launcher(f.projects, { catalog: f.catalog, query: ({ options }) => {
-    models.push(options.model!);
-    return options.model === DEFAULT_LAUNCHER_MODEL ? Object.assign((async function* () { yield { type: 'result', subtype: 'error_during_execution', is_error: true } as any; })(), { close() {} }) : stream(f.value);
-  } });
-  let result = await settled(launcher, launcher.start({ id: randomUUID(), brief: 'fixture' }).id);
-  assert.equal(result.status, 'failed'); assert.match(result.error!, /claude-sonnet-5/);
-  result = await settled(launcher, launcher.start({ id: randomUUID(), brief: 'fixture', model: 'claude-model' }).id);
-  assert.equal(result.status, 'ready'); assert.deepEqual(models, ['claude-sonnet-5', 'claude-model']); assert.equal(result.proposal?.model, 'codex-model'); launcher.close();
-});
-test('cancellation overtakes POST, during catalog wait and in-flight SDK; delayed results never win', async (t) => {
-  const f = setup(t); let calls = 0, closed = 0, release!: () => void;
-  const pending = new Promise<void>((r) => { release = r; });
-  const launcher = new Launcher(f.projects, { catalog: f.catalog, query: () => {
-    calls++; return Object.assign((async function* () { await pending; yield { type: 'result', subtype: 'success', is_error: false, result: JSON.stringify(f.value) } as any; })(), { close() { closed++; } });
-  } });
-  const early = randomUUID(); launcher.cancel(early); assert.equal(launcher.start({ id: early, brief: 'fixture' }).status, 'cancelled');
-  const beforeCatalog = launcher.start({ id: randomUUID(), brief: 'fixture' }).id; launcher.cancel(beforeCatalog); await delay(5); assert.equal(calls, 0);
-  const during = launcher.start({ id: randomUUID(), brief: 'fixture' }).id; await delay(5); assert.equal(calls, 1);
-  launcher.cancel(during); assert.equal(closed, 1); release(); await delay(10);
-  assert.equal(launcher.get(during).status, 'cancelled'); assert.equal(launcher.get(during).proposal, undefined); launcher.close();
-});
-for (const method of ['timeout', 'close'] as const) test(`${method} aborts the actual active stream`, async (t) => {
-  const f = setup(t); let started = false, stopped = false;
-  const launcher = new Launcher(f.projects, { catalog: f.catalog, timeoutMs: 30, query: ({ options }) => {
-    started = true; return Object.assign((async function* () { await new Promise<void>((resolve) => options.abortController!.signal.addEventListener('abort', () => { stopped = true; resolve(); }, { once: true })); })(), { close() {} });
-  } });
-  const id = launcher.start({ id: randomUUID(), brief: 'fixture' }).id; await delay(5); assert.equal(started, true);
-  if (method === 'close') launcher.close();
-  const result = await settled(launcher, id); assert.equal(stopped, true); assert.equal(result.status, method === 'close' ? 'cancelled' : 'failed');
-  assert.equal(result.proposal, undefined); launcher.close();
-});
-test('project deletion and symlink retarget while proposing fail before publishing', async (t) => {
-  const f = setup(t), target = join(f.home, 'target'); mkdirSync(target); const link = join(f.home, 'link'); symlinkSync(f.path, link);
-  f.projects.register({ name: 'link', path: link });
-  for (const change of [() => { rmSync(link); symlinkSync(target, link); }, () => f.projects.remove(f.project.id)]) {
-    const launcher = new Launcher(f.projects, { catalog: f.catalog, query: () => { change(); return stream(f.value); } });
-    const result = await settled(launcher, launcher.start({ id: randomUUID(), brief: 'fixture' }).id);
-    assert.equal(result.status, 'failed'); assert.match(result.error!, /symlink target|Project changed/); launcher.close();
-  }
-});
-test('missing registry/catalog and tool-use output fail explicitly', async (t) => {
-  const f = setup(t); let calls = 0;
-  const launcher = new Launcher(f.projects, { catalog: { list: async () => { throw new Error('offline'); } }, query: () => { calls++; return stream(f.value); } });
-  let result = await settled(launcher, launcher.start({ id: randomUUID(), brief: 'fixture' }).id);
-  assert.match(result.error!, /catalogs are unavailable/); assert.equal(calls, 0); launcher.close();
-  const tools = new Launcher(f.projects, { catalog: f.catalog, query: () => Object.assign((async function* () { yield { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash' }] } } as any; })(), { close() {} }) });
-  result = await settled(tools, tools.start({ id: randomUUID(), brief: 'fixture' }).id);
-  assert.match(result.error!, /unsupported tool/); tools.close();
-  f.projects.remove(f.project.id);
-  const empty = new Launcher(f.projects, { catalog: f.catalog, query: () => { calls++; return stream(f.value); } });
-  result = await settled(empty, empty.start({ id: randomUUID(), brief: 'fixture' }).id); assert.match(result.error!, /No registered/); assert.equal(calls, 0); empty.close();
+  const identityFile = join(home, 'launcher-sessions.json');
+  const owned = randomUUID(), other = randomUUID();
+  writeFileSync(identityFile, JSON.stringify([owned]), { mode: 0o600 });
+  const launcher = new Launcher({ identityFile });
+  assert.equal(launcher.ownsSession({ provider: 'claude', session_id: owned }), true);
+  assert.equal(launcher.ownsSession({ provider: 'codex', session_id: owned }), false);
+  assert.equal(launcher.ownsSession({ provider: 'claude', session_id: other }), false);
+  // The file is only read, never rewritten.
+  assert.equal(readFileSync(identityFile, 'utf8'), JSON.stringify([owned]));
 });
 
-test('single observed JSON fence is accepted but prose, multiple fences and fenced policy fields still fail', async (t) => {
-  const f = setup(t);
-  for (const [text, expected] of [
-    ['```json\n' + JSON.stringify(f.value) + '\n```', 'ready'],
-    ['Before the proposal\n```json\n' + JSON.stringify(f.value) + '\n```', 'failed'],
-    ['```json\n' + JSON.stringify(f.value) + '\n```\n```json\n{}\n```', 'failed'],
-    ['```json\n' + JSON.stringify({ ...f.value, permission_mode: 'bypass' }) + '\n```', 'failed'],
-  ]) {
-    const launcher = new Launcher(f.projects, { catalog: f.catalog, query: () => stream(text) });
-    const result = await settled(launcher, launcher.start({ id: randomUUID(), brief: 'fixture' }).id);
-    assert.equal(result.status, expected); launcher.close();
-  }
+test('no identity file owns nothing; a malformed one is refused (as before) rather than ignored', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'foreman-launch-test-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const missing = new Launcher({ identityFile: join(home, 'launcher-sessions.json') });
+  assert.equal(missing.ownsSession({ provider: 'claude', session_id: randomUUID() }), false);
+  assert.equal(new Launcher().ownsSession({ provider: 'claude', session_id: randomUUID() }), false);
+  const bad = join(home, 'bad.json');
+  writeFileSync(bad, JSON.stringify(['not-a-uuid']));
+  assert.throws(() => new Launcher({ identityFile: bad }), /Invalid launcher session identities/);
 });
 
-test('host-generated native IDs are reserved before query and remain excluded after completion, cancellation and restart', async (t) => {
-  const f = setup(t), identityFile = join(f.home, 'launcher-sessions.json'); let nativeId = '', launcher: Launcher;
-  const id = randomUUID();
-  launcher = new Launcher(f.projects, { identityFile, catalog: f.catalog, query: ({ options }) => {
-    nativeId = options.sessionId!; assert.ok(nativeId); assert.notEqual(nativeId, id);
-    assert.equal(launcher.ownsSession({ provider: 'claude', session_id: nativeId }), true);
-    const restarted = new Launcher(f.projects, { identityFile });
-    assert.equal(restarted.ownsSession({ provider: 'claude', session_id: nativeId }), true); restarted.close();
-    return stream(f.value);
-  } });
-  assert.equal((await settled(launcher, launcher.start({ id, brief: 'fixture' }).id)).status, 'ready');
-  launcher.cancel(id); launcher.close();
-  const restarted = new Launcher(f.projects, { identityFile });
-  assert.equal(restarted.ownsSession({ provider: 'claude', session_id: nativeId }), true);
-  assert.equal(restarted.ownsSession({ provider: 'codex', session_id: nativeId }), false);
-  assert.equal(restarted.ownsSession({ provider: 'claude', session_id: id }), false);
-  restarted.close();
+test('the launcher has no propose, get or cancel API left', () => {
+  const launcher: any = new Launcher();
+  for (const method of ['start', 'get', 'cancel', 'close']) assert.equal(typeof launcher[method], 'undefined', method);
+});
+
+// --- launch_decision → a Foreman message to the Lead requester, and retire-on-approval ---------------
+
+class FakeClaude extends EventEmitter {
+  sent: { text: string; id: string }[] = [];
+  send(text: string, id: string) { this.sent.push({ text, id }); return { id, status: 'running' }; }
+  pendingApprovals() { return []; }
+  complete() { this.emit('receipt', { id: this.sent.at(-1)!.id, status: 'completed' }); }
+  close() {}
+}
+const until = async (check: () => boolean, label: string) => {
+  for (let i = 0; i < 400; i++) { if (check()) return; await new Promise((r) => setTimeout(r, 5)); }
+  assert.fail(label);
+};
+
+function decisionFixture(t: any) {
+  const home = mkdtempSync(join(tmpdir(), 'foreman-decision-test-'));
+  mkdirSync(join(home, 'project')); const project = realpathSync(join(home, 'project'));
+  const claudes = new Map<string, FakeClaude>(); let launching: FakeClaude[] = [];
+  const settings: any = { bypass_ask: true };
+  const service = new SessionService({ home, env: { FOREMAN_MAX_LEADS: '10' }, claudeFactory: (() => { const c = new FakeClaude(); launching.push(c); return c; }) as any, codexFactory: () => { throw new Error('codex'); } });
+  service.setGrantSource({ devSettings: async () => ({ settings: effectiveDevSettings(settings), versions: { roles: 0, bypass_grants: 0, bypass_ask: 0 }, updated_at: null }) });
+  const logs: unknown[][] = []; const relayed: Promise<void>[] = []; const events: LaunchDecisionEvent[] = [];
+  service.on(LAUNCH_DECISION_EVENT, (event: LaunchDecisionEvent) => { events.push(event); relayed.push(relayLaunchDecision(service, event, (...args) => logs.push(args))); });
+  t.after(() => { service.close(); rmSync(home, { recursive: true, force: true }); });
+  const startLead = async (name: string) => {
+    launching = [];
+    const result = await service.launchAgent({ id: randomUUID(), name, cwd: project, text: 'Lead the work', provider: 'claude', role: 'lead', requester_role: 'coordinator', launched_by: 'coordinator', workstream: name.replace(/^lead-/, ''), requested_mode: 'auto' });
+    assert.equal(result.status, 'started');
+    await until(() => service.detail(result.session_key).session.capabilities.message && launching.length === 1 && launching[0]!.sent.length === 1, `${name} ready`);
+    const claude = launching[0]!; claudes.set(result.session_key, claude);
+    claude.complete(); await until(() => service.detail(result.session_key).session.state === 'turn_finished', `${name} idle`);
+    return result;
+  };
+  const holdWorker = (lead: string, name: string) => service.launchAgent({ id: randomUUID(), name, cwd: project, text: 'Implement the fix', provider: 'claude', role: 'worker', requester_role: 'lead', launched_by: lead, parent: lead });
+  const holdLead = (supersedes: string) => service.launchAgent({ id: randomUUID(), name: 'lead-docs', cwd: project, text: 'Continue the docs work', provider: 'claude', role: 'lead', requester_role: 'coordinator', launched_by: 'coordinator', workstream: 'docs', supersedes });
+  return { service, project, claudes, logs, relayed, events, startLead, holdWorker, holdLead };
+}
+
+test('a decided held worker launch sends one Foreman message into the requesting Lead (denied and approved), never a duplicate', async (t) => {
+  const f = decisionFixture(t);
+  const lead = await f.startLead('lead-triage');
+  const denied = await f.holdWorker(lead.session_key, 'worker-a');
+  assert.equal(denied.status, 'awaiting_developer_approval');
+  const approval = f.service.approvals(denied.session_key)[0]!;
+  await f.service.approve(denied.session_key, approval.id, 'deny');
+  await Promise.all(f.relayed);
+  const receipts = () => f.service.detail(lead.session_key).receipts;
+  const deniedId = `foreman-launch:${approval.id}:denied`;
+  let receipt: any = receipts().find((r: any) => r.id === deniedId);
+  assert.ok(receipt, 'the Lead got a Foreman message for the denial');
+  assert.deepEqual(receipt.source, FOREMAN_SENDER);
+  assert.match(receipt.text, /denied the Bypass launch of your worker worker-a .*Nothing ran/);
+  assert.equal(launchDecisionMessageId(f.events[0]!), deniedId);
+  // The same event again (e.g. a duplicate listener call) is the same receipt, not a second message.
+  await relayLaunchDecision(f.service, f.events[0]!, () => {});
+  assert.equal(receipts().filter((r: any) => r.id === deniedId).length, 1);
+  // It reached the Lead's provider as a Foreman message, not as the developer.
+  const claude = f.claudes.get(lead.session_key)!;
+  await until(() => claude.sent.some((m) => m.id === deniedId), 'dispatched to the Lead');
+  assert.match(claude.sent.find((m) => m.id === deniedId)!.text, /^\[Message from Foreman session foreman\./);
+  claude.complete();
+
+  const approved = await f.holdWorker(lead.session_key, 'worker-b');
+  const second = f.service.approvals(approved.session_key)[0]!;
+  await f.service.approve(approved.session_key, second.id, 'allow');
+  await Promise.all(f.relayed);
+  receipt = receipts().find((r: any) => r.id === `foreman-launch:${second.id}:approved`);
+  assert.ok(receipt); assert.match(receipt.text, /approved the Bypass launch of your worker worker-b\b.*starting with Bypass/);
+  assert.deepEqual(f.logs, []);
+});
+
+test('an approved held Lead retires the Lead it supersedes; a denied one leaves it running; the Coordinator gets no session message', async (t) => {
+  const f = decisionFixture(t);
+  const old = await f.startLead('lead-docs');
+  const successor = await f.holdLead(old.session_key);
+  assert.equal(successor.status, 'awaiting_developer_approval');
+  const denied = await f.holdLead(old.session_key);
+  await f.service.approve(denied.session_key, f.service.approvals(denied.session_key)[0]!.id, 'deny');
+  await Promise.all(f.relayed);
+  assert.notEqual(f.service.detail(old.session_key).session.state, 'ended', 'a denied successor retires nothing');
+  await f.service.approve(successor.session_key, f.service.approvals(successor.session_key)[0]!.id, 'allow');
+  await Promise.all(f.relayed);
+  const retired = f.service.detail(old.session_key).session;
+  assert.equal(retired.state, 'ended');
+  assert.equal(retired.superseded_by, successor.session_key);
+  assert.match(String(retired.end_reason), /superseded by/);
+  assert.equal(f.service.detail(old.session_key).receipts.filter((r: any) => String(r.id).startsWith('foreman-launch:')).length, 0);
+});
+
+test('a decision for a Lead that cannot take messages is logged, not thrown, and never retried', async (t) => {
+  const f = decisionFixture(t);
+  const logs: unknown[][] = [];
+  const event: LaunchDecisionEvent = { session_key: `fm:${randomUUID()}`, name: 'worker-x', role: 'worker', requested_by: `fm:${randomUUID()}`, decision: 'expired', approval_id: 'launch-1', at: new Date().toISOString() };
+  await relayLaunchDecision(f.service, event, (...args) => logs.push(args));
+  assert.equal(logs.length, 1);
+  assert.match(String(logs[0]![0]), /could not tell the Lead/);
 });

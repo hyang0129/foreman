@@ -49,11 +49,10 @@ test('local daemon shuts down on SIGTERM with an open SSE client and no provider
     });
     assert.equal(wrongHostStatus, 403);
     assert.equal((await fetch(`${origin}/api/sessions`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', Origin: origin }, body: '[]' })).status, 400);
+    // Epic #157 D7: the launcher routes are gone (authenticated requests are not served either).
     const requestId = '11111111-1111-4111-8111-111111111111';
-    const cancelled = await fetch(`${origin}/api/launch/cancel`, { method: 'POST', headers, body: JSON.stringify({ id: requestId }) }).then((r) => r.json());
-    assert.equal(cancelled.status, 'cancelled');
-    const late = await fetch(`${origin}/api/launch/propose`, { method: 'POST', headers, body: JSON.stringify({ id: requestId, brief: 'Do not run' }) }).then((r) => r.json());
-    assert.equal(late.status, 'cancelled');
+    assert.equal((await fetch(`${origin}/api/launch/cancel`, { method: 'POST', headers, body: JSON.stringify({ id: requestId }) })).status, 404);
+    assert.equal((await fetch(`${origin}/api/launch/propose`, { method: 'POST', headers, body: JSON.stringify({ id: requestId, brief: 'Do not run' }) })).status, 404);
     assert.deepEqual(await fetch(`${origin}/api/sessions`, { headers }).then((r) => r.json()), []);
     const events = await fetch(`http://127.0.0.1:${port}/api/events`, {headers});
     reader = events.body.getReader(); await reader.read();
