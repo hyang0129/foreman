@@ -30,7 +30,7 @@ npm run service:restart
 npm run status
 ```
 
-Restart interrupts managed sessions and active Coordinator work. Every Lead and worker becomes unavailable (history kept, nothing replayed or respawned), and a Bypass launch still waiting for approval expires. The LaunchAgent restarts automatically and holds an AC-only sleep assertion. Keep the Mac awake, network-connected, and logged in. [Execution host details](docs/EXECUTION_HOST.md).
+Restart interrupts managed sessions and active Coordinator work. Every Lead and worker ends (history kept, nothing replayed or respawned), Leads move under Archived, and a Bypass launch still waiting for approval expires. The LaunchAgent restarts automatically and holds an AC-only sleep assertion. Keep the Mac awake, network-connected, and logged in. [Execution host details](docs/EXECUTION_HOST.md).
 
 ## Install on Android
 
@@ -70,7 +70,7 @@ The responsive inbox groups work needing your attention and shows provider, proj
 
 State lives under `~/.foreman` (override `FOREMAN_HOME`): managed snapshots/receipts, hook observations, the project registry, this machine's identity, and the private cloud pairing. The Coordinator's memory, the Lead registry, synced handoffs and the developer's settings live in the cloud relay; without one, memory is in `pm/state.json` and there are no settings (see [Portable Coordinator](#portable-coordinator-and-more-machines)). Each Lead's handoffs are also kept on its machine under `leads/`. An exclusive service lock prevents simultaneous writers. Browser refresh restores history. Reusing a managed creation/message ID with identical input returns the existing result; different input is rejected.
 
-After daemon restart, unfinished receipts become uncertain and recovered sessions become read-only. Nothing is automatically replayed or resumed. Start a new session to continue; for a Lead, ask the Coordinator for a successor, which is seeded from the Lead's last handoff. The Coordinator keeps no conversation history: its conversation starts empty after a restart, and a message interrupted by the restart is reported once as uncertain, not replayed. Arbitrary takeover of a live terminal/desktop, multiple users, and seeing or starting sessions (including Leads) on a machine that does not run the Coordinator from the hosted app are deferred (#162). Push notifications exist only on the hosted app (see [Install on Android](#install-on-android)), not at `localhost:4177`.
+After daemon restart, unfinished receipts become uncertain and recovered sessions become read-only. Nothing is automatically replayed or resumed. Start a new session to continue; for a Lead, ask the Coordinator for a successor, which is seeded from the Lead's last handoff. The Coordinator keeps listing restarted Leads that have no successor yet, so it can offer one. The Coordinator keeps no conversation history: its conversation starts empty after a restart, and a message interrupted by the restart is reported once as uncertain, not replayed. Arbitrary takeover of a live terminal/desktop, multiple users, and seeing or starting sessions (including Leads) on a machine that does not run the Coordinator from the hosted app are deferred (#162). Push notifications exist only on the hosted app (see [Install on Android](#install-on-android)), not at `localhost:4177`.
 
 The Coordinator reads only specific existing documents on its own thread: no Bash, Glob, Grep, file writes, code, or `spawn_session`. Its only subagents are read-only investigators (a strict allowlist of `gh` and `git` read commands, no access to Foreman state or credential directories, at most 3 at a time). It reaches its memory only through its memory tools and cannot directly read Foreman configuration. Leads and workers perform implementation work under their launch mode, which cannot change while they run; Foreman adds no sandbox.
 
@@ -80,7 +80,7 @@ The Coordinator's memory (projects, preferences, its log and its model) lives in
 
 When upgrading to a release that changes the relay (such as the Lead registry and Settings), deploy the Worker first (`npm run cloud:deploy`), then restart the host.
 
-- [Add a second machine](docs/CLOUD_SETUP.md#add-a-second-machine) and [upgrade order](docs/CLOUD_SETUP.md#upgrading-to-the-portable-pm)
+- [Add a second machine](docs/CLOUD_SETUP.md#add-a-second-machine) and [upgrade order](docs/CLOUD_SETUP.md#upgrading-to-portable-coordinator-memory)
 - [More than one machine](docs/EXECUTION_HOST.md#more-than-one-machine), [moving the Coordinator](docs/EXECUTION_HOST.md#moving-the-pm), [Leads, settings and routes](docs/EXECUTION_HOST.md#leads-settings-and-routes) and the [Linux host](docs/EXECUTION_HOST.md#linux-host) note
 - [PM memory and the PM host](docs/DESIGN.md#pm-memory-and-the-pm-host): the one-time import, uncertain messages, the hung-provider rule, and the `~/.foreman` layout
 

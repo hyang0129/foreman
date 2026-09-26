@@ -103,8 +103,10 @@ and appends it to the system prompt (`agents/coordinator-system-prompt.md`): the
 `preferences` docs, the newest 40 log entries, and a `## leads` section. That section lists up to 20
 non-archived Leads from the Lead registry, newest first, with state, mode, pending approvals,
 workers, the latest handoff's status and summary, and whether each Lead is on this machine or "on
-<machine>, not reachable from here". The registry read is bounded to 3 s; when it fails, the section
-says so. The Coordinator's durable state is that memory, not its conversations.
+<machine>, not reachable from here". After them it lists Leads ended by a restart and not yet
+superseded (at most 5 of the 20), marked "ended (restarted)" with their latest handoff, so the
+Coordinator can offer the developer a successor. The registry read is bounded to 3 s; when it
+fails, the section says so. The Coordinator's durable state is that memory, not its conversations.
 
 **Model and effort.** The model is the saved `pm_settings.model`, then `FOREMAN_PM_MODEL`, then the
 role default `opus[1m]` (Opus 5.5). Effort comes from the role config: the developer's Settings
@@ -224,6 +226,9 @@ force?, machine? }`:
   `FOREMAN_LEAD_EFFORT`, then `opus[1m]` at `medium`.
 - `goal` must not contain filesystem paths. The Lead's first message is the goal and first task,
   plus the predecessor's handoff and live workers when it supersedes one.
+- The result reports `seeded_from` (`{ lead, seq, kind }` of the predecessor handoff the new Lead
+  was seeded from, or `null`) and `own_seed_seq` (the `seq` of the new Lead's own `seed` handoff).
+  If that seed handoff could not be recorded, the Lead still runs and `own_seed_error` says so.
 
 A Lead's `spawn_session { name, prompt, model?, effort?, permission_mode?, cwd? }` starts a managed
 Claude worker (no `bg` or `tab` modes). `cwd` defaults to the Lead's own checkout; otherwise it is a
@@ -241,7 +246,8 @@ Enforced by the host, not the prompt, and checked before and after the grant rea
 - at most **4 active workers per Lead** (`FOREMAN_MAX_WORKERS_PER_LEAD`).
 
 The overrides are positive integers; anything else keeps the default. They are read from the
-daemon's environment; the macOS service installer does not copy them into the installed service.
+daemon's environment; the macOS service installer does not copy them into the installed service,
+and the dev preview scripts (`npm run dev:*`) refuse any inherited `FOREMAN_*` variable.
 Active means not `ended`, `dead` or `unknown`. Held Bypass launches count toward both limits. A Lead
 that the new launch supersedes is not counted, so superseding one of 3 Leads works with every slot
 in use. The refusal names the limit and its variable.
@@ -313,13 +319,25 @@ and the Coordinator's memory, but has no chat row there (#162).
 
 ### Restart
 
-A daemon restart ends every Lead's provider, like every managed session: the Lead becomes
-unavailable (state `unknown`, "Foreman restarted…"), its history stays readable, and unfinished
-messages become uncertain and are never replayed. Nothing respawns automatically. The registry keeps
-its row with that state and reason. The Coordinator does not react on its own (it gets no automatic
-turns); when the developer next asks, it treats the Lead as dead and starts a successor seeded from
-the last handoff. A held launch expires on restart
-(see [Held launches](SESSION_PERMISSIONS.md#held-launches)).
+A daemon restart ends every Lead's provider, like every managed session. The host's own session
+row stays `unknown` ("Foreman restarted…"), its history stays readable, and unfinished messages
+become uncertain and are never replayed. Nothing respawns automatically.
+
+- **The registry reports it as ended.** The Lead's registry row says state `dead` with
+  `end_reason: restarted`, so the relay marks it ended and the app moves its chat under
+  **Archived**. Its workers are reported `dead` the same way (`list_workers` shows their
+  `end_reason`), and a successor is not seeded with them as live workers.
+- **The Coordinator still sees it.** `list_leads` hides ended Leads unless `include_ended`, except
+  a restarted Lead that has not been superseded: it stays listed as ended, with a hint to start a
+  successor with `start_lead`. The `## leads` memory block lists such Leads too. A row synced by an
+  older host that still says `unknown` for a Lead that is not alive is shown as ended
+  (`end_reason: unavailable` when it has none).
+- **A successor is started on request.** The Coordinator gets no automatic turns. When the developer
+  next asks, it offers a successor: `start_lead` on the same project and workstream (or with
+  `supersedes`) seeds the new Lead from the restarted Lead's latest handoff and retires it with
+  `superseded by <key>`.
+
+A held launch expires on restart (see [Held launches](SESSION_PERMISSIONS.md#held-launches)).
 
 ## PM memory and the PM host
 
@@ -401,7 +419,7 @@ The Durable Object records exactly one **active PM host**, with an **epoch** (`c
 **Relay traffic goes only to the active PM host**: sessions, projects and the Coordinator alike.
 Other connected machines are standbys. They receive no relayed requests, and the hosted app shows
 them only in the Move Coordinator dialog's machine list. When the PM host is down, relayed requests get 503
-"Your PM's machine (<name>) is offline." The hosted app's host status and the offline push
+"Your Coordinator's machine (<name>) is offline." The hosted app's host status and the offline push
 notification follow the active PM host too. The Worker answers `GET` and `POST /api/pm/host`,
 `GET /api/leads`, and `GET` and `POST /api/settings` itself and never relays them, so the machine
 list, Move Coordinator, the Lead registry and Settings work while the PM host is offline. Standbys
