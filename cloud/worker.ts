@@ -393,8 +393,8 @@ export class HostRelay extends DurableObject<Env> {
     else {
       const machineId = HostRelay.attachment(socket)?.machine_id;
       try {
-        result = machineId ? this.pm.execute(machineId, parsed.value, Date.now()) : pmRpcError(parsed.value.id, 'not_active', 'Send a protocol 2 hello before PM state requests');
-      } catch { result = pmRpcError(parsed.value.id, 'unavailable', 'PM state storage failed'); }
+        result = machineId ? this.pm.execute(machineId, parsed.value, Date.now()) : pmRpcError(parsed.value.id, 'not_active', 'Send a protocol 2 hello before Coordinator state requests');
+      } catch { result = pmRpcError(parsed.value.id, 'unavailable', 'Coordinator state storage failed'); }
     }
     if (result) try { socket.send(JSON.stringify(result)); } catch {}
   }
@@ -471,9 +471,9 @@ export class HostRelay extends DurableObject<Env> {
     if (!this.pm.machine(target)) return json({ error: 'Unknown machine' }, 404);
     const current = this.pm.assignment();
     const name = this.pm.machineName(target);
-    if ((current?.epoch ?? 0) !== expected_epoch) return json({ error: 'The PM host changed since this page loaded. Refresh and try again.' }, 409);
-    if (current?.machine_id === target) return badRequest(`The PM already runs on ${name}.`);
-    if (!isOnline(target)) return json({ error: `${name} is offline. The PM can move only to an online machine.` }, 409);
+    if ((current?.epoch ?? 0) !== expected_epoch) return json({ error: 'The Coordinator host changed since this page loaded. Refresh and try again.' }, 409);
+    if (current?.machine_id === target) return badRequest(`The Coordinator already runs on ${name}.`);
+    if (!isOnline(target)) return json({ error: `${name} is offline. The Coordinator can move only to an online machine.` }, 409);
     const assignment = this.pm.reassign(target, Date.now(), isOnline);
     // Every connected machine learns the new assignment; only the new host gets the uncertain turns.
     for (const socket of this.ctx.getWebSockets('host')) {

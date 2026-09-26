@@ -103,7 +103,7 @@ async function fixture(page: Page, options: { machines?: Machine[]; active?: str
     } else if (!active?.online) {
       // Relayed routes while the PM's machine is offline (contract D).
       status = 503;
-      result = { error: `Your PM's machine (${active?.name}) is offline.` };
+      result = { error: `Your Coordinator's machine (${active?.name}) is offline.` };
     } else if (path === "/api/sessions") result = [structuredClone(managed)];
     else if (path === "/api/session")
       result = { session: managed, history: [{ id: "r", role: "assistant", text: "Working on it." }], receipts: [], approvals: [] };
@@ -617,7 +617,7 @@ test("a slow /api/pm/host answer does not hold up the session list", async ({ pa
 test("the relay-mode local UI shows this machine's own view and points to the hosted app", async ({ page }) => {
   const state = await fixture(page);
   const view = (over: object) => ({
-    error: "The cloud relay answers /api/pm/host; open the hosted app to see every machine or move the PM.",
+    error: "The cloud relay answers /api/pm/host; open the hosted app to see every machine or move the Coordinator.",
     view: { mode: "relay", connected: true, this_machine_active: true, epoch: 4,
       active_machine: { machine_id: A, host: "machine-a" }, this_machine: { machine_id: A, name: "machine-a" }, ...over },
   });

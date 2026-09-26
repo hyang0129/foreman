@@ -333,7 +333,7 @@ export class HostBridge {
     for (const [id, call] of this.pending) {
       if (call.socket !== socket) continue;
       this.pending.delete(id); clearTimeout(call.timer);
-      call.reject(new PmRpcError('disconnected', call.op, call.epoch, 'The cloud relay connection closed before the PM state store answered.'));
+      call.reject(new PmRpcError('disconnected', call.op, call.epoch, 'The cloud relay connection closed before the Coordinator state store answered.'));
     }
     for (const [id, call] of this.leadPending) {
       if (call.socket !== socket) continue;
@@ -383,7 +383,7 @@ export class HostBridge {
     if (!checked.ok) return fail(checked.code, checked.error);
     const socket = this.socket;
     if (this.stopped || !socket || !this.connected) return fail('disconnected', 'The cloud relay is not connected.');
-    if (this.pending.size >= PM_RPC_MAX_PENDING) return fail('unavailable', 'Too many PM state requests are outstanding.');
+    if (this.pending.size >= PM_RPC_MAX_PENDING) return fail('unavailable', 'Too many Coordinator state requests are outstanding.');
     const id = `rpc-${Date.now().toString(36)}-${(++this.rpcSeq).toString(36)}`;
     const raw = JSON.stringify({ type: 'pm_rpc', id, epoch, op, args: checked.value });
     if (utf8Length(raw) > (op === 'memory.import' ? MAX_PM_IMPORT_FRAME : MAX_PM_FRAME)) return fail('too_large', `${op} frame is too large`);
@@ -391,7 +391,7 @@ export class HostBridge {
     return new Promise<PmOpResults[O]>((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!this.pending.delete(id)) return;
-        reject(new PmRpcError('timeout', op, epoch, `The PM state store did not answer ${op} within ${Math.ceil(timeoutMs / 1000)} s.`));
+        reject(new PmRpcError('timeout', op, epoch, `The Coordinator state store did not answer ${op} within ${Math.ceil(timeoutMs / 1000)} s.`));
       }, timeoutMs);
       this.pending.set(id, { op, epoch, socket, timer, resolve, reject });
       try { socket.send(raw); }

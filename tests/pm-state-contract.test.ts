@@ -42,7 +42,7 @@ test('constants match the sprint contract', () => {
     assert.ok(PM_DO_SCHEMA.some((s) => s.startsWith(`CREATE TABLE IF NOT EXISTS ${table} (`)), table);
   }
   assert.equal(PM_HOST_LOCAL_ONLY_ERROR, 'Reassignment needs the cloud relay');
-  assert.equal(pmHostOfflineMessage('machine-b'), "Your PM's machine (machine-b) is offline.");
+  assert.equal(pmHostOfflineMessage('machine-b'), "Your Coordinator's machine (machine-b) is offline.");
 });
 
 // ----- A. machine identity and hello -----

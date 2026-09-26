@@ -231,7 +231,7 @@ function atomicWrite(path: string, text: string): void {
   renameSync(tmp, path);
 }
 
-const DISCONNECTED_MESSAGE = 'The cloud relay is unreachable, so this machine cannot confirm it is the PM host.';
+const DISCONNECTED_MESSAGE = 'The cloud relay is unreachable, so this machine cannot confirm it is the Coordinator host.';
 
 // ---------------------------------------------------------------------------------------------
 // RelayPmStore
@@ -514,7 +514,7 @@ export class RelayPmStore implements HostPmStore {
   private notActiveMessage(): string {
     // After a fence the last known active host may still be this machine's own name: say nothing more.
     const other = this.activeHost && this.activeHost !== this.identity.name ? this.activeHost : null;
-    return other ? `The PM runs on ${other}.` : 'This machine is not the PM host.';
+    return other ? `The Coordinator runs on ${other}.` : 'This machine is not the Coordinator host.';
   }
   private usable(): boolean { return !this.closed && this.connected && this.assigned && this.active && !this.fenced; }
   private guard() {
@@ -533,7 +533,7 @@ export class RelayPmStore implements HostPmStore {
   // Maps an rpc failure to a store error; a stale epoch (or not_active) for the current epoch fences
   // this store and drops the queued outcomes.
   private failure(error: unknown, epoch: number): PmStoreError {
-    if (!(error instanceof PmRpcError)) return new PmStoreError('unavailable', 'The PM state store failed.');
+    if (!(error instanceof PmRpcError)) return new PmStoreError('unavailable', 'The Coordinator state store failed.');
     if (error.code === 'stale_epoch' || error.code === 'not_active') {
       if (epoch === this.epoch) this.fence();
       return new PmStoreError('not_active', this.notActiveMessage());
@@ -813,7 +813,7 @@ export class LocalPmStore implements HostPmStore {
       if (existing.state === 'open') return;
       throw new PmStoreError('invalid', 'turn_id is already recorded');
     }
-    if (this.state.turns.filter((t) => t.state === 'open').length >= MAX_OPEN_TURNS) throw new PmStoreError('unavailable', `At most ${MAX_OPEN_TURNS} PM turns can be open`);
+    if (this.state.turns.filter((t) => t.state === 'open').length >= MAX_OPEN_TURNS) throw new PmStoreError('unavailable', `At most ${MAX_OPEN_TURNS} Coordinator turns can be open`);
     this.mutate((s) => { s.turns.push({ turn_id: args.turn_id, accepted_at: args.accepted_at, state: 'open', reason: null }); });
   }
   async endTurn(turnId: string, outcome: TurnOutcome): Promise<void> {
