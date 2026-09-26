@@ -76,7 +76,8 @@ test('local-only: GET /api/leads serves this machine\'s Lead rows (with the late
   const entry = body.leads[0];
   assert.equal(entry.lead, lead); assert.equal(entry.name, 'lead-triage'); assert.equal(entry.project, 'foreman'); assert.equal(entry.workstream, 'triage');
   assert.equal(entry.machine_name, 'leads-test-machine'); assert.equal(entry.machine_online, true);
-  assert.equal(entry.state, 'unknown', 'a restart leaves the Lead not running');
+  assert.equal(entry.state, 'dead', 'a restart ends the Lead (#170): nothing respawns it');
+  assert.equal(entry.end_reason, 'restarted'); assert.equal(entry.alive, false); assert.equal(entry.ended, true);
   assert.equal(entry.goal, 'Triage the open bugs');
   assert.deepEqual([entry.last_handoff.seq, entry.last_handoff.status, entry.last_handoff.summary], [4, 'blocked', 'Waiting on review of PR 12']);
   assert.ok(!JSON.stringify(entry).includes(daemonHome) && !/cwd|transcript/.test(JSON.stringify(entry)), 'no filesystem path in a registry row');

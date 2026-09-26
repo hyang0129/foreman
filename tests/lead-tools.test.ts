@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ProjectRegistry } from '../server/projects.ts';
-import { buildLeadRecords, containsFilesystemPath, makeLeadTools, OTHER_MACHINE_REFUSED, LEAD_TOOL_NAMES, retireSupersededOnApproval, ROLE_CONFIG_TIMEOUT_MS } from '../server/lead-tools.ts';
+import { buildLeadRecords, containsFilesystemPath, RESTARTED_END_REASON, makeLeadTools, OTHER_MACHINE_REFUSED, LEAD_TOOL_NAMES, retireSupersededOnApproval, ROLE_CONFIG_TIMEOUT_MS } from '../server/lead-tools.ts';
 import {
   AGENT_NATIVE_REFUSED, HELD_LAUNCH_REASON, ROLE_DEFAULTS, defaultDevSettings, parseLeadHandoff,
   type AgentLaunchRequest, type AgentLaunchResult, type AgentSessionService, type DevSettingsView, type LeadHandoff, type LeadListEntry, type LeadStore,
@@ -132,7 +132,9 @@ test('start_lead launches a Claude Lead in the registered checkout with role, re
     assert.equal(seed[0].kind, 'seed');
     assert.equal(seed[0].project, 'Foreman');
     assert.equal(seed[0].goal, 'Triage open bugs');
-    assert.equal(out.seed_handoff, 1);
+    assert.equal(out.own_seed_seq, 1);
+    assert.equal(out.seeded_from, null, 'no predecessor: seeded from no handoff');
+    assert.equal(out.seed_handoff, undefined);
     assert.ok(!JSON.stringify(seed).includes('List the open bugs'));
     assert.ok(!JSON.stringify(seed).includes(f.home));
     assert.equal(f.seen.length, 1);
@@ -331,7 +333,8 @@ test('retire_lead, list_leads and read_handoff', async () => {
     assert.match(listed.leads[1].note, /on linux-box, not reachable from here/);
     assert.match(listed.leads[1].note, /last known state at 1970-01-01T00:00:00.000Z; machine offline/);
     assert.equal(listed.leads[1].machine_online, false);
-    assert.deepEqual(f.store.listCalls.at(-1), { include_ended: false });
+    // The default view reads ended rows too (restarted Leads awaiting a successor) and filters.
+    assert.deepEqual(f.store.listCalls.at(-1), { include_ended: true });
     await f.tools.call('list_leads', { include_ended: true });
     assert.deepEqual(f.store.listCalls.at(-1), { include_ended: true });
     await f.store.appendHandoff(checkpoint(local));
@@ -535,4 +538,154 @@ test('retire on approval: force interrupts a working predecessor; without force 
     const out3 = await g.tools.call('start_lead', { ...start, workstream: 'fresh-ws' });
     assert.equal((await retireSupersededOnApproval(g.sessions, { session_key: out3.lead, decision: 'approved' })).retired, 'not needed');
   } finally { g.cleanup(); }
+});
+
+const RESTART_REASON = 'Foreman restarted. History is retained; start a new session to continue safely.';
+
+test('buildLeadRecords: a Lead and workers left unknown by a Foreman restart are reported dead (end_reason restarted), path-free', () => {
+  const machine = { machine_id: randomUUID(), name: 'mac' };
+  const lead = leadKey(), other = leadKey(), pathy = leadKey(), live = leadKey(), w1 = leadKey(), w2 = leadKey();
+  const base = { role: 'lead', launched_by: 'coordinator', project_name: 'Foreman', cwd: '/Users/hong/code/foreman', started_at: iso(1000), updated_at: iso(2000) };
+  const rows = [
+    { ...base, session_key: lead, name: 'lead-restarted', workstream: 'restarted', state: 'unknown', alive: false, control_reason: RESTART_REASON },
+    { ...base, session_key: other, name: 'lead-codex-gone', workstream: 'gone', state: 'unknown', alive: false, control_reason: 'Codex thread closed' },
+    { ...base, session_key: pathy, name: 'lead-pathy', workstream: 'pathy', state: 'unknown', alive: false, control_reason: 'spawn /Users/hong/bin/claude ENOENT' },
+    { ...base, session_key: live, name: 'lead-live', workstream: 'live', state: 'idle', alive: true },
+    { session_key: w1, name: 'fix-restarted', role: 'worker', parent: live, state: 'unknown', alive: false, control_reason: RESTART_REASON, updated_at: iso(9000) },
+    { session_key: w2, name: 'fix-running', role: 'worker', parent: live, state: 'working', alive: true, updated_at: iso(1000) },
+  ];
+  const records = buildLeadRecords(rows, { machine });
+  const by = new Map(records.map((r) => [r.name, r]));
+  const restarted = by.get('lead-restarted')!;
+  assert.equal(restarted.state, 'dead');
+  assert.equal(restarted.alive, false);
+  assert.equal(restarted.end_reason, RESTARTED_END_REASON);
+  assert.equal(by.get('lead-codex-gone')!.state, 'dead');
+  assert.equal(by.get('lead-codex-gone')!.end_reason, 'Codex thread closed');
+  assert.equal(by.get('lead-pathy')!.state, 'dead');
+  assert.equal(by.get('lead-pathy')!.end_reason, 'unavailable');
+  const liveRecord = by.get('lead-live')!;
+  assert.equal(liveRecord.state, 'idle');
+  assert.equal(liveRecord.end_reason, undefined);
+  // The restarted worker is dead and sorts after the running one despite being newer.
+  assert.deepEqual(liveRecord.workers.map((w) => [w.name, w.state]), [['fix-running', 'working'], ['fix-restarted', 'dead']]);
+  assert.ok(!JSON.stringify(records).includes('/Users/'));
+});
+
+test('supersede a restarted Lead: seeded from its last handoff (seeded_from) and retired as superseded; own_seed_seq is the new seed', async () => {
+  const f = setup();
+  try {
+    const old = oldLead(f, { state: 'unknown', alive: false, control_reason: RESTART_REASON });
+    f.sessions.rows.push({ session_key: leadKey(), name: 'fix-restarted', role: 'worker', parent: old, state: 'unknown', alive: false, control_reason: RESTART_REASON, updated_at: iso() });
+    await f.store.appendHandoff(checkpoint(old));
+    await f.store.appendHandoff(checkpoint(old));
+    const out = await f.tools.call('start_lead', start);
+    const text = f.sessions.launches[0].text;
+    assert.equal(f.sessions.launches[0].supersedes, old);
+    assert.match(text, /Half the bugs are triaged/);
+    assert.match(text, /Handoff seq 2 \(checkpoint/);
+    assert.ok(!text.includes('fix-restarted'), 'a restarted worker is not listed as live');
+    assert.deepEqual(out.seeded_from, { lead: old, seq: 2, kind: 'checkpoint' });
+    assert.equal(out.own_seed_seq, 1);
+    assert.equal(out.seed_handoff, undefined);
+    assert.deepEqual(f.sessions.retired, [{ id: old, reason: `superseded by ${out.lead}` }]);
+    assert.equal(out.superseded.retired, true);
+    assert.equal(out.superseded.live_workers, 0);
+    const seed = f.store.handoffs.get(out.lead)!;
+    assert.equal(seed[0].seq, 1);
+    assert.match(seed[0].summary, /Predecessor handoff seq 2/);
+    // A predecessor without any handoff: seeded_from is null.
+    const g = setup();
+    try {
+      oldLead(g, { state: 'unknown', alive: false, control_reason: RESTART_REASON });
+      const next = await g.tools.call('start_lead', start);
+      assert.equal(next.seeded_from, null);
+      assert.equal(next.own_seed_seq, 1);
+      assert.equal(g.sessions.retired.length, 1);
+    } finally { g.cleanup(); }
+  } finally { f.cleanup(); }
+});
+
+test('list_leads reports a stale unknown, not-alive registry row as ended; list_workers shows restarted workers as dead', async () => {
+  const f = setup();
+  try {
+    const stale = leadKey(), fine = leadKey();
+    f.store.entries.push(entry({ lead: stale, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-stale', state: 'unknown', alive: false }));
+    f.store.entries.push(entry({ lead: fine, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-fine' }));
+    const active = await f.tools.call('list_leads', {});
+    assert.deepEqual(active.leads.map((l: any) => l.name), ['lead-fine']);
+    const all = await f.tools.call('list_leads', { include_ended: true });
+    const row = all.leads.find((l: any) => l.name === 'lead-stale');
+    assert.equal(row.state, 'dead');
+    assert.equal(row.ended, true);
+    assert.equal(row.end_reason, 'unavailable');
+
+    const lead = oldLead(f);
+    const bound = f.tools.bindLead(lead);
+    f.sessions.rows.push({ session_key: leadKey(), name: 'fix-restarted', role: 'worker', parent: lead, state: 'unknown', alive: false, control_reason: RESTART_REASON, updated_at: iso() });
+    f.sessions.rows.push({ session_key: leadKey(), name: 'fix-running', role: 'worker', parent: lead, state: 'working', alive: true, updated_at: iso() });
+    const current = await bound.call('list_workers', {});
+    assert.deepEqual(current.workers.map((w: any) => w.name), ['fix-running']);
+    const every = await bound.call('list_workers', { include_ended: true });
+    const dead = every.workers.find((w: any) => w.name === 'fix-restarted');
+    assert.equal(dead.state, 'dead');
+    assert.equal(dead.end_reason, RESTARTED_END_REASON);
+  } finally { f.cleanup(); }
+});
+
+test('list_leads shows a restarted, not-yet-superseded Lead by default (ended, with a successor hint); other ended Leads stay hidden', async () => {
+  const f = setup();
+  try {
+    const restarted = leadKey(), replaced = leadKey(), retired = leadKey(), live = leadKey();
+    f.store.entries.push(entry({ lead: restarted, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-restarted', state: 'dead', alive: false, ended: true, end_reason: RESTARTED_END_REASON,
+      last_handoff: { seq: 3, at: iso(), kind: 'checkpoint', status: 'in_progress', summary: 'PR 12 open' } }));
+    f.store.entries.push(entry({ lead: replaced, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-replaced', state: 'ended', alive: false, ended: true, end_reason: RESTARTED_END_REASON, superseded_by: live }));
+    f.store.entries.push(entry({ lead: retired, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-retired', state: 'ended', alive: false, ended: true, end_reason: 'retired by the Coordinator' }));
+    f.store.entries.push(entry({ lead: live, machine_id: f.machine.machine_id, machine_name: 'mac', name: 'lead-live' }));
+    const active = await f.tools.call('list_leads', {});
+    assert.deepEqual(active.leads.map((l: any) => l.name).sort(), ['lead-live', 'lead-restarted']);
+    const row = active.leads.find((l: any) => l.name === 'lead-restarted');
+    assert.equal(row.ended, true);
+    assert.equal(row.state, 'dead');
+    assert.equal(row.end_reason, RESTARTED_END_REASON);
+    assert.match(row.hint, /restarted; start a successor with start_lead to continue from its last handoff/);
+    assert.equal(row.last_handoff.seq, 3);
+    assert.equal(active.leads.find((l: any) => l.name === 'lead-live').hint, undefined);
+    const all = await f.tools.call('list_leads', { include_ended: true });
+    assert.deepEqual(all.leads.map((l: any) => l.name).sort(), ['lead-live', 'lead-replaced', 'lead-restarted', 'lead-retired']);
+    assert.equal(all.leads.find((l: any) => l.name === 'lead-replaced').hint, undefined);
+  } finally { f.cleanup(); }
+});
+
+test('superseding a Lead on another machine seeds only its live workers: an unknown worker counts as dead', async () => {
+  const f = setup();
+  try {
+    const remote = leadKey();
+    f.store.entries.push(entry({ lead: remote, machine_id: randomUUID(), machine_name: 'linux-box', name: 'lead-remote', workers: [
+      { session_key: leadKey(), name: 'fix-unknown', state: 'unknown', permission_mode: 'bypass', needs_attention: false },
+      { session_key: leadKey(), name: 'fix-dead', state: 'dead', permission_mode: 'bypass', needs_attention: false },
+      { session_key: leadKey(), name: 'fix-working', state: 'working', permission_mode: 'bypass', needs_attention: false },
+    ] }));
+    const out = await f.tools.call('start_lead', { ...start, supersedes: remote });
+    const text = f.sessions.launches[0].text;
+    assert.ok(text.includes('fix-working'));
+    assert.ok(!text.includes('fix-unknown'), 'an unknown remote worker is not seeded as live');
+    assert.ok(!text.includes('fix-dead'));
+    assert.equal(out.superseded.live_workers, 1);
+  } finally { f.cleanup(); }
+});
+
+test('list_workers needs_attention follows the reported state: needs_input yes, a restarted (unknown) worker no', async () => {
+  const f = setup();
+  try {
+    const lead = oldLead(f);
+    const bound = f.tools.bindLead(lead);
+    f.sessions.rows.push({ session_key: leadKey(), name: 'fix-asking', role: 'worker', parent: lead, state: 'needs_input', alive: true, updated_at: iso() });
+    f.sessions.rows.push({ session_key: leadKey(), name: 'fix-restarted', role: 'worker', parent: lead, state: 'unknown', alive: false, control_reason: RESTART_REASON, updated_at: iso() });
+    const every = await bound.call('list_workers', { include_ended: true });
+    const by = new Map(every.workers.map((w: any) => [w.name, w]));
+    assert.equal((by.get('fix-asking') as any).needs_attention, true);
+    assert.equal((by.get('fix-restarted') as any).needs_attention, false);
+    assert.equal((by.get('fix-restarted') as any).state, 'dead');
+  } finally { f.cleanup(); }
 });
