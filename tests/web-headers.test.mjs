@@ -1,6 +1,6 @@
 // The hosted app's HTML and code must never mix deploys: a stale app.js/style.css under a fresh
-// index.html broke the installed Android app after the #154 deploy. web/_headers keeps all
-// three out of the browser cache. The e2e fixture server sends no-store on everything, so only
+// index.html broke the installed Android app after the #154 deploy. web/_headers keeps them all
+// out of the browser cache. The e2e fixture server sends no-store on everything, so only
 // a check on the file itself can catch a regression.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -18,9 +18,9 @@ function headerRules(text) {
   return rules;
 }
 
-test("the page, app.js and style.css are never stored in the browser cache", () => {
+test("the page and its code are never stored in the browser cache", () => {
   const rules = headerRules(readFileSync(new URL("../web/_headers", import.meta.url), "utf8"));
-  for (const path of ["/", "/index.html", "/app.js", "/style.css"])
+  for (const path of ["/", "/index.html", "/app.js", "/appearance.js", "/style.css"])
     assert.equal(rules.get(path)?.get("cache-control"), "no-store", `${path} must be Cache-Control: no-store`);
 });
 

@@ -24,3 +24,6 @@
 
 /style.css
   Cache-Control: no-store
+
+/appearance.js
+  Cache-Control: no-store
