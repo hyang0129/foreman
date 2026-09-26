@@ -132,7 +132,7 @@ const pollNow = (page: Page) => page.evaluate(() => window.dispatchEvent(new Eve
 
 async function openPm(page: Page) {
   await page.goto("/?view=pm");
-  await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
 }
 // The machine line, Move PM and the model details live on the PM's info screen (#154), reached
 // from the header's overflow menu. The offline warning stays in the conversation as a banner.
@@ -433,7 +433,7 @@ test("Back closes the Move PM dialog before leaving the PM", async ({ page }) =>
   await expect(page.locator("#info-dialog")).toBeHidden();
   // The PM is the home view, at "/".
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
 });
 
 test("an empty PM conversation uses neutral copy, not an error", async ({ page }) => {

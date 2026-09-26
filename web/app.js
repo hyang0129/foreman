@@ -817,9 +817,12 @@ function leadMachine(entry) {
 // A Lead's workers: the registry's list, plus any worker session on this host that names it.
 function leadWorkers(s, entry) {
   const workers = new Map();
-  for (const w of entry?.workers || []) workers.set(w.session_key.toLowerCase(), { key: w.session_key, name: w.name, state: w.state, permission_mode: w.permission_mode });
+  for (const w of Array.isArray(entry?.workers) ? entry.workers : []) {
+    if (typeof w?.session_key !== "string" || !w.session_key) continue;
+    workers.set(w.session_key.toLowerCase(), { key: w.session_key, name: typeof w.name === "string" && w.name ? w.name : w.session_key, state: w.state, permission_mode: w.permission_mode });
+  }
   for (const row of sessions) {
-    if (roleOf(row) !== "worker" || !sameKey(row.parent, s.session_key)) continue;
+    if (roleOf(row) !== "worker" || typeof row.session_key !== "string" || !sameKey(row.parent, s.session_key)) continue;
     workers.set(row.session_key.toLowerCase(), { key: row.session_key, name: row.name || row.session_key, state: row.state, permission_mode: row.permission_mode, row });
   }
   return [...workers.values()];
@@ -893,13 +896,30 @@ function renderCoordinatorSettings() {
   summary.dataset.signature = signature;
   summary.replaceChildren(...fields.flatMap(([label, value]) => [node("dt", "", label), node("dd", "", value)]));
 }
+// The info screen carries the conversation's full name (and the Project field its full project).
+function setTitle(header, full) {
+  if (ui.title.textContent !== header) ui.title.textContent = header;
+  ui.title.title = header;
+  $("#info-title").textContent = full;
+}
+// The header names what the conversation is, on one row (#176): the agent for the Coordinator, the
+// project and role for a Lead or worker, and the chat's own name otherwise. There is no generic
+// title; while a chat loads, its name from the list is shown if known.
+function chatTitle(s) {
+  const role = roleOf(s);
+  if (role === "lead" || role === "worker") {
+    const project = s.project_name || (role === "lead" ? leadEntry(s.session_key)?.project : "") || projectName(s);
+    return `${project} · ${role === "lead" ? "Lead" : "Worker"}`;
+  }
+  return s.name || projectName(s);
+}
 function renderHeading() {
   const model = $("#header-model");
   const isPm = selected === "pm";
   const fields = [];
   let selectedModel = "";
   if (isPm) {
-    ui.title.textContent = "Claude · Coordinator";
+    setTitle("Coordinator", "Claude · Coordinator");
     ui.provider.hidden = true;
     selectedModel = pmModelReady ? pmModel || "Provider default" : "Loading model…";
     fields.push(["Selected model", selectedModel]);
@@ -911,7 +931,7 @@ function renderHeading() {
     const s = detail.session;
     const role = roleOf(s);
     const entry = role === "lead" ? leadEntry(s.session_key) : null;
-    ui.title.textContent = s.name || "Session";
+    setTitle(chatTitle(s), s.name || chatTitle(s));
     ui.provider.hidden = false;
     ui.provider.textContent = s.provider === "codex" ? "Codex" : "Claude";
     selectedModel = s.model || entry?.model || (s.managed ? "Provider default" : "Model not reported");
@@ -928,11 +948,11 @@ function renderHeading() {
     const outcome = launchOutcome(s);
     if (outcome) fields.push(["Launch", outcome]);
   } else {
-    ui.title.textContent = selected ? "Loading session…" : "Your session inbox";
+    const row = selected ? sessions.find((s) => sameKey(s.session_key, selected)) : null;
+    const title = row ? chatTitle(row) : selected ? "Loading…" : "Choose a chat";
+    setTitle(title, row?.name || title);
     ui.provider.hidden = true;
   }
-  // The info screen repeats the conversation's name, and says what it configures.
-  $("#info-title").textContent = ui.title.textContent;
   $("#info-eyebrow").textContent = isPm ? "COORDINATOR INFO" : roleOf(detail?.session) === "lead" ? "PROJECT LEAD INFO" : "SESSION INFO";
   $("#open-info").textContent = isPm ? "Coordinator info and model" : roleOf(detail?.session) === "lead" ? "Lead info" : "Session info";
   model.hidden = !selectedModel;
@@ -1952,7 +1972,13 @@ function renderSettings(force = false) {
       const remove = node("button", "btn ghost small", "Remove");
       remove.type = "button";
       remove.setAttribute("aria-label", `Remove the ${grant.project} override for ${who.toLowerCase()}`);
-      remove.addEventListener("click", () => saveSetting("bypass_grants", grants.filter((g) => g !== grant)));
+      // Built from the settings as they are at click time, never from the list drawn earlier: a
+      // stale copy would re-post grants changed since (e.g. turn a role's Bypass back on).
+      const { role, project } = grant;
+      remove.addEventListener("click", () => {
+        const current = settingsView?.settings.bypass_grants || [];
+        void saveSetting("bypass_grants", current.filter((g) => !(g.role === role && g.project.toLowerCase() === project.toLowerCase())));
+      });
       item.append(remove);
       list.append(item);
     }
@@ -1962,6 +1988,9 @@ function renderSettings(force = false) {
 async function saveSetting(key, value) {
   if (!settingsView?.writable || settingsBusy || !authorized) return;
   const epoch = authEpoch;
+  // A read still in flight predates this write; its answer must not replace the saved view.
+  settingsRequest++;
+  settingsLoading = false;
   settingsBusy = true;
   renderSettings();
   let saved = false;

@@ -70,7 +70,7 @@ const defaultSettings = () => ({
   versions: { roles: 0, bypass_grants: 0, bypass_ask: 0 }, updated_at: null,
 });
 
-async function fixture(page: Page, options: { writable?: boolean; leads?: boolean; settings?: boolean } = {}) {
+async function fixture(page: Page, options: { writable?: boolean; leads?: boolean; settings?: boolean; auth?: any } = {}) {
   const state = {
     sessions: rows() as any[],
     approvals: {} as Record<string, any[]>,
@@ -86,7 +86,7 @@ async function fixture(page: Page, options: { writable?: boolean; leads?: boolea
     const body = request.method() === "POST" ? request.postDataJSON() : null;
     state.calls.push({ path, method: request.method(), body });
     let result: any = {}, status = 200;
-    if (path === "/api/config") result = { auth: { required: false } };
+    if (path === "/api/config") result = { auth: options.auth ?? { required: false } };
     else if (path === "/api/host") result = { online: true, host: "machine-a", machine_id: M };
     else if (path === "/api/pm/host" && request.method() === "GET") result = {
       active: { machine_id: M, name: "machine-a", online: true, epoch: 1 },
@@ -144,7 +144,7 @@ test("the Coordinator is pinned and named; Leads are chats, workers are hidden, 
   await fixture(page);
   await page.goto("/");
   // The home view is the Coordinator, named in the header and pinned above the list.
-  await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
   await expect(page.getByText("Coordinator here. What are we working on?")).toBeVisible();
   await expect(page.getByLabel("Message this session")).toHaveAttribute("placeholder", "What are we working on?");
   await openRail(page);
@@ -170,7 +170,7 @@ test("the Coordinator is pinned and named; Leads are chats, workers are hidden, 
   // It stays open across polls, and the archived chat opens from there.
   await pollNow(page);
   await archived.getByRole("button", { name: /lead-triage-old/ }).tap();
-  await expect(page.getByRole("heading", { name: "lead-triage-old", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "app · Lead", exact: true })).toBeVisible();
   await expect(page.getByText("History of lead-triage-old")).toBeVisible();
 });
 
@@ -217,11 +217,11 @@ test("agent-launched sessions show ⚠ Bypass (standing or approved) or Auto; yo
   await expect(tag("Fix sign-in")).toHaveCount(0);
   // The label is spelled out on the info screen.
   await railRows(page).filter({ hasText: "lead-docs" }).tap();
-  await page.getByRole("heading", { name: "lead-docs", exact: true }).tap();
+  await page.getByRole("heading", { name: "app · Lead", exact: true }).tap();
   await expect(page.locator("#conversation-subtitle")).toContainText("Auto · Claude decides routine permissions");
   await page.getByRole("button", { name: "Close info" }).tap();
   await openChat(page, /lead-release/);
-  await page.getByRole("heading", { name: "lead-release", exact: true }).tap();
+  await page.getByRole("heading", { name: "app · Lead", exact: true }).tap();
   await expect(page.locator("#conversation-subtitle")).toContainText("⚠ Bypass · no permission prompts · you approved this launch");
 });
 
@@ -306,8 +306,8 @@ test("the Lead info screen shows model · effort, policy, machine, the latest ha
   await expect(worker).toBeVisible();
   await worker.tap();
   await expect(info).toBeHidden();
-  await expect(page.getByRole("heading", { name: "fix-tests", exact: true })).toBeVisible();
-  await page.getByRole("heading", { name: "fix-tests", exact: true }).tap();
+  await expect(page.getByRole("heading", { name: "app · Worker", exact: true })).toBeVisible();
+  await page.getByRole("heading", { name: "app · Worker", exact: true }).tap();
   await expect(page.locator("#conversation-subtitle dt", { hasText: "Role" }).locator("+ dd")).toHaveText("Worker · via lead-triage");
   await expect(page.locator("#lead-workers")).toBeHidden();
 });
@@ -315,7 +315,7 @@ test("the Lead info screen shows model · effort, policy, machine, the latest ha
 test("a Lead on an offline machine shows its last known state", async ({ page }) => {
   await fixture(page);
   await page.goto(`/?session=${encodeURIComponent(DOCS)}`);
-  await page.getByRole("heading", { name: "lead-docs", exact: true }).tap();
+  await page.getByRole("heading", { name: "app · Lead", exact: true }).tap();
   const info = page.getByRole("dialog", { name: "lead-docs" });
   await expect(info.locator("#conversation-subtitle dt", { hasText: "Selected model" }).locator("+ dd")).toHaveText("opus[1m] · high");
   await expect(info.locator("#conversation-subtitle dt", { hasText: "Machine" }).locator("+ dd")).toHaveText(/^machine-a · machine offline · last known state at .*2026/);
@@ -327,7 +327,7 @@ test("without /api/leads the list still works, and the Lead info says so without
   const state = await fixture(page, { leads: false });
   await page.goto(`/?session=${encodeURIComponent(TRIAGE)}`);
   await expect(page.getByText("History of lead-triage")).toBeVisible();
-  await page.getByRole("heading", { name: "lead-triage", exact: true }).tap();
+  await page.getByRole("heading", { name: "app · Lead", exact: true }).tap();
   const info = page.getByRole("dialog", { name: "lead-triage" });
   await expect(info.locator("#lead-handoff-status")).toHaveText("Handoffs are unavailable here.");
   // Workers still come from the session list.
@@ -402,7 +402,7 @@ test("Settings reads and writes role models, standing grants and ask-before-Bypa
   // Back closes Settings and returns to the Coordinator.
   await page.goBack();
   await expect(settings).toBeHidden();
-  await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
 });
 
 test("Settings are read-only in the local UI", async ({ page }) => {
@@ -483,7 +483,7 @@ test("New session has no launcher: Ask the Coordinator posts to the Coordinator 
   await send.tap();
   await expect.poll(() => state.calls.filter((c) => c.path === "/api/pm/message").map((c) => c.body)).toEqual([{ text: "Start a Lead on app to triage open bugs" }]);
   await expect(dialog).toBeHidden();
-  await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
   await expect(page.locator(".message.user").filter({ hasText: "Start a Lead on app to triage open bugs" })).toBeVisible();
   expect(state.calls.filter((c) => c.path.startsWith("/api/launch") || (c.path === "/api/sessions" && c.method === "POST"))).toHaveLength(0);
   // Back from the Coordinator leaves nothing of the dialog behind.
@@ -534,4 +534,236 @@ test("the machine-offline notification setting uses machine wording", async ({ p
   await page.goto("/");
   const kinds = page.locator("#notify-kinds label");
   await expect(kinds).toHaveText(["Approvals and questions", "A session failed", "Coordinator errors", "Machine offline"]);
+});
+
+async function openSettingsDialog(page: Page) {
+  await page.getByRole("button", { name: "Conversation options" }).tap();
+  await page.getByRole("menuitem", { name: "Settings" }).tap();
+  const settings = page.getByRole("dialog", { name: "Settings" });
+  await expect(settings).toBeVisible();
+  return settings;
+}
+
+test("removing an override after turning a role's all-projects grant off leaves Bypass off", async ({ page }) => {
+  const state = await fixture(page);
+  state.settings.settings.bypass_grants = [
+    { role: "coordinator", project: "*", allow: true }, { role: "lead", project: "*", allow: true }, { role: "coordinator", project: "secrets", allow: false }];
+  await page.goto("/");
+  const settings = await openSettingsDialog(page);
+  const leadGrant = settings.getByRole("checkbox", { name: "Workers that Leads start (all projects)" });
+  await expect(leadGrant).toBeChecked();
+  await expect(settings.locator(".grant-override")).toHaveText([/^secrets · Leads the Coordinator starts/]);
+  await leadGrant.uncheck();
+  await expect(settings.locator("#settings-status")).toHaveText("Saved.");
+  expect(state.settings.settings.bypass_grants).toContainEqual({ role: "lead", project: "*", allow: false });
+  // The override list was drawn before the uncheck; removing from it must not re-post the old grant.
+  await settings.getByRole("button", { name: "Remove the secrets override for leads the coordinator starts" }).tap();
+  await expect.poll(() => state.settings.versions.bypass_grants).toBe(2);
+  expect(state.settings.settings.bypass_grants).toEqual([{ role: "lead", project: "*", allow: false }, { role: "coordinator", project: "*", allow: true }]);
+  await expect(leadGrant).not.toBeChecked();
+  await expect(settings.locator(".grant-override")).toHaveCount(0);
+});
+
+test("a settings read that started before a save cannot replace the saved values", async ({ page }) => {
+  const state = await fixture(page);
+  let hold = false, release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let heldRequests = 0;
+  await page.route("**/api/settings", async (route) => {
+    if (!hold || route.request().method() !== "GET") return route.fallback();
+    // Answer with the settings as they were when the read was made, once released.
+    const snapshot = JSON.stringify({ ...structuredClone(state.settings), writable: true });
+    heldRequests++;
+    await held;
+    await route.fulfill({ contentType: "application/json", body: snapshot });
+  });
+  await page.goto("/");
+  let settings = await openSettingsDialog(page);
+  const ask = () => settings.getByRole("checkbox", { name: "Ask me before each Bypass launch" });
+  await expect(ask()).toBeEnabled();
+  await settings.getByRole("button", { name: "Close settings" }).tap();
+  await expect(settings).toBeHidden();
+  // Reopening reads the settings again; that read is held while the developer changes a setting.
+  hold = true;
+  settings = await openSettingsDialog(page);
+  await expect.poll(() => heldRequests).toBe(1);
+  await ask().check();
+  await expect(settings.locator("#settings-status")).toHaveText("Saved.");
+  expect(state.settings.settings.bypass_ask).toBe(true);
+  hold = false;
+  release();
+  await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 300)));
+  await expect(ask()).toBeChecked();
+  // The view kept the saved version: the next change is not a conflict.
+  await ask().uncheck();
+  await expect(settings.locator("#settings-status")).toHaveText("Saved.");
+  const posts = state.calls.filter((c) => c.path === "/api/settings" && c.method === "POST").map((c) => c.body);
+  expect(posts).toEqual([{ key: "bypass_ask", value: true, version: 0 }, { key: "bypass_ask", value: false, version: 1 }]);
+  expect(state.settings.settings.bypass_ask).toBe(false);
+});
+
+test("signing out clears unsent Ask the Coordinator text", async ({ page }) => {
+  await page.route("https://www.gstatic.com/firebasejs/**/firebase-app.js", (route) =>
+    route.fulfill({ contentType: "application/javascript", body: "export const initializeApp = value => value;" }));
+  await page.route("https://www.gstatic.com/firebasejs/**/firebase-auth.js", (route) => route.fulfill({ contentType: "application/javascript", body: `
+    const user = {email:'owner@example.com',getIdToken:async()=> 'fixture-id-token'};
+    let callback;
+    export const getAuth = () => ({currentUser:user});
+    export const onAuthStateChanged = (auth,fn) => { callback=fn; queueMicrotask(()=>fn(user)); };
+    export const signOut = async auth => { auth.currentUser=null; callback(null); };
+  ` }));
+  await fixture(page, { auth: { required: true, firebase: { apiKey: "fixture-api-key" } } });
+  await page.goto("/");
+  await openRail(page);
+  await page.getByRole("button", { name: "New session", exact: true }).tap();
+  const dialog = page.getByRole("dialog", { name: "New session" });
+  await dialog.getByRole("textbox", { name: /Describe the work/ }).fill("Private plan for the Coordinator");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  // Closing the dialog alone keeps the text; signing out does not.
+  await expect(page.locator("#ask-coordinator")).toHaveValue("Private plan for the Coordinator");
+  // The rail is still open behind the closed dialog.
+  await expect(page.locator("#rail")).toBeInViewport();
+  await page.getByRole("button", { name: "Sign out" }).tap();
+  await expect(page.locator("#app")).toBeHidden();
+  await expect(page.locator("#ask-coordinator")).toHaveValue("");
+});
+
+// #176: the header is one row that names the conversation, never a generic title.
+const LONG_PROJECT = "a-very-long-project-name-that-cannot-possibly-fit-on-one-phone-row";
+async function recordTitles(page: Page) {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.__titles = [];
+    document.addEventListener("DOMContentLoaded", () => {
+      const title = document.querySelector("#conversation-title")!;
+      w.__titles.push(title.textContent);
+      new MutationObserver(() => w.__titles.push(title.textContent)).observe(title, { childList: true, characterData: true, subtree: true });
+    });
+  });
+}
+async function headerMetrics(page: Page) {
+  return page.evaluate(() => {
+    const head = document.querySelector(".conversation-head")!.getBoundingClientRect();
+    const title = document.querySelector("#conversation-title") as HTMLElement;
+    const style = getComputedStyle(title);
+    return {
+      head: head.height, titleHeight: title.getBoundingClientRect().height, lineHeight: parseFloat(style.lineHeight),
+      truncated: title.scrollWidth > title.clientWidth, textOverflow: style.textOverflow, whiteSpace: style.whiteSpace,
+      titleRight: title.getBoundingClientRect().right, menuLeft: document.querySelector("#conversation-menu-button")!.getBoundingClientRect().left,
+    };
+  });
+}
+async function expectOneRow(page: Page, text: string, maxHead?: number) {
+  await expect(page.locator("#conversation-title")).toHaveText(text);
+  const m = await headerMetrics(page);
+  expect(m.titleHeight).toBeLessThanOrEqual(m.lineHeight + 1);
+  expect(m.whiteSpace).toBe("nowrap");
+  expect(m.titleRight).toBeLessThanOrEqual(m.menuLeft);
+  if (maxHead) expect(m.head).toBeLessThanOrEqual(maxHead);
+  return m;
+}
+function longLead(project = LONG_PROJECT) {
+  return { ...base, session_key: "fm:88888888-8888-4888-8888-888888888888", session_id: "long", name: "lead-long", state: "working", current_tool: "Bash",
+    role: "lead", launched_by: "coordinator", project_name: project, cwd: `/Users/dev/code/${project}`, permission_mode: "auto", updated_at: iso(1000) };
+}
+
+test("#176 at 360×780 the header is one row of at most 56 px naming the Coordinator, a Lead, a session and a loading chat", async ({ page }) => {
+  const state = await fixture(page);
+  state.sessions.push(longLead());
+  let holdDetail = false, release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/api/session?*", async (route) => { if (holdDetail) await held; await route.fallback(); });
+  await recordTitles(page);
+  expect(page.viewportSize()).toEqual({ width: 360, height: 780 });
+  const html = await (await page.request.get("/")).text();
+  expect(html).not.toContain("Your session inbox");
+  await page.goto("/");
+  // The Coordinator.
+  await expect(page.getByText("Coordinator here. What are we working on?")).toBeVisible();
+  await expectOneRow(page, "Coordinator", 56);
+  // A plain session keeps its own name.
+  await openChat(page, /Fix sign-in/);
+  await expect(page.getByText("History of Fix sign-in")).toBeVisible();
+  await expectOneRow(page, "Fix sign-in", 56);
+  // A Lead is named by its project and role; a working one also shows its status in the header.
+  await openChat(page, /lead-triage Lead/);
+  await expect(page.getByText("History of lead-triage")).toBeVisible();
+  await expect(page.locator("#activity-status")).toBeVisible();
+  await expectOneRow(page, "app · Lead", 56);
+  await openChat(page, /lead-long/);
+  await expect(page.getByText("History of lead-long")).toBeVisible();
+  // A long project name is cut with an ellipsis on the same row; the info screen has it in full.
+  const long = await expectOneRow(page, `${LONG_PROJECT} · Lead`, 56);
+  expect(long.truncated).toBe(true);
+  expect(long.textOverflow).toBe("ellipsis");
+  await page.locator("#conversation-heading").tap();
+  const info = page.getByRole("dialog", { name: "lead-long" });
+  await expect(info.locator("#conversation-subtitle dt", { hasText: /^Project$/ }).locator("+ dd")).toHaveText(LONG_PROJECT);
+  await page.getByRole("button", { name: "Close info" }).tap();
+  await expect(info).toBeHidden();
+  // Loading: the chat's name from the list, on the same single row, before its history arrives.
+  holdDetail = true;
+  await openChat(page, /lead-docs/);
+  await expectOneRow(page, "app · Lead", 56);
+  await expect(page.getByText("History of lead-docs")).toBeHidden();
+  holdDetail = false;
+  release();
+  await expect(page.getByText("History of lead-docs")).toBeVisible();
+  // Never the generic title, at any point.
+  const titles: string[] = await page.evaluate(() => (window as any).__titles);
+  expect(titles.length).toBeGreaterThan(1);
+  for (const title of titles) {
+    expect(title).not.toBe("Your session inbox");
+    expect(title?.trim()).toBeTruthy();
+  }
+});
+
+test("#176 a worker chat is named by its project and role", async ({ page }) => {
+  await fixture(page);
+  await page.goto(`/?session=${encodeURIComponent(WORKER)}`);
+  await expect(page.getByText("History of fix-tests")).toBeVisible();
+  await expectOneRow(page, "app · Worker", 56);
+});
+
+test("#176 a deep link that is still loading shows a short neutral title on one row", async ({ page }) => {
+  await fixture(page);
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  // Neither the list nor the chat has answered yet.
+  await page.route("**/api/sessions", async (route) => { await held; await route.fallback(); });
+  await page.route("**/api/session?*", async (route) => { await held; await route.fallback(); });
+  await recordTitles(page);
+  await page.goto(`/?session=${encodeURIComponent(DOCS)}`);
+  await expectOneRow(page, "Loading…", 56);
+  release();
+  await expectOneRow(page, "app · Lead", 56);
+  await expect(page.getByText("History of lead-docs")).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__titles)).not.toContain("Your session inbox");
+});
+
+test.describe("#176 desktop header", () => {
+  test.use({ viewport: { width: 1280, height: 800 }, isMobile: false, hasTouch: false, deviceScaleFactor: 1 });
+  test("one row naming the Coordinator, a Lead and a session; a long name is cut with an ellipsis", async ({ page }) => {
+    const state = await fixture(page);
+    state.sessions.push(longLead(LONG_PROJECT.repeat(4)));
+    await recordTitles(page);
+    await page.goto("/");
+    await expect(page.getByText("Coordinator here. What are we working on?")).toBeVisible();
+    await expectOneRow(page, "Coordinator");
+    const list = page.locator("#session-list");
+    await list.getByRole("button", { name: /Fix sign-in/ }).click();
+    await expect(page.getByText("History of Fix sign-in")).toBeVisible();
+    await expectOneRow(page, "Fix sign-in");
+    await list.getByRole("button", { name: /lead-triage Lead/ }).click();
+    await expect(page.getByText("History of lead-triage")).toBeVisible();
+    await expectOneRow(page, "app · Lead");
+    await list.getByRole("button", { name: /lead-long/ }).click();
+    await expect(page.getByText("History of lead-long")).toBeVisible();
+    const long = await expectOneRow(page, `${LONG_PROJECT.repeat(4)} · Lead`);
+    expect(long.truncated).toBe(true);
+    expect(long.textOverflow).toBe("ellipsis");
+    expect(await page.evaluate(() => (window as any).__titles)).not.toContain("Your session inbox");
+    await expect(page.locator("body")).not.toContainText("Your session inbox");
+  });
 });

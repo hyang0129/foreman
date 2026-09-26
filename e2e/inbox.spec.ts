@@ -935,7 +935,7 @@ test.describe("mobile polish", () => {
     await page.keyboard.press("Escape");
     await expect(page.locator("#new-session")).toBeFocused();
     await page.keyboard.press("Enter");
-      await page.setViewportSize({ width: 740, height: 360 });
+    await page.setViewportSize({ width: 740, height: 360 });
     await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
     await page.getByLabel("Session name").fill("Landscape test");
     await page.getByLabel("Project directory").fill("/Users/dev/code/app");
@@ -1335,7 +1335,7 @@ test("header identifies the PM and honestly explains its selected model and inde
   const state = await fixture(page);
   await page.goto("/");
   await page.getByRole("button", { name: /Coordinator Plan and delegate/ }).click();
-  await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
   await expect(page.locator("#header-model")).toHaveText("Model · Provider default");
   await openInfo(page);
   await expect(page.locator("#header-model")).toBeVisible();

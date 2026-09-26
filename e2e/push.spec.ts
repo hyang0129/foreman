@@ -176,7 +176,7 @@ test.describe("notification settings", () => {
     await fixture(page, { auth: { required: false } });
     await page.goto("/");
     await expect(page.locator("#app")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
     await expect(page.locator("#notify-settings")).toBeHidden();
   });
 
@@ -561,7 +561,7 @@ test.describe("notification click", () => {
     const state = await fixture(page);
     await page.goto("/");
     await signedIn(page);
-    await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
     const sw = await worker(page);
     await page.evaluate(() => { (window as any).__sameDocument = true; });
     await deliver(page, JSON.stringify(payload()));
@@ -576,7 +576,7 @@ test.describe("notification click", () => {
     // The notification was closed.
     expect(await shown(page)).toEqual([]);
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
   });
 
   test("a PM notification opens the project manager", async ({ page }) => {
@@ -590,7 +590,7 @@ test.describe("notification click", () => {
     await click(sw, "pm");
     // The PM is the home view: its canonical URL is "/".
     await expect(page).toHaveURL(`${ORIGIN}/`);
-    await expect(page.getByRole("heading", { name: "Claude · Coordinator" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
   });
 
   test("a session missing from the Mac falls back to the PM with the neutral notice", async ({ page }) => {
@@ -602,7 +602,7 @@ test.describe("notification click", () => {
     await expect.poll(() => shown(page)).toHaveLength(1);
     await click(sw, "session:fm:gone");
     await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing the Coordinator.");
-    await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Coordinator", exact: true })).toBeVisible();
     await expect.poll(() => page.url()).toBe(`${ORIGIN}/`);
   });
 
