@@ -499,7 +499,7 @@ describe('developer settings are never written by a host', () => {
     const { stub, a } = await pair();
     await sql(stub, "INSERT INTO dev_settings (key, value, version, updated_at) VALUES ('bypass_grants', 'not json', 3, 10), ('bypass_ask', '\"yes\"', 1, 20), ('future_key', '1', 1, 30)");
     const view = await ok(a, 'settings.get', {});
-    expect(view.settings).toMatchObject({ bypass_grants: [], bypass_ask: true });
+    expect(view.settings).toMatchObject({ bypass_grants: [], bypass_ask: false });
     expect(view.versions).toEqual({ roles: 0, bypass_grants: 3, bypass_ask: 1 });
     expect(view.updated_at).toBe(20);
   });

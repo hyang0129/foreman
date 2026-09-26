@@ -160,11 +160,18 @@ as one `Agent` tool line in the Coordinator chat. Every tool call a subagent mak
 - **Protected locations.** `Read`, `Grep`, `Glob` and `git -C` need an existing path, resolved with
   realpath. Refused: `FOREMAN_HOME`; home credential and agent-state locations (`~/.ssh`,
   `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.config/gh`, `~/.aws`, `~/.gnupg`, `~/.docker`,
-  `~/.kube`, `~/.netrc`, `~/.npmrc`, `~/.git-credentials`, `~/Library/Keychains` and similar); the
-  process's `CLAUDE_CONFIG_DIR` and `CODEX_HOME`; and any `.env*` file. They are matched by path
-  and by **file identity** (device and inode), so a symlinked parent, a hard link or a macOS alias
-  path (`/System/Volumes/Data`, `/.nofollow`, `/.resolve`, which are refused outright) cannot reach
-  them. A directory that contains a protected location, such as `~` or `/`, is refused too.
+  `~/.kube`, `~/.netrc`, `~/.npmrc`, `~/.git-credentials`, `~/Library/Keychains` and similar),
+  also cloud CLI credentials (wrangler, cloudflared, Terraform, Vault, database configs), shell and
+  REPL histories, browser profiles, and `~/Library/Application Support`, `Cookies`, `Containers`
+  and `Group Containers`; the process's `CLAUDE_CONFIG_DIR` and `CODEX_HOME`; and any `.env*`
+  file. They are matched by path and by **file identity** (device and inode), so a symlinked
+  parent, a hard link or a macOS alias path (`/System/Volumes/Data`, `/.nofollow`, `/.resolve`,
+  which are refused outright) cannot reach them. A regular file with more than one hard link is
+  refused. A directory that contains a protected location, such as `~` or `/`, is refused too.
+  For `git -C`, every location git reads is checked the same way: the `.git` entry or gitfile
+  target, `commondir`, object alternates, and the work tree root (a submodule's own git directory
+  is not checked, and `git status` still reads it: #216). These are parsed exactly as git
+  reads them, and any other form is refused. A bare repository outside a checkout is refused.
 - **Grep and Glob** need an explicit `path`, and their patterns cannot leave that directory or
   target `.env`. Grep with `output_mode: "content"` needs a single readable file, and a directory
   Grep always excludes `.env` files.
@@ -174,11 +181,19 @@ as one `Agent` tool line in the Coordinator chat. Every tool call a subagent mak
   `gh api`, gh's global flags, `--web` and `--watch` are refused. For git, options that write
   files, run programs or read outside the repository are refused (`--output`, `--ext-diff`,
   `--textconv`, `--no-index`, `--orderfile`/`-O`, `--exec`, `--upload-pack`, `--config-env`,
-  signature formats and their abbreviations), as are absolute or `..` path arguments and any
-  argument naming `.env`; `git branch` may only list.
+  `--full-diff`, signature formats and their abbreviations), as are absolute or `..` path
+  arguments and any argument naming `.env`. For `log`, `show` and `diff`, `--follow`, `-L`, any
+  `--submodule` except `--submodule=short`, and a value-taking option written last (just before
+  the pathspec) without `=value` are refused too, and so is `git status -v`. `git branch` may only
+  list.
 - **Forced git options.** The hook rewrites every allowed git command to run with `--no-pager
-  -c core.fsmonitor=false -c log.showSignature=false`, and `log`, `show` and `diff` also with
-  `--no-ext-diff --no-textconv`.
+  --no-optional-locks -c core.fsmonitor=false -c log.showSignature=false`, every signature program
+  (`gpg.program`, `gpg.x509.program`, `gpg.ssh.program`) set to `/usr/bin/false`, and
+  `-c diff.submodule=short -c status.submoduleSummary=false`. `log`, `show` and `diff` also get
+  `--no-ext-diff --no-textconv`, and a `--` followed by `.env*` exclusion pathspecs (any case, any
+  depth). `log` and `show` with no pathspec of their own also get `--full-history --sparse`, so
+  listings are unchanged.
+- **Subagent id.** A tool call with an empty or non-string subagent id is denied.
 - **Concurrency:** at most 3 investigators at once. A slot is reserved at the `Agent` call and
   released when the subagent stops or the call ends.
 - **Model and effort** come from the role config: Settings (`roles.investigator`), then
@@ -188,10 +203,14 @@ as one `Agent` tool line in the Coordinator chat. Every tool call a subagent mak
 
 **Known residual risks.** These are accepted, not fixed:
 
-- A repository's own `.git/config` can still define behaviour the forced options do not turn off
-  (for example clean/smudge filters), which a read-only git command in that checkout may run.
+- A repository's own `.git/config` can still define behaviour the forced options do not turn off:
+  filters, partial-clone lazy fetch, `core.worktree` and config includes in a checkout's own
+  `.git/config` (#216). A read-only git command in that checkout may act on them.
 - Content already committed in git history is readable with `git show`/`git log`, even where the
-  current file would be refused.
+  current file would be refused. `.env` files (including a submodule's) are excluded, but other
+  committed secrets are still readable, and a `.env` blob named directly by its SHA is shown
+  (#216).
+- A directory Grep can still count matches inside a hard-linked file.
 - An investigator may read any file outside the protected locations, and `WebFetch` is allowed, so
   a prompt-injected investigator could send out a non-credential file it read.
 
