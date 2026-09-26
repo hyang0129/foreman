@@ -117,5 +117,5 @@ Blocking means it fails an approved acceptance criterion. Everything else — a 
 - Do not modify `package.json` or `package-lock.json` unless the task is specifically about dependencies.
 - Do not touch `~/.foreman`, `wrangler.jsonc` credentials, or the `.claude` directory, except through the deploy and service scripts described under [Deploying and restarting](#deploying-and-restarting).
 - Do not weaken a failing assertion to make a suite green. Fix the behavior, or report that you could not. The same applies to skipping a test, raising a tolerance, updating a golden, or relaxing a budget — unless the sprint explicitly changed that expectation.
-- Do not treat a passing retry as proof a flaky test is fine. Flakiness is itself a failure.
+- Do not treat a passing retry as proof a flaky test is fine. Flakiness is itself a failure. The bar is the normal load of parallel agent work in the development cadence, not synthetic CPU saturation. A test that fails only under deliberate saturation, with no race behind it, is not a flake to fix. To tell the two apart, repeat the test on an idle machine.
 - Do not report a check as passing if it was skipped, run against a dirty tree, or run against a different commit than the one you pushed.
