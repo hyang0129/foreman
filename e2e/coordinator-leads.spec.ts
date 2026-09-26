@@ -312,6 +312,33 @@ test("the Lead info screen shows model · effort, policy, machine, the latest ha
   await expect(page.locator("#lead-workers")).toBeHidden();
 });
 
+// #197: the registry is relay data and may be malformed. A worker without a string session key is
+// skipped (it cannot be opened or matched to a session); one with a non-string name is named by its key.
+test("the Lead info screen skips registry workers without a string session key", async ({ page }) => {
+  const state = await fixture(page);
+  state.leads[0].workers = [
+    { session_key: 42, name: "numeric key", state: "working" },
+    { session_key: null, name: "null key", state: "working" },
+    { session_key: "", name: "empty key", state: "working" },
+    { name: "no key", state: "working" },
+    null,
+    "fm:plain-string",
+    { session_key: { toLowerCase: "not a function" }, name: "object key" },
+    { session_key: "fm:odd-name", name: 7, state: "idle" },
+    { session_key: WORKER, name: "fix-tests", state: "working", permission_mode: "bypass", needs_attention: false },
+  ];
+  await page.goto("/");
+  await openChat(page, /lead-triage Lead/);
+  await page.getByRole("button", { name: "Conversation options" }).tap();
+  await page.getByRole("menuitem", { name: "Lead info" }).tap();
+  const info = page.getByRole("dialog", { name: "lead-triage" });
+  await expect(info).toBeVisible();
+  const items = info.locator("#lead-worker-list > li");
+  await expect(items).toHaveText(["fm:odd-name · Idle", "fix-tests · Working · ⚠ Bypass"]);
+  await expect(info.locator("#lead-handoff-summary")).toHaveText("Triaged 12 bugs; 3 need a decision.");
+  await expect(page.locator("#error-banner")).toBeHidden();
+});
+
 test("a Lead on an offline machine shows its last known state", async ({ page }) => {
   await fixture(page);
   await page.goto(`/?session=${encodeURIComponent(DOCS)}`);
@@ -767,3 +794,83 @@ test.describe("#176 desktop header", () => {
     await expect(page.locator("body")).not.toContainText("Your session inbox");
   });
 });
+
+// #197: a dialog's close event is queued. Closing and at once reopening Info, Settings or New
+// session delivers the first close after the reopening; that late event must not pop the reopened
+// dialog's Back entry or send focus away, and the next real close still returns focus to its opener.
+const LATE_CLOSE_DIALOGS = [
+  { name: "Info", dialog: "#info-dialog", reopen: "#open-info", overlay: "info", back: null as string | null,
+    async open(page: Page) {
+      await page.getByRole("button", { name: "Conversation options" }).tap();
+      await page.getByRole("menuitem", { name: "Coordinator info and model" }).tap();
+    },
+    opener: "#conversation-menu-button", close: "#close-info" },
+  { name: "Settings", dialog: "#settings-dialog", reopen: "#open-settings", overlay: "settings", back: null as string | null,
+    async open(page: Page) {
+      await page.getByRole("button", { name: "Conversation options" }).tap();
+      await page.getByRole("menuitem", { name: "Settings" }).tap();
+    },
+    opener: "#conversation-menu-button", close: "#close-settings" },
+  { name: "New session", dialog: "#new-dialog", reopen: "#new-session", overlay: "dialog", back: "nav" as string | null,
+    async open(page: Page) {
+      await openRail(page);
+      await page.getByRole("button", { name: "New session", exact: true }).tap();
+    },
+    opener: "#new-session", close: "#close-dialog" },
+];
+for (const target of LATE_CLOSE_DIALOGS) {
+  test(`a late close event after a quick close and reopen leaves ${target.name} open and its Back entry in place`, async ({ page }) => {
+    await fixture(page);
+    await page.goto("/");
+    await expect(page.getByText("Coordinator here. What are we working on?")).toBeVisible();
+    await target.open(page);
+    const dialog = page.locator(target.dialog);
+    await expect(dialog).toBeVisible();
+    await expect.poll(() => page.evaluate(() => history.state?.overlay)).toBe(target.overlay);
+    // Close and reopen in one task, before the close event can be dispatched.
+    const late = await page.evaluate(({ dialog, reopen }) => {
+      const element = document.querySelector(dialog) as HTMLDialogElement;
+      const w = window as any;
+      w.__closes = 0;
+      element.addEventListener("close", () => { w.__closes++; });
+      element.close();
+      (document.querySelector(reopen) as HTMLButtonElement).click();
+      return { reopened: element.open, firedBeforeReopen: w.__closes };
+    }, { dialog: target.dialog, reopen: target.reopen });
+    expect(late).toEqual({ reopened: true, firedBeforeReopen: 0 });
+    await expect.poll(() => page.evaluate(() => (window as any).__closes)).toBe(1);
+    await expect(dialog).toBeVisible();
+    await expect.poll(() => page.evaluate(() => history.state?.overlay)).toBe(target.overlay);
+    // A real close now returns focus to the opener and steps off the dialog's entry.
+    await page.locator(target.close).tap();
+    await expect(dialog).toBeHidden();
+    await expect(page.locator(target.opener)).toBeFocused();
+    await expect.poll(() => page.evaluate(() => history.state?.overlay ?? null)).toBe(target.back);
+  });
+
+  test(`close, reopen and close ${target.name} before either close event fires returns focus to its opener`, async ({ page }) => {
+    await fixture(page);
+    await page.goto("/");
+    await expect(page.getByText("Coordinator here. What are we working on?")).toBeVisible();
+    await target.open(page);
+    const dialog = page.locator(target.dialog);
+    await expect(dialog).toBeVisible();
+    await expect.poll(() => page.evaluate(() => history.state?.overlay)).toBe(target.overlay);
+    const late = await page.evaluate(({ dialog, reopen }) => {
+      const element = document.querySelector(dialog) as HTMLDialogElement;
+      const w = window as any;
+      w.__closes = 0;
+      element.addEventListener("close", () => { w.__closes++; });
+      element.close();
+      (document.querySelector(reopen) as HTMLButtonElement).click();
+      const reopened = element.open;
+      element.close();
+      return { reopened, closedAgain: !element.open, firedSoFar: w.__closes };
+    }, { dialog: target.dialog, reopen: target.reopen });
+    expect(late).toEqual({ reopened: true, closedAgain: true, firedSoFar: 0 });
+    await expect.poll(() => page.evaluate(() => (window as any).__closes)).toBe(2);
+    await expect(dialog).toBeHidden();
+    await expect(page.locator(target.opener)).toBeFocused();
+    await expect.poll(() => page.evaluate(() => history.state?.overlay ?? null)).toBe(target.back);
+  });
+}

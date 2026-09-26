@@ -276,20 +276,39 @@ test("each poll requests the PM summary exactly once", async ({ page }) => {
   expect(fullPmCalls(state)).toHaveLength(0);
 });
 
-// #148: a poll asked for while another is in flight is not dropped; it runs as soon as the
-// in-flight one finishes. The page clock is paused, so the 3 s timer never fires and only that
-// follow-up poll can make the next read.
-test("a poll requested while one is in flight runs right after it", async ({ page }) => {
-  const state = await fixture(page);
-  // Paused before the page loads, so none of its timers fire; the first poll runs on load.
+// The page clock paused before the page loads, so none of its timers fire on their own; the first
+// poll runs on load. Every timer the app arms for its next poll (`setTimeout(poll, …)`) is counted:
+// a poll arms it only once it has completely finished (its /api/pm/host and /api/leads reads
+// settled), so the count is the signal that a poll is over and nothing else is running.
+async function pausedClock(page: Page) {
   await page.clock.install({ time: new Date("2026-09-25T10:00:00Z") });
   await page.clock.pauseAt(new Date("2026-09-25T10:00:01Z"));
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.__pollTimers = [];
+    const setTimer = window.setTimeout;
+    window.setTimeout = ((fn: any, delay?: number, ...rest: any[]) => {
+      if (typeof fn === "function" && fn.name === "poll") w.__pollTimers.push(delay);
+      return setTimer(fn, delay, ...rest);
+    }) as typeof setTimeout;
+  });
+}
+const pollTimers = (page: Page) => page.evaluate(() => (window as any).__pollTimers.length as number);
+
+// #148: a poll asked for while another is in flight is not dropped; it runs as soon as the
+// in-flight one finishes. The page clock is paused, so the 3 s timer never fires and only that
+// follow-up poll can make the next read. #187: exactly one follow-up, then the timer again.
+test("a poll requested while one is in flight runs right after it", async ({ page }) => {
+  const state = await fixture(page);
+  await pausedClock(page);
   await page.goto(SESSION_URL);
   await expect.poll(() => summaryCalls(state).length).toBe(1);
+  await expect.poll(() => pollTimers(page)).toBe(1);
   const hosts = () => state.calls.filter((c) => c.path === "/api/host").length;
   const sessionReads = () => state.calls.filter((c) => c.path === "/api/sessions").length;
 
-  // Hold the next poll at its session read, then ask for another poll while it waits.
+  // Hold the next poll at its session read, then ask for another poll while it waits (twice:
+  // requests made during one poll still make a single follow-up).
   let release!: () => void;
   state.sessionsGate = new Promise<void>((resolve) => { release = resolve; });
   const hostsBefore = hosts(), sessionsBefore = sessionReads();
@@ -297,15 +316,43 @@ test("a poll requested while one is in flight runs right after it", async ({ pag
   await expect.poll(sessionReads).toBe(sessionsBefore + 1);
   expect(hosts()).toBe(hostsBefore + 1);
   await pollNow(page);
+  await pollNow(page);
 
   // The requested poll starts once the held one has finished: one more complete poll, then the
-  // paused timer again.
+  // paused timer again. The count is checked once the follow-up has armed its timer, so a
+  // runaway re-poll (which would read /api/host again before arming one) cannot slip past.
   const summariesBefore = summaryCalls(state).length;
   state.sessionsGate = null;
   release();
-  await expect.poll(hosts).toBe(hostsBefore + 2);
-  await expect.poll(() => summaryCalls(state).length).toBe(summariesBefore + 2);
+  await expect.poll(() => pollTimers(page)).toBe(2);
   expect(hosts()).toBe(hostsBefore + 2);
+  expect(summaryCalls(state).length).toBe(summariesBefore + 2);
+  expect(await page.evaluate(() => (window as any).__pollTimers)).toEqual([3000, 3000]);
+
+  // #187: after the queued follow-up the app keeps polling on its own: 3 s later, exactly one more.
+  await page.clock.runFor(3000);
+  await expect.poll(() => pollTimers(page)).toBe(3);
+  expect(hosts()).toBe(hostsBefore + 3);
+});
+
+// #187: the app keeps polling on its own after a poll: 3 s later exactly one more /api/host read,
+// and again 3 s after that.
+test("with the clock paused, each 3 s makes exactly one more poll", async ({ page }) => {
+  const state = await fixture(page);
+  await pausedClock(page);
+  await page.goto(SESSION_URL);
+  const hosts = () => state.calls.filter((c) => c.path === "/api/host").length;
+  await expect.poll(() => pollTimers(page)).toBe(1);
+  expect(hosts()).toBe(1);
+  // Not yet: the timer is 3 s.
+  await page.clock.runFor(2900);
+  expect(hosts()).toBe(1);
+  await page.clock.runFor(100);
+  await expect.poll(() => pollTimers(page)).toBe(2);
+  expect(hosts()).toBe(2);
+  await page.clock.runFor(3000);
+  await expect.poll(() => pollTimers(page)).toBe(3);
+  expect(hosts()).toBe(3);
 });
 
 for (const failure of [500, "network"] as const) {
