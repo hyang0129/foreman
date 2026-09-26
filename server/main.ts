@@ -5,10 +5,13 @@ import { join, extname } from "node:path";
 import { Fleet, transcriptTail } from "./fleet.ts";
 import { modelCatalog } from "./models.ts";
 import { ProjectManager, choosePmStore } from "./pm.ts";
-import { Launcher } from "./launcher.ts";
+import { Launcher, relayLaunchDecision } from "./launcher.ts";
 import { ProjectRegistry } from "./projects.ts";
-import { SessionService } from "./session-service.ts";
-import { preparePeerTools } from "./peer-tools.ts";
+import { SessionService, LAUNCH_DECISION_EVENT, type LaunchDecisionEvent } from "./session-service.ts";
+import { makeSessionPrep } from "./peer-tools.ts";
+import { createLeadStore } from "./lead-store.ts";
+import { buildLeadRecords, makeLeadTools, type LeadToolsDeps } from "./lead-tools.ts";
+import { GRANT_TIMEOUT_MS, LEADS_ROUTE, SETTINGS_ROUTE, isLeadKey, normalizeLeadKey, roleOf, type HandoffWorker, type LeadHandoff, type LeadRecord, type LeadStore, type LeadsResponse, type SettingsResponse } from "../shared/roles.ts";
 import { startHostBridge, readBridgeConfig } from "./host-bridge.ts";
 import { Notifier } from "./notifier.ts";
 import { runClaude } from "./tools.ts";
@@ -31,11 +34,16 @@ const auth = localAuth(FOREMAN_HOME);
 // mode). The daemon no longer seeds or reads memory/PROJECTS.md or LOG.md; the store imports them once.
 
 const projects = new ProjectRegistry();
-const launcher = new Launcher(projects, { identityFile: join(FOREMAN_HOME, 'launcher-sessions.json') });
+// D7: the launcher's propose flow is gone; only its old native identities stay hidden from the fleet.
+const launcher = new Launcher({ identityFile: join(FOREMAN_HOME, 'launcher-sessions.json') });
 const fleet = new Fleet({ excludeSession: (session) => launcher.ownsSession(session) });
 const sessions = new SessionService({ fleet, projects });
+// Attached right after construction: held launches that expired on restart are emitted on the next tick.
+sessions.on(LAUNCH_DECISION_EVENT, (event: LaunchDecisionEvent) => { void relayLaunchDecision(sessions, event); });
 projects.seed(sessions.list());
-sessions.setPrepare((session) => preparePeerTools(sessions, session));
+// Role-aware provider setup. Until the Lead store exists (below) a Lead row is refused with a
+// clear error ("Lead tools are unavailable on this host"); every other session gets peer tools.
+sessions.setPrepare(makeSessionPrep(sessions));
 // Machine identity (machine.json). As with an invalid cloud.json (logged, and the daemon runs
 // without the relay and without a PM), an invalid, symlinked or foreign-owned machine.json is logged and the daemon
 // keeps running: without an identity it speaks the legacy relay protocol and runs no PM, and the
@@ -63,6 +71,83 @@ fleet.on("change", () => { projects.seed(sessions.list()); broadcast("fleet", se
 sessions.on("change", (list) => broadcast("fleet", list));
 sessions.on("session", (event) => broadcast("session", event));
 pm.on("event", (ev) => broadcast("pm", ev));
+
+// --- Leads (epic #157) ---------------------------------------------------------------------------
+// The Lead store (relay DO registry, or this machine's files in local-only mode) exists whenever
+// this machine has an identity and a PM store mode, whether or not it is the active Coordinator
+// host: Leads left on a standby keep syncing. It is also the GrantSource for agent launches
+// (no store: every agent launch runs Auto).
+let leadStore: LeadStore | null = null;
+// The latest handoff per Lead (fed by the Lead tools, seeded from the store at startup), for
+// the registry rows' `last_handoff` and goal.
+const latestHandoffs = new Map<string, LeadHandoff>();
+// The last row sent per Lead, without `updated_at`: an unchanged row is not re-sent on every
+// session change (the periodic resync still refreshes it).
+const sentLeadRows = new Map<string, string>();
+
+const managedRows = () => sessions.list().filter((row) => row.managed);
+function leadRecords(machine: { machine_id: string; name: string }): LeadRecord[] {
+  return buildLeadRecords(managedRows(), { machine, handoffs: latestHandoffs, approvals: (key) => sessions.approvals(key).length });
+}
+function syncLeadRows(machine: { machine_id: string; name: string }) {
+  if (!leadStore) return;
+  for (const record of leadRecords(machine)) {
+    const { updated_at: _updated, ...rest } = record;
+    const signature = JSON.stringify(rest);
+    if (sentLeadRows.get(record.lead) === signature) continue;
+    sentLeadRows.set(record.lead, signature);
+    leadStore.upsert(record);
+  }
+}
+function workersOf(lead: string): HandoffWorker[] {
+  return managedRows().filter((row) => roleOf(row) === 'worker' && typeof row.parent === 'string' && normalizeLeadKey(row.parent) === lead && row.name)
+    .map((row) => ({ session_key: row.session_key, name: row.name!, state: row.state as HandoffWorker['state'] }));
+}
+
+function wireLeads(machineIdentity: MachineIdentity, relayBridge: NonNullable<ReturnType<typeof startHostBridge>['bridge']> | null, localOnly: boolean) {
+  const machine = { machine_id: machineIdentity.machine_id, name: machineIdentity.name };
+  try {
+    leadStore = relayBridge ? createLeadStore({ identity: machineIdentity, bridge: relayBridge, workersOf })
+      : localOnly ? createLeadStore({ identity: machineIdentity, workersOf }) : null;
+  } catch (error) {
+    console.error('foreman: Lead store error:', redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300));
+    leadStore = null;
+  }
+  if (!leadStore) return;
+  const store = leadStore;
+  sessions.setGrantSource(store);
+  const deps: LeadToolsDeps = {
+    sessions, store, projects, machine,
+    onHandoff: (handoff) => { latestHandoffs.set(handoff.lead, handoff); syncLeadRows(machine); },
+  };
+  const tools = makeLeadTools(deps);
+  sessions.setPrepare(makeSessionPrep(sessions, { leadServer: tools.leadServer }));
+  store.track(() => leadRecords(machine));
+  sessions.on('change', () => syncLeadRows(machine));
+  // Seed each local Lead's latest handoff (from its file or the DO), so a restart keeps last_handoff.
+  for (const row of managedRows()) {
+    if (roleOf(row) !== 'lead' || !isLeadKey(row.session_key)) continue;
+    const key = normalizeLeadKey(row.session_key);
+    store.latestHandoff(key).then((handoff) => {
+      if (handoff && !latestHandoffs.has(key)) { latestHandoffs.set(key, handoff); syncLeadRows(machine); }
+    }, () => {});
+  }
+  syncLeadRows(machine);
+  // The Coordinator's `leads` server is built fresh for each provider start (an SDK MCP server
+  // instance serves one connection); the tools share this store and the held-supersede state.
+  pm.setLeads({ store, machineId: machine.machine_id, tools: { server: () => makeLeadTools(deps).server } });
+}
+
+// GET /api/settings (host-local): the developer's settings, read-only here. Only the hosted app
+// changes them (POST /api/settings on the Worker). Local-only mode has none: agent launches use Auto.
+async function settingsView(res: ServerResponse) {
+  if (!leadStore) return json(res, 503, { error: 'this machine has no Lead registry, so there are no developer settings here; agent launches use Auto.' });
+  if (leadStore.mode === 'local') return json(res, 503, { error: 'local-only mode has no developer settings; agent launches use Auto. Connect the cloud relay to use Settings.' });
+  const view = await leadStore.devSettings(GRANT_TIMEOUT_MS);
+  if (!view) return json(res, 503, { error: 'the cloud relay did not answer; agent launches use Auto until it does.' });
+  const response: SettingsResponse = { ...view, writable: false };
+  return json(res, 200, response);
+}
 
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png" };
 
@@ -105,9 +190,13 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (url.pathname === "/api/sessions" && req.method === 'GET') { await fleet.refresh(); return json(res, 200, sessions.list()); }
-    if (url.pathname === '/api/launch/propose' && req.method === 'POST') return json(res, 202, launcher.start(await body(req)));
-    if (url.pathname === '/api/launch' && req.method === 'GET') return json(res, 200, launcher.get(url.searchParams.get('id') ?? ''));
-    if (url.pathname === '/api/launch/cancel' && req.method === 'POST') { const { id } = await body(req); return json(res, 200, launcher.cancel(id)); }
+    if (url.pathname === LEADS_ROUTE && req.method === 'GET') {
+      if (!leadStore) return json(res, 404, { error: 'The Lead registry is unavailable on this machine.' });
+      const response: LeadsResponse = { leads: await leadStore.list({ include_ended: true }), mode: leadStore.mode };
+      return json(res, 200, response);
+    }
+    if (url.pathname === SETTINGS_ROUTE && req.method === 'GET') return settingsView(res);
+    if (url.pathname === SETTINGS_ROUTE && req.method === 'POST') return json(res, 400, { error: 'Change settings from the hosted app' });
     if (url.pathname === '/api/projects' && req.method === 'GET') { await fleet.refresh(); projects.seed(sessions.list()); return json(res, 200, { projects: projects.list() }); }
     if (url.pathname === '/api/projects/resolve' && req.method === 'POST') { const { reference } = await body(req); return json(res, 200, projects.resolve(reference)); }
     if (url.pathname === '/api/projects/register' && req.method === 'POST') return json(res, 200, projects.register(await body(req)));
@@ -149,12 +238,12 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/api/pm/host' && req.method === 'POST') {
       // Only the relay reassigns the PM; the Worker answers this route for the hosted app.
       // #122: with no PM store (e.g. an invalid relay configuration), name the cause.
-      const error = store?.mode === 'relay' ? 'Move the PM from the hosted app; the cloud relay makes that change.'
+      const error = store?.mode === 'relay' ? 'Move the Coordinator from the hosted app; the cloud relay makes that change.'
         : !store && pmUnavailable ? `${PM_HOST_LOCAL_ONLY_ERROR}, which this machine cannot use: ${pmUnavailable}` : PM_HOST_LOCAL_ONLY_ERROR;
       return json(res, 400, { error });
     }
     if (url.pathname === "/api/memory" && req.method === 'GET') {
-      if (!store) return json(res, 503, { error: pm.lastError ?? 'PM memory is unavailable on this machine' });
+      if (!store) return json(res, 503, { error: pm.lastError ?? 'Coordinator memory is unavailable on this machine' });
       let memory;
       try { memory = await store.read(); }
       catch (error) { return json(res, 503, { error: redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300) }); }
@@ -197,7 +286,7 @@ function pmHost(res: ServerResponse) {
       },
     });
   }
-  return json(res, 404, { error: pm.lastError ?? 'The PM is unavailable on this machine.' });
+  return json(res, 404, { error: pm.lastError ?? 'The Coordinator is unavailable on this machine.' });
 }
 
 server.listen(PORT, "127.0.0.1", () => {
@@ -215,6 +304,9 @@ server.listen(PORT, "127.0.0.1", () => {
   // Never two PMs: LocalPmStore only when no relay is configured at all (no cloud.json, no relay
   // env). A configured relay that is invalid or did not start means no PM on this machine.
   const choice = choosePmStore(readBridgeConfig, Boolean(bridge.bridge), process.env, bridge.error);
+  // The Lead store is created next to the PM store and independently of which machine is the
+  // active Coordinator host (relay: the bridge; local-only: this machine's files).
+  wireLeads(identity, bridge.bridge ?? null, choice.mode === 'local');
   if (choice.mode === 'unavailable') { failUnavailable(choice.reason); return; }
   try {
     // RelayPmStore when the relay is configured (a v2 bridge), else LocalPmStore (pm/state.json).
@@ -222,7 +314,7 @@ server.listen(PORT, "127.0.0.1", () => {
   } catch (error) {
     const reason = redactSecrets(String((error as Error)?.message ?? error)).slice(0, 300);
     console.error('foreman: PM state store error:', reason);
-    failUnavailable(`the PM state store could not be opened (${reason})`);
+    failUnavailable(`the Coordinator state store could not be opened (${reason})`);
     return;
   }
   // The PM runs only while this machine is the active PM host. FOREMAN_PM_DISABLED=1 only defers
@@ -235,7 +327,7 @@ async function shutdown() {
   stopping = true;
   // Detach the notifier first: closing sessions below marks them unavailable, which is not a failure.
   notifier?.close();
-  fleet.stop(); pm.close(); store?.close(); launcher.close(); bridge?.close();
+  fleet.stop(); pm.close(); store?.close(); leadStore?.close(); bridge?.close();
   const providersClosed = sessions.close();
   for (const client of clients) client.end();
   clients.clear();

@@ -59,7 +59,7 @@ async function moveError(origin, headers) {
 test('#122: POST /api/pm/host on a machine whose relay env is invalid names the invalid configuration, never the token', { timeout: 20000 }, async (t) => {
   const { origin, headers, output } = await daemon(t, { env: { FOREMAN_RELAY_URL: 'http://127.0.0.1:9', FOREMAN_HOST_TOKEN: TOKEN } });
   const error = await moveError(origin, headers);
-  assert.equal(error, 'Reassignment needs the cloud relay, which this machine cannot use: the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN) is invalid (Relay URL must be an HTTPS origin); the PM is unavailable on this machine');
+  assert.equal(error, 'Reassignment needs the cloud relay, which this machine cannot use: the relay configuration (FOREMAN_RELAY_URL/FOREMAN_HOST_TOKEN) is invalid (Relay URL must be an HTTPS origin); the Coordinator is unavailable on this machine');
   assert.ok(!error.includes(TOKEN));
   assert.ok(!output().includes(TOKEN), 'the token is never logged');
 });
@@ -67,7 +67,7 @@ test('#122: POST /api/pm/host on a machine whose relay env is invalid names the 
 test('#122: POST /api/pm/host names an invalid cloud.json', { timeout: 20000 }, async (t) => {
   const { origin, headers } = await daemon(t, { prepare: (home) => writeFileSync(join(home, 'cloud.json'), JSON.stringify({ url: 'https://relay.invalid', token: TOKEN }), { mode: 0o644 }) });
   const error = await moveError(origin, headers);
-  assert.equal(error, 'Reassignment needs the cloud relay, which this machine cannot use: cloud.json is invalid (cloud.json must be an owned regular file with mode 0600); the PM is unavailable on this machine');
+  assert.equal(error, 'Reassignment needs the cloud relay, which this machine cannot use: cloud.json is invalid (cloud.json must be an owned regular file with mode 0600); the Coordinator is unavailable on this machine');
 });
 
 test('#122: GET /api/pm/history reports the stored model before the first PM start', { timeout: 20000 }, async (t) => {

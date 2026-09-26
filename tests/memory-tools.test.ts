@@ -264,8 +264,8 @@ test('log_note collapses whitespace, enforces 3-500 characters after collapsing,
   assert.equal((await invoke('log_note', { note: ' ab ' })).isError, true);
 });
 
-test('PM system prompt describes portable tool-backed memory, not ~/.foreman/memory files', () => {
-  const prompt = readFileSync(join(ROOT, 'agents', 'pm-system-prompt.md'), 'utf8');
+test('Coordinator system prompt describes portable tool-backed memory, not ~/.foreman/memory files', () => {
+  const prompt = readFileSync(join(ROOT, 'agents', 'coordinator-system-prompt.md'), 'utf8');
   assert.doesNotMatch(prompt, /~\/\.foreman\/memory|\.foreman\/memory/);
   assert.doesNotMatch(prompt, /PROJECTS\.md|LOG\.md/);
   for (const full of PM_MEMORY_TOOLS) assert.ok(prompt.includes(`\`${full.replace('mcp__fleet__', '')}\``), `${full} named`);

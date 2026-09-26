@@ -227,7 +227,7 @@ test('a restart reports a turn left open by the previous daemon once, as uncerta
       const entries = pm.history().filter((e) => /could not be confirmed \(Foreman restarted\)\. It was not replayed\./.test(e.text ?? ''));
       assert.equal(entries.length, i === 0 ? 1 : 0, `restart ${i}`);
       if (i === 0) {
-        assert.equal(entries[0]!.text, 'Your message sent at 2026-09-24 12:00 UTC to the PM on test-mac could not be confirmed (Foreman restarted). It was not replayed.');
+        assert.equal(entries[0]!.text, 'Your message sent at 2026-09-24 12:00 UTC to the Coordinator on test-mac could not be confirmed (Foreman restarted). It was not replayed.');
         assert.equal(entries[0]!.error, true); assert.equal(pm.lastError, entries[0]!.text);
       }
       await quiet(); assert.equal(received, 0);
@@ -348,7 +348,7 @@ test('an explicit send restarts an alive-but-rejecting PM as a fresh session and
   assert.equal(f.pm.history().filter((e) => e.error).length, 1);
   // The conversation is kept across the in-process restart, with one neutral notice.
   const texts = f.pm.history().map((e) => e.text);
-  const notice = texts.indexOf('Started a fresh PM session. It answers from memory, not from the messages above.');
+  const notice = texts.indexOf('Started a fresh Coordinator session. It answers from memory, not from the messages above.');
   assert.ok(notice > 0 && notice < texts.indexOf('explicit retry after login repair'), JSON.stringify(texts));
   assert.equal(f.pm.history()[notice]!.error, undefined);
 });
@@ -683,7 +683,8 @@ test('a model change whose save and restore both fail closes the PM and keeps bo
   const running = pm.start(); t.after(async () => { pm.close(); await running; });
   await settle(() => pm.sessionId === 'test-session');
   await assert.rejects(pm.setModel('claude-sonnet-4-5'), (error: any) => /ENOENT/.test(error.message) && /control channel closed while restoring/.test(error.message));
-  assert.deepEqual(models, ['claude-sonnet-4-5', undefined]);
+  // The restore returns to the model the provider started with: with none saved or configured, the Coordinator role default (epic #157).
+  assert.deepEqual(models, ['claude-sonnet-4-5', 'opus[1m]']);
   assert.match(pm.lastError!, /control channel closed while restoring/);
   assert.match(pm.lastError!, /ENOENT/);
   assert.match(errorEntries(pm).at(-1)!, /control channel closed while restoring/);
@@ -713,7 +714,7 @@ test('an assistant error with a code and prose keeps both in lastError, the conv
   await f.pm.send('hello');
   await settle(() => f.events.some((e) => e.type === 'turn_end'));
   assert.deepEqual(f.consumed, ['hello']);
-  assert.match(f.pm.lastError!, /^Project manager failed: authentication_failed: OAuth session expired and could not be refreshed\. /);
+  assert.match(f.pm.lastError!, /^Coordinator failed: authentication_failed: OAuth session expired and could not be refreshed\. /);
   const entries = errorEntries(f.pm);
   assert.equal(entries.length, 1);
   assert.equal(entries[0], f.pm.lastError);
@@ -742,7 +743,7 @@ test('an assistant error with a code but no prose reports the code', { timeout: 
   ]);
   await f.pm.send('hello');
   await settle(() => f.events.some((e) => e.type === 'turn_end'));
-  assert.match(f.pm.lastError!, /^Project manager failed: account_on_hold: provider returned no message\. /);
+  assert.match(f.pm.lastError!, /^Coordinator failed: account_on_hold: provider returned no message\. /);
   assert.match(errorEntries(f.pm)[0]!, /account_on_hold/);
   const logs = failureLogs(f.diagnostics);
   assert.equal(logs.length, 1);
@@ -753,7 +754,7 @@ test('a failure with no code and no diagnostic keeps the fallback and logs code 
   const f = codedTurn(t, [{ type: 'result', is_error: true, subtype: 'error_during_execution', errors: [] }]);
   await f.pm.send('hello');
   await settle(() => f.events.some((e) => e.type === 'turn_end'));
-  assert.match(f.pm.lastError!, /^Project manager failed: Provider returned error_during_execution without a diagnostic\. /);
+  assert.match(f.pm.lastError!, /^Coordinator failed: Provider returned error_during_execution without a diagnostic\. /);
   const logs = failureLogs(f.diagnostics);
   assert.equal(logs.length, 1);
   assert.ok('code' in logs[0], 'the diagnostic always carries a code field');
@@ -963,9 +964,9 @@ test('inputs queued behind a provider that stops get one entry each, and none is
   await settle(() => f.consumed.length === 1);
   release.open(); await running;
   const entries = errorEntries(f.pm);
-  assert.equal(entries.filter((e) => /could not be confirmed \(the PM stopped: Claude Code process exited with code 1\)/.test(e)).length, 1);
-  assert.equal(entries.filter((e) => /was not delivered \(the PM stopped: Claude Code process exited with code 1\)/.test(e)).length, 2);
-  assert.match(entries.at(-1)!, /^Project manager failed: Claude Code process exited with code 1/);
+  assert.equal(entries.filter((e) => /could not be confirmed \(the Coordinator stopped: Claude Code process exited with code 1\)/.test(e)).length, 1);
+  assert.equal(entries.filter((e) => /was not delivered \(the Coordinator stopped: Claude Code process exited with code 1\)/.test(e)).length, 2);
+  assert.match(entries.at(-1)!, /^Coordinator failed: Claude Code process exited with code 1/);
   assert.deepEqual(ends.map(([, outcome]) => outcome).sort(), ['failed', 'failed', 'uncertain']);
   assert.deepEqual(store.openTurnIds(), []);
   await f.pm.send('new'); await settle(() => f.pm.history().some((e) => e.text === 'fresh answer'));
@@ -1006,8 +1007,8 @@ test('uncertain turns are shown once, at the top of the conversation, and acknow
   for (let i = 0; i < 3; i++) listeners[0]({ active: true, connected: true, epoch: 2, activeHost: 'machine-b' }, [turn, lost]); // duplicate deliveries
   const history = pm.history();
   assert.deepEqual(history.map((e) => e.text), [
-    'Your message sent at 2026-09-24 09:30 UTC to the PM on machine-a could not be confirmed (the PM was moved). It was not replayed.',
-    'Your message sent at 2026-09-24 09:31 UTC to the PM on machine-a could not be confirmed (machine went offline). It was not replayed.',
+    'Your message sent at 2026-09-24 09:30 UTC to the Coordinator on machine-a could not be confirmed (the Coordinator was moved). It was not replayed.',
+    'Your message sent at 2026-09-24 09:31 UTC to the Coordinator on machine-a could not be confirmed (machine went offline). It was not replayed.',
   ]);
   assert.ok(history.every((e) => e.error === true && e.role === 'system'));
   assert.equal(pm.lastError, history[1]!.text);
@@ -1018,8 +1019,8 @@ test('uncertain turns are shown once, at the top of the conversation, and acknow
 
 test('the hung-turn reason and the restart reason read as plain words', async () => {
   const { UNCERTAIN_REASON_TEXT, uncertainText } = await import('../server/pm.ts');
-  assert.deepEqual(UNCERTAIN_REASON_TEXT, { restarted: 'Foreman restarted', reassigned: 'the PM was moved', host_lost: 'machine went offline', hung: 'the PM stopped responding' });
-  assert.equal(uncertainText('not a date', 'm', 'x'), 'Your message sent at not a date to the PM on m could not be confirmed (x). It was not replayed.');
+  assert.deepEqual(UNCERTAIN_REASON_TEXT, { restarted: 'Foreman restarted', reassigned: 'the Coordinator was moved', host_lost: 'machine went offline', hung: 'the Coordinator stopped responding' });
+  assert.equal(uncertainText('not a date', 'm', 'x'), 'Your message sent at not a date to the Coordinator on m could not be confirmed (x). It was not replayed.');
 });
 
 // The real SDK reads prompt input eagerly and forwards each input's uuid; the installed CLI echoes

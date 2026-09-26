@@ -27,15 +27,14 @@ test('spawn_session accepts each managed preset and omission without native flag
   assert.equal((await spawn({ ...input, permission_mode: 'bypassPermissions' })).isError, true);
   assert.equal(launches.length, before);
 });
-test('PM may propose elevated settings but cannot approve its own elevated spawn', async () => {
+test('the Coordinator cannot spawn sessions at all (epic #157: it starts Leads; the Bypass deny moved to start_lead → launchAgent)', async () => {
   const pm = new ProjectManager({} as any);
   const guard = (pm as any).canUseTool;
-  for (const permission_mode of ['bypass', 'bypassPermissions']) {
+  for (const permission_mode of ['bypass', 'bypassPermissions', 'native', undefined]) {
     assert.equal((await guard('mcp__fleet__spawn_session', { permission_mode })).behavior, 'deny');
     const hook = await (pm as any).enforceToolBoundary({ hook_event_name: 'PreToolUse', tool_name: 'mcp__fleet__spawn_session', tool_input: { permission_mode } });
     assert.equal(hook.hookSpecificOutput.permissionDecision, 'deny');
   }
-  assert.equal((await guard('mcp__fleet__spawn_session', { permission_mode: 'native' })).behavior, 'allow');
 });
 
 test('the Coordinator fleet server (spawn: false) has no spawn_session; the default keeps it; sender reaches the peer binding', async () => {
