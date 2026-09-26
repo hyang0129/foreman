@@ -222,9 +222,9 @@ export class PmState {
    */
   execute(machineId: string, rpc: TypedPmRpc, now: number): PmRpcResult {
     const assignment = this.assignment();
-    if (!assignment) return pmRpcError(rpc.id, 'not_active', 'No machine is the PM host yet');
-    if (rpc.epoch !== assignment.epoch) return pmRpcError(rpc.id, 'stale_epoch', `Epoch ${rpc.epoch} is stale; the current PM epoch is ${assignment.epoch}`);
-    if (assignment.machine_id !== machineId) return pmRpcError(rpc.id, 'not_active', `This machine is not the PM host; the PM runs on ${this.machineName(assignment.machine_id)}`);
+    if (!assignment) return pmRpcError(rpc.id, 'not_active', 'No machine is the Coordinator host yet');
+    if (rpc.epoch !== assignment.epoch) return pmRpcError(rpc.id, 'stale_epoch', `Epoch ${rpc.epoch} is stale; the current Coordinator epoch is ${assignment.epoch}`);
+    if (assignment.machine_id !== machineId) return pmRpcError(rpc.id, 'not_active', `This machine is not the Coordinator host; the Coordinator runs on ${this.machineName(assignment.machine_id)}`);
     const epoch = assignment.epoch;
     return this.storage.transactionSync((): PmRpcResult => {
       switch (rpc.op) {
@@ -259,7 +259,7 @@ export class PmState {
         }
         case 'memory.import': {
           const { projects, log, model, source_machine } = rpc.args;
-          if (this.initialized()) return pmRpcError(rpc.id, 'already_initialized', 'PM memory is already initialized; nothing was imported');
+          if (this.initialized()) return pmRpcError(rpc.id, 'already_initialized', 'Coordinator memory is already initialized; nothing was imported');
           if (source_machine !== machineId) return pmRpcError(rpc.id, 'invalid', 'source_machine must be the importing machine');
           if (projects) this.writeDoc('projects', projects, this.doc('projects').version + 1, now, epoch);
           for (const line of log) this.appendLog(line, now, epoch);
@@ -280,7 +280,7 @@ export class PmState {
               ? pmRpcOk(rpc.id, rpc.op, {})
               : pmRpcError(rpc.id, 'invalid', 'turn_id is already recorded');
           }
-          if (this.turnCounts().open >= MAX_OPEN_TURNS) return pmRpcError(rpc.id, 'unavailable', `At most ${MAX_OPEN_TURNS} PM turns can be open`);
+          if (this.turnCounts().open >= MAX_OPEN_TURNS) return pmRpcError(rpc.id, 'unavailable', `At most ${MAX_OPEN_TURNS} Coordinator turns can be open`);
           this.sql.exec("INSERT INTO pm_turns (turn_id, machine_id, epoch, accepted_at, state, reason) VALUES (?, ?, ?, ?, 'open', NULL)", turn_id, machineId, epoch, Date.parse(accepted_at));
           return pmRpcOk(rpc.id, rpc.op, {});
         }

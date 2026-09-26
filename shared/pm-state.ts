@@ -583,7 +583,7 @@ export const PM_HOST_LOCAL_ONLY_ERROR = 'Reassignment needs the cloud relay';
 
 /** 503 body text for a relayed request while the active PM host is offline. */
 export function pmHostOfflineMessage(name: string): string {
-  return `Your PM's machine (${name}) is offline.`;
+  return `Your Coordinator's machine (${name}) is offline.`;
 }
 
 export function parsePmHostMoveRequest(raw: unknown): Parsed<PmHostMoveRequest> {

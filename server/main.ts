@@ -279,7 +279,7 @@ function pmHost(res: ServerResponse) {
   if (store?.mode === 'relay') {
     const a = store.assignment(), frame = bridge?.bridge?.currentAssignment() ?? null;
     return json(res, 404, {
-      error: 'The cloud relay answers /api/pm/host; open the hosted app to see every machine or move the PM.',
+      error: 'The cloud relay answers /api/pm/host; open the hosted app to see every machine or move the Coordinator.',
       view: {
         mode: 'relay', connected: a.connected, this_machine_active: a.active, epoch: frame?.epoch ?? null, active_machine: frame?.active_machine ?? null,
         this_machine: identity ? { machine_id: identity.machine_id, name: identity.name } : null,
