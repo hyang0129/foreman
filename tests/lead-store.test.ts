@@ -531,16 +531,160 @@ test('createLeadStore picks the relay store with a bridge and the local store wi
   assert.ok(remote instanceof RelayLeadStore); assert.equal(remote.mode, 'relay');
 });
 
-test('an invalid outbox.json is ignored with a log line, never thrown', async (t) => {
+test('an invalid outbox.json is ignored with a log line, never thrown; the undelivered handoff is queued again from its log', async (t) => {
   const dir = home(t);
   const logs: string[] = [];
+  const lead = newLead();
   const first = relay(t, { home: dir, logs }).store;
-  await first.appendHandoff(input(newLead()));
+  await first.appendHandoff(input(lead));
   first.close();
   writeFileSync(join(dir, 'leads', 'outbox.json'), '{not json');
   const { store } = relay(t, { home: dir, logs });
-  assert.deepEqual(store.pendingHandoffs(), []);
   assert.ok(logs.some((l) => /outbox\.json is invalid/.test(l)));
+  // #196: the delivered cursor says seq 1 never reached the DO, so the log offers it again.
+  assert.deepEqual(store.pendingHandoffs().map((h) => [h.lead, h.seq]), [[lead, 1]]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// #196: delivered cursor, startup reconcile, seq floor, local-only → paired
+// ---------------------------------------------------------------------------------------------
+
+test('#196 crash between the log append and the outbox save: the next start queues the logged handoff, and only that one', async (t) => {
+  const dir = home(t);
+  const bridge = new FakeBridge();
+  const lead = newLead();
+  const first = relay(t, { home: dir, bridge }).store;
+  first.track(() => [record(lead)]);
+  bridge.setConnected(true); await settle();
+  await first.appendHandoff(input(lead)); await first.appendHandoff(input(lead)); await settle();
+  assert.deepEqual([...bridge.handoffs.keys()], [`${lead}#1`, `${lead}#2`]);
+  bridge.setConnected(false);
+  first.close();
+  // The crash: seq 3 reached the log, the process died before the outbox was saved.
+  const lost = { ...input(lead, { summary: 'written just before the crash' }), v: 1, seq: 3, at: new Date().toISOString(), workers: [] };
+  appendFileSync(join(dir, 'leads', `${lead.slice(3)}.jsonl`), JSON.stringify(lost) + '\n');
+  const logs: string[] = [];
+  const { store } = relay(t, { home: dir, bridge, logs });
+  store.track(() => [record(lead)]);
+  assert.deepEqual(store.pendingHandoffs().map((h) => h.seq), [3], 'delivered seqs 1 and 2 are not queued again');
+  assert.ok(logs.some((l) => /queued 1 logged handoff not yet confirmed/.test(l)));
+  const sent = bridge.ops('lead.handoff').length;
+  bridge.setConnected(true); await settle();
+  assert.deepEqual(bridge.ops('lead.handoff').slice(sent).map((c) => c.args.handoff.seq), [3]);
+  assert.equal(bridge.handoffs.get(`${lead}#3`)?.summary, 'written just before the crash');
+  assert.deepEqual(store.pendingHandoffs(), []);
+});
+
+test('#196 a deleted handoff log does not restart the seq under handoffs the DO already has', async (t) => {
+  const dir = home(t);
+  const bridge = new FakeBridge();
+  const lead = newLead();
+  const first = relay(t, { home: dir, bridge }).store;
+  first.track(() => [record(lead)]);
+  bridge.setConnected(true); await settle();
+  await first.appendHandoff(input(lead)); await first.appendHandoff(input(lead)); await settle();
+  bridge.setConnected(false);
+  first.close();
+  rmSync(join(dir, 'leads', `${lead.slice(3)}.jsonl`));
+  const { store } = relay(t, { home: dir, bridge });
+  store.track(() => [record(lead)]);
+  const next = await store.appendHandoff(input(lead, { summary: 'after the log was deleted' }));
+  assert.equal(next.seq, 3, 'one past the delivered cursor, not 1');
+  bridge.setConnected(true); await settle();
+  assert.equal(bridge.handoffs.get(`${lead}#3`)?.summary, 'after the log was deleted', 'stored, not answered stored:false as a duplicate');
+  assert.equal(bridge.handoffs.get(`${lead}#1`)?.summary, 'Working on it', 'the old seq 1 is untouched');
+});
+
+test('#196 a queued (not yet delivered) handoff also floors the seq when its log is gone', async (t) => {
+  const dir = home(t);
+  const lead = newLead();
+  const first = relay(t, { home: dir }).store;
+  await first.appendHandoff(input(lead)); await first.appendHandoff(input(lead));
+  first.close();
+  rmSync(join(dir, 'leads', `${lead.slice(3)}.jsonl`));
+  const { store } = relay(t, { home: dir });
+  assert.equal((await store.appendHandoff(input(lead))).seq, 3);
+  assert.deepEqual(store.pendingHandoffs().map((h) => h.seq), [1, 2, 3]);
+});
+
+test('#196 handoffs written in local-only mode reach the relay once this machine is paired', async (t) => {
+  const dir = home(t);
+  const lead = newLead();
+  const local = new LocalLeadStore({ identity: MACHINE, home: dir, log: () => {} });
+  await local.appendHandoff(input(lead, { kind: 'seed' }));
+  await local.appendHandoff(input(lead, { summary: 'local checkpoint' }));
+  local.close();
+  // Paired later: the relay store starts on the same home.
+  const { bridge, store } = relay(t, { home: dir });
+  store.track(() => [record(lead)]);
+  bridge.setConnected(true); await settle();
+  assert.deepEqual(bridge.calls.map((c) => c.op), ['lead.sync', 'lead.handoff', 'lead.handoff'], 'the row first, then the logged handoffs');
+  assert.deepEqual([...bridge.handoffs.keys()], [`${lead}#1`, `${lead}#2`]);
+  assert.deepEqual(store.pendingHandoffs(), []);
+  // Settled: a restart offers nothing again.
+  store.close();
+  const again = relay(t, { home: dir, bridge }).store;
+  assert.deepEqual(again.pendingHandoffs(), []);
+});
+
+test('#196 localList serves non-ended Leads first, so a live Lead is not cut behind 200 newer ended rows', async (t) => {
+  const store = new LocalLeadStore({ identity: MACHINE, home: home(t), log: () => {} });
+  t.after(() => store.close());
+  const live = newLead();
+  const ended = Array.from({ length: 200 }, (_, i) => record(newLead(), { state: 'ended', alive: false, updated_at: 10_000 + i }));
+  store.track(() => [record(live, { state: 'idle', updated_at: 1_000 }), ...ended]);
+  const all = await store.list({ include_ended: true });
+  assert.equal(all.length, 200);
+  assert.equal(all[0]!.lead, live, 'the idle Lead leads the list');
+  assert.equal(all[1]!.updated_at, 10_199, 'then the newest ended rows');
+});
+
+test('#196 rowDelivered: a row delivered while a flush pass is running (its handoff answer still in flight) flushes once more', async (t) => {
+  const { bridge, store } = relay(t);
+  const lead = newLead();
+  let answer!: () => void;
+  let first = true;
+  bridge.respond = (op, args) => {
+    if (op === 'lead.handoff' && first) {
+      first = false;
+      // The DO has no row yet when this handoff arrives; its not_found answer is held back until the row's upsert is answered.
+      return new Promise((_resolve, reject) => { answer = () => reject(new LeadRpcError('not_found', op, 'unknown Lead')); });
+    }
+    return bridge.fakeDo(op, args);
+  };
+  bridge.setConnected(true); await settle();
+  await store.appendHandoff(input(lead)); await settle();
+  assert.equal(bridge.ops('lead.handoff').length, 1, 'in flight');
+  store.upsert(record(lead)); await settle();
+  assert.ok(bridge.rows.has(lead), 'the upsert was answered while the handoff pass is still running');
+  answer(); await settle();
+  assert.deepEqual([...bridge.handoffs.keys()], [`${lead}#1`], 'the pass ran again at once and delivered it');
+  assert.deepEqual(store.pendingHandoffs(), []);
+});
+
+test('#196 awaitingRow forgets a Lead whose held handoffs were dropped: its later row sends no extra flush pass', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 100_000 });
+  const { bridge, store } = relay(t);
+  const a = newLead(), b = newLead();
+  bridge.respond = (op, args) => {
+    if (op === 'lead.handoff' && args.handoff.lead === a) throw new LeadRpcError('not_found', op, 'unknown Lead');
+    if (op === 'lead.handoff' && args.handoff.lead === b) throw new LeadRpcError('timeout', op, 'no answer');
+    return bridge.fakeDo(op, args);
+  };
+  bridge.setConnected(true); await settle();
+  await store.appendHandoff(input(a)); await settle(); // held not_found: a waits for its row
+  // a's entry ages out on a later tick and is dropped.
+  t.mock.timers.setTime(100_000 + LEAD_OUTBOX_MAX_AGE_MS);
+  t.mock.timers.tick(LEAD_RESYNC_INTERVAL_MS); await settle();
+  assert.deepEqual(store.pendingHandoffs(), []);
+  // b's handoff fails transiently (kept for the next tick).
+  await store.appendHandoff(input(b)); await settle();
+  assert.deepEqual(store.pendingHandoffs().map((h) => h.lead), [b]);
+  const tries = bridge.ops('lead.handoff').length;
+  // a's row now reaches the DO: nothing of a is queued, so no flush pass (which would retry b early).
+  store.upsert(record(a)); await settle();
+  assert.equal(bridge.ops('lead.upsert').length, 1);
+  assert.equal(bridge.ops('lead.handoff').length, tries);
 });
 
 // ---------------------------------------------------------------------------------------------

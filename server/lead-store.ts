@@ -17,6 +17,15 @@
 //   once) or the next hello or tick, and drops an entry held that way once it is older than
 //   `LEAD_OUTBOX_MAX_AGE_MS` (logged); `forbidden` / `invalid` / `too_large` drop the entry with a logged
 //   diagnostic, so nothing is ever retried in a loop.
+// - Delivered cursor (#196). `<home>/leads/delivered.json` (0600, atomic write) keeps, per Lead,
+//   the highest seq the DO has settled (stored, a duplicate, or refused and dropped). It serves two
+//   repairs: on start, every handoff in a local log above its Lead's cursor that is not in the
+//   outbox is queued again (a crash between the log append and the outbox save, and handoffs
+//   written in local-only mode before this machine was paired); and a Lead's next seq is one past
+//   the highest of its log, its cursor and its queued handoffs, so a deleted log does not restart
+//   the seq at 1 under handoffs the DO already has. A missing or invalid cursor file means nothing
+//   is known to be delivered: the logs are queued again (bounded like the outbox), and the DO
+//   answers what it already has with `stored: false`, which counts as delivered.
 // - Registry. `upsert` sends a row at once and coalesces further edges for the same Lead into one
 //   send per 30 s (latest row wins). `track(source)` registers this machine's rows; all of them are
 //   resynced with `lead.sync` (chunked to fit `MAX_LEAD_FRAME` and `MAX_SYNC_RECORDS`) on every
@@ -31,7 +40,7 @@
 // shared contract before they are stored or sent.
 
 import { randomUUID } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { LEADS_DIR } from './paths.ts';
 import { LeadRpcError, type HostBridge, type LeadRpcFailure } from './host-bridge.ts';
@@ -51,6 +60,7 @@ export const LEAD_UPSERT_DEBOUNCE_MS = 30_000;
 /** Full resync period while connected (keeps the DO's `reported_at` within 5 min). */
 export const LEAD_RESYNC_INTERVAL_MS = 4 * 60_000;
 export const LEAD_OUTBOX_FILE = 'outbox.json';
+export const LEAD_DELIVERED_FILE = 'delivered.json';
 /** Outbox bounds: the DO keeps only the newest 20 handoffs per Lead, so older queued ones are dropped first. */
 export const MAX_OUTBOX_PER_LEAD = MAX_HANDOFFS_KEPT;
 export const MAX_OUTBOX_TOTAL = 400;
@@ -160,6 +170,18 @@ export class LeadFiles {
     if ((stat.mode & 0o077) !== 0) chmodSync(this.dir, 0o700);
   }
   fileOf(lead: string): string { return join(this.dir, `${leadUuid(lead)}.jsonl`); }
+  /** Lead keys that have a log file here. */
+  leads(): string[] {
+    let names: string[] = [];
+    try { names = readdirSync(this.dir); } catch { return []; }
+    const out: string[] = [];
+    for (const name of names) {
+      if (!name.endsWith('.jsonl')) continue;
+      const key = `fm:${name.slice(0, -'.jsonl'.length)}`;
+      if (isLeadKey(key) && normalizeLeadKey(key) === key) out.push(key);
+    }
+    return out.sort();
+  }
 
   /** Valid handoffs of `lead` in file order (invalid or foreign lines are skipped). */
   read(lead: string): LeadHandoff[] {
@@ -284,7 +306,7 @@ abstract class BaseLeadStore implements LeadStore {
       catch { this.logger('foreman: the Lead workers provider failed; the handoff lists no workers'); }
     }
     // Synchronous from here: the seq is read and written with no await in between.
-    const seq = this.files.lastSeq(lead) + 1;
+    const seq = Math.max(this.files.lastSeq(lead), this.seqFloor(lead)) + 1;
     const parsed = parseLeadHandoff({ ...input, v: 1, lead, seq, at: this.now().toISOString(), workers });
     if (!parsed.ok) throw new LeadStoreError(/exceeds/.test(parsed.error) ? 'too_large' : 'invalid', parsed.error);
     try { this.files.append(parsed.value); }
@@ -297,6 +319,8 @@ abstract class BaseLeadStore implements LeadStore {
   }
   /** Called after a handoff is on disk. */
   protected stored(_handoff: LeadHandoff): void {}
+  /** The lowest seq a new handoff of `lead` must be above, besides its log (the relay store's cursor and outbox). */
+  protected seqFloor(_lead: string): number { return 0; }
 
   /** This machine's rows: the tracked source, overlaid by newer upserted rows. Validated, own machine only. */
   protected records(): LeadRecord[] {
@@ -325,7 +349,8 @@ abstract class BaseLeadStore implements LeadStore {
     return this.records()
       .map((record) => this.localEntry(record))
       .filter((entry) => opts.include_ended === true || !entry.ended)
-      .sort((a, b) => b.updated_at - a.updated_at)
+      // Non-ended first (like the DO's list), so a live Lead never falls out behind newer ended rows.
+      .sort((a, b) => Number(a.ended) - Number(b.ended) || b.updated_at - a.updated_at)
       .slice(0, limit);
   }
   protected localGet(lead: string, handoffs: number): LeadGetResult | null {
@@ -371,6 +396,9 @@ export class RelayLeadStore extends BaseLeadStore {
   private connected: boolean;
   private outboxFile: string;
   private outbox: LeadHandoff[];
+  private deliveredFile: string;
+  /** Per Lead, the highest seq the DO has settled (see the header). */
+  private delivered: Map<string, number>;
   private flushing: Promise<void> | null = null;
   private flushAgain = false;
   /** Leads whose handoffs were last refused `not_found`: a successful upsert/sync of their row flushes at once. */
@@ -392,6 +420,9 @@ export class RelayLeadStore extends BaseLeadStore {
     this.resyncMs = options.resyncIntervalMs ?? LEAD_RESYNC_INTERVAL_MS;
     this.outboxFile = join(this.files.dir, LEAD_OUTBOX_FILE);
     this.outbox = this.readOutbox();
+    this.deliveredFile = join(this.files.dir, LEAD_DELIVERED_FILE);
+    this.delivered = this.readDelivered();
+    this.reconcile();
     this.connected = false;
     this.unsubscribe.push(bridge.onConnection((connected) => this.connectionChanged(connected)));
     if (bridge.connected) this.connectionChanged(true);
@@ -491,6 +522,35 @@ export class RelayLeadStore extends BaseLeadStore {
 
   private readable(): boolean { return !this.closed && this.connected && this.bridge.connected; }
 
+  protected override seqFloor(lead: string): number {
+    let floor = this.delivered.get(lead) ?? 0;
+    for (const h of this.outbox) if (h.lead === lead && h.seq > floor) floor = h.seq;
+    return floor;
+  }
+
+  /**
+   * On start: queues every logged handoff above its Lead's delivered cursor that the outbox does
+   * not hold (newest MAX_OUTBOX_PER_LEAD per Lead, then the usual bounds), in time order.
+   */
+  private reconcile(): void {
+    const found: LeadHandoff[] = [];
+    for (const lead of this.files.leads()) {
+      const cursor = this.delivered.get(lead) ?? 0;
+      const missing = this.files.read(lead).filter((h) => h.seq > cursor && !this.queued(h))
+        .sort((a, b) => a.seq - b.seq);
+      // Keep only one handoff per seq (a log may repeat one after a torn write was retried).
+      const bySeq = new Map<number, LeadHandoff>();
+      for (const h of missing) if (!bySeq.has(h.seq)) bySeq.set(h.seq, h);
+      found.push(...[...bySeq.values()].slice(-MAX_OUTBOX_PER_LEAD));
+    }
+    if (!found.length) return;
+    const time = (h: LeadHandoff) => { const t = Date.parse(h.at); return Number.isFinite(t) ? t : 0; };
+    this.outbox = [...this.outbox, ...found].sort((a, b) => time(a) - time(b) || (a.lead === b.lead ? a.seq - b.seq : 0));
+    this.boundOutbox();
+    this.saveOutbox();
+    this.logger(`foreman: queued ${found.length} logged handoff${found.length === 1 ? '' : 's'} not yet confirmed by the relay`);
+  }
+
   /** DO handoffs plus this machine's newer ones not yet delivered, newest first. */
   private withLocal(lead: string, remote: LeadHandoff[], count: number): LeadHandoff[] {
     if (count === 0) return remote;
@@ -563,7 +623,7 @@ export class RelayLeadStore extends BaseLeadStore {
       try {
         await this.bridge.leadRpc('lead.handoff', { handoff });
         // `stored: false` is a duplicate (lead, seq): the DO already has it, so it is delivered too.
-        this.remove(handoff);
+        this.settle(handoff);
         this.awaitingRow.delete(handoff.lead);
       } catch (error) {
         const code = failureCode(error);
@@ -571,24 +631,39 @@ export class RelayLeadStore extends BaseLeadStore {
         if (code === 'not_found') {
           const age = this.now().getTime() - Date.parse(handoff.at);
           if (age > LEAD_OUTBOX_MAX_AGE_MS) {
-            this.remove(handoff);
+            this.settle(handoff);
             this.logger(`foreman: handoff ${handoff.seq} of ${handoff.lead} waited over 24 h for its Lead row to reach the relay; dropped from the outbox, kept in the local log`);
             continue;
           }
           // The Lead's row has not reached the DO yet: hold this Lead's handoffs (in order) until it does.
           held.add(handoff.lead); this.awaitingRow.add(handoff.lead); continue;
         }
-        this.remove(handoff);
+        this.settle(handoff);
         this.logger(`foreman: the relay refused handoff ${handoff.seq} of ${handoff.lead} (${code}); dropped from the outbox, kept in the local log`);
       }
     }
+  }
+
+  /** The DO has answered for this handoff for good (stored, duplicate, or refused and dropped): advance the cursor, then unqueue it. */
+  private settle(handoff: LeadHandoff): void {
+    if (handoff.seq > (this.delivered.get(handoff.lead) ?? 0)) {
+      this.delivered.set(handoff.lead, handoff.seq);
+      this.saveDelivered();
+    }
+    this.remove(handoff);
   }
 
   private remove(handoff: LeadHandoff): void {
     const at = this.outbox.findIndex((h) => h.lead === handoff.lead && h.seq === handoff.seq);
     if (at < 0) return;
     this.outbox.splice(at, 1);
+    this.forgetIdleAwaiting();
     this.saveOutbox();
+  }
+
+  /** A Lead with nothing left in the outbox no longer waits for its row. */
+  private forgetIdleAwaiting(): void {
+    for (const lead of this.awaitingRow) if (!this.outbox.some((h) => h.lead === lead)) this.awaitingRow.delete(lead);
   }
 
   private boundOutbox(): void {
@@ -601,6 +676,7 @@ export class RelayLeadStore extends BaseLeadStore {
       return true;
     });
     if (this.outbox.length > MAX_OUTBOX_TOTAL) { dropped += this.outbox.length - MAX_OUTBOX_TOTAL; this.outbox.splice(0, this.outbox.length - MAX_OUTBOX_TOTAL); }
+    if (dropped) this.forgetIdleAwaiting();
     if (dropped) this.logger(`foreman: dropped the ${dropped} oldest undelivered handoff${dropped === 1 ? '' : 's'} from the outbox (kept in the local logs)`);
   }
 
@@ -620,6 +696,34 @@ export class RelayLeadStore extends BaseLeadStore {
     } catch {
       this.logger('foreman: leads/outbox.json is invalid; ignoring it (the handoffs stay in the local logs)');
       return [];
+    }
+  }
+
+  private readDelivered(): Map<string, number> {
+    const out = new Map<string, number>();
+    if (!existsSync(this.deliveredFile)) return out;
+    try {
+      const stat = lstatSync(this.deliveredFile);
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('not a file');
+      const raw = JSON.parse(readFileSync(this.deliveredFile, 'utf8'));
+      if (!isObject(raw) || raw.version !== 1 || !isObject(raw.seqs)) throw new Error('shape');
+      for (const [lead, seq] of Object.entries(raw.seqs)) {
+        if (isLeadKey(lead) && typeof seq === 'number' && Number.isSafeInteger(seq) && seq > 0) out.set(normalizeLeadKey(lead), seq);
+      }
+    } catch {
+      this.logger('foreman: leads/delivered.json is invalid; ignoring it (logged handoffs are offered to the relay again)');
+      out.clear();
+    }
+    return out;
+  }
+
+  // Best effort, like the outbox: a failed write keeps the in-memory cursor.
+  private saveDelivered(): void {
+    try {
+      this.files.ensureDir();
+      atomicWrite(this.deliveredFile, JSON.stringify({ version: 1, seqs: Object.fromEntries(this.delivered) }) + '\n');
+    } catch {
+      this.logger('foreman: could not save leads/delivered.json');
     }
   }
 

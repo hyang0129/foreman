@@ -184,6 +184,12 @@ export function sessionUrl(key: string): string {
 
 export const PM_URL = '/?view=pm';
 
+/**
+ * #144: the relay's name for a host socket that has not said hello yet (machine-neutral). It is a
+ * placeholder, not a machine name: a host_offline push for it reads "Your machine …" (#196).
+ */
+export const UNNAMED_HOST = 'execution host';
+
 // Every PushKind has a case; buildPushPayload never passes anything else.
 function render(kind: PushKind, host: string, key: string | undefined, name: string | undefined, at: string): PushPayload {
   const who = name || 'A session';
@@ -200,7 +206,7 @@ function render(kind: PushKind, host: string, key: string | undefined, name: str
     case 'pm_failed':
       return { v: 1, kind, host, at, tag: 'pm', url: PM_URL, title: 'Coordinator needs attention', body: 'The Coordinator hit an error. Open Foreman for details.' };
     case 'host_offline':
-      return { v: 1, kind, host, at, tag: 'host', url: '/', title: 'Machine offline', body: `${host || 'Your machine'} has been disconnected for over 5 minutes.` };
+      return { v: 1, kind, host, at, tag: 'host', url: '/', title: 'Machine offline', body: `${host && host !== UNNAMED_HOST ? host : 'Your machine'} has been disconnected for over 5 minutes.` };
     case 'test':
       return { v: 1, kind: 'test', host, at, tag: 'test', url: '/', title: 'Foreman notifications are on', body: 'You will be notified when a session needs you.' };
   }

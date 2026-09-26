@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { verifyUser, validHostToken } from './auth.ts';
 import { allowedRequest, MAX_BODY, MAX_RESPONSE, MAX_RESPONSE_FRAME, type RelayResponse } from '../shared/relay.ts';
-import { buildPushPayload, cleanDisplayName, DEFAULT_PUSH_KINDS, isPushPreferenceKind, parseNotifyFrame, PUSH_KINDS, utf8Length, type PushEvent, type PushKind } from '../shared/notify.ts';
+import { buildPushPayload, cleanDisplayName, DEFAULT_PUSH_KINDS, isPushPreferenceKind, parseNotifyFrame, PUSH_KINDS, UNNAMED_HOST, utf8Length, type PushEvent, type PushKind } from '../shared/notify.ts';
 import { fromB64u, loadVapidKeys, pushEndpointAllowed, sendPush, topicFor, validReceiverKeys, type PushTarget } from './push.ts';
 import { isHelloV2, isPmId, parseHello, parsePmHostMoveRequest, parsePmRpc, pmHostOfflineMessage, pmRpcError, type HelloV2, type HostStatusResponse, type PmAssignment, type PmHostMoveResponse, type PmRpcResult } from '../shared/pm-state.ts';
 import { PmState } from './pm-state.ts';
@@ -28,8 +28,8 @@ export const CHECK_INTERVAL = 60_000;
 const HOST_FRESH = 65_000;
 /** 503 text while no PM host is assigned and no legacy host is connected (#122: platform-neutral). */
 export const HOST_OFFLINE_MESSAGE = 'The execution host is offline. Open Foreman on it and reconnect.';
-/** #144: the name of a host socket that has not said hello yet (machine-neutral; was 'Mac'). */
-export const UNNAMED_HOST = 'execution host';
+/** #144: the name of a host socket that has not said hello yet (machine-neutral; was 'Mac'). Defined in shared/notify.ts. */
+export { UNNAMED_HOST };
 
 function pushRoute(method: string, url: URL) {
   return method === 'POST' && !url.search && PUSH_ROUTES.includes(url.pathname);
@@ -261,6 +261,8 @@ export class HostRelay extends DurableObject<Env> {
       // #115: the PM may have moved while the body was read; route to the host that is the target now.
       socket = this.hostSocket();
       if (!socket) return offline();
+      // #143: other requests may have filled the pending table while this body was read.
+      if (this.pending.size >= 64) return json({ error: 'Host is busy; try again shortly' }, 429);
     }
     const id = crypto.randomUUID();
     return new Promise<Response>((resolve) => {
@@ -405,15 +407,22 @@ export class HostRelay extends DurableObject<Env> {
    * A `lead_rpc` whose raw text is over MAX_LEAD_FRAME is answered `too_large` without being
    * parsed. Recognized here: frames that open the way hosts serialize them
    * (`{"type":"lead_rpc","id":"…"`); an oversized lead_rpc with any other key order is still refused
-   * on its raw byte length in acceptLeadRpc, before its arguments are validated.
+   * on its raw byte length in acceptLeadRpc, before its arguments are validated. One that opens with
+   * `"type":"lead_rpc"` but carries its `id` later (#196) goes that way too when it parses, so it is
+   * answered rather than dropped; only an unparseable one with no leading id is dropped unanswered.
    */
   private refuseOversizedLeadRpc(socket: WebSocket, raw: string): boolean {
     if (raw.length <= MAX_LEAD_FRAME) return false; // UTF-16 length <= UTF-8 length: a cheap first test
     const head = /^\s*\{\s*"type"\s*:\s*"lead_rpc"\s*(?:,\s*"id"\s*:\s*"([^"\\]{1,128})")?/.exec(raw.slice(0, 256));
     if (!head || utf8Length(raw) <= MAX_LEAD_FRAME) return false;
-    this.refreshHeartbeat(socket);
     const id = head[1];
-    if (id !== undefined && isPmId(id)) try { socket.send(JSON.stringify(leadRpcError(id, 'too_large', 'frame too large'))); } catch {}
+    if (id === undefined) {
+      // The id is not the second key: parse (bounded by MAX_RESPONSE_FRAME) so acceptLeadRpc can
+      // answer it. Unparseable, it has no id to answer: drop it without closing the socket.
+      try { JSON.parse(raw); return false; } catch { this.refreshHeartbeat(socket); return true; }
+    }
+    this.refreshHeartbeat(socket);
+    if (isPmId(id)) try { socket.send(JSON.stringify(leadRpcError(id, 'too_large', 'frame too large'))); } catch {}
     return true;
   }
 

@@ -352,8 +352,10 @@ export const ROLE_CONFIG_TIMEOUT_MS = 2_000;
 
 /**
  * Supersedes recorded by `start_lead` when the new Lead's launch was held for the developer.
- * Keyed by the new Lead's session key. Process-local: after a restart `force` is forgotten, which
- * errs on the safe side (a working predecessor is left running and reported).
+ * Keyed by the new Lead's session key. Process-local on purpose: a held launch does not survive a
+ * Foreman restart (SessionService expires it on start and emits `expired`, so nothing is approved
+ * after a restart and nothing here is needed then), and the predecessor itself is left unavailable
+ * by the same restart, so it is never working when a later approval could arrive.
  */
 const heldSupersedes = new Map<string, { supersedes: string; force: boolean }>();
 
@@ -474,10 +476,12 @@ export function makeLeadTools(deps: LeadToolsDeps) {
       .sort(byRecent)[0];
     if (local) return { key: keyOf(local), name: local.name, local: true, row: local };
     let entries: LeadListEntry[] = [];
-    try { entries = await store.list({ include_ended: false }); } catch { entries = []; }
+    try { entries = await store.list({ include_ended: true }); } catch { entries = []; }
+    // A live Lead on another machine, or one ended by a restart there and not yet superseded (#196):
+    // live ones first, then the most recent.
     const remote = entries
-      .filter((e) => !isThisMachine(e.machine_id) && e.workstream === input.workstream && sameProject(e.project, input.project) && !e.superseded_by && !e.ended)
-      .sort((a, b) => b.updated_at - a.updated_at)[0];
+      .filter((e) => !isThisMachine(e.machine_id) && e.workstream === input.workstream && sameProject(e.project, input.project) && !e.superseded_by && (!e.ended || awaitsSuccessor(e)))
+      .sort((a, b) => Number(a.ended) - Number(b.ended) || b.updated_at - a.updated_at)[0];
     return remote ? { key: remote.lead, name: remote.name, local: false, entry: remote } : null;
   }
 
@@ -673,7 +677,12 @@ export function makeLeadTools(deps: LeadToolsDeps) {
         const row = ownRow();
         const previous = await latestHandoff(lead);
         const project = isProjectName(row?.project_name) ? row.project_name : previous?.project;
-        const workstream = args.workstream ?? (isWorkstream(row?.workstream) ? row.workstream : previous?.workstream);
+        const own = isWorkstream(row?.workstream) ? row.workstream : previous?.workstream;
+        // #196: a Lead's handoffs stay on its own workstream; `workstream` only fills one in when none is known.
+        if (args.workstream !== undefined && own !== undefined && args.workstream !== own) {
+          throw new Error(`workstream is fixed to your own (${own}); omit it`);
+        }
+        const workstream = own ?? args.workstream;
         const goal = args.goal ?? previous?.goal;
         if (!project) throw new Error('Your project is not registered on this machine; the handoff cannot be recorded');
         if (!workstream) throw new Error('workstream is required (a kebab-case key)');

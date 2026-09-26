@@ -689,3 +689,62 @@ test('list_workers needs_attention follows the reported state: needs_input yes, 
     assert.equal((by.get('fix-restarted') as any).state, 'dead');
   } finally { f.cleanup(); }
 });
+
+test('#196 start_lead auto-picks a Lead ended by a restart on another machine (not yet superseded) as the predecessor; a live one wins', async () => {
+  const f = setup();
+  try {
+    const restarted = leadKey();
+    f.store.entries.push(entry({ lead: restarted, machine_id: randomUUID(), machine_name: 'linux-box', state: 'dead', alive: false, ended: true, end_reason: RESTARTED_END_REASON, updated_at: 50 }));
+    // Ended for good (retired) or already superseded: never auto-picked.
+    f.store.entries.push(entry({ lead: leadKey(), machine_id: randomUUID(), state: 'ended', alive: false, ended: true, end_reason: 'retired by the Coordinator', updated_at: 90 }));
+    f.store.entries.push(entry({ lead: leadKey(), machine_id: randomUUID(), state: 'dead', alive: false, ended: true, end_reason: RESTARTED_END_REASON, superseded_by: leadKey(), updated_at: 95 }));
+    await f.store.appendHandoff(checkpoint(restarted));
+    const out = await f.tools.call('start_lead', start);
+    assert.equal(f.sessions.launches[0].supersedes, restarted);
+    assert.deepEqual(out.seeded_from, { lead: restarted, seq: 1, kind: 'checkpoint' });
+    assert.match(f.sessions.launches[0].text, /on machine linux-box/);
+    assert.equal(f.sessions.retired.length, 0, 'a Lead on another machine is not retired from here');
+  } finally { f.cleanup(); }
+  const g = setup();
+  try {
+    const live = leadKey();
+    g.store.entries.push(entry({ lead: leadKey(), machine_id: randomUUID(), state: 'dead', alive: false, ended: true, end_reason: RESTARTED_END_REASON, updated_at: 500 }));
+    g.store.entries.push(entry({ lead: live, machine_id: randomUUID(), state: 'idle', updated_at: 10 }));
+    await g.tools.call('start_lead', start);
+    assert.equal(g.sessions.launches[0].supersedes, live, 'a live Lead is preferred over a newer restarted one');
+  } finally { g.cleanup(); }
+});
+
+test('#196 write_handoff keeps a Lead\'s handoffs on its own workstream: a different workstream is refused, the same one or a first one is accepted', async () => {
+  const f = setup();
+  try {
+    const lead = oldLead(f);
+    const bound = f.tools.bindLead(lead);
+    const base = { kind: 'checkpoint', status: 'in_progress', summary: 'Working.', decisions: [], open_questions: [], next_steps: [], links: [], goal: 'Triage open bugs' };
+    await assert.rejects(bound.call('write_handoff', { ...base, workstream: 'somewhere-else' }), /workstream is fixed to your own \(triage-bugs\)/);
+    assert.equal(f.store.handoffs.get(lead), undefined, 'nothing stored');
+    assert.equal((await bound.call('write_handoff', { ...base, workstream: 'triage-bugs' })).seq, 1);
+    assert.equal(f.store.handoffs.get(lead)!.at(-1)!.workstream, 'triage-bugs');
+    // A Lead row without a workstream and no handoff yet: the argument fills it in, then it is fixed.
+    const bare = oldLead(f, { workstream: undefined });
+    const other = f.tools.bindLead(bare);
+    assert.equal((await other.call('write_handoff', { ...base, workstream: 'docs-pass' })).seq, 1);
+    assert.equal(f.store.handoffs.get(bare)!.at(-1)!.workstream, 'docs-pass');
+    await assert.rejects(other.call('write_handoff', { ...base, workstream: 'another-pass' }), /fixed to your own \(docs-pass\)/);
+  } finally { f.cleanup(); }
+});
+
+test('#196 a held supersede needs no force after a restart: the held launch expires, so nothing is retired', async () => {
+  const held = { status: 'awaiting_developer_approval' as const, permission_mode: null, policy_reason: 'ask_before_bypass' as const, bypass_grant: undefined };
+  const f = setup();
+  try {
+    const old = oldLead(f, { state: 'working' });
+    f.sessions.result = held;
+    const out = await f.tools.call('start_lead', { ...start, force: true });
+    // SessionService expires every held launch when Foreman restarts and emits `expired`.
+    const outcome = await retireSupersededOnApproval(f.sessions, { session_key: out.lead, decision: 'expired' });
+    assert.equal(outcome.retired, 'not needed');
+    assert.equal(f.sessions.retired.length, 0);
+    assert.equal(f.sessions.rows.find((r) => r.session_key === old).state, 'working');
+  } finally { f.cleanup(); }
+});
