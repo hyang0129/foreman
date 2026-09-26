@@ -18,7 +18,7 @@ npm run hooks:codex:install
 npm start
 ```
 
-Use installed provider logins. `FOREMAN_CODEX_BIN` selects a supported Codex executable; `FOREMAN_CLAUDE_BIN` overrides the SDK-bundled Claude binary. On this Mac, the launchd service already selects the newer VS Code Codex binary because the global 0.149 CLI cannot run the configured model.
+Use installed provider logins. `FOREMAN_CODEX_BIN` selects a supported Codex executable; Foreman runs the installed `claude` found on its own `PATH` (the service's explicit search path) for model discovery, managed sessions, launches and the PM; `FOREMAN_CLAUDE_BIN` overrides it, and the SDK-bundled binary is used only when no installed `claude` is found. `npm run status` shows which CLI and version the daemon uses. On this Mac, the launchd service already selects the newer VS Code Codex binary because the global 0.149 CLI cannot run the configured model.
 
 The service is already installed on this Mac, so do not also run `npm start` on the same port/state directory:
 

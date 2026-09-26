@@ -22,6 +22,13 @@ else try {
   } else {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const sessions = await response.json();
+    // #155: which Claude CLI (and version) the daemon runs for model discovery, sessions and the PM.
+    try {
+      const cli = await fetch(`http://127.0.0.1:${PORT}/api/claude-cli`, { headers:{ authorization:`Bearer ${token}` }, signal:AbortSignal.timeout(10_000) });
+      if (!cli.ok) throw new Error(`HTTP ${cli.status}`);
+      const info: { path: string; source_text: string; version: string | null } = await cli.json();
+      console.log(`Claude CLI: ${info.path} (${info.source_text}), version ${info.version ?? 'unknown (could not run --version)'}`);
+    } catch (error) { console.log(`Claude CLI: not reported by this daemon (${error})`); }
     console.table(sessions.map((s: { provider: string; session_key: string; name: string | null; state: string; current_tool: string | null }) => ({
       provider:s.provider, session:s.name ?? s.session_key, state:s.state, tool:s.current_tool ?? '',
     })));

@@ -27,7 +27,7 @@ import type { Fleet } from "./fleet.ts";
 import type { ProjectRegistry } from "./projects.ts";
 import { makeFleetServer, type ManagedFleetService } from "./tools.ts";
 import { makePeerMcpServer, PEER_ALLOWED_TOOLS, PEER_INSTRUCTIONS } from "./peer-tools.ts";
-import { FOREMAN_HOME, HOST, REPO_ROOT } from "./paths.ts";
+import { CLAUDE_BIN, FOREMAN_HOME, HOST, REPO_ROOT } from "./paths.ts";
 import { PmStoreError, type HostPmStore } from "./pm-store.ts";
 import { redactSecrets } from "../shared/redact.ts";
 import {
@@ -684,6 +684,8 @@ export class ProjectManager extends EventEmitter {
           prompt: inbox.open(),
           options: {
             cwd: FOREMAN_HOME,
+            // #155: the same CLI as model discovery and managed sessions, not the SDK's bundled default.
+            pathToClaudeCodeExecutable: CLAUDE_BIN,
             systemPrompt: { type: "preset", preset: "claude_code", append: base + '\nUse list_projects and resolve_project for project references; ask when ambiguous or missing. When the developer gives a name or alias for their current known project, register_project records it. Never invent directories.' + this.memoryBlock(memory) + (this.sessions ? '\n\n' + PEER_INSTRUCTIONS + '\nFor Foreman-managed sessions, use peer tools to request updates and read outcomes. Native SendMessage subscriptions apply only to legacy Claude background sessions. You still must not read or edit source code or bypass your PM tool restrictions.' : '') },
             settingSources: ["user"],
             permissionMode: "default",
