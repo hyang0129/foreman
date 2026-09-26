@@ -1453,7 +1453,8 @@ test("copy controls stay discoverable and tappable on touch at enlarged text", a
 });
 
 
-// Messages no longer carry a Copy button (#154); their menu is covered in messaging-layout.spec.ts.
+// Messages no longer carry a Copy button (#154). The message menu, including copying the text
+// a streaming message had when its menu opened, is covered in messaging-layout.spec.ts.
 for (const kind of ["code"]) test(`pending ${kind} clipboard results follow streaming while copying the clicked text`, async ({ page }) => {
   const content = (text: string) => kind === "code" ? `\`\`\`sh\n${text}\n\`\`\`` : text;
   const copied = (text: string) => kind === "code" ? `${text}\n` : text;

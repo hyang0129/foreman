@@ -356,6 +356,10 @@ function revokeAccess(message) {
   ui.moveDialog.close();
   ui.infoDialog.close();
   closeMenus();
+  // Nothing of the previous identity's messages outlives sign-out.
+  copyStatus("");
+  messageMenuText = "";
+  messageMenuTarget = null;
   clearDrafts();
   // A PM failure seen by the previous identity is not shown to the next one.
   polledPmError = null;
@@ -665,7 +669,10 @@ function updateControls() {
   ui.interrupt.textContent = ui.interrupt.dataset.busy === "true" ? "Interrupting…" : "Interrupt";
   // Interrupt shows only while a turn is running (or a request to stop one is in flight).
   const running = isPm ? pmBusy : !!session?.capabilities?.interrupt && ["working", "needs_input"].includes(session?.state);
-  ui.interrupt.hidden = !running && ui.interrupt.dataset.busy !== "true";
+  const hideInterrupt = !running && ui.interrupt.dataset.busy !== "true";
+  // A keyboard user who pressed Interrupt keeps focus in the conversation when it goes away.
+  if (hideInterrupt && !ui.interrupt.hidden && document.activeElement === ui.interrupt) ui.timeline.focus({ preventScroll: true });
+  ui.interrupt.hidden = hideInterrupt;
   renderActionFeedback();
   ui.input.placeholder = !selected
     ? "Choose a session to start a conversation"
@@ -891,7 +898,7 @@ function messageNode(entry, receipt, entryKey) {
   // or Enter / the context-menu key while the message has focus).
   article.copyText = String(entry.text || entry.summary || "");
   article.tabIndex = 0;
-  article.setAttribute("aria-haspopup", "menu");
+  article.setAttribute("aria-description", "Press Enter for message options");
   renderMessageReceipt(article, receipt);
   return article;
 }
@@ -1622,7 +1629,11 @@ for (const menu of [ui.menu, ui.messageMenu]) {
     // Closing returns focus to what opened the menu, unless focus already moved elsewhere.
     const lost = menu.contains(document.activeElement) || document.activeElement === document.body || !document.activeElement;
     if (!lost) return;
-    const back = menu === ui.menu ? $("#conversation-menu-button") : messageMenuTarget;
+    // A message re-rendered while its menu was open (streaming) is found again by its entry key.
+    const key = messageMenuTarget?.dataset.entryKey;
+    const back = menu === ui.menu ? $("#conversation-menu-button")
+      : messageMenuTarget?.isConnected ? messageMenuTarget
+      : [...ui.messages.querySelectorAll(".message")].find((article) => article.dataset.entryKey === key);
     if (back?.isConnected && !back.closest("[hidden], [inert]")) back.focus({ preventScroll: true });
   });
   menu.addEventListener("keydown", (event) => {
@@ -1701,16 +1712,14 @@ ui.messages.addEventListener("contextmenu", (event) => {
 });
 // The message menu is a manual popover: it opens while the finger or mouse button that opened it
 // is still down, and the automatic light dismiss would close it again on that release. It closes
-// on a press outside it, Escape, or scrolling the conversation.
+// on a press outside it or Escape. It deliberately survives scrolling: a streaming reply keeps
+// the conversation pinned to the latest message, and that must not close the menu under the user.
 document.addEventListener("pointerdown", (event) => {
   if (ui.messageMenu.matches(":popover-open") && !ui.messageMenu.contains(event.target)) ui.messageMenu.hidePopover();
 }, true);
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && ui.messageMenu.matches(":popover-open")) { event.preventDefault(); ui.messageMenu.hidePopover(); }
 });
-ui.timeline.addEventListener("scroll", () => {
-  if (ui.messageMenu.matches(":popover-open") && !pressTimer) ui.messageMenu.hidePopover();
-}, { passive: true });
 // Some Android builds do not raise contextmenu for a long-press on plain text; a 500 ms touch
 // hold without movement opens the same menu.
 let pressTimer = null, pressStart = null;

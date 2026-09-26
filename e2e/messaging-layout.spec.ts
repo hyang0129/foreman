@@ -45,7 +45,7 @@ const idle = {
 };
 
 async function fixture(page: Page) {
-  const state = { pmModel: null as string | null, pmBusy: false, machineAOnline: true, calls: [] as { path: string; body: any }[] };
+  const state = { history: structuredClone(pmHistory), pmModel: null as string | null, pmBusy: false, machineAOnline: true, calls: [] as { path: string; body: any }[] };
   await page.route("**/api/**", async (route) => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
     const body = request.method() === "POST" ? request.postDataJSON() : null;
@@ -57,7 +57,7 @@ async function fixture(page: Page) {
     else if (path === "/api/session") {
       const session = [worker, waiting, idle].find((s) => s.session_key === url.searchParams.get("id"));
       result = { session, history: [{ id: "h1", role: "assistant", text: `History of ${session?.name}`, at: new Date(now).toISOString() }], receipts: [], approvals: [] };
-    } else if (path === "/api/pm/history") result = { history: pmHistory, busy: state.pmBusy, error: null, model: state.pmModel };
+    } else if (path === "/api/pm/history") result = { history: state.history, busy: state.pmBusy, error: null, model: state.pmModel };
     else if (path === "/api/pm/host" && request.method() === "GET") result = {
       active: { machine_id: A, name: "machine-a", online: state.machineAOnline, epoch: 1 },
       machines: [
@@ -259,6 +259,46 @@ test("long-press on a message opens its menu, and Copy message copies its text",
   await message.tap();
   await page.waitForTimeout(600);
   await expect(page.getByRole("menu", { name: "Message options" })).toBeHidden();
+});
+
+test("a message menu copies the text the message had when it opened, while the message streams", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const state = await fixture(page);
+  await openPm(page);
+  const message = page.locator(".message").filter({ hasText: LAST });
+  // Keyboard path: focus the message, Enter opens its menu with Copy message focused.
+  await message.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menuitem", { name: "Copy message" })).toBeFocused();
+  // The reply keeps streaming while the menu is open.
+  state.history[state.history.length - 1].text = `${LAST} More output arrived.`;
+  await pollNow(page);
+  await expect(page.getByText("More output arrived.", { exact: false })).toBeVisible();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menu", { name: "Message options" })).toBeHidden();
+  await expect(page.locator("#copy-status")).toHaveText("Copied");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(LAST);
+  // Focus returns to the (re-rendered) message.
+  await expect(page.locator(".message").last()).toBeFocused();
+  // Escape closes the menu and returns focus to the message.
+  await page.locator(".message").last().focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menu", { name: "Message options" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("menu", { name: "Message options" })).toBeHidden();
+  await expect(page.locator(".message").last()).toBeFocused();
+});
+
+test("focus stays in the conversation when Interrupt goes away after the turn ends", async ({ page }) => {
+  const state = await fixture(page);
+  state.pmBusy = true;
+  await openPm(page);
+  const interrupt = page.getByRole("button", { name: "Interrupt", exact: true });
+  await interrupt.focus();
+  state.pmBusy = false;
+  await pollNow(page);
+  await expect(page.locator("#interrupt")).toBeHidden();
+  await expect(page.locator("#timeline")).toBeFocused();
 });
 
 test("the session list reads like a chat list: PM pinned, then name, time, preview and a needs-you badge", async ({ page }) => {
