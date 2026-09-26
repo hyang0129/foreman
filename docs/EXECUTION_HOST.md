@@ -15,7 +15,7 @@ node scripts/service.mjs plist
 node scripts/service.mjs install
 node scripts/service.mjs status
 
-# Restart interrupts the running Foreman process, managed sessions, and active PM work.
+# Restart interrupts the running Foreman process, managed sessions (Leads and workers too), and active Coordinator work.
 node scripts/service.mjs restart
 
 # Removes only this checkout's service; keeps session state and logs.
@@ -52,23 +52,26 @@ The authenticated outbound Cloudflare relay, host identity, heartbeat/offline st
 
 ## More than one machine
 
-Several machines can be paired with the same relay at once, for example this Mac and the Linux box `homen`. Each `FOREMAN_HOME` is one machine, identified by `<FOREMAN_HOME>/machine.json` (a random `machine_id` and a display name, created on first start). The display name defaults to the short hostname. Set `FOREMAN_MACHINE_NAME` in the daemon's environment to choose another name (1–80 printable characters); it is saved to `machine.json`, so later starts keep it. An invalid value means no PM on that machine until it is fixed. The macOS service installer does not pass `FOREMAN_MACHINE_NAME` to the installed service, so a variable set in your shell does not reach it.
+Several machines can be paired with the same relay at once, for example this Mac and the Linux box `homen`. Each `FOREMAN_HOME` is one machine, identified by `<FOREMAN_HOME>/machine.json` (a random `machine_id` and a display name, created on first start). The display name defaults to the short hostname. Set `FOREMAN_MACHINE_NAME` in the daemon's environment to choose another name (1–80 printable characters); it is saved to `machine.json`, so later starts keep it. An invalid value means no Coordinator on that machine until it is fixed. The macOS service installer copies a `FOREMAN_MACHINE_NAME` set at install time into the installed service (and refuses an invalid one); a service installed without it keeps the saved name.
 
 To pair another machine, copy `cloud.json` to it; see [Add a second machine](CLOUD_SETUP.md#add-a-second-machine). Never copy `machine.json` or a whole `~/.foreman`: two daemons with the same `machine_id` count as one machine and replace each other's relay connection.
 
-- **One PM at a time.** The relay records one active PM host. The first machine that connects with this version becomes the PM host, and it stays the PM host until you move it. Every other connected machine is a standby.
-- **The hosted app talks to the PM host only.** Sessions, projects, launches and the PM are all relayed to that one machine. A standby receives nothing through the relay. The hosted app shows standbys only in the Move PM dialog. A standby's own sessions are still available from its local UI (`http://localhost:4177`).
-- **PM memory is shared; everything else is per machine.** The PM's memory (projects, preferences, log, model) lives in the relay, so it is the same on every machine. Worker sessions, their transcripts and receipts, worktrees, and the project registry (`projects.json`, with its paths) stay on the machine that owns them. Register a project under the same name on each machine where the PM should find it: PM memory refers to projects by name, and each machine resolves the name to its own path.
-- **A machine that is not the PM host runs no PM.** Its local UI refuses PM messages with "The PM runs on <name>.". A PM host that loses the relay also refuses PM messages ("The cloud relay is unreachable; the PM is unavailable on this machine.") until it reconnects, because it cannot confirm it is still the PM host.
+The PM is called the **Coordinator** in the app; the relay and its APIs still call the machine that runs it the PM host.
 
-See [PM memory and the PM host](DESIGN.md#pm-memory-and-the-pm-host) for the full model.
+- **One Coordinator at a time.** The relay records one active PM host. The first machine that connects with this version becomes the PM host, and it stays the PM host until you move it. Every other connected machine is a standby.
+- **The hosted app talks to the PM host only.** Sessions, projects and the Coordinator are all relayed to that one machine. A standby receives nothing through the relay. The hosted app shows standbys only in the Move Coordinator dialog. A standby's own sessions are still available from its local UI (`http://localhost:4177`). The Worker answers `/api/pm/host`, `/api/leads` and `/api/settings` itself, so those work while the PM host is offline.
+- **Coordinator memory is shared; everything else is per machine.** The Coordinator's memory (projects, preferences, log, model), the Lead registry, synced handoffs and the developer's settings live in the relay, so they are the same on every machine. Sessions (Leads and workers included), their transcripts and receipts, worktrees, the handoff logs under `leads/`, and the project registry (`projects.json`, with its paths) stay on the machine that owns them. Register a project under the same name on each machine where the Coordinator should find it: its memory refers to projects by name, and each machine resolves the name to its own path.
+- **Leads run on the Coordinator's machine.** `start_lead` starts a Lead only in a project registered on the machine that runs the Coordinator. Leads left on a machine the Coordinator moved away from keep running and keep syncing their registry rows and handoffs, because the relay accepts `lead_rpc` from standbys; the Coordinator lists them as "on <machine>, not reachable from here" and can start a successor from their last handoff. Leads on other machines are the follow-up epic #162.
+- **A machine that is not the PM host runs no Coordinator.** Its local UI refuses Coordinator messages with "The Coordinator runs on <name>.". A PM host that loses the relay also refuses them ("The cloud relay is unreachable; the Coordinator is unavailable on this machine.") until it reconnects, because it cannot confirm it is still the PM host.
+
+See [PM memory and the PM host](DESIGN.md#pm-memory-and-the-pm-host) and [Leads and workers](DESIGN.md#leads-and-workers) for the full model.
 
 ## Moving the PM
 
-Moving the PM is always a developer action; there is no automatic failover.
+Moving the Coordinator is always a developer action; there is no automatic failover.
 
-1. Open the hosted app and the PM view. The header shows "PM on <name> · online" (or offline).
-2. Choose **Move PM…**. It appears only when another machine is online.
+1. Open the hosted app and the Coordinator's info screen. Its machine line shows "Coordinator on <name> · online" (or offline).
+2. Choose **Move Coordinator…**. It appears only when another machine is online.
 3. Pick an online machine and confirm.
 
 The move needs an online target. The current PM host may be offline, which is how you recover from losing a machine. If the PM host changed since the page loaded, the move is refused (409); the dialog reloads the machine list.
@@ -76,16 +79,26 @@ The move needs an online target. The current PM host may be offline, which is ho
 After the move:
 
 - The new PM host starts with an empty conversation and a fresh provider session built from the shared memory. Past conversations are not kept anywhere.
-- A message that was still in progress on the old machine appears once on the new one as an uncertain entry: "…could not be confirmed (the PM was moved)", or "(machine went offline)" if the old machine was offline. It is never replayed. Send it again if you still need it.
-- The old machine stops its PM and refuses PM messages from its local UI ("The PM runs on <name>."). If its daemon kept running, its PM view also shows "The PM now runs on <name>.": at once if it was online during the move, otherwise when it reconnects. A machine whose daemon restarted shows no entry. When a lost machine comes back, it is a standby; it never takes the PM back.
+- A message that was still in progress on the old machine appears once on the new one as an uncertain entry: "…could not be confirmed (the Coordinator was moved)", or "(machine went offline)" if the old machine was offline. It is never replayed. Send it again if you still need it.
+- The old machine stops its Coordinator and refuses Coordinator messages from its local UI ("The Coordinator runs on <name>."). If its daemon kept running, its Coordinator chat also shows "The Coordinator now runs on <name>. …": at once if it was online during the move, otherwise when it reconnects. A machine whose daemon restarted shows no entry. When a lost machine comes back, it is a standby; it never takes the Coordinator back.
+- Leads the old machine was running stay there (see above). New Leads start on the new machine.
 
-In relay mode the PM can be moved only from the hosted app. The local UI at `localhost` cannot see the other machines. A machine without `cloud.json` (local-only mode) is always its own PM host and has nothing to move to.
+In relay mode the Coordinator can be moved only from the hosted app. The local UI at `localhost` cannot see the other machines. A machine without `cloud.json` (local-only mode) is always its own PM host and has nothing to move to.
 
-Restarting the PM host's daemon keeps the PM there. A message in progress during the restart is reported once as uncertain ("Foreman restarted") and not replayed. A brief network drop is not reported: a turn that finishes across it completes normally.
+Restarting the PM host's daemon keeps the Coordinator there. A message in progress during the restart is reported once as uncertain ("Foreman restarted") and not replayed. A brief network drop is not reported: a turn that finishes across it completes normally. A restart also ends every Lead and worker on that machine (they become unavailable, with history kept) and expires held Bypass launches; nothing respawns automatically.
+
+## Leads, settings and routes
+
+- **Host routes.** `GET /api/leads` returns `{ leads, mode }` from this machine's Lead store (the relay's registry, or local files in local-only mode; 404 when the machine has no Lead store). `GET /api/settings` returns the developer's settings read-only (`writable: false`), or 503 with the reason in local-only mode or when the relay does not answer. `POST /api/settings` answers 400 "Change settings from the hosted app". The `/api/launch*` routes are removed, from the host and from the relay allowlist.
+- **Hosted routes.** In the hosted app the Worker answers `GET /api/leads` and `GET` / `POST /api/settings` itself; they are never relayed to a host. They need the Firebase bearer, the allowed email and a same-origin request. `POST /api/settings` takes `{ key, value, version }` and answers 409 when `version` is stale. This is the only way to change settings, including Bypass grants.
+- **`lead_rpc`.** Hosts reach the Lead registry over their existing relay socket with `lead_rpc` frames (`lead.upsert`, `lead.sync`, `lead.handoff`, `lead.list`, `lead.get`, `settings.get`). Unlike `pm_rpc`, they are accepted from any machine that sent a protocol-2 hello, not only the PM host, and a machine may write only its own Lead rows. `settings.get` is read-only; no host op writes settings.
+- **Local files.** `~/.foreman/leads/<uuid>.jsonl` (one per Lead, its handoffs) and, in relay mode, `~/.foreman/leads/outbox.json` (handoffs not yet delivered). See [Handoffs](DESIGN.md#handoffs).
+- **Environment.** `FOREMAN_MAX_LEADS` (default 3), `FOREMAN_MAX_WORKERS_PER_LEAD` (default 4), `FOREMAN_PM_EFFORT`, `FOREMAN_LEAD_MODEL`, `FOREMAN_LEAD_EFFORT`, `FOREMAN_INVESTIGATOR_MODEL` and `FOREMAN_INVESTIGATOR_EFFORT` are read from the daemon's environment. Settings made in the hosted app win over the role variables. The macOS service installer does not copy any of these into the installed service.
+- **Deploy order.** A release that changes these routes or frames deploys the **Worker first, then restarts the host** (`npm run cloud:deploy`, then `npm run service:restart`). An older Worker ignores `lead_rpc`, so a new host connected to it gets no answer: its agent launches fall back to Auto and its handoffs wait in the outbox until the Worker is updated.
 
 ## Linux host
 
-A Linux machine runs the daemon in the foreground with `npm start` (after `npm install`, `npm run hooks:install` and the provider logins). Service management (`npm run service:*`, `scripts/service.mjs`) is macOS-only and refuses to run elsewhere, so keep `npm start` running yourself and restart it by hand. Visible-tab launches (`spawn_session` mode `tab`) need `warp-spawn` at `FOREMAN_WARP_SPAWN` (default `~/.claude/warp-playbook/bin/warp-spawn`); without it they fail. Managed launches (the default) do not use it.
+A Linux machine runs the daemon in the foreground with `npm start` (after `npm install`, `npm run hooks:install` and the provider logins). Service management (`npm run service:*`, `scripts/service.mjs`) is macOS-only and refuses to run elsewhere, so keep `npm start` running yourself and restart it by hand. No agent tool starts visible-tab (`tab`) or background (`bg`) sessions any more: the Coordinator has no `spawn_session`, and a Lead's `spawn_session` starts managed workers only, so `warp-spawn` is not needed.
 
 ## Validation
 
