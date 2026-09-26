@@ -31,6 +31,8 @@ class InputQueue {
 export class ClaudeControl extends EventEmitter {
   state: State = "idle";
   sessionId: string | null = null;
+  /** Why the controller stopped (set before the `closed`/`failed` state event), or null while running. */
+  lastError: string | null = null;
   private input = new InputQueue();
   private stream?: Query;
   private pending: Pending[] = [];
@@ -64,7 +66,10 @@ export class ClaudeControl extends EventEmitter {
         for await (const message of this.stream) {
           if (message.type === "system" && message.subtype === "init") {
             const expected = claudePolicy(this.policy);
-            if (message.permissionMode !== expected) throw new Error('Claude did not apply the requested launch policy');
+            if (message.permissionMode !== expected) {
+              const hint = expected === 'auto' ? '; this model may not support Auto' : '';
+              throw new Error(`Claude did not apply the requested launch policy: requested ${expected}, provider reported ${String(message.permissionMode)}${hint}`);
+            }
             this.sessionId = message.session_id;
           }
           this.emit("message", message);
@@ -87,7 +92,7 @@ export class ClaudeControl extends EventEmitter {
         }
         if (!this.isClosed()) this.stop("failed", "Claude process ended");
       } catch (error) {
-        if (!this.isClosed()) this.stop("failed", String(error));
+        if (!this.isClosed()) this.stop("failed", error instanceof Error ? error.message : String(error));
       }
     });
   }
@@ -173,6 +178,7 @@ export class ClaudeControl extends EventEmitter {
   close() { this.stop("closed", "Claude controller closed"); }
 
   private stop(state: "closed" | "failed", error: string) {
+    this.lastError ??= error;
     this.setState(state);
     for (const approval of [...this.approvals.values()]) approval.resolve({ behavior: "deny", message: error });
     for (const item of [...(this.active ? [this.active] : []), ...this.pending]) {

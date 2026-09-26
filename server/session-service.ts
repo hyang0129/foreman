@@ -10,9 +10,9 @@ import { CodexControl } from './codex-control.ts';
 import { Fleet, transcriptTail, type Session } from './fleet.ts';
 import { CLAUDE_BIN, FOREMAN_HOME, HOST } from './paths.ts';
 import {
-  approvedLaunchPolicy, effectiveDevSettings, isEffort, isLeadKey, isSessionKey, isWorkstream, launchedBy, leadLimits, normalizeLeadKey,
-  parseRequestedAgentMode, resolveAgentLaunchPolicy, roleOf, truncateFirstTask,
-  GRANT_TIMEOUT_MS, HELD_LAUNCH_REASON, HELD_LAUNCH_STATE, LAUNCH_APPROVAL_TOOL, LAUNCH_DENIED, LAUNCH_EXPIRED, MAX_SESSION_NAME,
+  approvedLaunchPolicy, isEffort, isLeadKey, isSessionKey, isSessionName, isWorkstream, launchedBy, leadLimits, normalizeLeadKey,
+  parseDevSettingsView, parseLaunchApprovalInput, parseRequestedAgentMode, resolveAgentLaunchPolicy, roleOf, truncateFirstTask,
+  GRANT_TIMEOUT_MS, HELD_LAUNCH_REASON, HELD_LAUNCH_STATE, LAUNCH_APPROVAL_TOOL, LAUNCH_DENIED, LAUNCH_EXPIRED,
   type AgentLaunchRequest, type AgentLaunchResult, type AgentPermissionMode, type AgentRole, type AgentSessionService, type BypassGrantRef,
   type DevSettings, type Effort, type GrantSource, type LaunchApprovalInput, type LaunchedBy, type PolicyReason, type Role, type SessionRoleFields,
 } from '../shared/roles.ts';
@@ -211,7 +211,8 @@ export class SessionService extends EventEmitter implements AgentSessionService 
     if (req.requester_role !== 'coordinator' && req.requester_role !== 'lead') throw new Error('requester_role must be coordinator or lead');
     const cwdInput = textValue(req.cwd, 'Project directory', 4096);
     const text = textValue(req.text, 'Message', 64 * 1024);
-    const name = textValue(req.name, 'Name', MAX_SESSION_NAME);
+    if (!isSessionName(req.name)) throw new Error('name must be 1-200 printable characters on one line and not a path');
+    const name = req.name;
     const model = normalizeModel(req.model);
     if (req.effort !== undefined && !isEffort(req.effort)) throw new Error('effort must be one of low, medium, high, xhigh, max');
     if (req.workstream !== undefined && !isWorkstream(req.workstream)) throw new Error('workstream must be a kebab-case key of at most 64 characters');
@@ -233,18 +234,25 @@ export class SessionService extends EventEmitter implements AgentSessionService 
     const cwd = resolution?.path ?? readableDirectory(cwdInput);
     const project = resolution && 'project' in resolution ? resolution.project : undefined;
     const projectName = (project ?? this.options.projects?.forPath(cwd))?.name ?? null;
-    this.checkLimits(req.role, who.parent);
+    const supersedes = typeof request.supersedes === 'string' ? request.supersedes : undefined;
+    this.checkLimits(req.role, who.parent, supersedes);
     // Read on every launch (no cache) unless the request already fixes the outcome (Auto).
     const settings = requested.value === 'auto' ? null : await this.readGrants();
     const policy = resolveAgentLaunchPolicy({ requesterRole: who.requester_role, project: projectName, requested: requested.value, settings });
     // Re-check after the await: a concurrent launch may have used this id or the last slot.
     if (this.closed) throw new Error('Session service is closed');
     const raced = retry(); if (raced) return raced;
-    this.checkLimits(req.role, who.parent);
+    this.checkLimits(req.role, who.parent, supersedes);
     if (this.records.size >= 500) throw new Error('Session limit reached');
     const held = policy.decision === 'hold';
     const mode = held ? undefined : policy.decision as AgentPermissionMode;
-    const supersedes = typeof request.supersedes === 'string' ? request.supersedes : undefined;
+    let hold: HeldLaunch | undefined;
+    if (held) {
+      // The approval card's input must satisfy the contract the UI and notifier parse; otherwise refuse (fail closed).
+      const input = parseLaunchApprovalInput({ name, project: projectName, cwd, provider: 'claude', model: model ?? 'default', effort: req.effort ?? 'high', role: req.role, requested_by: who.launched_by, first_task: truncateFirstTask(text) });
+      if (!input.ok) throw new Error(`This launch needs the developer's approval, but its approval card is invalid (${input.error}); nothing was launched`);
+      hold = { approval_id: `launch-${randomUUID()}`, input: input.value };
+    }
     const roleFields: SessionRoleFields = { role: req.role as Role, launched_by: who.launched_by, ...(who.parent ? { parent: who.parent } : {}),
       ...(supersedes ? { supersedes } : {}), ...(req.workstream ? { workstream: req.workstream } : {}),
       ...(req.effort ? { effort: req.effort } : {}), ...(policy.bypass_grant ? { bypass_grant: policy.bypass_grant } : {}), policy_reason: policy.policy_reason };
@@ -258,7 +266,7 @@ export class SessionService extends EventEmitter implements AgentSessionService 
     const receipt: Receipt = { id, status: 'queued', text, at: now(), source: 'user' };
     const data: RecordData = { version: 1, creation: { id, provider: 'claude', name, cwd, text, ...(model ? { model } : {}), ...(req.effort ? { effort: req.effort } : {}), ...(mode ? { permission_mode: mode } : {}), project_reference: cwdInput, agent },
       session, receipts: [receipt], history: [{ id, role: 'user', text, at: receipt.at, source: 'user' }], request };
-    if (held) data.hold = { approval_id: `launch-${randomUUID()}`, input: { name, project: projectName, cwd, provider: 'claude', model: model ?? 'default', effort: req.effort ?? 'high', role: req.role, requested_by: who.launched_by, first_task: truncateFirstTask(text) } };
+    if (hold) data.hold = hold;
     this.options.projects?.used(cwd);
     this.save(data); this.records.set(key, data);
     if (held) { this.changed(data); return this.launchResult(data); }
@@ -275,10 +283,14 @@ export class SessionService extends EventEmitter implements AgentSessionService 
     return { session_key: data.session.session_key, name, status: 'started', permission_mode: mode,
       ...(agent.bypass_grant ? { bypass_grant: agent.bypass_grant } : {}), policy_reason: agent.policy_reason };
   }
-  /** Role rules: only the Coordinator or the developer starts a Lead; a worker is started by its active parent Lead. */
+  /**
+   * Role rules: only the Coordinator starts a Lead through this path; a worker is started by its
+   * active parent Lead. Developer launches use `create()`, so `launched_by: 'developer'` is refused.
+   */
   private requester(req: AgentLaunchRequest): { requester_role: AgentRole; launched_by: LaunchedBy; parent?: string } {
     if (req.role === 'lead') {
-      if (req.launched_by !== 'coordinator' && req.launched_by !== 'developer') throw new Error('Only the Coordinator or the developer can start a Lead; a Lead cannot start a Lead');
+      if (req.launched_by === 'developer') throw new Error('Agent launches come from the Coordinator or a Lead; developer launches use create()');
+      if (req.launched_by !== 'coordinator') throw new Error('Only the Coordinator can start a Lead here; a Lead cannot start a Lead');
       if (req.requester_role !== 'coordinator') throw new Error('A Lead launch is requested by the Coordinator role');
       if (req.parent !== undefined) throw new Error('A Lead has no parent');
       return { requester_role: 'coordinator', launched_by: req.launched_by };
@@ -293,12 +305,15 @@ export class SessionService extends EventEmitter implements AgentSessionService 
     return { requester_role: 'lead', launched_by: lead, parent: lead };
   }
   private isActive(data: RecordData) { return !INACTIVE_STATES.includes(data.session.state); }
-  /** Host-enforced limits (D4). Held launches are `needs_input`, so they count. */
-  private checkLimits(role: 'lead' | 'worker', parent?: string) {
+  /**
+   * Host-enforced limits (D4). Held launches are `needs_input`, so they count. A Lead being
+   * superseded by this launch is not counted, so superseding works with every Lead slot in use.
+   */
+  private checkLimits(role: 'lead' | 'worker', parent?: string, supersedes?: string) {
     const limits = leadLimits(this.options.env ?? process.env);
     const active = [...this.records.values()].filter((data) => this.isActive(data));
     if (role === 'lead') {
-      const count = active.filter((data) => roleOf(data.session) === 'lead').length;
+      const count = active.filter((data) => roleOf(data.session) === 'lead' && data.session.session_key !== supersedes).length;
       if (count >= limits.maxLeads) throw new Error(`Lead limit reached: ${count} active Leads, at most ${limits.maxLeads} (FOREMAN_MAX_LEADS; held launches count). Retire a Lead first.`);
     } else {
       const count = active.filter((data) => roleOf(data.session) === 'worker' && data.session.parent === parent).length;
@@ -312,8 +327,9 @@ export class SessionService extends EventEmitter implements AgentSessionService 
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const view = await Promise.race([Promise.resolve().then(() => source.devSettings(timeout)), new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeout); })]);
-      // Re-validate: anything malformed fails toward lower privilege (grant off → Auto; ask → hold).
-      return view && typeof view === 'object' && view.settings && typeof view.settings === 'object' ? effectiveDevSettings(view.settings) : null;
+      // Re-validate the whole view: partial or malformed means unavailable (→ Auto), never defaults (→ Bypass).
+      const parsed = parseDevSettingsView(view);
+      return parsed.ok ? parsed.value.settings : null;
     } catch { return null; }
     finally { clearTimeout(timer); }
   }
@@ -419,7 +435,7 @@ export class SessionService extends EventEmitter implements AgentSessionService 
         });
         control.on('state', (state: string) => {
           if (this.closed) return;
-          if (state === 'failed' || state === 'closed') { this.unavailable(data, runtime, 'Claude process ended'); return; }
+          if (state === 'failed' || state === 'closed') { this.unavailable(data, runtime, control.lastError ?? 'Claude process ended'); return; }
           data.session.state = state === 'input-needed' ? 'needs_input' : runtime.active ? 'working' : 'idle'; this.changed(data);
         });
         control.on('approval', () => this.changed(data));

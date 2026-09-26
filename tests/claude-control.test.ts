@@ -123,6 +123,21 @@ test('Claude refuses an effective provider mode different from its launch policy
   h.emit({type:'system',subtype:'init',session_id:'test',permissionMode:'bypassPermissions'});
   await h.control.finished;
   assert.equal(h.control.state, 'failed');
+  assert.match(h.control.lastError!, /requested default, provider reported bypassPermissions$/);
+});
+
+test('lastError is set before the state event, keeps the first stop reason, and names a plain close', async () => {
+  const failing = harness('auto'); await tick();
+  let seen: string | null = 'unset';
+  failing.control.on('state', (state: string) => { if (state === 'failed') seen = failing.control.lastError; });
+  failing.emit({type:'system',subtype:'init',session_id:'x',permissionMode:'default'});
+  await failing.control.finished;
+  assert.match(String(seen), /requested auto, provider reported default; this model may not support Auto/);
+  failing.control.close();
+  assert.match(failing.control.lastError!, /provider reported default/, 'a later close does not overwrite the failure');
+  const closing = harness('native'); await tick();
+  closing.control.close(); await closing.control.finished;
+  assert.equal(closing.control.lastError, 'Claude controller closed');
 });
 
 for (const [policy, reported, ok] of [['auto', 'auto', true], ['auto', 'default', false], ['auto', 'bypassPermissions', false], ['bypass', 'auto', false], ['native', 'auto', false]] as const) {
@@ -131,8 +146,12 @@ for (const [policy, reported, ok] of [['auto', 'auto', true], ['auto', 'default'
     t.after(() => h.control.close());
     h.emit({type:'system',subtype:'init',session_id:'verified',permissionMode:reported});
     await tick();
-    if (ok) { assert.equal(h.control.state, 'idle'); assert.equal(h.control.sessionId, 'verified'); }
-    else { await h.control.finished; assert.equal(h.control.state, 'failed'); assert.equal(h.control.sessionId, null); }
+    if (ok) { assert.equal(h.control.state, 'idle'); assert.equal(h.control.sessionId, 'verified'); assert.equal(h.control.lastError, null); }
+    else {
+      await h.control.finished; assert.equal(h.control.state, 'failed'); assert.equal(h.control.sessionId, null);
+      const expected = policy === 'bypass' ? 'bypassPermissions' : policy === 'auto' ? 'auto' : 'default';
+      assert.equal(h.control.lastError, `Claude did not apply the requested launch policy: requested ${expected}, provider reported ${reported}${policy === 'auto' ? '; this model may not support Auto' : ''}`);
+    }
   });
 }
 

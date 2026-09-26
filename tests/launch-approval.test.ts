@@ -139,11 +139,23 @@ test('no GrantSource, a failing source, a null result or a timeout all mean Auto
   assert.equal((await late.service.launchAgent(late.lead())).policy_reason, 'grant_unavailable');
 });
 
-test('a malformed settings view fails toward lower privilege', async (t) => {
-  const grants = new FakeGrants(() => ({ settings: { roles: {}, bypass_grants: 'everything', bypass_ask: 'no' }, versions: {}, updated_at: null } as any));
-  const f = fixture(t, { grants });
-  const r = await f.service.launchAgent(f.lead());
-  assert.deepEqual([r.permission_mode, r.policy_reason], ['auto', 'grant_off']);
+test('a malformed or partial settings view is unavailable (Auto), never widened to the default Bypass grant', async (t) => {
+  const views = [
+    { settings: { roles: {}, bypass_grants: 'everything', bypass_ask: 'no' }, versions: {}, updated_at: null },
+    { settings: {} },
+    { settings: { bypass_ask: false } },
+    { settings: view().settings },
+    { settings: view().settings, versions: { roles: 0, bypass_grants: 0 }, updated_at: null },
+    'bypass',
+  ];
+  for (const raw of views) {
+    const f = fixture(t, { grants: new FakeGrants(() => raw as any) });
+    const r = await f.service.launchAgent(f.lead());
+    assert.deepEqual([r.status, r.permission_mode, r.policy_reason, r.bypass_grant], ['started', 'auto', 'grant_unavailable', undefined], JSON.stringify(raw));
+  }
+  // A valid full view (the DO fills every key) still applies its defaults: the standing grant → Bypass.
+  const ok = fixture(t, { grants: new FakeGrants(() => view()) });
+  assert.equal((await ok.service.launchAgent(ok.lead())).permission_mode, 'bypass');
 });
 
 test('requested auto launches Auto without reading grants; native and codex are refused before anything is saved', async (t) => {
@@ -337,10 +349,10 @@ test('limits: a 5th worker per Lead is refused (held counts), other Leads are un
   await assert.rejects(two.service.launchAgent(two.worker(l2.session_key)), /at most 2/);
 });
 
-test('roles: a Lead cannot start a Lead; workers need an existing, active parent Lead; developer and Coordinator can start Leads', async (t) => {
+test('roles: a Lead cannot start a Lead; workers need an existing, active parent Lead; only the Coordinator starts Leads here', async (t) => {
   const f = fixture(t);
   const lead = await f.service.launchAgent(f.lead());
-  assert.equal((await f.service.launchAgent(f.lead({ launched_by: 'developer' }))).status, 'started');
+  await assert.rejects(f.service.launchAgent(f.lead({ launched_by: 'developer' })), /developer launches use create\(\)/);
   await assert.rejects(f.service.launchAgent(f.lead({ launched_by: lead.session_key })), /a Lead cannot start a Lead/);
   await assert.rejects(f.service.launchAgent(f.lead({ requester_role: 'lead' })), /Coordinator role/);
   await assert.rejects(f.service.launchAgent(f.lead({ parent: lead.session_key })), /no parent/);
@@ -410,3 +422,86 @@ async function until(check: () => unknown, timeout = 2000) {
   while (Date.now() < end) { if (check()) return; await new Promise((resolve) => setTimeout(resolve, 5)); }
   throw new Error('timed out');
 }
+
+test('launched_by developer is refused for every outcome (it cannot form a valid approval card); nothing is saved', async (t) => {
+  for (const settings of [{}, { bypass_ask: true }, { bypass_grants: [] }] as Partial<DevSettings>[]) {
+    const f = fixture(t, { grants: new FakeGrants(() => view(settings)) });
+    await assert.rejects(f.service.launchAgent(f.lead({ launched_by: 'developer' })), /developer launches use create\(\)/);
+    await assert.rejects(f.service.launchAgent(f.lead({ launched_by: 'developer', requested_mode: 'auto' })), /developer launches use create\(\)/);
+    await tick();
+    assert.equal(f.launches.length, 0); assert.equal(managedFiles(f.home).length, 0);
+  }
+});
+
+test('a held launch whose approval card would not parse is refused before anything is saved', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'foreman-launch-card-'));
+  mkdirSync(join(home, 'project')); const project = realpathSync(join(home, 'project'));
+  // A project source reporting a name the approval contract rejects (path-like).
+  const projects = { require: () => ({ path: project }), forPath: () => ({ name: '~/weird' }), used() {} };
+  const f = fixture(t, { grants: new FakeGrants(() => view({ bypass_ask: true })), projects });
+  await assert.rejects(f.service.launchAgent(f.lead({ cwd: project })), /approval card is invalid \(project must be/);
+  assert.equal(f.launches.length, 0); assert.equal(managedFiles(f.home).length, 0); assert.deepEqual(f.decisions, []);
+  rmSync(home, { recursive: true, force: true });
+});
+
+test('session names are validated: path-like names and control characters are refused', async (t) => {
+  const f = fixture(t);
+  for (const name of ['/etc/passwd', '~/x', '~', 'C:\\temp', '\\\\server\\share', 'bad\nname', 'tab\there', 'bell\u0007', '', '   ', 'x'.repeat(201), 42 as any]) {
+    await assert.rejects(f.service.launchAgent(f.lead({ name })), /name must be/, JSON.stringify(name));
+  }
+  assert.equal(managedFiles(f.home).length, 0);
+  assert.equal((await f.service.launchAgent(f.lead({ name: 'lead: triage (v2) ✓' }))).name, 'lead: triage (v2) ✓');
+});
+
+test('limits: superseding an active Lead works with every Lead slot in use', async (t) => {
+  const f = fixture(t, { grants: new FakeGrants(() => view()) });
+  const leads = [];
+  for (const name of ['lead-a', 'lead-b', 'lead-c']) leads.push(await f.service.launchAgent(f.lead({ name })));
+  await assert.rejects(f.service.launchAgent(f.lead({ name: 'lead-d' })), /Lead limit reached: 3 active Leads/);
+  // Superseding a key that is not an active Lead does not free a slot.
+  await assert.rejects(f.service.launchAgent(f.lead({ name: 'lead-d', supersedes: `fm:${randomUUID()}` })), /Lead limit reached: 3 active Leads/);
+  const successor = await f.service.launchAgent(f.lead({ name: 'lead-a2', supersedes: leads[0].session_key.toUpperCase() }));
+  assert.equal(successor.status, 'started');
+  assert.equal(f.service.detail(successor.session_key).session.supersedes, leads[0].session_key);
+  // Now 4 active until the old Lead retires; a further non-superseding Lead is still refused.
+  await assert.rejects(f.service.launchAgent(f.lead({ name: 'lead-e' })), /Lead limit reached: 4 active Leads/);
+  await tick(); f.claudes[0].complete(); await tick();
+  await f.service.retire(leads[0].session_key, `superseded by ${successor.session_key}`);
+  assert.equal(f.service.detail(leads[0].session_key).session.superseded_by, successor.session_key);
+});
+
+test('launch() refuses an agent record without a Bypass or Auto policy (never Native)', async (t) => {
+  const f = fixture(t, { grants: new FakeGrants(() => view()) });
+  const r = await f.service.launchAgent(f.lead()); await tick();
+  assert.equal(f.launches.length, 1);
+  const service = f.service as any;
+  const data = service.records.get(r.session_key);
+  for (const mode of ['native', undefined]) {
+    const copy = structuredClone(data); copy.creation.permission_mode = mode;
+    const runtime = { ready: false, dispatching: false };
+    await service.launch(copy, runtime);
+    assert.equal(f.launches.length, 1, `no provider started for ${mode}`);
+    assert.equal(copy.session.state, 'unknown');
+    assert.match(copy.session.last_error, /An agent launch without an approved policy cannot start/);
+    assert.equal(runtime.ready, false);
+  }
+});
+
+test('an Auto launch the provider does not apply fails with the requested and reported modes in last_error', async (t) => {
+  const fakeQuery = (params: any) => {
+    let closed = false; let wake: (() => void) | undefined;
+    return { async *[Symbol.asyncIterator]() {
+      yield { type: 'system', subtype: 'init', session_id: 'native-haiku', permissionMode: 'default' };
+      while (!closed) await new Promise<void>((resolve) => { wake = resolve; });
+    }, close() { closed = true; wake?.(); }, async interrupt() {}, params };
+  };
+  const f = fixture(t, { claudeFactory: (options: any) => new ClaudeControl(options, fakeQuery as any) });
+  const n = notifier(f.service); t.after(n.close);
+  const r = await f.service.launchAgent(f.lead({ model: 'haiku', requested_mode: 'auto' }));
+  await until(() => f.service.detail(r.session_key).session.state === 'unknown');
+  const row = f.service.detail(r.session_key).session;
+  const expected = 'Claude did not apply the requested launch policy: requested auto, provider reported default; this model may not support Auto';
+  assert.equal(row.last_error, expected); assert.equal(row.control_reason, expected);
+  assert.equal(row.alive, false);
+  assert.deepEqual(f.service.detail(r.session_key).receipts.map((x) => [x.status, x.error]), [['uncertain', expected]]);
+});

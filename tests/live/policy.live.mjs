@@ -232,6 +232,8 @@ if (process.env.FOREMAN_LIVE !== '1') {
       t.diagnostic(`haiku + auto: provider init reported ${JSON.stringify(modes)}`);
       assert.deepEqual(modes, ['default']);
       assert.deepEqual([detail(result).session.alive, detail(result).session.capabilities.message], [false, false]);
+      const reason = 'Claude did not apply the requested launch policy: requested auto, provider reported default; this model may not support Auto';
+      assert.deepEqual([detail(result).session.last_error, detail(result).session.control_reason], [reason, reason]);
     });
 
     await t.test('ask before each Bypass launch: held (nothing runs) → approved → verified bypassPermissions', async () => {
