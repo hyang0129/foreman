@@ -8,15 +8,18 @@ import { execFileSync } from 'node:child_process';
 if (process.env.FOREMAN_LIVE !== '1') {
   test('live PM success and authentication failure', { skip: 'spends real provider turns' }, () => {});
 } else {
-  assert.equal(process.env.FOREMAN_LIVE_CLAUDE_KEYCHAIN, '1', 'Explicit read-only Keychain opt-in required');
   const home = mkdtempSync(join(tmpdir(), 'foreman-pm-live-'));
   process.env.FOREMAN_HOME = home;
   process.env.CLAUDE_CONFIG_DIR = join(home, 'claude');
   mkdirSync(process.env.CLAUDE_CONFIG_DIR);
-  // Read the current access token only. Never clone or rotate the owner's refresh token.
-  const credentials = JSON.parse(execFileSync('/usr/bin/security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
-  process.env.CLAUDE_CODE_OAUTH_TOKEN = credentials.claudeAiOauth.accessToken;
-  assert.ok(process.env.CLAUDE_CODE_OAUTH_TOKEN);
+  if (process.platform === 'darwin') {
+    assert.equal(process.env.FOREMAN_LIVE_CLAUDE_KEYCHAIN, '1', 'Explicit read-only Keychain opt-in required');
+    // Read the current access token only. Never clone or rotate the owner's refresh token.
+    const credentials = JSON.parse(execFileSync('/usr/bin/security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = credentials.claudeAiOauth.accessToken;
+  }
+  // Elsewhere (no Keychain) the caller supplies an access token in CLAUDE_CODE_OAUTH_TOKEN.
+  assert.ok(process.env.CLAUDE_CODE_OAUTH_TOKEN, 'An access token is required: the macOS Keychain, or CLAUDE_CODE_OAUTH_TOKEN');
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.FOREMAN_PM_MODEL;
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
@@ -82,6 +85,38 @@ if (process.env.FOREMAN_LIVE !== '1') {
       assert.equal(pm.lastError, null, JSON.stringify(logs));
       const answer = pm.history().filter((e) => e.role === 'assistant').map((e) => e.text).join('\n');
       assert.match(answer, /FOREMAN_MEMORY_CANARY_7Q/, `the answer must come from injected memory: ${answer}`);
+      assert.deepEqual(unconfirmed(pm), []);
+    } finally { pm.close(); await running; }
+  });
+
+  // #233: the memory tools were deferred behind ToolSearch, which the Coordinator is denied, so it
+  // said they "weren't available". The store is the evidence: only a real tool call can write it.
+  test('live PM: a turn asked to remember something actually writes memory and the log through the tools', { timeout: 120000 }, async (t) => {
+    const { pm, store } = await livePm();
+    const logs = []; t.mock.method(console, 'error', (...args) => logs.push(args));
+    // Every tool the model called. Before the fix it tried ToolSearch first, was denied, and then
+    // either gave up (production) or guessed the unloaded tools' inputs (haiku, sometimes).
+    const calls = [];
+    pm.queryFactory = (args) => {
+      const q = query(args), iterate = q[Symbol.asyncIterator].bind(q);
+      const frames = (async function* () { for await (const m of { [Symbol.asyncIterator]: iterate }) {
+        if (m.type === 'assistant') for (const b of m.message?.content ?? []) if (b.type === 'tool_use') calls.push(b.name);
+        yield m;
+      } })();
+      return new Proxy(q, { get: (target, key) => key === Symbol.asyncIterator ? () => frames : typeof target[key] === 'function' ? target[key].bind(target) : target[key] });
+    };
+    const running = pm.start();
+    try {
+      await pm.send('Remember this: the developer decided that zebra-project ships on FOREMAN_DECISION_CANARY_4K. Record it now with log_note (a one-line note containing FOREMAN_DECISION_CANARY_4K) and add a `## zebra-project` section containing FOREMAN_DECISION_CANARY_4K to the projects memory doc. Then reply in one sentence.');
+      await waitFor(() => pm.history().some((e) => e.role === 'assistant') || !!pm.lastError, 'an answer', 110000);
+      assert.equal(pm.lastError, null, JSON.stringify(logs));
+      const answer = pm.history().filter((e) => e.role === 'assistant').map((e) => e.text).join('\n');
+      const memory = await store.read();
+      assert.ok(memory.log.some((e) => e.text.includes('FOREMAN_DECISION_CANARY_4K')), `log_note must have run: ${JSON.stringify(memory.log)} / ${answer}`);
+      assert.match(memory.projects.content, /FOREMAN_DECISION_CANARY_4K/, `a memory write must have run: ${answer}`);
+      assert.doesNotMatch(answer, /(n't|not|un)\s*(been\s*)?available|could(n't| not) (load|access)/i, answer);
+      assert.ok(calls.includes('mcp__fleet__log_note'), calls.join(','));
+      assert.ok(!calls.includes('ToolSearch'), `the memory tools must already be loaded, not searched for: ${calls.join(',')}`);
       assert.deepEqual(unconfirmed(pm), []);
     } finally { pm.close(); await running; }
   });
