@@ -1057,15 +1057,17 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 #project-management summary { min-height: 44px; padding-block: 12px; cursor: pointer; }
 #project-status, #project-feedback { overflow-wrap: anywhere; }
 
-/* Launcher reuses the shared activity, form, and scrollable dialog patterns. */
+/* New session: "Ask the Coordinator" above the manual form (epic #157, D7). */
 #session-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
-#session-fields legend { font-weight: 600; margin-bottom: 12px; }
-#launch-brief-panel { display: grid; gap: 12px; }
-#launch-brief-panel[hidden] { display: none; }
-.launch-mode-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-#launch-status { min-height: 0; }
-#launch-status:has(#launch-status-label:empty) { display: none; }
-#launch-reason { overflow-wrap: anywhere; }
+#session-fields legend { font-weight: 600; margin-bottom: 4px; padding-top: 18px; }
+#session-fields .dialog-intro { margin: 4px 0 8px; }
+.ask-coordinator { display: grid; gap: 8px; margin-top: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--accent-soft); }
+.ask-coordinator .info-heading { margin: 0; color: var(--accent); }
+.ask-coordinator label { margin-top: 0; font-weight: 400; color: var(--secondary); }
+.ask-coordinator textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); padding: 9px 11px; font: inherit; font-size: .75rem; resize: vertical; }
+.ask-coordinator .btn { justify-self: start; }
+.ask-coordinator .field-hint:empty { display: none; }
+.ask-coordinator .field-hint.error { color: var(--error); }
 
 /* A separate row reserves space for navigation without obscuring requests. */
 .latest-control { flex-shrink: 0; text-align: center; }
@@ -1274,3 +1276,66 @@ label.machine-choice input[type="radio"] { flex-shrink: 0; width: 20px; height: 
   font-weight: 650;
 }
 .session-age { justify-self: end; }
+/* Coordinator and Project Leads (epic #157): chat-list roles, agent launch policy, Archived. */
+.session-via { font-weight: 400; color: var(--secondary); }
+.role-tag, .policy-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: .6875rem;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--secondary);
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+.policy-tag.is-bypass { border-color: var(--warning); background: var(--warning-soft); color: var(--warning); }
+.archived-group { margin-top: 10px; }
+.archived-summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  padding: 0 11px;
+  cursor: pointer;
+  font-size: .75rem;
+  font-weight: 650;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.archived-group .session-row { opacity: .85; }
+/* The "Launch with Bypass" card. */
+.launch-approval { border-color: var(--warning); }
+.launch-approval h3 { color: var(--warning); }
+.launch-details .header-metadata { margin: 8px 0; }
+.launch-task-label { margin: 8px 0 2px; font-size: .75rem; font-weight: 650; color: var(--muted); }
+.launch-task { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 12rem; overflow: auto; padding: 8px 10px; border-radius: 8px; background: var(--code); font-size: .8125rem; }
+.btn.bypass-action { background: var(--warning); border-color: var(--warning); color: var(--on-accent); }
+.btn.bypass-action:hover { background: var(--warning); filter: brightness(.9); }
+.launch-outcome { margin: 8px 0; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--code); color: var(--secondary); font-size: .8125rem; font-weight: 600; }
+/* Lead info: its latest handoff and its workers. */
+.lead-handoff-status { margin: 0; font-weight: 600; font-size: .8125rem; }
+.lead-handoff-summary { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8125rem; color: var(--secondary); }
+.lead-handoff-summary:empty { display: none; }
+.lead-worker-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.lead-worker { font-size: .8125rem; overflow-wrap: anywhere; }
+.lead-worker-open { width: 100%; min-height: 44px; text-align: left; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); font: inherit; }
+.lead-worker-open:hover { background: var(--accent-soft); }
+#coordinator-settings .btn { margin-top: 8px; }
+/* Settings: a sheet on desktop, the whole screen on a phone (the info-screen pattern). */
+.settings-fields { border: 0; margin: 0; padding: 0; min-width: 0; }
+.settings-status:empty { display: none; }
+.settings-status.error { color: var(--error); }
+.settings-dialog label.check-row { display: flex; align-items: center; gap: 10px; min-height: 44px; margin-top: 6px; font-weight: 500; }
+.settings-dialog label.check-row input { width: 20px; height: 20px; margin: 0; flex-shrink: 0; }
+.settings-subheading { margin: 12px 0 4px; font-size: .75rem; font-weight: 650; color: var(--secondary); }
+.grant-override-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.grant-override { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; font-size: .8125rem; overflow-wrap: anywhere; }
+.grant-add { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0 10px; align-items: end; }
+.grant-add .btn { margin-top: 12px; min-height: 36px; }
+.settings-fields:disabled label, .settings-fields:disabled .btn { opacity: .7; }
+@media (max-width: 760px) {
+  .grant-add .btn, #coordinator-settings .btn { min-height: 44px; }
+}

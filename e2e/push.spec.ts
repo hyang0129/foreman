@@ -176,7 +176,7 @@ test.describe("notification settings", () => {
     await fixture(page, { auth: { required: false } });
     await page.goto("/");
     await expect(page.locator("#app")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
     await expect(page.locator("#notify-settings")).toBeHidden();
   });
 
@@ -219,7 +219,7 @@ test.describe("notification settings", () => {
       device_label: "Android · Chrome",
       kinds: ALL_KINDS,
     });
-    for (const name of ["Approvals and questions", "A session failed", "Project manager errors", "Mac offline"])
+    for (const name of ["Approvals and questions", "A session failed", "Coordinator errors", "Machine offline"])
       await expect(page.getByLabel(name)).toBeChecked();
     await expect(page.getByRole("button", { name: "Send test notification" })).toBeVisible();
 
@@ -269,7 +269,7 @@ test.describe("notification settings", () => {
     await signedIn(page);
     await enable(page, state);
     await expect(page.locator("#notify-status")).toHaveText(/^This device gets Foreman notifications/);
-    const labels = ["Approvals and questions", "A session failed", "Project manager errors", "Mac offline"];
+    const labels = ["Approvals and questions", "A session failed", "Coordinator errors", "Machine offline"];
     for (const [index, name] of labels.entries()) {
       await page.getByLabel(name).tap();
       await expect.poll(() => pushCalls(state, "/api/push/subscribe").length).toBe(index + 2);
@@ -561,7 +561,7 @@ test.describe("notification click", () => {
     const state = await fixture(page);
     await page.goto("/");
     await signedIn(page);
-    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
     const sw = await worker(page);
     await page.evaluate(() => { (window as any).__sameDocument = true; });
     await deliver(page, JSON.stringify(payload()));
@@ -576,7 +576,7 @@ test.describe("notification click", () => {
     // The notification was closed.
     expect(await shown(page)).toEqual([]);
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
   });
 
   test("a PM notification opens the project manager", async ({ page }) => {
@@ -590,7 +590,7 @@ test.describe("notification click", () => {
     await click(sw, "pm");
     // The PM is the home view: its canonical URL is "/".
     await expect(page).toHaveURL(`${ORIGIN}/`);
-    await expect(page.getByRole("heading", { name: "Claude · Project manager" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Claude · Coordinator" })).toBeVisible();
   });
 
   test("a session missing from the Mac falls back to the PM with the neutral notice", async ({ page }) => {
@@ -601,8 +601,8 @@ test.describe("notification click", () => {
     await deliver(page, JSON.stringify(payload({ session_key: "fm:gone", tag: "session:fm:gone", url: "/?session=fm%3Agone" })));
     await expect.poll(() => shown(page)).toHaveLength(1);
     await click(sw, "session:fm:gone");
-    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing the project manager.");
-    await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
+    await expect(page.locator("#app-notice")).toHaveText("That conversation isn’t available on the execution host. Showing the Coordinator.");
+    await expect(page.getByRole("heading", { name: "Claude · Coordinator", exact: true })).toBeVisible();
     await expect.poll(() => page.url()).toBe(`${ORIGIN}/`);
   });
 

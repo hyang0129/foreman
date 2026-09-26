@@ -112,10 +112,10 @@ for (const colorScheme of ["light", "dark"] as const) {
     await expect(failure).toHaveCount(1);
     await expect(failure).toContainText("OAuth session expired.");
     await expect(failure.locator(".message-label")).toHaveText(
-      /^Project manager error/,
+      /^Coordinator error/,
     );
     await expect(
-      page.getByRole("article", { name: "Project manager error" }),
+      page.getByRole("article", { name: "Coordinator error" }),
     ).toHaveCount(1);
 
     const plain = page.locator(".message.system", {
@@ -184,14 +184,14 @@ test("rail flags a PM failure from the summary read and clears it", async ({
   await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(0);
   await expect(indicator).toHaveCount(0);
   await expect(pmRow).not.toHaveClass(/has-error/);
-  await expect(page.getByRole("button", { name: "Project manager, has an error" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Coordinator, has an error" })).toHaveCount(0);
 
   // Error appears on a later poll.
   state.pmError = "Project manager failed: provider outage";
   await expect(indicator).toHaveCount(1);
-  await expect(indicator).toHaveText(/Project manager has an error/);
+  await expect(indicator).toHaveText(/Coordinator has an error/);
   await expect(
-    page.getByRole("button", { name: "Project manager, has an error" }),
+    page.getByRole("button", { name: "Coordinator, has an error" }),
   ).toBeVisible();
   await expect(pmRow).toHaveAttribute("title", /provider outage/);
   // The #28 banner is for the selected PM only; it is not raised from the rail read.
@@ -210,7 +210,7 @@ test("rail flags a PM failure from the summary read and clears it", async ({
   await expect(pmRow).not.toHaveClass(/has-error/);
   expect(await pmRow.getAttribute("aria-label")).toBeNull();
   expect(await pmRow.getAttribute("title")).toBeNull();
-  await expect(page.getByRole("button", { name: /Project manager/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Coordinator/ })).toBeVisible();
 });
 
 test("summary is not requested while the PM is selected", async ({ page }) => {
@@ -312,7 +312,7 @@ test("the rail indicator appears even when the PM row has no PINNED tag", async 
   state.pmError = "Project manager failed: provider outage";
   const indicator = page.locator("#select-pm .pm-alert");
   await expect(indicator).toHaveCount(1);
-  await expect(page.getByRole("button", { name: "Project manager, has an error" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Coordinator, has an error" })).toBeVisible();
   state.pmError = null;
   await expect(indicator).toHaveCount(0);
 });
@@ -328,7 +328,7 @@ test("a PM error entry that gains its error flag re-renders as a failure", async
   // Same role, text and timestamp: only the error flag changes.
   state.pmHistory = [{ role: "system", error: true, text: "Project manager stopped.", at }];
   await expect(entry).toHaveClass(/\berror\b/);
-  await expect(entry.locator(".message-label")).toHaveText(/^Project manager error/);
+  await expect(entry.locator(".message-label")).toHaveText(/^Coordinator error/);
 });
 
 test("signing out clears the PM failure indicator", async ({ page }) => {
