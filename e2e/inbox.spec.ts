@@ -188,6 +188,16 @@ async function fixture(
   });
   return state;
 }
+// Configuration and details live on the info screen (#154), reached from the header's menu.
+async function openInfo(page: Page) {
+  await page.locator("#conversation-menu-button").click();
+  await page.getByRole("menuitem", { name: /info/ }).click();
+  await expect(page.locator("#info-dialog")).toBeVisible();
+}
+async function closeInfo(page: Page) {
+  await page.getByRole("button", { name: "Close info", exact: true }).click();
+  await expect(page.locator("#info-dialog")).toBeHidden();
+}
 async function openManaged(page: Page) {
   await page.goto("/");
   await page.getByRole("button", { name: /Fix sign-in/ }).click();
@@ -301,9 +311,9 @@ test("external session is readable and clearly monitor-only", async ({
   ).toBeVisible();
   await expect(page.getByText("I found the sign-in issue.")).toBeVisible();
   await expect(page.getByLabel("Message this session")).toBeDisabled();
-  await expect(
-    page.getByRole("button", { name: "Interrupt", exact: true }),
-  ).toBeDisabled();
+  // Interrupt shows only while a turn is running that Foreman can stop.
+  await expect(page.locator("#interrupt")).toBeHidden();
+  await openInfo(page);
   await expect(page.locator("#control-note")).toContainText(
     "does not own its input",
   );
@@ -570,10 +580,13 @@ test("project manager model persists across reload and is locked while busy", as
   await page.goto("/");
   await page.locator("#select-pm").click();
   await expect(page.locator("#pm-model option[value=haiku]")).toHaveCount(1);
+  await openInfo(page);
   await page.locator("#pm-model").selectOption("haiku");
   await expect.poll(() => state.pmModel).toBe("haiku");
   await page.reload();
   await expect(page.locator("#pm-model")).toHaveValue("haiku");
+  await expect(page.locator("#info-dialog")).toBeHidden();
+  await openInfo(page);
   state.pmBusy = true;
   await expect(page.locator("#pm-model")).toBeDisabled();
   state.pmBusy = false;
@@ -828,6 +841,7 @@ test("session creation and model save wait for confirmation before reporting suc
   await page.goto("/");
   await page.locator("#select-pm").click();
   await expect(page.locator("#pm-model")).toBeEnabled();
+  await openInfo(page);
   let release = state.defer("/api/pm/model");
   await page.locator("#pm-model").selectOption("haiku");
   await expect(page.locator("#pm-model-hint")).toHaveText("Saving…");
@@ -836,6 +850,7 @@ test("session creation and model save wait for confirmation before reporting suc
   expect(state.pmModel).toBeNull();
   release();
   await expect(page.locator("#pm-model-hint")).toContainText("Saved");
+  await closeInfo(page);
   await page.getByRole("button", { name: "New session", exact: true }).click();
   await page.locator("#start-manually").click();
   await page.getByLabel("Session name").fill("Pending launch");
@@ -891,10 +906,12 @@ test.describe("mobile polish", () => {
     await page.goto("/");
     await page.getByRole("button", { name: "Open session navigation" }).tap();
     await page.getByRole("button", { name: /Fix sign-in/ }).tap();
-    await page.getByText("Session details", { exact: true }).tap();
+    await page.locator("#conversation-menu-button").tap();
+    await page.getByRole("menuitem", { name: "Session info", exact: true }).tap();
     await expect(page.getByText(longPath, { exact: false })).toBeVisible();
     await expectNoPageOverflow(page);
-    await page.getByText("Session details", { exact: true }).tap();
+    await page.getByRole("button", { name: "Close info", exact: true }).tap();
+    await expect(page.locator("#conversation-menu-button")).toBeFocused();
     await page.getByRole("button", { name: "Open session navigation" }).tap();
     const appearance = page.getByRole("combobox", { name: "Appearance", exact: true });
     await appearance.selectOption("dark");
@@ -1024,9 +1041,14 @@ test("a developer remembers, renames, removes projects on the host and can read 
   await page.setViewportSize({ width: 360, height: 640 }); await page.goto("/");
   await page.getByRole("button", { name: "Open session navigation" }).click();
   await page.getByRole("button", { name: /Fix sign-in/ }).click();
-  const details = page.locator("#heading-details summary"); await details.focus(); await page.keyboard.press("Enter");
+  // The info screen is reachable by keyboard: the overflow menu, then its first item.
+  await page.locator("#conversation-menu-button").focus(); await page.keyboard.press("Enter");
+  await expect(page.getByRole("menuitem", { name: "Session info", exact: true })).toBeFocused();
+  await page.keyboard.press("Enter");
   await expect(page.locator("#conversation-subtitle")).toContainText(managed.cwd);
-  await expect(details).toContainText("personal");
+  await expect(page.locator("#conversation-subtitle")).toContainText("personal");
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#conversation-menu-button")).toBeFocused();
   await page.getByRole("button", { name: "Open session navigation" }).click();
   await page.getByRole("button", { name: "New session", exact: true }).click();
   await page.locator("#start-manually").click();
@@ -1372,9 +1394,11 @@ test("copy controls write original message and fenced code bytes without sending
   await expect(codeCopy.locator("..").getByRole("status")).toHaveText("Copied");
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(code);
   await expect(codeCopy).toBeFocused();
-  const messageCopy = page.getByRole("button", { name: "Copy message", exact: true });
-  await messageCopy.click();
-  await expect(messageCopy.locator("..").getByRole("status")).toHaveText("Copied");
+  // No permanent Copy message button (#154): copying a message is in its menu (right-click here).
+  await expect(page.getByRole("button", { name: "Copy message", exact: true })).toHaveCount(0);
+  await page.locator(".message .message-label").first().click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Copy message", exact: true }).click();
+  await expect(page.locator("#copy-status")).toHaveText("Copied");
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(original);
   expect(state.calls.filter((call) => call.body && /message|sessions|approval/.test(call.path))).toHaveLength(0);
   await expect(page.locator("#messages unsafe")).toHaveCount(0);
@@ -1387,10 +1411,13 @@ test("copy feedback waits for clipboard success and preserves focus through deni
     Object.defineProperty(navigator, "clipboard", { value: { writeText: () => new Promise<void>((resolve, reject) => { (window as any).finishCopy = { resolve, reject }; }) } });
   });
   await openManaged(page);
-  const copy = page.getByRole("button", { name: "Copy message", exact: true });
+  // The message itself takes focus; Enter opens its menu with Copy message focused.
+  const copy = page.locator(".message").first();
   await copy.focus();
   await page.keyboard.press("Enter");
-  await expect(copy).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByRole("menuitem", { name: "Copy message", exact: true })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(copy).toBeFocused();
   await expect(page.getByText("Copied", { exact: true })).toHaveCount(0);
   state.receipts[0].status = "running";
   await refreshTimeline(page);
@@ -1399,6 +1426,8 @@ test("copy feedback waits for clipboard success and preserves focus through deni
   await expect(page.getByRole("status").filter({ hasText: "Could not copy." })).toBeVisible();
   await expect(copy).toBeFocused();
   await expect(page.locator(".message-body")).toHaveText("Original task");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menuitem", { name: "Copy message", exact: true })).toBeFocused();
   await page.keyboard.press("Enter");
   await page.evaluate(() => (window as any).finishCopy.resolve());
   await expect(page.getByText("Copied", { exact: true })).toBeVisible();
@@ -1424,7 +1453,9 @@ test("copy controls stay discoverable and tappable on touch at enlarged text", a
 });
 
 
-for (const kind of ["message", "code"]) test(`pending ${kind} clipboard results follow streaming while copying the clicked text`, async ({ page }) => {
+// Messages no longer carry a Copy button (#154). The message menu, including copying the text
+// a streaming message had when its menu opened, is covered in messaging-layout.spec.ts.
+for (const kind of ["code"]) test(`pending ${kind} clipboard results follow streaming while copying the clicked text`, async ({ page }) => {
   const content = (text: string) => kind === "code" ? `\`\`\`sh\n${text}\n\`\`\`` : text;
   const copied = (text: string) => kind === "code" ? `${text}\n` : text;
   const state = await fixture(page, { history: [{ id: "stream", role: "assistant", text: content("First chunk") }] });
@@ -1459,8 +1490,8 @@ test("header identifies the PM and honestly explains its selected model and inde
   await page.getByRole("button", { name: /Project manager Plan and delegate/ }).click();
   await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
   await expect(page.locator("#header-model")).toHaveText("Model · Provider default");
-  await page.getByText("Model details", { exact: true }).focus();
-  await page.keyboard.press("Enter");
+  await openInfo(page);
+  await expect(page.locator("#header-model")).toBeVisible();
   await expect(page.locator("#conversation-subtitle")).toContainText("Provider settings determine the model");
   await expect(page.locator(".pm-model-help")).toContainText("replies and planning");
   await expect(page.locator(".pm-model-help")).toContainText("agents have their own model selection");
@@ -1481,9 +1512,9 @@ test("worker header separates identity state project and full model details with
   await expect(page.locator("#provider")).toHaveText("Claude");
   await expect(page.locator("#activity-label")).toContainText("Working");
   await expect(page.locator("#header-model")).toContainText((state.sessions[0] as any).model);
-  const details = page.locator("#heading-details summary");
-  await details.focus();
-  await page.keyboard.press("Enter");
+  await openInfo(page);
+  const details = page.locator("#close-info");
+  await expect(page.locator("#provider")).toBeVisible();
   await expect(page.locator("#conversation-subtitle dd").filter({ hasText: (state.sessions[0] as any).model })).toBeVisible();
   await expect(page.locator("#conversation-subtitle")).toContainText(managed.cwd);
   await expect(page.locator("#conversation-subtitle")).toContainText("Native");
@@ -1507,7 +1538,9 @@ test("phone header keeps history space and exposes long model and project values
   const header = await page.locator(".conversation-head").boundingBox();
   const history = await page.locator("#timeline").boundingBox();
   expect(header!.height).toBeLessThan(history!.height);
-  await page.locator("#heading-details summary").tap();
+  // The long values are on the info screen, not in the header.
+  await expect(page.locator("#header-model")).toBeHidden();
+  await page.locator("#conversation-heading").tap();
   await expect(page.locator("#conversation-subtitle")).toContainText(longModel);
   await expect(page.locator("#conversation-subtitle")).toContainText(longPath);
   await page.locator("#conversation-subtitle dd").filter({ hasText: longPath }).scrollIntoViewIfNeeded();
@@ -1603,7 +1636,7 @@ test("PM dates use ts and midnight relabeling preserves copy focus without a new
   await page.getByRole("button", { name: /Project manager Plan and delegate/ }).click();
   await expect(page.locator(".date-separator")).toHaveText(["Today"]);
   await expect(page.locator("time")).toHaveCount(30);
-  const copy = page.getByRole("button", { name: "Copy message", exact: true }).nth(10);
+  const copy = page.locator(".message").nth(10);
   await copy.focus();
   await expect(page.getByRole("button", { name: "Jump to latest", exact: true })).toBeVisible();
   const before = await copy.evaluate((el) => el.getBoundingClientRect().top);

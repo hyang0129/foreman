@@ -111,29 +111,20 @@
           >
             ☰
           </button>
-          <div class="conversation-heading">
-            <div class="title-line">
-              <h1 id="conversation-title">Your session inbox</h1>
-              <span id="provider" class="badge" hidden></span>
-            </div>
-            <p id="header-model" class="header-model" hidden></p>
+          <!-- Minimal messaging header: name, one status line, Interrupt only while a turn runs,
+               and one overflow menu. Configuration lives on the info screen (#info-dialog). -->
+          <div class="conversation-heading" id="conversation-heading">
+            <h1 id="conversation-title">Your session inbox</h1>
             <div id="activity-status" class="activity-status" role="status" aria-live="polite" aria-atomic="true" hidden>
               <span class="activity-symbol" aria-hidden="true"></span><span id="activity-label"></span>
             </div>
-            <details id="heading-details">
-              <summary>Session details</summary>
-              <div id="conversation-subtitle">Choose a session or start something new.</div>
-            </details>
           </div>
-          <button id="interrupt" class="btn ghost small" aria-describedby="interrupt-feedback" disabled>
+          <button id="interrupt" class="btn ghost small" aria-describedby="interrupt-feedback" disabled hidden>
             Interrupt
           </button>
+          <button id="conversation-menu-button" class="icon-btn" type="button" aria-label="Conversation options" aria-haspopup="menu" popovertarget="conversation-menu">⋮</button>
         </header>
-        <section id="pm-host" class="pm-host" aria-label="Project manager machine" hidden>
-          <p class="pm-host-line"><span id="pm-host-dot" class="dot" aria-hidden="true"></span><span id="pm-host-label"></span></p>
-          <p id="pm-host-offline" class="pm-host-offline" role="status"></p>
-          <button id="move-pm" class="btn ghost small" type="button" aria-haspopup="dialog" hidden>Move PM…</button>
-        </section>
+        <p id="pm-host-offline" class="banner warning pm-host-offline" role="status" hidden></p>
         <p id="interrupt-feedback" class="action-feedback" role="status" hidden></p>
         <div
           id="connection-banner"
@@ -166,20 +157,13 @@
           ></section>
         </div>
         <div class="latest-control"><button id="jump-latest" class="btn ghost" type="button" aria-controls="timeline" aria-live="polite" aria-atomic="true" hidden>Jump to latest</button></div>
-        <div id="pm-model-control" class="model-control" hidden>
-          <label for="pm-model">Project manager model · Claude</label>
-          <select id="pm-model" aria-describedby="pm-model-hint" disabled><option value="">Provider default</option></select>
-          <p class="field-hint pm-model-help">Controls the PM’s replies and planning. Newly launched agents have their own model selection.</p>
-          <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn and are saved with the PM.</span>
-        </div>
-        <div id="control-note" class="control-note" role="status"></div>
         <form id="composer" class="composer">
           <p id="send-feedback" class="action-feedback" role="status" hidden></p>
           <label class="sr-only" for="message-input">Message this session</label
           ><textarea
             id="message-input"
             aria-describedby="send-feedback"
-            rows="2"
+            rows="1"
             placeholder="Choose a session to start a conversation"
             maxlength="60000"
             disabled
@@ -194,6 +178,44 @@
         </form>
       </main>
     </div>
+    <!-- The header's overflow menu, and the per-message menu opened by long-press, right-click,
+         or Enter / the context-menu key on a focused message. Both use the popover top layer. -->
+    <div id="conversation-menu" class="menu" popover role="menu" aria-label="Conversation options">
+      <button id="open-info" class="menu-item" type="button" role="menuitem">Info and settings</button>
+      <button id="copy-last" class="menu-item" type="button" role="menuitem">Copy last message</button>
+    </div>
+    <div id="message-menu" class="menu" popover="manual" role="menu" aria-label="Message options">
+      <button id="copy-message" class="menu-item" type="button" role="menuitem">Copy message</button>
+    </div>
+    <p id="copy-status" class="toast" role="status" hidden></p>
+    <!-- Info screen (like a contact-info screen): everything that configures or describes the
+         conversation, kept out of the conversation view. -->
+    <dialog id="info-dialog" class="info-dialog" aria-labelledby="info-title">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow" id="info-eyebrow">CONVERSATION INFO</p>
+          <h2 id="info-title">Conversation</h2>
+        </div>
+        <button id="close-info" type="button" class="icon-btn" aria-label="Close info">×</button>
+      </div>
+      <p class="info-identity"><span id="provider" class="badge" hidden></span><span id="header-model" class="header-model" hidden></span></p>
+      <section class="info-section" aria-labelledby="info-details-title">
+        <h3 id="info-details-title" class="info-heading">Details</h3>
+        <div id="conversation-subtitle">Choose a session or start something new.</div>
+      </section>
+      <section id="pm-host" class="pm-host info-section" aria-label="Project manager machine" hidden>
+        <h3 class="info-heading">Machine</h3>
+        <p class="pm-host-line"><span id="pm-host-dot" class="dot" aria-hidden="true"></span><span id="pm-host-label"></span></p>
+        <button id="move-pm" class="btn ghost small" type="button" aria-haspopup="dialog" hidden>Move PM…</button>
+      </section>
+      <section id="pm-model-control" class="model-control info-section" aria-label="Project manager model" hidden>
+        <label for="pm-model">Project manager model · Claude</label>
+        <select id="pm-model" aria-describedby="pm-model-hint" disabled><option value="">Provider default</option></select>
+        <p class="field-hint pm-model-help">Controls the PM’s replies and planning. Newly launched agents have their own model selection.</p>
+        <span id="pm-model-hint" class="field-hint" role="status">Changes apply to the next turn and are saved with the PM.</span>
+      </section>
+      <p id="control-note" class="control-note info-section" role="status"></p>
+    </dialog>
     <dialog id="new-dialog" aria-labelledby="new-title">
       <form id="new-form">
         <div class="dialog-heading">

@@ -30,6 +30,9 @@ const ui = {
   dialog: $("#new-dialog"),
   newForm: $("#new-form"),
   moveDialog: $("#move-pm-dialog"),
+  infoDialog: $("#info-dialog"),
+  menu: $("#conversation-menu"),
+  messageMenu: $("#message-menu"),
 };
 const LABEL = {
   needs_input: "Needs you",
@@ -166,13 +169,29 @@ function updateLatest() {
   if (ui.latest.textContent !== label) ui.latest.textContent = label;
 }
 function resetLatest() {
+  pinnedToLatest = true;
+  seenScrollTop = ui.timeline.scrollTop;
   for (const state of copyStates.values()) { clearTimeout(state.timer); state.render = () => {}; }
   copyStates.clear();
   timelineEntries = [];
   newMessages = false;
   ui.latest.hidden = true;
 }
-ui.timeline.addEventListener("scroll", updateLatest, { passive: true });
+// Whether the reader is at the latest message. Kept from scroll events, so a resize (the keyboard
+// opening, a banner appearing) that shrinks the timeline keeps the latest message in view, as a
+// messaging app does. The resize itself changes no scroll position, so it cannot clear this.
+// `seenScrollTop` is the position `pinnedToLatest` was taken at: a scroll whose event has not
+// arrived yet (it is dispatched on the next frame) must not be mistaken for staying pinned.
+let pinnedToLatest = true, seenScrollTop = 0;
+ui.timeline.addEventListener("scroll", () => { pinnedToLatest = nearLatest(); seenScrollTop = ui.timeline.scrollTop; updateLatest(); }, { passive: true });
+function stillPinned() {
+  return nearLatest() || (pinnedToLatest && ui.timeline.scrollTop === seenScrollTop);
+}
+function keepLatestInView() {
+  if (stillPinned()) { ui.timeline.scrollTop = ui.timeline.scrollHeight; pinnedToLatest = true; seenScrollTop = ui.timeline.scrollTop; }
+  updateLatest();
+}
+if ("ResizeObserver" in window) new ResizeObserver(keepLatestInView).observe(ui.timeline);
 ui.latest.addEventListener("click", () => {
   newMessages = false;
   // Keep keyboard focus in the history when the button disappears at the bottom.
@@ -335,6 +354,12 @@ function revokeAccess(message) {
   pmHost = null; pmHostChecked = false; pmHostView = null; hostError = "";
   renderPmHost();
   ui.moveDialog.close();
+  ui.infoDialog.close();
+  closeMenus();
+  // Nothing of the previous identity's messages outlives sign-out.
+  copyStatus("");
+  messageMenuText = "";
+  messageMenuTarget = null;
   clearDrafts();
   // A PM failure seen by the previous identity is not shown to the next one.
   polledPmError = null;
@@ -375,7 +400,8 @@ function setNav(open) {
   $(".conversation").inert = mobile && open;
   if (open) $("#close-nav").focus();
 }
-// History model (Android Back). The stack is at most [PM, conversation, drawer, dialog]:
+// History model (Android Back). The stack is at most [PM, conversation, drawer, dialog] (or
+// [PM, conversation, info, Move PM] for the info screen):
 // opening a conversation from the PM pushes an entry, switching conversations replaces it,
 // and the drawer and the new-session dialog each push an overlay entry. Back therefore closes
 // the dialog, then the drawer, then returns to the PM, then leaves the app. Every entry
@@ -446,7 +472,8 @@ function closeNav() {
 // identical entries behind (which made the next Back appear to do nothing). `budget` bounds the
 // steps (the stack holds at most two overlays); if it runs out, the entry is kept as a plain view.
 function deadOverlay(state) {
-  return (state?.overlay === "nav" && !navOpen()) || (state?.overlay === "dialog" && !ui.dialog.open) || (state?.overlay === "move" && !ui.moveDialog.open);
+  return (state?.overlay === "nav" && !navOpen()) || (state?.overlay === "dialog" && !ui.dialog.open) || (state?.overlay === "move" && !ui.moveDialog.open)
+    || (state?.overlay === "info" && !ui.infoDialog.open);
 }
 function dropDeadOverlay(budget = 3) {
   afterHistory(() => {
@@ -480,6 +507,9 @@ window.addEventListener("popstate", (event) => {
   // Back closes the top-most layer first: the dialog, then the drawer, then the conversation.
   if (ui.dialog.open && state.overlay !== "dialog") ui.dialog.close();
   if (ui.moveDialog.open && state.overlay !== "move") ui.moveDialog.close();
+  // Move PM opens on top of the info screen, so Back from it returns to the info screen.
+  if (ui.infoDialog.open && state.overlay !== "info" && state.overlay !== "move") ui.infoDialog.close();
+  closeMenus();
   if (navOpen() && !state.overlay) {
     setNav(false);
     $("#open-nav").focus({ preventScroll: true });
@@ -534,7 +564,7 @@ function renderConnectionBanner() {
     : `${hostName("The execution host")} is disconnected. Showing the last available state. Messages and approvals will be available when it reconnects.`;
   if (banner.textContent !== text) banner.textContent = text;
   // In the PM view the machine line already says the PM's machine is offline.
-  const saidByPmLine = selected === "pm" && !$("#pm-host").hidden && !$("#pm-host-offline").hidden;
+  const saidByPmLine = selected === "pm" && !$("#pm-host-offline").hidden;
   banner.hidden = !!host.online || !hostChecked || (!hostError && saidByPmLine);
 }
 function renderRail() {
@@ -553,53 +583,40 @@ function renderRail() {
   );
   $("#select-pm").classList.toggle("selected", selected === "pm");
   $("#select-pm").setAttribute("aria-pressed", String(selected === "pm"));
+  // A chat list: sessions that need you first, then the most recently active. Each row is the
+  // name, the time, a one-line preview, and a badge when the session needs you.
   const known = new Set(GROUPS.map(([state]) => state));
-  const groups = [...GROUPS, ["other", "Other sessions"]];
-  for (const [state, label] of groups) {
-    const rows = visible.filter((s) =>
-      state === "other" ? !known.has(s.state) : s.state === state,
+  const rows = [...visible].sort((a, b) =>
+    Number(b.state === "needs_input") - Number(a.state === "needs_input")
+    || String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+  for (const s of rows) {
+    const row = node(
+      "button",
+      `session-row${selected === s.session_key ? " selected" : ""}`,
     );
-    if (!rows.length) continue;
-    ui.list.append(node("h2", "group-heading", `${label} · ${rows.length}`));
-    rows.sort((a, b) =>
-      String(b.updated_at || "").localeCompare(String(a.updated_at || "")),
+    row.title = s.cwd || "";
+    row.setAttribute("aria-description", `${projectName(s)} · ${LABEL[s.state] || "Unknown state"}${!host.online ? " · Last known" : ""}`);
+    row.type = "button";
+    row.dataset.session = s.session_key;
+    row.dataset.state = s.state || "";
+    row.setAttribute("aria-pressed", String(selected === s.session_key));
+    const dot = node("span", `dot ${known.has(s.state) ? s.state : "unknown"}`);
+    dot.setAttribute("aria-hidden", "true");
+    row.append(
+      dot,
+      node("span", "session-name", s.name || s.session_id?.slice(0, 8) || "Session"),
+      node("span", "session-age", ago(s.updated_at || s.started_at)),
     );
-    for (const s of rows) {
-      const row = node(
-        "button",
-        `session-row${selected === s.session_key ? " selected" : ""}`,
-      );
-      row.title = s.cwd || "";
-      row.setAttribute("aria-description", s.cwd || "");
-      row.type = "button";
-      row.dataset.session = s.session_key;
-      row.setAttribute("aria-pressed", String(selected === s.session_key));
-      row.append(
-        node("span", `dot ${known.has(s.state) ? s.state : "unknown"}`),
-        node(
-          "span",
-          "session-name",
-          s.name || s.session_id?.slice(0, 8) || "Session",
-        ),
-        node("span", "session-age", ago(s.updated_at || s.started_at)),
-      );
-      const summary =
-        s.state === "needs_input"
-          ? s.reason || "Waiting for your response"
-          : s.state === "working"
-            ? s.current_tool || "Working on your task"
-            : s.last_message || projectName(s);
-      row.append(
-        node("span", "session-sub", summary),
-        node(
-          "span",
-          "session-meta",
-          `${projectName(s)} · ${s.provider === "codex" ? "Codex" : "Claude"} · ${s.managed ? `Managed · ${policyLabel(s)}` : "Monitoring"}${!host.online ? " · Last known" : ""}`,
-        ),
-      );
-      row.addEventListener("click", () => selectSession(s.session_key));
-      ui.list.append(row);
-    }
+    const summary =
+      s.state === "needs_input"
+        ? s.reason || "Waiting for your response"
+        : s.state === "working"
+          ? s.current_tool || "Working on your task"
+          : s.last_message || projectName(s);
+    row.append(node("span", "session-sub", summary));
+    if (s.state === "needs_input") row.append(node("span", "attention-badge", "Needs you"));
+    row.addEventListener("click", () => selectSession(s.session_key));
+    ui.list.append(row);
   }
   if (!visible.length) {
     const empty = node("div", "rail-empty");
@@ -650,6 +667,12 @@ function updateControls() {
     (isPm && sending) ||
     ui.interrupt.dataset.busy === "true";
   ui.interrupt.textContent = ui.interrupt.dataset.busy === "true" ? "Interrupting…" : "Interrupt";
+  // Interrupt shows only while a turn is running (or a request to stop one is in flight).
+  const running = isPm ? pmBusy : !!session?.capabilities?.interrupt && ["working", "needs_input"].includes(session?.state);
+  const hideInterrupt = !running && ui.interrupt.dataset.busy !== "true";
+  // A keyboard user who pressed Interrupt keeps focus in the conversation when it goes away.
+  if (hideInterrupt && !ui.interrupt.hidden && document.activeElement === ui.interrupt) ui.timeline.focus({ preventScroll: true });
+  ui.interrupt.hidden = hideInterrupt;
   renderActionFeedback();
   ui.input.placeholder = !selected
     ? "Choose a session to start a conversation"
@@ -678,15 +701,8 @@ function updateControls() {
     });
 }
 function renderHeading() {
-  const headingSummary = $("#heading-details summary"), model = $("#header-model");
+  const model = $("#header-model");
   const isPm = selected === "pm";
-  const headingName = detail?.session && !isPm ? projectName(detail.session) : "";
-  const summaryLabel = isPm ? "Model details" : "Session details";
-  const summarySignature = JSON.stringify([summaryLabel, headingName]);
-  if (headingSummary.dataset.signature !== summarySignature) {
-    headingSummary.replaceChildren(node("span", "", summaryLabel), ...(headingName ? [node("span", "", ` · ${headingName}`)] : []));
-    headingSummary.dataset.signature = summarySignature;
-  }
   const fields = [];
   let selectedModel = "";
   if (isPm) {
@@ -711,6 +727,10 @@ function renderHeading() {
     ui.title.textContent = selected ? "Loading session…" : "Your session inbox";
     ui.provider.hidden = true;
   }
+  // The info screen repeats the conversation's name, and says what it configures.
+  $("#info-title").textContent = ui.title.textContent;
+  $("#info-eyebrow").textContent = isPm ? "PROJECT MANAGER INFO" : "SESSION INFO";
+  $("#open-info").textContent = isPm ? "Project manager info and model" : "Session info";
   model.hidden = !selectedModel;
   model.textContent = selectedModel ? `Model · ${selectedModel}` : "";
   model.title = selectedModel;
@@ -874,7 +894,11 @@ function messageNode(entry, receipt, entryKey) {
   } else label.append(node("span", "timestamp-unavailable", "Time unavailable"));
   article.append(label);
   appendContent(article, entry.text || entry.summary || "", entryKey);
-  article.append(copyControl(String(entry.text || entry.summary || ""), "Copy message", "message", entryKey));
+  // No permanent per-message chrome: copying a message is in its menu (long-press, right-click,
+  // or Enter / the context-menu key while the message has focus).
+  article.copyText = String(entry.text || entry.summary || "");
+  article.tabIndex = 0;
+  article.setAttribute("aria-description", "Press Enter for message options");
   renderMessageReceipt(article, receipt);
   return article;
 }
@@ -906,12 +930,13 @@ function renderMessages(history = [], receipts = []) {
   const now = new Date();
   const signature = JSON.stringify([selected, history, receipts, localDay(now), hostChecked, host.online, sessionsLoaded, sessions.length, detail?.session?.capabilities?.message]);
   if (signature === messageSignature) return;
-  const wasNearBottom = nearLatest();
+  const wasNearBottom = stillPinned();
   const firstRender = !messageSignature;
   const oldTop = ui.timeline.scrollTop;
   const focusedCopy = ui.messages.contains(document.activeElement) ? document.activeElement : null;
   const focusEntry = focusedCopy?.closest("[data-entry-key]")?.dataset.entryKey;
-  const focusCopy = focusedCopy?.dataset.copyKey;
+  // A focused message (not a control inside it) keeps its focus across re-renders too.
+  const focusCopy = focusedCopy?.classList.contains("message") ? "message" : focusedCopy?.dataset.copyKey;
   const viewportTop = ui.timeline.getBoundingClientRect().top;
   const anchors = timelineEntries.map((item) => ({ key: item.key, top: item.element.getBoundingClientRect().top - viewportTop, bottom: item.element.getBoundingClientRect().bottom - viewportTop }))
     .filter((item) => item.bottom > 0);
@@ -984,9 +1009,10 @@ function renderMessages(history = [], receipts = []) {
   ui.messages.replaceChildren(fragment);
   if (focusEntry && focusCopy) {
     const article = entries.find((item) => String(item.key) === focusEntry)?.element;
-    [...(article?.querySelectorAll("[data-copy-key]") || [])].find((button) => button.dataset.copyKey === focusCopy)?.focus({ preventScroll: true });
+    if (focusCopy === "message") article?.focus({ preventScroll: true });
+    else [...(article?.querySelectorAll("[data-copy-key]") || [])].find((button) => button.dataset.copyKey === focusCopy)?.focus({ preventScroll: true });
   }
-  if (wasNearBottom || firstRender) ui.timeline.scrollTop = ui.timeline.scrollHeight;
+  if (wasNearBottom || firstRender) { ui.timeline.scrollTop = ui.timeline.scrollHeight; pinnedToLatest = true; seenScrollTop = ui.timeline.scrollTop; }
   else {
     const anchor = anchors.find((old) => entries.some((item) => item.key === old.key));
     const element = anchor && entries.find((item) => item.key === anchor.key).element;
@@ -1187,6 +1213,7 @@ async function selectSession(key, record = true) {
   selected = key;
   deepLinkPending = null;
   hideNotice();
+  closeMenus();
   if (record) recordView(key);
   selectionEpoch++;
   const epoch = selectionEpoch;
@@ -1383,7 +1410,9 @@ function renderPmHost() {
   const offlineText = offline ? pmHostOfflineMessage(active.name) : "";
   const offlineLine = $("#pm-host-offline");
   if (offlineLine.textContent !== offlineText) offlineLine.textContent = offlineText;
-  offlineLine.hidden = !offlineText;
+  // The offline warning is status, not configuration: it stays in the PM conversation view as a
+  // banner. The machine line and Move PM live on the info screen.
+  offlineLine.hidden = !offlineText || selected !== "pm" || !authorized;
   bar.classList.toggle("is-offline", offline);
   $("#move-pm").hidden = !moveTargets().length;
   if (ui.moveDialog.open) renderMoveList();
@@ -1487,8 +1516,10 @@ ui.moveDialog.addEventListener("close", () => {
   if (!authorized) return;
   const opener = moveOpener;
   moveOpener = null;
-  // Back to the Move button, or to the conversation when the button has gone away.
+  // Back to the Move button, or, when the button has gone away, to the info screen it was
+  // opened from (or the conversation).
   if (opener?.isConnected && !opener.hidden && !opener.closest("[hidden], [inert]")) opener.focus({ preventScroll: true });
+  else if (ui.infoDialog.open) $("#close-info").focus({ preventScroll: true });
   else ui.timeline.focus({ preventScroll: true });
 });
 // Keep Tab and Shift+Tab inside the modal dialog (a radio group is one Tab stop).
@@ -1558,6 +1589,161 @@ $("#move-pm-form").addEventListener("submit", async (event) => {
     }
   }
 });
+// Info screen (like a messaging app's contact info): the model and its picker, the PM's machine
+// and Move PM, the session's project, directory and permissions, and the control note.
+let infoOpener = null;
+function openInfo(event) {
+  if (ui.infoDialog.open || !authorized) return;
+  closeMenus();
+  const opener = event?.currentTarget;
+  infoOpener = opener && opener !== $("#open-info") && opener.matches?.("button") ? opener : $("#conversation-menu-button");
+  renderHeading();
+  ui.infoDialog.showModal();
+  pushOverlay("info", () => ui.infoDialog.open);
+  $("#close-info").focus();
+}
+$("#open-info").addEventListener("click", openInfo);
+$("#close-info").addEventListener("click", () => ui.infoDialog.close());
+ui.infoDialog.addEventListener("close", () => {
+  popOverlay("info");
+  if (!authorized) return;
+  const opener = infoOpener;
+  infoOpener = null;
+  if (opener?.isConnected && !opener.closest("[hidden], [inert]")) opener.focus({ preventScroll: true });
+});
+// Tapping the conversation's name opens its info, as in a messaging app. Keyboard and screen
+// reader users reach the same screen through the overflow menu.
+$("#conversation-heading").addEventListener("click", (event) => { if (selected) openInfo(event); });
+
+// Menus use the popover top layer; light dismiss and Escape come from the browser.
+function closeMenus() {
+  for (const menu of [ui.menu, ui.messageMenu]) if (menu.matches(":popover-open")) menu.hidePopover();
+}
+function menuItems(menu) {
+  return [...menu.querySelectorAll('[role="menuitem"]')].filter((item) => !item.hidden && !item.disabled);
+}
+let messageMenuTarget = null, messageMenuText = "";
+for (const menu of [ui.menu, ui.messageMenu]) {
+  menu.addEventListener("toggle", (event) => {
+    if (event.newState === "open") { menuItems(menu)[0]?.focus(); return; }
+    // Closing returns focus to what opened the menu, unless focus already moved elsewhere.
+    const lost = menu.contains(document.activeElement) || document.activeElement === document.body || !document.activeElement;
+    if (!lost) return;
+    // A message re-rendered while its menu was open (streaming) is found again by its entry key.
+    const key = messageMenuTarget?.dataset.entryKey;
+    const back = menu === ui.menu ? $("#conversation-menu-button")
+      : messageMenuTarget?.isConnected ? messageMenuTarget
+      : [...ui.messages.querySelectorAll(".message")].find((article) => article.dataset.entryKey === key);
+    if (back?.isConnected && !back.closest("[hidden], [inert]")) back.focus({ preventScroll: true });
+  });
+  menu.addEventListener("keydown", (event) => {
+    const items = menuItems(menu), index = items.indexOf(document.activeElement);
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
+    } else if (event.key === "Tab") menu.hidePopover();
+  });
+}
+function placeMenu(menu, anchor, point) {
+  const width = Math.min(280, window.innerWidth - 16);
+  const left = point ? Math.min(Math.max(8, point.x), window.innerWidth - width - 8) : Math.max(8, anchor.right - width);
+  const top = point ? point.y : anchor.bottom + 4;
+  menu.style.left = `${left}px`;
+  menu.style.top = `${Math.max(8, Math.min(top, window.innerHeight - 120))}px`;
+  menu.style.width = `${width}px`;
+}
+const lastMessage = () => [...ui.messages.querySelectorAll(".message")].at(-1);
+ui.menu.addEventListener("beforetoggle", (event) => {
+  if (event.newState !== "open") return;
+  $("#open-info").hidden = !selected;
+  $("#copy-last").hidden = typeof lastMessage()?.copyText !== "string";
+  placeMenu(ui.menu, $("#conversation-menu-button").getBoundingClientRect());
+});
+let copyStatusTimer;
+function copyStatus(text, error = false) {
+  const status = $("#copy-status");
+  clearTimeout(copyStatusTimer);
+  if (status.textContent !== text) status.textContent = text;
+  status.classList.toggle("error", error);
+  status.hidden = !text;
+  if (text) copyStatusTimer = setTimeout(() => copyStatus(""), error ? 8000 : 2500);
+}
+async function copyText(text) {
+  copyStatus("");
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+    await navigator.clipboard.writeText(text);
+    copyStatus("Copied");
+  } catch {
+    copyStatus("Could not copy. Allow clipboard access or select and copy the text manually.", true);
+  }
+}
+$("#copy-last").addEventListener("click", () => {
+  const text = lastMessage()?.copyText;
+  ui.menu.hidePopover();
+  if (typeof text === "string") void copyText(text);
+});
+// The message menu: long-press (touch), right-click, or Enter / Space / the context-menu key on
+// a focused message. It copies the text the message had when the menu opened.
+function openMessageMenu(article, point) {
+  if (typeof article?.copyText !== "string") return;
+  if (ui.messageMenu.matches(":popover-open") && messageMenuTarget === article) return;
+  closeMenus();
+  messageMenuTarget = article;
+  messageMenuText = article.copyText;
+  const rect = article.getBoundingClientRect(), top = ui.timeline.getBoundingClientRect().top;
+  placeMenu(ui.messageMenu, rect, point || { x: rect.left + 12, y: Math.max(rect.top, top) + 12 });
+  ui.messageMenu.showPopover();
+  menuItems(ui.messageMenu)[0]?.focus();
+}
+$("#copy-message").addEventListener("click", () => {
+  const text = messageMenuText;
+  ui.messageMenu.hidePopover();
+  void copyText(text);
+});
+ui.messages.addEventListener("contextmenu", (event) => {
+  const article = event.target.closest?.(".message");
+  // Links, controls, code blocks and selected text keep the browser's own menu.
+  if (!article || event.target.closest("a, button, pre") || String(window.getSelection?.() || "")) return;
+  event.preventDefault();
+  if (ui.messageMenu.matches(":popover-open") && messageMenuTarget === article) return;
+  const pointer = event.clientX || event.clientY;
+  openMessageMenu(article, pointer ? { x: event.clientX, y: event.clientY } : null);
+});
+// The message menu is a manual popover: it opens while the finger or mouse button that opened it
+// is still down, and the automatic light dismiss would close it again on that release. It closes
+// on a press outside it or Escape. It deliberately survives scrolling: a streaming reply keeps
+// the conversation pinned to the latest message, and that must not close the menu under the user.
+document.addEventListener("pointerdown", (event) => {
+  if (ui.messageMenu.matches(":popover-open") && !ui.messageMenu.contains(event.target)) ui.messageMenu.hidePopover();
+}, true);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && ui.messageMenu.matches(":popover-open")) { event.preventDefault(); ui.messageMenu.hidePopover(); }
+});
+// Some Android builds do not raise contextmenu for a long-press on plain text; a 500 ms touch
+// hold without movement opens the same menu.
+let pressTimer = null, pressStart = null;
+const cancelPress = () => { clearTimeout(pressTimer); pressTimer = null; };
+ui.messages.addEventListener("pointerdown", (event) => {
+  const article = event.target.closest?.(".message");
+  if (event.pointerType !== "touch" || !article || event.target.closest("a, button, pre")) return;
+  pressStart = { x: event.clientX, y: event.clientY };
+  cancelPress();
+  pressTimer = setTimeout(() => {
+    pressTimer = null;
+    if (!ui.messageMenu.matches(":popover-open")) openMessageMenu(article, pressStart);
+  }, 500);
+});
+for (const type of ["pointerup", "pointercancel", "pointerleave"]) ui.messages.addEventListener(type, cancelPress);
+ui.messages.addEventListener("pointermove", (event) => {
+  if (pressTimer && pressStart && Math.hypot(event.clientX - pressStart.x, event.clientY - pressStart.y) > 10) cancelPress();
+});
+ui.messages.addEventListener("keydown", (event) => {
+  if (!event.target.classList?.contains("message") || (event.key !== "Enter" && event.key !== " ")) return;
+  event.preventDefault();
+  openMessageMenu(event.target);
+});
+
 async function poll() {
   clearTimeout(pollTimer);
   if (!authorized || polling) return;
@@ -2019,7 +2205,7 @@ for (const selector of ["#close-nav", "#nav-backdrop"])
     $("#open-nav").focus();
   });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !ui.dialog.open && !ui.moveDialog.open && ui.app.classList.contains("nav-open")) {
+  if (event.key === "Escape" && !ui.dialog.open && !ui.moveDialog.open && !ui.infoDialog.open && ui.app.classList.contains("nav-open")) {
     closeNav();
     $("#open-nav").focus();
   }
@@ -2325,6 +2511,8 @@ function openFromNotification(url) {
   const key = parseDeepLinkKey(target.search);
   if (ui.dialog.open) ui.dialog.close();
   if (ui.moveDialog.open) ui.moveDialog.close();
+  if (ui.infoDialog.open) ui.infoDialog.close();
+  closeMenus();
   if (!key) {
     if (navOpen()) closeNav();
     if (selected !== "pm") { showInbox(); recordView(null); }
