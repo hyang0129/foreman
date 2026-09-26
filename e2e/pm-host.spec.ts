@@ -384,6 +384,50 @@ test("the dialog traps focus, works from the keyboard, and returns focus", async
   await expect(moveButton(page)).toBeFocused();
 });
 
+// #189: a dialog's close event is queued, so closing and at once reopening the dialog delivers the
+// first close after the second opening. That late event must not drop the new opening's return
+// focus or its Back entry. A poll re-rendering the info screen and the list while the dialog is
+// open must not either.
+test("a late close event from a quick close and reopen leaves the reopened dialog intact", async ({ page }) => {
+  const state = await fixture(page, {
+    machines: [
+      { machine_id: A, name: "machine-a", platform: "darwin", online: true, last_seen: Date.now() },
+      { machine_id: B, name: "machine-b", platform: "linux", online: true, last_seen: Date.now() },
+    ],
+  });
+  await openPm(page);
+  await openInfo(page);
+  await moveButton(page).click();
+  await expect(dialog(page)).toBeVisible();
+  await expect.poll(() => page.evaluate(() => history.state?.overlay)).toBe("move");
+  // Close and reopen in one task, before the close event can be dispatched.
+  const lateClose = await page.evaluate(() => {
+    const move = document.getElementById("move-pm-dialog") as HTMLDialogElement;
+    let fired = false;
+    move.addEventListener("close", () => { fired = true; }, { once: true });
+    move.close();
+    document.getElementById("move-pm")!.click();
+    return { reopened: move.open, firedBeforeReopen: fired };
+  });
+  // The premise: the dialog is open again and its first close event is still pending.
+  expect(lateClose).toEqual({ reopened: true, firedBeforeReopen: false });
+  await machineRadio(page, "machine-b").check();
+  // A poll re-renders the info screen and the machine list while the dialog is open.
+  const gets = pmHostGets(state).length;
+  await pollNow(page);
+  await expect.poll(() => pmHostGets(state).length).toBeGreaterThan(gets);
+  await expect(dialog(page)).toBeVisible();
+  await expect(machineRadio(page, "machine-b")).toBeChecked();
+  await expect(dialog(page).getByRole("button", { name: "Move Coordinator", exact: true })).toBeEnabled();
+  // The reopened dialog still owns a history entry, and Cancel returns focus to Move Coordinator….
+  await expect.poll(() => page.evaluate(() => history.state?.overlay)).toBe("move");
+  await dialog(page).getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(dialog(page)).toBeHidden();
+  await expect(moveButton(page)).toBeFocused();
+  await expect(page.locator("#info-dialog")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => history.state?.overlay)).toBe("info");
+});
+
 test("Move PM and the dialog fit a phone with 44px touch targets", async ({ browser }) => {
   const context = await browser.newContext({ viewport: { width: 360, height: 740 }, hasTouch: true });
   const page = await context.newPage();
