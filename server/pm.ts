@@ -188,7 +188,6 @@ export function investigatorAgents(config: RoleConfig): Record<string, AgentDefi
   };
 }
 
-/** Directories and files no investigator may read, search or run git in (also canonical when they exist). */
 /** Home-relative credential and agent-state locations no investigator may read, search or run git in. */
 export const PROTECTED_HOME_ENTRIES = [
   '.ssh', '.claude', '.claude.json', '.claude.json.backup', '.codex', '.codex.json', '.config/gh', '.config/hub', '.config/git/credentials',
@@ -196,34 +195,82 @@ export const PROTECTED_HOME_ENTRIES = [
   '.git-credentials', '.gem/credentials', '.cargo/credentials', '.cargo/credentials.toml', '.password-store', 'Library/Keychains',
 ] as const;
 
+/** Directories and files no investigator may read, search or run git in (also canonical when they exist). */
 function protectedDirs(ctx: InvestigatorContext = {}): string[] {
-  const homes = [...new Set([home, ...(ctx.home ? [ctx.home] : [])])];
-  const dirs = [FOREMAN_HOME, ...homes.flatMap((h) => PROTECTED_HOME_ENTRIES.map((d) => join(h, d)))];
+  const dirs = [FOREMAN_HOME, ...investigatorHomes(ctx).flatMap((h) => PROTECTED_HOME_ENTRIES.map((d) => join(h, d)))];
   for (const key of ['CLAUDE_CONFIG_DIR', 'CODEX_HOME']) { const v = process.env[key]; if (v && isAbsolute(v)) dirs.push(v); }
   const out = new Set<string>();
   for (const dir of dirs) { out.add(resolve(dir)); try { out.add(realpath(dir)); } catch { /* absent */ } }
   return [...out];
 }
+const investigatorHomes = (ctx: InvestigatorContext) => [...new Set([home, ...(ctx.home ? [ctx.home] : [])])];
 const isEnvFile = (path: string) => path.split(sep).some((segment) => /^\.env/i.test(segment));
+
+// macOS reaches the same files through other absolute paths that realpath keeps as they are: the
+// data-volume firmlink (`/System/Volumes/Data/Users/...`) and the `/.nofollow` and `/.resolve`
+// prefixes. String comparison cannot catch these, so they are refused outright, and every check
+// below is also made by file identity (device and inode), which no spelling changes.
+const ALIAS_PREFIX = /^\/(system\/volumes|\.nofollow|\.resolve)(\/|$)/i;
+export const isAliasPath = (p: string) => ALIAS_PREFIX.test(p) || ALIAS_PREFIX.test(resolve(p));
+
+/** `dev:ino` of what `p` names (symlinks followed), or null when it does not exist. */
+const identity = (p: string): string | null => {
+  try { const s = statSync(p, { bigint: true }); return `${s.dev}:${s.ino}`; } catch { return null; }
+};
+/** `p` and each of its ancestors, up to `/`. */
+const selfAndAncestors = (p: string): string[] => {
+  const out = [p];
+  for (let at = p; dirname(at) !== at; at = dirname(at)) out.push(dirname(at));
+  return out;
+};
+/**
+ * File identities of protected locations: `locations` (every one that exists) and, for the
+ * "contains" check, `ancestors`: every directory above a protected location (or equal to an extra
+ * `containers` entry, e.g. the home directory), found by walking up each location's realpath.
+ */
+function protectedIdentities(locations: string[], containers: string[] = []): { locations: Set<string>; ancestors: Set<string> } {
+  const ids = new Set<string>(); const ancestors = new Set<string>();
+  for (const location of locations) {
+    const id = identity(location);
+    if (!id) continue;
+    ids.add(id);
+    let real: string;
+    try { real = realpath(location); } catch { continue; }
+    for (const dir of selfAndAncestors(real).slice(1)) { const a = identity(dir); if (a) ancestors.add(a); }
+  }
+  for (const dir of containers) { const id = identity(dir); if (id) ancestors.add(id); }
+  return { locations: ids, ancestors };
+}
+/** True when `actual` (a realpath) or any of its ancestors is one of the protected identities. */
+const insideProtected = (actual: string, ids: Set<string>) => selfAndAncestors(actual).some((p) => { const id = identity(p); return id !== null && ids.has(id); });
 
 /**
  * Why an investigator may not use `path` (null when it may). The path is resolved against the
- * Coordinator's cwd and canonicalized (symlinks followed, on-disk case); it must exist. A directory
- * that contains a protected location (e.g. the home directory) is refused too.
+ * Coordinator's cwd and canonicalized (symlinks followed, on-disk case); it must exist. Protected
+ * locations are matched as strings (case-insensitively on darwin/win32) and by file identity, so an
+ * alias (a firmlink, `/.nofollow`, a symlinked parent, a hard link to a protected file) is refused
+ * too. A directory that contains a protected location (e.g. the home directory) is refused as well.
  */
 export function investigatorPathDenial(raw: unknown, kind: 'file' | 'any', ctx: InvestigatorContext = {}): string | null {
   if (typeof raw !== 'string' || !raw.trim()) return 'an explicit path is required';
   if (/[\0\n\r]/.test(raw)) return 'invalid path';
   const lexical = resolve(ctx.cwd ?? FOREMAN_HOME, expandFrom(ctx.home ?? home, raw));
+  if (isAliasPath(lexical)) return 'system volume alias paths (/System/Volumes, /.nofollow, /.resolve) are not readable by investigators';
   let actual: string;
   try { actual = realpath(lexical); } catch { return 'the path must exist'; }
+  if (isAliasPath(actual)) return 'system volume alias paths (/System/Volumes, /.nofollow, /.resolve) are not readable by investigators';
   const protectedList = protectedDirs(ctx);
   if (isEnvFile(actual) || isEnvFile(lexical)) return '.env files are not readable by investigators';
-  if (protectedList.some((dir) => under(actual, dir) || under(lexical, dir))) return "Foreman's state and credential directories are not readable by investigators";
+  const credentials = "Foreman's state and credential directories are not readable by investigators";
+  if (protectedList.some((dir) => under(actual, dir) || under(lexical, dir))) return credentials;
+  const ids = protectedIdentities(protectedList, investigatorHomes(ctx));
+  if (insideProtected(actual, ids.locations)) return credentials;
   let stat;
   try { stat = statSync(actual); } catch { return 'the path must exist'; }
   if (kind === 'file' && !stat.isFile()) return 'the path must be a file';
-  if (stat.isDirectory() && protectedList.some((dir) => under(dir, actual))) return "this directory contains Foreman's state or a credential directory; search a project directory instead";
+  if (stat.isDirectory() && (protectedList.some((dir) => under(dir, actual)) || ids.ancestors.has(identity(actual) ?? ''))) {
+    return "this directory contains Foreman's state or a credential directory; search a project directory instead";
+  }
   return null;
 }
 
@@ -242,8 +289,11 @@ const GIT_BRANCH_VALUE_FLAGS = /^--(contains|no-contains|merged|no-merged|points
 const GIT_BLOCKED_LONG = ['--output', '--output-directory', '--ext-diff', '--textconv', '--no-index', '--open-files-in-pager', '--orderfile', '--show-signature', '--exec', '--upload-pack', '--config-env'];
 // Exact options that are prefixes of a blocked option but harmless on their own.
 const GIT_SAFE_PREFIXES = ['--text'];
-// `-O<orderfile>`, the short form of --orderfile.
-const GIT_BLOCKED_SHORT = /^-O/;
+// `-O<orderfile>`, the short form of --orderfile, also inside a short-option cluster (`-pO/etc/x`).
+const GIT_BLOCKED_SHORT = /^-[^-]*O/;
+// Format placeholders that run gpg.program: `%G?`, `%GS`, `%GK`, … (log/show --format/--pretty) and
+// the `%(signature…)` atoms of `branch --format`.
+const GIT_SIGNATURE_FORMAT = /%G|%\(signature/;
 /**
  * Prepended to every allowed git command by the hook itself (never taken from input): no pager, no
  * fsmonitor hook program, no gpg program for signatures. log/show/diff also get `--no-ext-diff
@@ -295,6 +345,8 @@ export function investigatorBashCheck(command: unknown, ctx: InvestigatorContext
     const forced = GIT_FORCED_GLOBALS.length;
     if (words.slice(1, 1 + forced).join(' ') === GIT_FORCED_GLOBALS.join(' ')) words = [program, ...words.slice(1 + forced)];
     const args = words.slice(1);
+    // A path or revision naming a .env file (`show HEAD:.env`, `-- .ENV`) is refused in any argument.
+    if (args.some((a) => /\.env/i.test(a))) return no('.env files are not readable by investigators');
     if (args[0] !== '-C') return no('git needs -C <absolute checkout directory> first');
     const dir = args[1];
     if (!dir || !isAbsolute(dir)) return no('git -C needs an absolute checkout directory');
@@ -311,6 +363,7 @@ export function investigatorBashCheck(command: unknown, ctx: InvestigatorContext
         continue;
       }
       if (GIT_BLOCKED_SHORT.test(a) || blockedLongOption(a)) return no(`git option ${a.split('=')[0]} can write files, run programs or read outside the repository`);
+      if (GIT_SIGNATURE_FORMAT.test(a)) return no('signature format placeholders (%G…, %(signature)) run gpg and are not allowed');
       const eq = a.indexOf('=');
       if (eq >= 0 && outsideValue(a.slice(eq + 1))) return no(`the value of ${a.slice(0, eq)} must not name a path outside the checkout`);
     }
@@ -985,10 +1038,14 @@ export class ProjectManager extends EventEmitter {
     if (name === "Read") {
       const p = expand(String(input.file_path ?? ""));
       if (!p) return deny("Read needs a file_path.");
+      const unavailable = 'Use session tools for session history and the memory tools for Coordinator memory. Foreman configuration and credentials are unavailable to the Coordinator.';
       try {
+        if (isAliasPath(resolve(FOREMAN_HOME, p))) return deny(`${unavailable} (System volume alias paths are refused.)`);
         const actual = canonical(p);
+        if (isAliasPath(actual)) return deny(`${unavailable} (System volume alias paths are refused.)`);
         if (!statSync(actual).isFile()) return deny('Read requires an existing document file.');
-        if (under(actual, canonical(FOREMAN_HOME))) return deny('Use session tools for session history and the memory tools for Coordinator memory. Foreman configuration and credentials are unavailable to the Coordinator.');
+        // By string and by file identity, so another path to FOREMAN_HOME (a symlinked parent, a firmlink) is refused too.
+        if (under(actual, canonical(FOREMAN_HOME)) || insideProtected(actual, protectedIdentities([FOREMAN_HOME]).locations)) return deny(unavailable);
         if (DOC_FILE.test(basename(actual))) return allow();
       } catch { return deny('Read requires an existing document file.'); }
       return deny(`${delegate} (Read is limited to document files.)`);

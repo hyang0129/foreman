@@ -6,9 +6,9 @@
 import './fixtures/temp-foreman-home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const {
@@ -297,6 +297,85 @@ test('capitalised spellings on a case-insensitive file system never reach FOREMA
   assert.equal((await guard('Read', { file_path: join(TEMP_FOREMAN_HOME, 'notes.md') })).behavior, 'deny');
   assert.equal((await guard('Read', { file_path: upper(join(TEMP_FOREMAN_HOME, 'notes.md')) })).behavior, 'deny');
   assert.equal((await guard('Read', { file_path: upper(join(project, 'README.md')) })).behavior, 'allow');
+});
+
+test('aliased paths (symlinked parents, hard links, macOS firmlink and /.nofollow prefixes) are matched by file identity', async (t) => {
+  // A second path to the parent of the stand-in home and FOREMAN_HOME, through a symlink.
+  const aliasRoot = join(mkdtempSync(join(tmpdir(), 'foreman-alias-')), 'root');
+  t.after(() => rmSync(dirname(aliasRoot), { recursive: true, force: true }));
+  symlinkSync(root, aliasRoot);
+  const aliasHome = join(aliasRoot, 'home');
+  denied('Read', { file_path: join(aliasHome, '.ssh', 'id_ed25519') });
+  denied('Read', { file_path: join(aliasHome, '.claude.json') });
+  for (const name of ['Grep', 'Glob']) {
+    denied(name, { pattern: 'token', path: aliasHome });
+    denied(name, { pattern: 'token', path: join(aliasHome, '.claude') });
+  }
+  allowed('Read', { file_path: join(aliasRoot, 'project', 'README.md') }); // the alias of a project is still that project
+  // A hard link to a protected file has its own path but the same identity: only the identity check can catch it.
+  const hardLink = join(project, 'claude-copy.json');
+  linkSync(join(home, '.claude.json'), hardLink);
+  t.after(() => rmSync(hardLink, { force: true }));
+  assert.match(investigatorPathDenial(hardLink, 'file')!, /credential/);
+  denied('Grep', { pattern: 'x', path: hardLink, output_mode: 'content' });
+
+  // Alias prefixes are refused outright, whatever they point at.
+  for (const p of ['/System/Volumes/Data/private/tmp', '/system/volumes/data', '/.nofollow/private/tmp', '/.resolve/1/2', '/.NoFollow']) {
+    assert.match(investigatorPathDenial(p, 'any') ?? '', /alias/, p);
+  }
+  // The literal macOS forms of the stand-in home and FOREMAN_HOME, where this machine resolves them.
+  const aliased = [
+    ['/System/Volumes/Data', join(home, '.ssh', 'id_ed25519')], ['/System/Volumes/Data', join(home, '.claude.json')],
+    ['/.nofollow', join(home, '.claude.json')], ['/System/Volumes/Data', join(realpathSync(TEMP_FOREMAN_HOME), 'cloud.json')], ['/.nofollow', join(realpathSync(TEMP_FOREMAN_HOME), 'cloud.json')],
+  ].map(([prefix, p]) => prefix + p);
+  const aliasedDirs = ['/System/Volumes/Data' + home, '/.nofollow' + home, '/System/Volumes/Data' + join(home, '.claude')];
+  const bootVolume = '/Volumes/Macintosh HD';
+  const present = [...aliased, ...aliasedDirs].filter((p) => existsSync(p));
+  if (process.platform === 'darwin') {
+    if (present.length < aliased.length + aliasedDirs.length) t.diagnostic(`skipped (no such path on this machine): ${[...aliased, ...aliasedDirs].filter((p) => !existsSync(p)).join(', ')}`);
+    for (const p of aliased.filter((q) => existsSync(q))) denied('Read', { file_path: p });
+    for (const p of aliasedDirs.filter((q) => existsSync(q))) {
+      denied('Grep', { pattern: 'token', path: p });
+      denied('Grep', { pattern: 'token', path: p, output_mode: 'count' });
+      denied('Glob', { pattern: '**', path: p });
+      assert.notEqual(investigatorBashDenial(`git -C ${p} log`), null, p);
+    }
+    // `/Volumes/<boot volume>` is a symlink to `/`: the same files, caught after realpath and by identity.
+    if (existsSync(bootVolume + home)) {
+      denied('Read', { file_path: bootVolume + join(home, '.claude.json') });
+      denied('Grep', { pattern: 'token', path: bootVolume + home });
+      allowed('Read', { file_path: bootVolume + join(project, 'README.md') });
+    }
+    // The Coordinator's own Read check refuses the aliased FOREMAN_HOME document too.
+    writeFileSync(join(TEMP_FOREMAN_HOME, 'alias-notes.md'), '# private');
+    const guard = (new ProjectManager({} as any) as any).canUseTool;
+    for (const prefix of ['/System/Volumes/Data', '/.nofollow']) {
+      const p = prefix + join(realpathSync(TEMP_FOREMAN_HOME), 'alias-notes.md');
+      if (existsSync(p)) assert.equal((await guard('Read', { file_path: p })).behavior, 'deny', p);
+    }
+    const viaSymlink = join(aliasRoot, '..', 'fh');
+    symlinkSync(dirname(TEMP_FOREMAN_HOME), viaSymlink);
+    assert.equal((await guard('Read', { file_path: join(viaSymlink, basename(TEMP_FOREMAN_HOME), 'alias-notes.md') })).behavior, 'deny');
+    assert.equal((await guard('Read', { file_path: join(aliasRoot, 'project', 'README.md') })).behavior, 'allow');
+  }
+});
+
+test('git: -O in a short-option cluster, signature format placeholders and .env paths or revisions are refused', () => {
+  for (const arg of ['-pO/etc/passwd', '-RO/x', '-pOx', '-O', '-nO5']) {
+    assert.notEqual(investigatorBashDenial(`git -C ${project} log ${arg}`), null, arg);
+    assert.notEqual(investigatorBashDenial(`git -C ${project} diff ${arg}`), null, arg);
+  }
+  for (const arg of ['--format=%GS', '--format=%GK', '--pretty=format:%GG', '--pretty=tformat:%H%GF', '--forma=%GP', '--format=%GT']) {
+    assert.match(investigatorBashDenial(`git -C ${project} log ${arg}`) ?? '', /gpg/, arg);
+    assert.notEqual(investigatorBashDenial(`git -C ${project} show ${arg}`), null, arg);
+  }
+  for (const command of [`show HEAD:.env`, `show HEAD:config/.ENV.local`, `show main:.Env`, `log -- .env`, `diff HEAD -- sub/.env.production`, `log -p -- .envrc`, `branch --list .env`]) {
+    assert.match(investigatorBashDenial(`git -C ${project} ${command}`) ?? '', /\.env/, command);
+  }
+  // Controls: ordinary clusters, formats and paths still pass.
+  for (const command of ['log -pn5', 'diff -R HEAD', 'log --format=%H,%an,%gd', 'log --pretty=oneline', 'show HEAD:README.md', 'log -- src/index.ts']) {
+    assert.equal(investigatorBashDenial(`git -C ${project} ${command}`), null, command);
+  }
 });
 
 test('the protected list covers agent and package-manager credential files in the home directory', () => {
