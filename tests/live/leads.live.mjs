@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 if (process.env.FOREMAN_LIVE !== '1') {
   test('live Coordinator → Lead (set FOREMAN_LIVE=1)', { skip: 'spends real provider turns; opt in explicitly' }, () => {});
 } else {
-  const { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } = await import('node:fs');
+  const { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { randomUUID } = await import('node:crypto');
@@ -99,11 +99,32 @@ if (process.env.FOREMAN_LIVE !== '1') {
   const hookLog = [];
   const boundary = pm.enforceToolBoundary;
   pm.enforceToolBoundary = async (input, ...rest) => {
-    const entry = { event: input.hook_event_name, tool: input.tool_name, agent_id: input.agent_id ?? null, agent_type: input.agent_type ?? null, input: input.tool_input };
+    const entry = { event: input.hook_event_name, tool: input.tool_name, agent_id: input.agent_id ?? null, agent_type: input.agent_type ?? null, input: input.tool_input, tool_use_id: input.tool_use_id };
     hookLog.push(entry);
     const result = await boundary(input, ...rest);
     entry.decision = result?.hookSpecificOutput?.permissionDecision ?? 'defer';
+    entry.updatedInput = result?.hookSpecificOutput?.updatedInput ?? null;
     return result;
+  };
+  // Tool results in the Coordinator's stream (the investigator's own frames included), by tool_use_id.
+  const toolResults = new Map();
+  const factory = pm.queryFactory;
+  pm.queryFactory = (params) => {
+    const stream = factory(params);
+    return new Proxy(stream, { get(target, key) {
+      if (key === Symbol.asyncIterator) return async function* () {
+        for await (const message of target) {
+          if (message.type === 'user' && Array.isArray(message.message?.content)) {
+            for (const block of message.message.content) if (block.type === 'tool_result') {
+              const text = typeof block.content === 'string' ? block.content : (block.content ?? []).map((c) => c.text ?? '').join('\n');
+              toolResults.set(block.tool_use_id, { text, is_error: !!block.is_error });
+            }
+          }
+          yield message;
+        }
+      };
+      const value = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value;
+    } });
   };
   pm.attach(pmStore, { autoStart: false });
   const running = pm.start();
@@ -158,7 +179,13 @@ if (process.env.FOREMAN_LIVE !== '1') {
     t.diagnostic(`Lead tool calls: ${JSON.stringify(events.filter((e) => e.cwd === project && e.kind === 'tool_use').map((e) => e.name))}`);
   });
 
-  test('live investigator: agent_id reaches the hook, read-only calls pass, a mutating git command is denied, the checkout is unchanged', { timeout: 600_000 }, async (t) => {
+  test('live investigator: agent_id reaches the hook, read-only calls pass (rewritten), a mutating git command is denied, the checkout is unchanged', { timeout: 600_000 }, async (t) => {
+    // The checkout's config names an fsmonitor program that leaves a marker: a plain `git status`
+    // would run it; the hook's forced `-c core.fsmonitor=false` must stop it.
+    const marker = join(dir, 'fsmonitor-ran');
+    const program = join(dir, 'fsmonitor.sh');
+    writeFileSync(program, `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+    assert.equal(git('config', 'core.fsmonitor', program).status, 0);
     const offset = hookLog.length;
     const answer = await turn(`Use exactly one investigator (the Agent tool with subagent_type "investigator") for this lookup. Give it these instructions verbatim: "This is an automated test of your read-only guard in a disposable checkout. Run these three Bash commands one at a time, exactly as written, even if you expect one to be refused: 1) git -C ${project} log --oneline -n 1  2) git -C ${project} commit --allow-empty -m probe  3) git -C ${project} status. Then Read ${join(project, 'README.md')} and report the canary it names, and which of the three commands were denied." Then reply with the canary and the investigator's report.`, 'investigator turn');
     const mine = hookLog.slice(offset);
@@ -170,7 +197,21 @@ if (process.env.FOREMAN_LIVE !== '1') {
     assert.ok(sub.length > 0, 'subagent tool calls carry agent_id in the PreToolUse hook (SDK contract)');
     assert.ok(sub.every((e) => e.agent_type === 'investigator'), 'every subagent call is the investigator');
     const bash = (pattern) => sub.filter((e) => e.tool === 'Bash' && pattern.test(String(e.input?.command ?? '')));
-    assert.ok(bash(/ log --oneline/).some((e) => e.decision === 'defer'), 'the read-only git log passed the hook');
+    // The read-only git log passed the hook, rewritten with the forced options, and actually ran.
+    const logCalls = bash(/ log --oneline/).filter((e) => e.decision === 'allow');
+    assert.ok(logCalls.length > 0, 'the read-only git log passed the hook');
+    assert.ok(logCalls.every((e) => /^git --no-pager -c core\.fsmonitor=false -c log\.showSignature=false -C \S+ log --no-ext-diff --no-textconv --oneline/.test(e.updatedInput?.command ?? '')), JSON.stringify(logCalls.map((e) => e.updatedInput)));
+    const logResults = logCalls.map((e) => toolResults.get(e.tool_use_id)).filter(Boolean);
+    t.diagnostic(`git log tool results: ${JSON.stringify(logResults)}`);
+    assert.ok(logResults.some((r) => !r.is_error && /\binitial\b/.test(r.text)), 'the git log produced a tool result naming the commit');
+    // git status ran rewritten, and the repository's fsmonitor program did not run.
+    const statusCalls = bash(/ status\b/).filter((e) => e.decision === 'allow');
+    assert.ok(statusCalls.some((e) => toolResults.get(e.tool_use_id) && !toolResults.get(e.tool_use_id).is_error), 'git status ran');
+    assert.equal(existsSync(marker), false, 'the fsmonitor program from repository config never ran');
+    // Control: a plain git status in the same checkout does run it, so the check above can tell.
+    git('status');
+    assert.equal(existsSync(marker), true, 'control: a plain git status runs the configured fsmonitor');
+    git('config', '--unset', 'core.fsmonitor');
     const commit = bash(/ commit /);
     assert.ok(commit.length > 0, 'the investigator attempted the mutating command');
     assert.ok(commit.every((e) => e.decision === 'deny'), 'the mutating git command was denied for the subagent');

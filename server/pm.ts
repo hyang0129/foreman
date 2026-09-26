@@ -69,6 +69,8 @@ export interface ProjectManagerOptions {
   hungMs?: number;
   /** Env for the role config (FOREMAN_PM_EFFORT, FOREMAN_INVESTIGATOR_*). Default process.env. */
   env?: Env;
+  /** Tests: an extra home directory whose credential files investigators may not read (the real home is always protected). */
+  investigatorHome?: string;
 }
 
 export interface PmAttachOptions {
@@ -137,9 +139,17 @@ function undeliveredText(acceptedAt: string, host: string, reason: string): stri
 const DOC_FILE = /\.(md|mdx|markdown|txt|rst|adoc)$|^(readme|changelog|contributing|license|todo|roadmap)$/i;
 
 const home = homedir();
-const under = (p: string, dir: string) => { const a = resolve(p); const d = resolve(dir); return a === d || a.startsWith(d.endsWith(sep) ? d : d + sep); };
-const expand = (p: string) => (p === '~' ? home : p.startsWith("~/") ? join(home, p.slice(2)) : p);
-const canonical = (p: string) => realpathSync(resolve(FOREMAN_HOME, p));
+// macOS (APFS/HFS+ by default) and Windows file systems are case-insensitive: `/Users/ME/.SSH` is
+// `~/.ssh`. Paths are canonicalized with realpathSync.native (which returns the on-disk case), and
+// containment is also compared case-insensitively there, so a capitalised spelling never escapes.
+const CASE_INSENSITIVE_FS = process.platform === 'darwin' || process.platform === 'win32';
+const foldCase = (p: string) => (CASE_INSENSITIVE_FS ? p.toLowerCase() : p);
+/** True when `p` is `dir` or inside it (lexically, after resolve; case-insensitive on darwin/win32). */
+export const under = (p: string, dir: string) => { const a = foldCase(resolve(p)); const d = foldCase(resolve(dir)); return a === d || a.startsWith(d.endsWith(sep) ? d : d + sep); };
+const expandFrom = (base: string, p: string) => (p === '~' ? base : p.startsWith("~/") ? join(base, p.slice(2)) : p);
+const expand = (p: string) => expandFrom(home, p);
+const realpath = (p: string) => realpathSync.native(p);
+const canonical = (p: string) => realpath(resolve(FOREMAN_HOME, p));
 
 // --- Investigators (epic #157, D5) ---------------------------------------------------------------
 // Read-only SDK subagents inside the Coordinator's own query. Every tool call a subagent makes
@@ -157,8 +167,15 @@ export const INVESTIGATOR_PROMPT = [
   'Answer the question you were given, concisely, with the facts you found and where you found them (file, issue, PR, commit).',
   'You are read-only. You can Read, Grep and Glob files outside Foreman\'s own state and credential directories, fetch web pages, and run only these read-only commands, exactly, with no shell operators, quotes, variables, globs or redirection:',
   '`gh issue view|list ...`, `gh pr view|list|diff|checks ...`, `gh run view|list ...` (pass `-R owner/repo`), and `git -C <absolute checkout directory> log|show|status|diff|branch ...`.',
-  'Grep and Glob need an explicit `path`; Grep with `output_mode: "content"` needs a single file. Never try to change anything. If the answer needs more than a lookup, say so and stop.',
+  'Grep and Glob need an explicit `path`; Grep with `output_mode: "content"` needs a single file, and a directory Grep always skips .env files. Git commands run with `--no-pager -c core.fsmonitor=false -c log.showSignature=false` and log/show/diff with `--no-ext-diff --no-textconv` (added for you). Never try to change anything. If the answer needs more than a lookup, say so and stop.',
 ].join('\n');
+
+/**
+ * Test seam for the investigator policy. `home` is an extra home directory whose credential files
+ * are protected (in addition to the real one, which is always protected); `cwd` is what relative
+ * paths resolve against (default FOREMAN_HOME, the Coordinator's cwd).
+ */
+export interface InvestigatorContext { home?: string; cwd?: string }
 
 /** The Coordinator's `agents` option: the investigator definition, model/effort from the role config. */
 export function investigatorAgents(config: RoleConfig): Record<string, AgentDefinition> {
@@ -172,27 +189,35 @@ export function investigatorAgents(config: RoleConfig): Record<string, AgentDefi
 }
 
 /** Directories and files no investigator may read, search or run git in (also canonical when they exist). */
-function protectedDirs(): string[] {
-  const dirs = [FOREMAN_HOME, ...['.ssh', '.claude', '.codex', '.config/gh', '.aws', '.gnupg', '.docker', '.kube', '.config/gcloud', '.netrc', '.npmrc', '.git-credentials'].map((d) => join(home, d))];
+/** Home-relative credential and agent-state locations no investigator may read, search or run git in. */
+export const PROTECTED_HOME_ENTRIES = [
+  '.ssh', '.claude', '.claude.json', '.claude.json.backup', '.codex', '.codex.json', '.config/gh', '.config/hub', '.config/git/credentials',
+  '.config/gcloud', '.config/op', '.aws', '.azure', '.gnupg', '.docker', '.kube', '.netrc', '.npmrc', '.yarnrc', '.yarnrc.yml', '.pypirc',
+  '.git-credentials', '.gem/credentials', '.cargo/credentials', '.cargo/credentials.toml', '.password-store', 'Library/Keychains',
+] as const;
+
+function protectedDirs(ctx: InvestigatorContext = {}): string[] {
+  const homes = [...new Set([home, ...(ctx.home ? [ctx.home] : [])])];
+  const dirs = [FOREMAN_HOME, ...homes.flatMap((h) => PROTECTED_HOME_ENTRIES.map((d) => join(h, d)))];
   for (const key of ['CLAUDE_CONFIG_DIR', 'CODEX_HOME']) { const v = process.env[key]; if (v && isAbsolute(v)) dirs.push(v); }
   const out = new Set<string>();
-  for (const dir of dirs) { out.add(resolve(dir)); try { out.add(realpathSync(dir)); } catch { /* absent */ } }
+  for (const dir of dirs) { out.add(resolve(dir)); try { out.add(realpath(dir)); } catch { /* absent */ } }
   return [...out];
 }
 const isEnvFile = (path: string) => path.split(sep).some((segment) => /^\.env/i.test(segment));
 
 /**
  * Why an investigator may not use `path` (null when it may). The path is resolved against the
- * Coordinator's cwd and canonicalized (symlinks followed); it must exist. A directory that
- * contains a protected location (e.g. the home directory) is refused too.
+ * Coordinator's cwd and canonicalized (symlinks followed, on-disk case); it must exist. A directory
+ * that contains a protected location (e.g. the home directory) is refused too.
  */
-export function investigatorPathDenial(raw: unknown, kind: 'file' | 'any', cwd = FOREMAN_HOME): string | null {
+export function investigatorPathDenial(raw: unknown, kind: 'file' | 'any', ctx: InvestigatorContext = {}): string | null {
   if (typeof raw !== 'string' || !raw.trim()) return 'an explicit path is required';
   if (/[\0\n\r]/.test(raw)) return 'invalid path';
-  const lexical = resolve(cwd, expand(raw));
+  const lexical = resolve(ctx.cwd ?? FOREMAN_HOME, expandFrom(ctx.home ?? home, raw));
   let actual: string;
-  try { actual = realpathSync(lexical); } catch { return 'the path must exist'; }
-  const protectedList = protectedDirs();
+  try { actual = realpath(lexical); } catch { return 'the path must exist'; }
+  const protectedList = protectedDirs(ctx);
   if (isEnvFile(actual) || isEnvFile(lexical)) return '.env files are not readable by investigators';
   if (protectedList.some((dir) => under(actual, dir) || under(lexical, dir))) return "Foreman's state and credential directories are not readable by investigators";
   let stat;
@@ -205,11 +230,27 @@ export function investigatorPathDenial(raw: unknown, kind: 'file' | 'any', cwd =
 // Every character a shell could treat specially is outside this set, so the command is plain words.
 const SAFE_COMMAND = /^[A-Za-z0-9 ._\/:=,@+%-]+$/;
 const GH_ALLOWED: Record<string, readonly string[]> = { issue: ['view', 'list'], pr: ['view', 'list', 'diff', 'checks'], run: ['view', 'list'] };
+// gh options that open a browser or keep watching: `--web`, `--web=true`, `--watch…`, and any short
+// cluster containing `w` (`-w`, `-w=true`, `-cw`).
+const GH_INTERACTIVE_ARG = /^(--(web|watch)|-[A-Za-z]*w)/;
 const GIT_SUBCOMMANDS = ['log', 'show', 'status', 'diff', 'branch'];
 const GIT_BRANCH_FLAGS = ['-a', '-r', '-v', '-vv', '--all', '--remotes', '--verbose', '--show-current', '--list', '-l', '--no-color', '--color=never'];
 const GIT_BRANCH_VALUE_FLAGS = /^--(contains|no-contains|merged|no-merged|points-at|sort|format)=./;
-// Options that write files, run external programs or read files outside the repository.
-const GIT_FORBIDDEN_ARG = /^(--output|--ext-diff|--no-index|--open-files-in-pager|-O)/;
+// Long options that write files, run external programs or read files outside the repository. Git
+// accepts unambiguous abbreviations of long options, so any prefix of these at least 4 characters
+// long (e.g. `--outp`, `--no-inde`) is refused too.
+const GIT_BLOCKED_LONG = ['--output', '--output-directory', '--ext-diff', '--textconv', '--no-index', '--open-files-in-pager', '--orderfile', '--show-signature', '--exec', '--upload-pack', '--config-env'];
+// Exact options that are prefixes of a blocked option but harmless on their own.
+const GIT_SAFE_PREFIXES = ['--text'];
+// `-O<orderfile>`, the short form of --orderfile.
+const GIT_BLOCKED_SHORT = /^-O/;
+/**
+ * Prepended to every allowed git command by the hook itself (never taken from input): no pager, no
+ * fsmonitor hook program, no gpg program for signatures. log/show/diff also get `--no-ext-diff
+ * --no-textconv`, so repository config cannot make a read run a program.
+ */
+export const GIT_FORCED_GLOBALS = ['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'log.showSignature=false'] as const;
+export const GIT_FORCED_DIFF_OPTIONS = ['--no-ext-diff', '--no-textconv'] as const;
 
 function insideWorkTree(dir: string): boolean {
   for (let at = dir; ; at = dirname(at)) {
@@ -218,77 +259,142 @@ function insideWorkTree(dir: string): boolean {
   }
 }
 
+const blockedLongOption = (arg: string): boolean => {
+  if (!arg.startsWith('--')) return false;
+  const name = arg.split('=')[0];
+  if (GIT_BLOCKED_LONG.includes(name)) return true;
+  if (name.length < 4 || GIT_SAFE_PREFIXES.includes(name)) return false;
+  return GIT_BLOCKED_LONG.some((blocked) => blocked.startsWith(name));
+};
+// A value that could name a file outside the checkout (`--opt=/abs`, `--opt=~/x`, `--opt=../x`).
+const outsideValue = (value: string) => isAbsolute(value) || value.startsWith('~') || value.split('/').includes('..');
+
+/**
+ * Checks one investigator Bash command. An allowed command comes back as the command to run: gh
+ * unchanged, git rewritten with GIT_FORCED_GLOBALS (and GIT_FORCED_DIFF_OPTIONS for log/show/diff).
+ * A command that already starts with exactly the forced prefix (the hook's own rewrite) is accepted
+ * and normalised, so the check is idempotent.
+ */
+export function investigatorBashCheck(command: unknown, ctx: InvestigatorContext = {}): { denial: string } | { command: string } {
+  const no = (denial: string) => ({ denial });
+  if (typeof command !== 'string' || !command.trim()) return no('a command is required');
+  if (command.length > 2000) return no('the command is too long');
+  if (!SAFE_COMMAND.test(command)) return no('shell operators, quotes, variables, globs, redirection and newlines are not allowed');
+  let words = command.split(' ').filter(Boolean);
+  if (words.some((w) => w.startsWith('='))) return no('shell operators are not allowed');
+  const [program] = words;
+  if (program === 'gh') {
+    const args = words.slice(1);
+    const [group, action] = args;
+    if (!group || !Object.hasOwn(GH_ALLOWED, group) || !GH_ALLOWED[group].includes(action ?? '')) return no('only gh issue view|list, gh pr view|list|diff|checks and gh run view|list are allowed (never gh api)');
+    if (args.slice(2).some((a) => GH_INTERACTIVE_ARG.test(a))) return no('interactive gh options (--web, -w, --watch) are not allowed');
+    return { command: words.join(' ') };
+  }
+  if (program === 'git') {
+    // The hook's own forced prefix, if present, is stripped here and re-applied below.
+    const forced = GIT_FORCED_GLOBALS.length;
+    if (words.slice(1, 1 + forced).join(' ') === GIT_FORCED_GLOBALS.join(' ')) words = [program, ...words.slice(1 + forced)];
+    const args = words.slice(1);
+    if (args[0] !== '-C') return no('git needs -C <absolute checkout directory> first');
+    const dir = args[1];
+    if (!dir || !isAbsolute(dir)) return no('git -C needs an absolute checkout directory');
+    const denial = investigatorPathDenial(dir, 'any', ctx);
+    if (denial) return no(`git -C ${dir}: ${denial}`);
+    const real = realpath(dir);
+    if (!statSync(real).isDirectory() || !insideWorkTree(real)) return no(`git -C ${dir}: not a directory inside a git checkout`);
+    const [sub, ...opts] = args.slice(2);
+    if (!GIT_SUBCOMMANDS.includes(sub ?? '')) return no('only git log|show|status|diff|branch are allowed');
+    for (const a of opts) {
+      if (!a.startsWith('-')) {
+        // A path argument outside the checkout would make `git diff` compare files on disk (no-index).
+        if (isAbsolute(a) || a.split('/').includes('..')) return no('paths must be relative to the checkout, without ..');
+        continue;
+      }
+      if (GIT_BLOCKED_SHORT.test(a) || blockedLongOption(a)) return no(`git option ${a.split('=')[0]} can write files, run programs or read outside the repository`);
+      const eq = a.indexOf('=');
+      if (eq >= 0 && outsideValue(a.slice(eq + 1))) return no(`the value of ${a.slice(0, eq)} must not name a path outside the checkout`);
+    }
+    if (sub === 'branch') {
+      const listing = opts.includes('--list') || opts.includes('-l');
+      for (const a of opts) {
+        if (a.startsWith('-')) { if (!GIT_BRANCH_FLAGS.includes(a) && !GIT_BRANCH_VALUE_FLAGS.test(a)) return no(`git branch ${a} is not allowed (listing only)`); }
+        else if (!listing) return no('git branch only lists branches (pass --list with a pattern)');
+      }
+    }
+    const diffOptions = ['log', 'show', 'diff'].includes(sub!) ? GIT_FORCED_DIFF_OPTIONS.filter((o) => !opts.includes(o)) : [];
+    return { command: ['git', ...GIT_FORCED_GLOBALS, '-C', dir, sub!, ...diffOptions, ...opts].join(' ') };
+  }
+  return no('only read-only gh and git commands are allowed');
+}
+
 /**
  * Why an investigator may not run `command` with Bash (null when it may). Only exact read-only
  * prefixes: `gh issue view|list`, `gh pr view|list|diff|checks`, `gh run view|list`, and
  * `git -C <dir> log|show|status|diff|branch`. Any shell metacharacter, quote, newline or
  * non-ASCII character is refused, as is `gh api`.
  */
-export function investigatorBashDenial(command: unknown): string | null {
-  if (typeof command !== 'string' || !command.trim()) return 'a command is required';
-  if (command.length > 2000) return 'the command is too long';
-  if (!SAFE_COMMAND.test(command)) return 'shell operators, quotes, variables, globs, redirection and newlines are not allowed';
-  const words = command.split(' ').filter(Boolean);
-  if (words.some((w) => w.startsWith('='))) return 'shell operators are not allowed';
-  const [program, ...args] = words;
-  if (program === 'gh') {
-    const [group, action] = args;
-    if (!group || !Object.hasOwn(GH_ALLOWED, group) || !GH_ALLOWED[group].includes(action ?? '')) return 'only gh issue view|list, gh pr view|list|diff|checks and gh run view|list are allowed (never gh api)';
-    if (args.slice(2).some((a) => a === '--web' || a === '-w' || a.startsWith('--watch'))) return 'interactive gh options are not allowed';
-    return null;
-  }
-  if (program === 'git') {
-    if (args[0] !== '-C') return 'git needs -C <absolute checkout directory> first';
-    const dir = args[1];
-    if (!dir || !isAbsolute(dir)) return 'git -C needs an absolute checkout directory';
-    const denial = investigatorPathDenial(dir, 'any');
-    if (denial) return `git -C ${dir}: ${denial}`;
-    if (!statSync(realpathSync(dir)).isDirectory() || !insideWorkTree(realpathSync(dir))) return `git -C ${dir}: not a directory inside a git checkout`;
-    const [sub, ...opts] = args.slice(2);
-    if (!GIT_SUBCOMMANDS.includes(sub ?? '')) return 'only git log|show|status|diff|branch are allowed';
-    if (opts.some((a) => GIT_FORBIDDEN_ARG.test(a))) return 'that git option can write files, run programs or read outside the repository';
-    // A path argument outside the checkout would make `git diff` compare files on disk (no-index).
-    if (opts.some((a) => !a.startsWith('-') && (isAbsolute(a) || a.split('/').includes('..')))) return 'paths must be relative to the checkout, without ..';
-    if (sub === 'branch') {
-      const listing = opts.includes('--list') || opts.includes('-l');
-      for (const a of opts) {
-        if (a.startsWith('-')) { if (!GIT_BRANCH_FLAGS.includes(a) && !GIT_BRANCH_VALUE_FLAGS.test(a)) return `git branch ${a} is not allowed (listing only)`; }
-        else if (!listing) return 'git branch only lists branches (pass --list with a pattern)';
-      }
-    }
-    return null;
-  }
-  return 'only read-only gh and git commands are allowed';
+export function investigatorBashDenial(command: unknown, ctx: InvestigatorContext = {}): string | null {
+  const check = investigatorBashCheck(command, ctx);
+  return 'denial' in check ? check.denial : null;
 }
 
 /**
- * The investigator rules for one subagent tool call: allow, or deny with a message. Anything not
- * listed (writes, Agent, every MCP tool: fleet, Lead, peer and memory tools) is denied.
+ * Appended to a directory Grep's `glob`: ripgrep lets a later glob win, so .env files (any case, any
+ * depth) are skipped even when the caller's glob would match them. The Grep tool splits `glob` on
+ * whitespace and commas into separate `--glob` arguments.
  */
-export function investigatorDecision(name: string, input: Record<string, any>): { behavior: 'allow' } | { behavior: 'deny'; message: string } {
+export const GREP_ENV_EXCLUSION = '!.[eE][nN][vV]*';
+
+export type InvestigatorVerdict = { behavior: 'allow'; updatedInput?: Record<string, any> } | { behavior: 'deny'; message: string };
+
+/**
+ * The investigator rules for one subagent tool call: allow (with `updatedInput` when the call must
+ * run rewritten), or deny with a message. Anything not listed (writes, Agent, every MCP tool:
+ * fleet, Lead, peer and memory tools) is denied.
+ */
+export function investigatorDecision(name: string, input: Record<string, any>, ctx: InvestigatorContext = {}): InvestigatorVerdict {
   const deny = (why: string) => ({ behavior: 'deny' as const, message: `Denied for investigators: ${why}. Investigators are read-only.` });
   const allow = { behavior: 'allow' as const };
   if (name === 'WebFetch' || name === 'WebSearch') return allow;
-  if (name === 'Read') { const why = investigatorPathDenial(input.file_path, 'file'); return why ? deny(why) : allow; }
+  if (name === 'Read') { const why = investigatorPathDenial(input.file_path, 'file', ctx); return why ? deny(why) : allow; }
   if (name === 'Glob' || name === 'Grep') {
-    const why = investigatorPathDenial(input.path, 'any');
+    const why = investigatorPathDenial(input.path, 'any', ctx);
     if (why) return deny(why);
     const patterns = name === 'Glob' ? [input.pattern, input.glob] : [input.glob];
     for (const value of patterns) {
       if (value === undefined) continue;
-      if (typeof value !== 'string' || isAbsolute(value) || value.startsWith('~') || value.split('/').includes('..') || /(^|[\/{,])\.env/i.test(value)) return deny(`${name} patterns must stay inside the searched directory and not target .env files`);
+      if (typeof value !== 'string' || isAbsolute(value) || value.startsWith('~') || value.split('/').includes('..') || /(^|[\/{,\s])\.env/i.test(value)) return deny(`${name} patterns must stay inside the searched directory and not target .env files`);
     }
-    // Content output only for one file that Read may open; a directory search reports file names.
-    if (name === 'Grep' && input.output_mode === 'content') { const file = investigatorPathDenial(input.path, 'file'); if (file) return deny(`Grep content output needs a single readable file (${file})`); }
+    if (name === 'Grep') {
+      const notFile = investigatorPathDenial(input.path, 'file', ctx);
+      // Content output only for one file that Read may open; a directory search reports file names.
+      if (input.output_mode === 'content' && notFile) return deny(`Grep content output needs a single readable file (${notFile})`);
+      // A directory search never looks inside .env files (file names or counts could leak a secret).
+      if (notFile) {
+        const glob = typeof input.glob === 'string' ? input.glob.trim() : '';
+        if (glob.split(/[\s,]+/).at(-1) !== GREP_ENV_EXCLUSION) return { behavior: 'allow', updatedInput: { ...input, glob: glob ? `${glob} ${GREP_ENV_EXCLUSION}` : GREP_ENV_EXCLUSION } };
+      }
+    }
     return allow;
   }
-  if (name === 'Bash') { const why = investigatorBashDenial(input.command); return why ? deny(why) : allow; }
+  if (name === 'Bash') {
+    const check = investigatorBashCheck(input.command, ctx);
+    if ('denial' in check) return deny(check.denial);
+    return check.command === input.command ? allow : { behavior: 'allow', updatedInput: { ...input, command: check.command } };
+  }
   return deny(`${name} is not available`);
 }
 
-/** Investigator slots: reserved at the Agent call, held from SubagentStart to SubagentStop. */
+/**
+ * Investigator slots. A slot is reserved at the Coordinator's Agent call (keyed by its tool_use_id)
+ * and bound to the next subagent that starts. It is released when either end is seen: the Agent
+ * call's PostToolUse/PostToolUseFailure, or the bound subagent's SubagentStop. `clear()` frees every
+ * slot when the Coordinator run ends or is retired.
+ */
 export class InvestigatorSlots {
-  private reserved = new Set<string>();
+  // tool_use_id → the subagent bound to it (null until one starts).
+  private reserved = new Map<string, string | null>();
+  // Subagents started and not yet stopped (or released with their Agent call).
   private active = new Set<string>();
   readonly limit: number;
   constructor(limit = MAX_INVESTIGATORS) { this.limit = limit; }
@@ -297,18 +403,31 @@ export class InvestigatorSlots {
   reserve(toolUseId: string): boolean {
     if (this.reserved.has(toolUseId)) return true;
     if (this.inUse >= this.limit) return false;
-    this.reserved.add(toolUseId); return true;
+    this.reserved.set(toolUseId, null); return true;
   }
-  /** The Agent tool call finished (or failed before starting): its reservation ends. */
-  release(toolUseId: string) { this.reserved.delete(toolUseId); }
-  started(agentId: string) { this.active.add(agentId); }
-  stopped(agentId: string) { this.active.delete(agentId); }
+  /** The Agent tool call finished (or failed before starting): its reservation and bound subagent end. */
+  release(toolUseId: string) {
+    const agent = this.reserved.get(toolUseId);
+    this.reserved.delete(toolUseId);
+    if (agent) this.active.delete(agent);
+  }
+  started(agentId: string) {
+    this.active.add(agentId);
+    for (const [id, bound] of this.reserved) if (bound === null) { this.reserved.set(id, agentId); break; }
+  }
+  /** The subagent stopped: it and the reservation it is bound to end. */
+  stopped(agentId: string) {
+    this.active.delete(agentId);
+    for (const [id, bound] of this.reserved) if (bound === agentId) { this.reserved.delete(id); break; }
+  }
+  /** Frees every slot (the Coordinator run ended or was retired). */
+  clear() { this.reserved.clear(); this.active.clear(); }
   /** The SDK hooks that keep the count: SubagentStart/SubagentStop, and PostToolUse(+Failure) for Agent. */
   hooks(): Record<'SubagentStart' | 'SubagentStop' | 'PostToolUse' | 'PostToolUseFailure', { matcher?: string; hooks: HookCallback[] }[]> {
     const track: HookCallback = async (input: any) => {
       if (input.hook_event_name === 'SubagentStart' && typeof input.agent_id === 'string') this.started(input.agent_id);
       else if (input.hook_event_name === 'SubagentStop' && typeof input.agent_id === 'string') this.stopped(input.agent_id);
-      else if ((input.hook_event_name === 'PostToolUse' || input.hook_event_name === 'PostToolUseFailure') && input.tool_name === 'Agent' && !input.agent_id) this.release(String(input.tool_use_id));
+      else if ((input.hook_event_name === 'PostToolUse' || input.hook_event_name === 'PostToolUseFailure') && input.tool_name === 'Agent' && !input.agent_id && typeof input.tool_use_id === 'string') this.release(input.tool_use_id);
       return {};
     };
     return { SubagentStart: [{ hooks: [track] }], SubagentStop: [{ hooks: [track] }], PostToolUse: [{ matcher: 'Agent', hooks: [track] }], PostToolUseFailure: [{ matcher: 'Agent', hooks: [track] }] };
@@ -485,6 +604,7 @@ export class ProjectManager extends EventEmitter {
   private readonly now: () => number;
   private readonly hungMs: number;
   private readonly env?: Env;
+  private readonly investigatorHome?: string;
   get modelBusy() { return this.busy || this.outstanding.length > 0 || this.changingModel; }
 
   private fleet: Fleet;
@@ -495,6 +615,7 @@ export class ProjectManager extends EventEmitter {
     this.fleet = fleet; this.sessions = options.sessions; this.projects = options.projects;
     this.machineName = options.machineName ?? HOST;
     this.env = options.env;
+    this.investigatorHome = options.investigatorHome;
     this.now = options.now ?? (() => Date.now());
     const envHung = Number(process.env.FOREMAN_PM_HUNG_MS);
     this.hungMs = options.hungMs ?? (Number.isFinite(envHung) && envHung > 0 ? envHung : PM_HUNG_DEFAULT_MS);
@@ -828,6 +949,7 @@ export class ProjectManager extends EventEmitter {
     this.generation++;
     this.q = null; this.running = false; this.busy = false; this.outstanding = [];
     this.interruptedAt = null; this.providerFailed = false;
+    this.slots.clear(); // no investigator of the retired run holds a slot
     this.inbox.retire(); this.inbox = this.newInbox(); // release the old provider's parked input reader
     try { q?.close(); } catch (error) { this.diagnostic('foreman: pm provider close failed', { error: errorText(error) }); }
   }
@@ -854,8 +976,8 @@ export class ProjectManager extends EventEmitter {
     const allow = (updated: Record<string, any> = input) => ({ behavior: "allow" as const, updatedInput: updated });
     const deny = (message: string) => ({ behavior: "deny" as const, message });
     if (options?.agentID) {
-      const decision = investigatorDecision(name, input);
-      return decision.behavior === 'allow' ? allow() : deny(decision.message);
+      const decision = investigatorDecision(name, input, this.investigatorContext);
+      return decision.behavior === 'allow' ? allow(decision.updatedInput ?? input) : deny(decision.message);
     }
     const delegate = "Denied: the Coordinator does not touch code. Give the work to a Lead with start_lead (or steer an alive Lead with send_message), or use an investigator for a small read-only lookup.";
     if (name === 'mcp__fleet__spawn_session') return deny('Denied: the Coordinator does not start sessions directly. Start a Lead with start_lead; Leads start their own workers.');
@@ -884,8 +1006,9 @@ export class ProjectManager extends EventEmitter {
     return deny(`Denied: ${name} is not available to the Coordinator.`);
   };
 
-  // Investigator slots of the current provider (a fresh start resets them).
+  // Investigator slots of the current provider (a fresh start resets them; a run's end clears them).
   private slots = new InvestigatorSlots();
+  private get investigatorContext(): InvestigatorContext { return this.investigatorHome ? { home: this.investigatorHome } : {}; }
 
   // Permission callbacks alone can be bypassed by provider defaults or user allow rules.
   // Enforce the Coordinator role before every tool invocation, including auto-approved reads, and
@@ -894,13 +1017,19 @@ export class ProjectManager extends EventEmitter {
   private enforceToolBoundary: HookCallback = async (input: any) => {
     if (input.hook_event_name !== 'PreToolUse') return {};
     const agentId = typeof input.agent_id === 'string' && input.agent_id ? input.agent_id : undefined;
-    const decision = await this.canUseTool(input.tool_name, (input.tool_input ?? {}) as Record<string, any>, agentId ? { agentID: agentId } : undefined);
+    const toolInput = (input.tool_input ?? {}) as Record<string, any>;
+    const decision = await this.canUseTool(input.tool_name, toolInput, agentId ? { agentID: agentId } : undefined);
     const denied = (reason: string) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'deny' as const, permissionDecisionReason: reason } });
+    const allowed = (updatedInput: Record<string, any>) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'allow' as const, updatedInput } });
     if (decision.behavior === 'deny') return denied(decision.message);
     if (input.tool_name === 'Agent' && !agentId) {
-      if (!this.slots.reserve(String(input.tool_use_id ?? randomUUID()))) return denied(`Denied: at most ${this.slots.limit} investigators run at once; wait for one to finish.`);
-      return { hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'allow' as const, updatedInput: decision.updatedInput } };
+      // A launch that cannot be tracked (no tool_use_id) could never release its slot: refused.
+      if (typeof input.tool_use_id !== 'string' || !input.tool_use_id) return denied('Denied: this investigator launch cannot be tracked (no tool_use_id).');
+      if (!this.slots.reserve(input.tool_use_id)) return denied(`Denied: at most ${this.slots.limit} investigators run at once; wait for one to finish.`);
+      return allowed(decision.updatedInput);
     }
+    // An investigator call the rules rewrote (git's forced options, Grep's .env exclusion) runs as rewritten.
+    if (agentId && decision.updatedInput !== toolInput) return allowed(decision.updatedInput);
     return {};
   };
 
@@ -1108,7 +1237,7 @@ export class ProjectManager extends EventEmitter {
       launched();
       // Reset lifecycle state before closing, so nothing close() throws can skip it.
       const owned = current() ? this.q : (q as Query | null);
-      if (current()) { this.q = null; this.running = false; this.busy = false; this.outstanding = []; this.interruptedAt = null; this.providerFailed = false; this.inbox.retire(); this.inbox = this.newInbox(); }
+      if (current()) { this.q = null; this.running = false; this.busy = false; this.outstanding = []; this.interruptedAt = null; this.providerFailed = false; this.slots.clear(); this.inbox.retire(); this.inbox = this.newInbox(); }
       try { owned?.close(); }
       catch (error: any) { this.diagnostic('foreman: pm provider close failed', { error: String(error?.message ?? error) }); }
     }
