@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ProjectRegistry } from '../server/projects.ts';
-import { buildLeadRecords, containsFilesystemPath, makeLeadTools, OTHER_MACHINE_REFUSED, LEAD_TOOL_NAMES } from '../server/lead-tools.ts';
+import { buildLeadRecords, containsFilesystemPath, makeLeadTools, OTHER_MACHINE_REFUSED, LEAD_TOOL_NAMES, retireSupersededOnApproval, ROLE_CONFIG_TIMEOUT_MS } from '../server/lead-tools.ts';
 import {
   AGENT_NATIVE_REFUSED, HELD_LAUNCH_REASON, ROLE_DEFAULTS, defaultDevSettings, parseLeadHandoff,
   type AgentLaunchRequest, type AgentLaunchResult, type AgentSessionService, type DevSettingsView, type LeadHandoff, type LeadListEntry, type LeadStore,
@@ -29,7 +29,7 @@ class FakeSessions implements AgentSessionService {
     this.launches.push(structuredClone(req));
     const key = leadKey();
     const held = this.result.status === 'awaiting_developer_approval';
-    this.rows.push({ session_key: key, name: req.name, provider: 'claude', role: req.role, launched_by: req.launched_by, parent: req.parent, workstream: req.workstream, cwd: req.cwd, state: held ? 'needs_input' : 'working', reason: held ? HELD_LAUNCH_REASON : 'starting', updated_at: iso(), started_at: iso() });
+    this.rows.push({ session_key: key, name: req.name, provider: 'claude', role: req.role, launched_by: req.launched_by, parent: req.parent, workstream: req.workstream, supersedes: req.supersedes, cwd: req.cwd, state: held ? 'needs_input' : 'working', reason: held ? HELD_LAUNCH_REASON : 'starting', updated_at: iso(), started_at: iso() });
     return { session_key: key, name: req.name, status: 'started', permission_mode: 'bypass', bypass_grant: 'standing:coordinator/*', policy_reason: 'standing_grant', ...this.result };
   }
   async retire(id: string, reason: string, options?: { force?: boolean }) {
@@ -53,7 +53,8 @@ class FakeStore implements LeadStore {
   entries: LeadListEntry[] = [];
   settings: DevSettingsView | null = null;
   listCalls: any[] = [];
-  async devSettings() { return this.settings; }
+  devSettingsCalls: (number | undefined)[] = [];
+  async devSettings(timeoutMs?: number) { this.devSettingsCalls.push(timeoutMs); return this.settings; }
   async appendHandoff(input: Omit<LeadHandoff, 'v' | 'seq' | 'at' | 'workers'>): Promise<LeadHandoff> {
     const list = this.handoffs.get(input.lead) ?? [];
     const parsed = parseLeadHandoff({ ...input, v: 1, seq: list.length + 1, at: iso(), workers: [] });
@@ -153,6 +154,9 @@ test('start_lead model/effort: arguments win, then developer settings, then env,
     assert.deepEqual([f.sessions.launches[2].model, f.sessions.launches[2].effort], ['claude-haiku-5', 'max']);
     await assert.rejects(f.tools.call('start_lead', { ...start, workstream: 'd', effort: 'extreme' }), /effort/);
     assert.equal(f.sessions.launches.length, 3);
+    // Settings are read only when model or effort is missing, and with a short timeout.
+    assert.deepEqual(f.store.devSettingsCalls, [ROLE_CONFIG_TIMEOUT_MS, ROLE_CONFIG_TIMEOUT_MS]);
+    assert.ok(ROLE_CONFIG_TIMEOUT_MS <= 2_000);
   } finally { f.cleanup(); }
 });
 
@@ -282,6 +286,13 @@ test('supersede: a dead Lead is retired; an already ended one is not retired aga
     const dead = oldLead(f, { state: 'unknown', alive: false });
     await f.tools.call('start_lead', start);
     assert.equal(f.sessions.retired[0].id, dead);
+    const d = setup();
+    try {
+      const gone = oldLead(d, { state: 'dead', alive: false });
+      const out = await d.tools.call('start_lead', start);
+      assert.deepEqual(d.sessions.retired, [{ id: gone, reason: `superseded by ${out.lead}` }]);
+      assert.equal(out.superseded.retired, true);
+    } finally { d.cleanup(); }
     const g = setup();
     try {
       oldLead(g, { state: 'ended' });
@@ -459,4 +470,69 @@ test('buildLeadRecords maps Lead rows and workers to valid LeadRecords with no p
   assert.equal(fallback.pending_approvals, 4);
   assert.equal(fallback.goal, 'Lead for triage');
   assert.equal(fallback.last_handoff, undefined);
+});
+
+test('supersede held for approval: the predecessor is not retired until approval; a denial leaves it running', async () => {
+  const held = { status: 'awaiting_developer_approval' as const, permission_mode: null, policy_reason: 'ask_before_bypass' as const, bypass_grant: undefined };
+  const f = setup();
+  try {
+    const old = oldLead(f);
+    f.sessions.result = held;
+    const out = await f.tools.call('start_lead', start);
+    assert.equal(f.sessions.launches[0].supersedes, old);
+    assert.equal(f.sessions.retired.length, 0);
+    assert.equal(out.superseded.lead, old);
+    assert.equal(out.superseded.retired, 'on approval');
+    assert.match(out.message, /not retired yet.*approves.*keeps running if they deny/);
+    const approved = await retireSupersededOnApproval(f.sessions, { session_key: out.lead, decision: 'approved' });
+    assert.deepEqual(f.sessions.retired, [{ id: old, reason: `superseded by ${out.lead}` }]);
+    assert.deepEqual(approved, { lead: out.lead, superseded: old, retired: true });
+  } finally { f.cleanup(); }
+
+  const g = setup();
+  try {
+    const old = oldLead(g);
+    g.sessions.result = held;
+    const out = await g.tools.call('start_lead', start);
+    const denied = await retireSupersededOnApproval(g.sessions, { session_key: out.lead, decision: 'denied' });
+    assert.equal(denied.retired, 'not needed');
+    assert.equal(g.sessions.retired.length, 0);
+    assert.equal(g.sessions.rows.find((r) => r.session_key === old).state, 'idle');
+  } finally { g.cleanup(); }
+});
+
+test('retire on approval: force interrupts a working predecessor; without force a working one is left and reported', async () => {
+  const held = { status: 'awaiting_developer_approval' as const, permission_mode: null, policy_reason: 'ask_before_bypass' as const, bypass_grant: undefined };
+  const f = setup();
+  try {
+    const old = oldLead(f, { state: 'working' });
+    f.sessions.result = held;
+    const out = await f.tools.call('start_lead', { ...start, force: true });
+    assert.equal(f.sessions.retired.length, 0, 'a held launch interrupts nothing, even with force');
+    assert.equal(f.sessions.rows.find((r) => r.session_key === old).state, 'working');
+    const approved = await retireSupersededOnApproval(f.sessions, { session_key: out.lead, decision: 'approved' });
+    assert.deepEqual(f.sessions.retired, [{ id: old, reason: `superseded by ${out.lead}`, options: { force: true } }]);
+    assert.equal(approved.retired, true);
+  } finally { f.cleanup(); }
+
+  const g = setup();
+  try {
+    const old = oldLead(g);
+    g.sessions.result = held;
+    const out = await g.tools.call('start_lead', start);
+    g.sessions.rows.find((r) => r.session_key === old).state = 'working'; // it picked up work while the launch was held
+    const approved = await retireSupersededOnApproval(g.sessions, { session_key: out.lead, decision: 'approved' });
+    assert.equal(approved.retired, false);
+    assert.match(approved.reason!, /is working.*no force.*left running/);
+    assert.equal(g.sessions.retired.length, 0);
+    // A dead predecessor at approval time is still retired.
+    const dead = oldLead(g, { workstream: 'other-ws', state: 'dead' });
+    g.sessions.result = held;
+    const out2 = await g.tools.call('start_lead', { ...start, workstream: 'other-ws' });
+    await retireSupersededOnApproval(g.sessions, { session_key: out2.lead, decision: 'approved' });
+    assert.deepEqual(g.sessions.retired, [{ id: dead, reason: `superseded by ${out2.lead}` }]);
+    // A Lead that supersedes nothing needs nothing.
+    const out3 = await g.tools.call('start_lead', { ...start, workstream: 'fresh-ws' });
+    assert.equal((await retireSupersededOnApproval(g.sessions, { session_key: out3.lead, decision: 'approved' })).retired, 'not needed');
+  } finally { g.cleanup(); }
 });

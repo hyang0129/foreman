@@ -83,7 +83,13 @@ export function clipBytes(text: string, max: number): string {
 }
 
 const ENDED_STATES: readonly string[] = ['ended', 'dead', 'closed'];
+/** Worker/listing view: a dead or ended session is no longer live. */
 const isEnded = (row: any) => ENDED_STATES.includes(row?.state);
+/**
+ * Retire view: only `ended` is final. A `dead` Lead (process gone, row not ended) still has to be
+ * retired so CL-04 ends it and stamps `superseded_by`.
+ */
+const isRetired = (row: any) => row?.state === 'ended';
 const time = (value: unknown) => { const t = typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(t) ? t : 0; };
 const byRecent = (a: any, b: any) => time(b.updated_at) - time(a.updated_at);
 
@@ -272,7 +278,7 @@ type CoordinatorTool = keyof typeof schemas;
 type LeadTool = keyof typeof leadSchemas;
 
 const descriptions: Record<CoordinatorTool, string> = {
-  start_lead: 'Start a Project Lead: a managed Claude session that owns one workstream of one registered project on this machine and delegates implementation to its own worker sessions. `project` is a registered project name (never a path); `workstream` a kebab-case key; `goal` ≤1000 chars; `first_task` the Lead\'s first brief. A Lead already on the same project/workstream (or the one named in `supersedes`) is superseded: the new Lead is seeded with its latest handoff and live workers, and it is retired. A working Lead is refused unless `force: true`. `permission_mode` is bypass or auto (omit for the developer\'s standing policy; native is not available). `model`/`effort` override the Lead role config. The host enforces the Lead limit.',
+  start_lead: 'Start a Project Lead: a managed Claude session that owns one workstream of one registered project on this machine and delegates implementation to its own worker sessions. `project` is a registered project name (never a path); `workstream` a kebab-case key; `goal` ≤1000 chars; `first_task` the Lead\'s first brief. A Lead already on the same project/workstream (or the one named in `supersedes`) is superseded: the new Lead is seeded with its latest handoff and live workers, and it is retired (if the new Lead is held for the developer\'s approval, only once they approve). A working Lead is refused unless `force: true`. `permission_mode` is bypass or auto (omit for the developer\'s standing policy; native is not available). `model`/`effort` override the Lead role config. The host enforces the Lead limit.',
   retire_lead: 'Retire (end) a Lead on this machine by session key or name. An idle, finished or dead Lead ends now; a working Lead is refused unless force: true. Its workers keep running and its chat stays readable.',
   list_leads: 'List Leads from the registry (all machines): project, workstream, goal, state, permission mode, pending approvals (including workers), workers, latest handoff, and whether the Lead\'s machine is online or reachable from here.',
   read_handoff: 'Read the newest handoffs (1-5, newest first) of a Lead by session key or name, from the registry.',
@@ -293,6 +299,61 @@ const failure = (error: unknown) => ({ content: [{ type: 'text' as const, text: 
 function zodMessage(error: unknown): string {
   if (error instanceof z.ZodError) return error.issues.map((i) => `${i.path.join('.') || 'input'}: ${i.message}`).join('; ');
   return error instanceof Error ? error.message : String(error);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retire-on-approval (held supersede)
+// ---------------------------------------------------------------------------------------------
+
+/** Bound on the role-config read in start_lead; on timeout it falls back to env/defaults. */
+export const ROLE_CONFIG_TIMEOUT_MS = 2_000;
+
+/**
+ * Supersedes recorded by `start_lead` when the new Lead's launch was held for the developer.
+ * Keyed by the new Lead's session key. Process-local: after a restart `force` is forgotten, which
+ * errs on the safe side (a working predecessor is left running and reported).
+ */
+const heldSupersedes = new Map<string, { supersedes: string; force: boolean }>();
+
+export interface LaunchDecisionEvent { session_key: string; decision: string }
+
+export interface SupersedeOutcome {
+  lead: string;
+  superseded?: string;
+  retired: boolean | 'already ended' | 'not needed';
+  reason?: string;
+  error?: string;
+}
+
+/**
+ * CL-06 calls this for every `launch_decision` event (CL-04 emits `{ session_key, decision, ... }`).
+ * On `approved` it retires the approved Lead's `supersedes` target with reason
+ * `superseded by <new key>`. A working predecessor is interrupted and retired only if the original
+ * `start_lead` passed `force`; otherwise it is left running and the outcome says so. On any other
+ * decision (denied) nothing is retired and the recorded supersede is dropped.
+ */
+export async function retireSupersededOnApproval(sessions: AgentSessionService, event: LaunchDecisionEvent): Promise<SupersedeOutcome> {
+  const lead = isLeadKey(event?.session_key) ? normalizeLeadKey(event.session_key) : String(event?.session_key ?? '');
+  const held = heldSupersedes.get(lead);
+  heldSupersedes.delete(lead);
+  if (event?.decision !== 'approved') return { lead, retired: 'not needed', reason: `launch ${event?.decision ?? 'not approved'}; the predecessor keeps running` };
+  const rows = rowsOf(sessions);
+  const self = rows.find((row) => keyOf(row) === lead);
+  const target = isLeadKey(self?.supersedes) ? normalizeLeadKey(self.supersedes) : held?.supersedes;
+  if (!target) return { lead, retired: 'not needed', reason: 'the approved Lead supersedes no Lead' };
+  const old = rows.find((row) => roleOf(row) === 'lead' && keyOf(row) === target);
+  if (!old) return { lead, superseded: target, retired: false, reason: 'the superseded Lead is not on this machine' };
+  if (isRetired(old)) return { lead, superseded: target, retired: 'already ended' };
+  const force = held?.force === true;
+  if (leadIsBusy(old) && !force) {
+    return { lead, superseded: target, retired: false, reason: `${old.name} (${target}) is working and the request had no force; it was left running. Retire it with retire_lead once it is idle.` };
+  }
+  try {
+    await sessions.retire(target, `superseded by ${lead}`, force ? { force: true } : undefined);
+    return { lead, superseded: target, retired: true };
+  } catch (error) {
+    return { lead, superseded: target, retired: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 export function makeLeadTools(deps: LeadToolsDeps) {
@@ -454,7 +515,7 @@ export function makeLeadTools(deps: LeadToolsDeps) {
       let model = args.model as string | undefined, effort = args.effort as Effort | undefined;
       if (!model || !effort) {
         let dev = null;
-        try { dev = (await store.devSettings())?.settings.roles ?? null; } catch { dev = null; }
+        try { dev = (await store.devSettings(ROLE_CONFIG_TIMEOUT_MS))?.settings.roles ?? null; } catch { dev = null; }
         const config = resolveRoleConfig('lead', { dev, env: env() });
         model ??= config.model; effort ??= config.effort;
       }
@@ -479,12 +540,18 @@ export function makeLeadTools(deps: LeadToolsDeps) {
       if (pred) {
         const superseded: Record<string, unknown> = { lead: pred.key, name: pred.name, latest_handoff: handoff ? { seq: handoff.seq, kind: handoff.kind } : null, live_workers: workers.length };
         if (!pred.local) superseded.note = `${pred.name} is on ${pred.entry?.machine_name ?? 'another machine'}, not reachable from here; it was not retired.`;
-        else if (pred.row && isEnded(pred.row)) superseded.retired = 'already ended';
-        else {
+        else if (pred.row && isRetired(pred.row)) superseded.retired = 'already ended';
+        else if (result.status === 'awaiting_developer_approval') {
+          // Held: the developer may deny, so the predecessor keeps running until approval.
+          heldSupersedes.set(lead, { supersedes: pred.key, force: args.force === true });
+          superseded.retired = 'on approval';
+          superseded.note = `${pred.name} keeps running until the developer approves ${result.name}; it is retired then${args.force ? ' (interrupted if still working)' : ' if it is idle'}. If they deny, it is not retired.`;
+        } else {
           try { await sessions.retire(pred.key, `superseded by ${lead}`, args.force ? { force: true } : undefined); superseded.retired = true; }
           catch (error) { superseded.retired = false; superseded.error = error instanceof Error ? error.message : String(error); }
         }
         output.superseded = superseded;
+        if (superseded.retired === 'on approval') output.message = `${output.message ?? ''} ${pred.name} is not retired yet: it is retired when the developer approves, and keeps running if they deny.`.trim();
       }
       return output;
     }
@@ -497,7 +564,7 @@ export function makeLeadTools(deps: LeadToolsDeps) {
         throw new Error(`No Lead matches "${args.lead}" on this machine`);
       }
       const key = keyOf(row);
-      if (isEnded(row)) return { lead: key, name: row.name, retired: 'already ended' };
+      if (isRetired(row)) return { lead: key, name: row.name, retired: 'already ended' };
       if (leadIsBusy(row) && !args.force) throw new Error(`${row.name} (${key}) is working. Ask it for a final handoff first, or pass force: true to interrupt and retire it.`);
       await sessions.retire(key, 'retired by the Coordinator', args.force ? { force: true } : undefined);
       return { lead: key, name: row.name, retired: true };
