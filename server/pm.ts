@@ -49,8 +49,12 @@ export type PmEvent =
   | { type: "status"; text: string }
   | { type: "peer"; text: string };
 
-/** One entry of the current conversation (the `/api/pm/history` shape). */
-export interface PmEntry { role: 'user' | 'assistant' | 'system' | 'tool' | 'peer'; ts: string; text?: string; error?: true; name?: string; summary?: string }
+/**
+ * One entry of the current conversation (the `/api/pm/history` shape). #144: `marker: 'pm_moved'`
+ * marks the system entry that says the Coordinator moved to another machine (its text is unchanged;
+ * clients from before the marker match that text).
+ */
+export interface PmEntry { role: 'user' | 'assistant' | 'system' | 'tool' | 'peer'; ts: string; text?: string; error?: true; name?: string; summary?: string; marker?: 'pm_moved' }
 
 /**
  * The part of the host bridge the PM reads: the latest `pm_assignment` on the current connection,
@@ -123,6 +127,8 @@ export const UNCERTAIN_REASON_TEXT: Readonly<Record<HostUncertainReason, string>
   hung: 'the Coordinator stopped responding',
 };
 const UNMATCHED_REPLY = 'the reply could not be matched to your message';
+/** #191: the failure entry's second sentence when the provider stopped owing no input. */
+export const NOTHING_OWED_NEXT = 'No message was in progress. After resolving the error, send a message to start the Coordinator again.';
 
 /** "2026-09-24 12:00 UTC" for an ISO timestamp (the input unchanged if it does not parse). */
 export function sendTime(iso: string): string {
@@ -857,6 +863,11 @@ export class ProjectManager extends EventEmitter {
   // The assignment epoch this PM is active for, or null while this machine is not the PM host.
   private activeEpoch: number | null = null;
   private shownUncertain = new Set<string>();
+  // #143: turn ids of sends not yet dispatched or rejected → an uncertain entry held for that turn.
+  private sending = new Map<string, string | null>();
+  // #145: the import-attempt count when the cached model read found memory uninitialized (null: the
+  // cached read found it initialized, or nothing is cached).
+  private storedModelImports: number | null = null;
   private store: HostPmStore | null = null;
   private bridge: PmAssignmentSource | null = null;
   private autoStart = true;
@@ -941,7 +952,7 @@ export class ProjectManager extends EventEmitter {
     this.activeEpoch = null;
     const other = activeHost && activeHost !== this.machineName ? activeHost : null;
     const text = other ? `The Coordinator now runs on ${other}. This machine no longer runs it; messages sent here are refused.` : 'This machine is no longer the Coordinator host; messages sent here are refused.';
-    this.record({ role: 'system', text });
+    this.record({ role: 'system', text, marker: 'pm_moved' });
     this.emitEvent({ type: 'status', text });
   }
 
@@ -955,7 +966,12 @@ export class ProjectManager extends EventEmitter {
     for (const turn of turns) {
       if (this.shownUncertain.has(turn.turn_id)) continue;
       this.shownUncertain.add(turn.turn_id);
-      this.reportFailureEntry(uncertainText(turn.accepted_at, turn.host, UNCERTAIN_REASON_TEXT[turn.reason] ?? turn.reason));
+      const text = uncertainText(turn.accepted_at, turn.host, UNCERTAIN_REASON_TEXT[turn.reason] ?? turn.reason);
+      // #143: the turn of a send still in progress here (A→B→A across its beginTurn). That send
+      // was not dispatched and rejects telling the developer so; "could not be confirmed" would
+      // contradict it. Held, and shown only if that send is dispatched after all.
+      if (this.sending.has(turn.turn_id)) { this.sending.set(turn.turn_id, text); continue; }
+      this.reportFailureEntry(text);
     }
   }
 
@@ -972,10 +988,18 @@ export class ProjectManager extends EventEmitter {
     const fallback = () => { try { return normalizeModel(process.env.FOREMAN_PM_MODEL) ?? ROLE_DEFAULTS.coordinator.model; } catch { return ROLE_DEFAULTS.coordinator.model; } };
     const store = this.store;
     if (!store || this.closed || !store.assignment().active) return fallback();
+    // #145: a read that found memory uninitialized is reused only while no import has started since.
+    if (this.storedModel && this.storedModelImports !== null && store.importAttempts?.() !== this.storedModelImports) this.storedModel = null;
     if (!this.storedModel) {
+      const attempts = store.importAttempts?.();
+      this.storedModelImports = null;
       const pending: Promise<string | null | undefined> = store.read().then((memory) => {
-        // Uninitialized memory may still receive this machine's import (and its model): not cached.
-        if (!memory.initialized && this.storedModel === pending) this.storedModel = null;
+        // Uninitialized memory may still receive this machine's import (and its model): cached only
+        // while the store's import count is unchanged (#145: not re-read on every poll meanwhile).
+        if (!memory.initialized && this.storedModel === pending) {
+          const now = store.importAttempts?.();
+          if (now === undefined || now !== attempts) this.storedModel = null; else this.storedModelImports = now;
+        }
         try { return normalizeModel(memory.model ?? process.env.FOREMAN_PM_MODEL) ?? ROLE_DEFAULTS.coordinator.model; } catch { return ROLE_DEFAULTS.coordinator.model; }
       }, () => { if (this.storedModel === pending) this.storedModel = null; return undefined; });
       this.storedModel = pending;
@@ -1168,6 +1192,19 @@ export class ProjectManager extends EventEmitter {
       if (unready) throw unready;
     }
     const input: PmInput = { turnId: randomUUID(), acceptedAt: new Date(this.now()).toISOString(), dispatchedAt: 0, taken: false };
+    this.sending.set(input.turnId, null);
+    let dispatched = false;
+    try {
+      await this.recordAndDispatch(store, epoch, input, text);
+      dispatched = true;
+    } finally {
+      const held = this.sending.get(input.turnId);
+      this.sending.delete(input.turnId);
+      if (dispatched && held) this.reportFailureEntry(held);
+    }
+  }
+  // send(), from recording the turn to dispatching it (see send()).
+  private async recordAndDispatch(store: HostPmStore, epoch: number | null, input: PmInput, text: string): Promise<void> {
     try { await store.beginTurn(input.turnId, input.acceptedAt); }
     catch (error) {
       if (this.activeEpoch !== epoch) throw this.movedError();
@@ -1501,8 +1538,10 @@ export class ProjectManager extends EventEmitter {
       const cause = turnFailure && !message.includes(turnFailure) ? ` (after the provider failure: ${turnFailure.slice(0, 700)})` : '';
       if (current() && !this.closed) {
         // Every input the provider still owed gets its own entry before the run's failure.
+        const owed = this.outstanding.length;
         this.settleOrphans(message);
-        if (!echo) this.fail(cause ? message.slice(0, 800) + cause : message);
+        // #191: with no input owed, no message of the developer's was cut short: say so, not "Your message was not completed".
+        if (!echo) this.fail(cause ? message.slice(0, 800) + cause : message, owed ? undefined : NOTHING_OWED_NEXT);
       }
     } finally {
       launched();

@@ -18,7 +18,7 @@ import { runClaude } from "./tools.ts";
 import { PORT, REPO_ROOT, ensureDirs, HOST, FOREMAN_HOME, CLAUDE_BIN_CHOICE } from "./paths.ts";
 import { claudeVersion, describeClaudeSource } from "./claude-bin.ts";
 import { loadMachineIdentity, type MachineIdentity } from "./machine.ts";
-import { createPmStore, type HostPmStore } from "./pm-store.ts";
+import { createPmStore, relayHostView, type HostPmStore } from "./pm-store.ts";
 import { redactSecrets } from "../shared/redact.ts";
 import { PM_HOST_LOCAL_ONLY_ERROR, type MemoryResponse, type PmHostResponse } from "../shared/pm-state.ts";
 
@@ -277,13 +277,10 @@ function pmHost(res: ServerResponse) {
     return json(res, 200, response);
   }
   if (store?.mode === 'relay') {
-    const a = store.assignment(), frame = bridge?.bridge?.currentAssignment() ?? null;
+    // #144: the view also carries the relay's latest policy refusal (e.g. 1008 "Too many machines").
     return json(res, 404, {
       error: 'The cloud relay answers /api/pm/host; open the hosted app to see every machine or move the Coordinator.',
-      view: {
-        mode: 'relay', connected: a.connected, this_machine_active: a.active, epoch: frame?.epoch ?? null, active_machine: frame?.active_machine ?? null,
-        this_machine: identity ? { machine_id: identity.machine_id, name: identity.name } : null,
-      },
+      view: relayHostView(store, bridge?.bridge ?? null, identity),
     });
   }
   return json(res, 404, { error: pm.lastError ?? 'The Coordinator is unavailable on this machine.' });

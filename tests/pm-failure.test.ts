@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 const home = mkdtempSync(join(tmpdir(), 'foreman-pm-failure-'));
 process.env.FOREMAN_HOME = home;
 delete process.env.FOREMAN_PM_MODEL;
-const { ProjectManager } = await import('../server/pm.ts');
+const { ProjectManager, NOTHING_OWED_NEXT } = await import('../server/pm.ts');
 const { LocalPmStore } = await import('../server/pm-store.ts');
 const { ensureDirs } = await import('../server/paths.ts');
 ensureDirs();
@@ -103,6 +103,32 @@ test('synchronous query startup failure is logged and reported', async (t) => {
   await pm.start();
   assert.equal(logs.length, 1); assert.match(pm.history()[0]!.text!, /spawn ENOENT/);
   assert.equal(pm.modelBusy, false);
+});
+
+test('#191: a provider that fails with no input owed does not say "Your message was not completed"; one that owed input does', { timeout: 10_000 }, async (t) => {
+  const idle = newPm();
+  t.mock.method(console, 'error', () => {});
+  (idle as any).queryFactory = () => ({ close() {}, async *[Symbol.asyncIterator]() {
+    yield { type: 'system', subtype: 'init', session_id: 'idle', tools: [] };
+    throw new Error('Claude Code process exited with code 9');
+  } });
+  await idle.start();
+  const entry = idle.history().at(-1)!;
+  assert.equal(entry.text, `Coordinator failed: Claude Code process exited with code 9. ${NOTHING_OWED_NEXT}`);
+  assert.equal(idle.lastError, entry.text);
+  assert.doesNotMatch(entry.text!, /Your message was not completed/);
+
+  const busy = newPm();
+  let release!: () => void; const opened = new Promise<void>((r) => { release = r; });
+  (busy as any).queryFactory = ({ prompt }: any) => ({ close() {}, async *[Symbol.asyncIterator]() {
+    yield { type: 'system', subtype: 'init', session_id: 'busy', tools: [] };
+    await prompt.next(); await opened;
+    throw new Error('Claude Code process exited with code 1');
+  } });
+  const running = busy.start();
+  await busy.send('in flight');
+  release(); await running;
+  assert.match(busy.history().at(-1)!.text!, /^Coordinator failed: Claude Code process exited with code 1\. Your message was not completed;/);
 });
 
 test('nonstreamed assistant text is recorded and a successful result clears the current error', async (t) => {
