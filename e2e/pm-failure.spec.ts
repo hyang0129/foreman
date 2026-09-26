@@ -281,10 +281,11 @@ test("each poll requests the PM summary exactly once", async ({ page }) => {
 // follow-up poll can make the next read.
 test("a poll requested while one is in flight runs right after it", async ({ page }) => {
   const state = await fixture(page);
-  await page.clock.install();
+  // Paused before the page loads, so none of its timers fire; the first poll runs on load.
+  await page.clock.install({ time: new Date("2026-09-25T10:00:00Z") });
+  await page.clock.pauseAt(new Date("2026-09-25T10:00:01Z"));
   await page.goto(SESSION_URL);
-  await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(0);
-  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1);
+  await expect.poll(() => summaryCalls(state).length).toBe(1);
   const hosts = () => state.calls.filter((c) => c.path === "/api/host").length;
   const sessionReads = () => state.calls.filter((c) => c.path === "/api/sessions").length;
 
