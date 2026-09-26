@@ -6,15 +6,19 @@
 import './fixtures/temp-foreman-home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const {
   ProjectManager, InvestigatorSlots, investigatorAgents, investigatorBashCheck, investigatorDecision: decide, investigatorPathDenial: pathDenial,
   INVESTIGATOR_TOOLS, INVESTIGATOR_MAX_TURNS, MAX_INVESTIGATORS, GIT_FORCED_GLOBALS, GREP_ENV_EXCLUSION, PROTECTED_HOME_ENTRIES,
 } = await import('../server/pm.ts');
+// #198 hardening. Read loosely (not destructured) so this file still loads against the pre-#198
+// policy, where each hardening test must then fail on its own assertion.
+const policy: any = await import('../server/pm.ts');
+const envSuffix: string = (policy.GIT_ENV_EXCLUSIONS ?? []).map((p: string) => `'${p}'`).join(' ');
 const { LocalPmStore } = await import('../server/pm-store.ts');
 const { effectiveDevSettings, resolveRoleConfig, ROLE_DEFAULTS } = await import('../shared/roles.ts');
 
@@ -416,18 +420,29 @@ test('git: blocked options are refused in abbreviated and --opt=value spellings,
 
 test('git: every allowed command runs with the forced read-only options, added by the hook (never taken from input)', async () => {
   const forced = GIT_FORCED_GLOBALS.join(' ');
-  assert.equal(forced, '--no-pager -c core.fsmonitor=false -c log.showSignature=false');
-  assert.equal(rewritten(`git -C ${project} log --oneline -n 5`), `git ${forced} -C ${project} log --no-ext-diff --no-textconv --oneline -n 5`);
-  assert.equal(rewritten(`git -C ${project} show HEAD`), `git ${forced} -C ${project} show --no-ext-diff --no-textconv HEAD`);
-  assert.equal(rewritten(`git -C ${project} diff --no-ext-diff HEAD`), `git ${forced} -C ${project} diff --no-textconv --no-ext-diff HEAD`);
+  assert.equal(forced, '--no-pager --no-optional-locks -c core.fsmonitor=false -c log.showSignature=false -c gpg.program=/usr/bin/false -c gpg.x509.program=/usr/bin/false -c gpg.ssh.program=/usr/bin/false -c diff.submodule=short -c status.submoduleSummary=false');
+  // log/show/diff always end with -- and the quoted .env exclusion; log/show without a pathspec keep their full listing.
+  const env = envSuffix;
+  assert.equal(env, "':(top,exclude,glob,icase)**/.env*' ':(top,exclude,glob,icase)**/.env*/**'");
+  assert.equal(rewritten(`git -C ${project} log --oneline -n 5`), `git ${forced} -C ${project} log --no-ext-diff --no-textconv --full-history --sparse --oneline -n 5 -- ${env}`);
+  assert.equal(rewritten(`git -C ${project} show HEAD`), `git ${forced} -C ${project} show --no-ext-diff --no-textconv --full-history --sparse HEAD -- ${env}`);
+  assert.equal(rewritten(`git -C ${project} diff --no-ext-diff HEAD`), `git ${forced} -C ${project} diff --no-textconv --no-ext-diff HEAD -- ${env}`);
+  // A pathspec of the command's own (after --, or an existing path) keeps git's usual history simplification.
+  assert.equal(rewritten(`git -C ${project} log -- src`), `git ${forced} -C ${project} log --no-ext-diff --no-textconv -- src ${env}`);
+  assert.equal(rewritten(`git -C ${project} log -p src/index.ts`), `git ${forced} -C ${project} log --no-ext-diff --no-textconv -p -- src/index.ts ${env}`);
   assert.equal(rewritten(`git -C ${project} status`), `git ${forced} -C ${project} status`);
   assert.equal(rewritten(`git -C ${project} branch -a`), `git ${forced} -C ${project} branch -a`);
   // Idempotent: the rewritten command passes the check unchanged (canUseTool may see it after the hook).
-  const once = rewritten(`git -C ${project} log`);
-  assert.equal(rewritten(once), once);
+  for (const command of [`git -C ${project} log`, `git -C ${project} log -- src`, `git -C ${project} diff`, `git -C ${project} status`, `git -C ${project} show --sparse HEAD`]) {
+    const once = rewritten(command);
+    assert.equal(rewritten(once), once, command);
+  }
   // Other -c overrides, or the forced prefix in another order or with other values, are not accepted from input.
   for (const command of [`git -c core.fsmonitor=false -C ${project} log`, `git --no-pager -C ${project} log`, `git -c core.fsmonitor=/tmp/x -C ${project} status`,
-    `git --no-pager -c core.fsmonitor=true -c log.showSignature=false -C ${project} status`, `git -C ${project} -c core.pager=x log`, `git -c core.fsmonitor=false -c log.showSignature=false --no-pager -C ${project} log`]) {
+    `git --no-pager -c core.fsmonitor=true -c log.showSignature=false -C ${project} status`, `git -C ${project} -c core.pager=x log`, `git -c core.fsmonitor=false -c log.showSignature=false --no-pager -C ${project} log`,
+    `git --no-pager -c core.fsmonitor=false -c log.showSignature=false -C ${project} log`, // the previous forced prefix is no longer the hook's own
+    `git ${forced.replace('--no-optional-locks ', '')} -C ${project} status`, `git ${forced.replace('/usr/bin/false', '/tmp/x')} -C ${project} log`,
+    `git -C ${project} log ${env.replace('icase', 'literal')}`, `git -C ${project} log ':(exclude).env'`, `git -C ${project} status ${env} x`]) {
     assert.notEqual(investigatorBashDenial(command), null, command);
   }
   // The hook hands the rewritten command to the SDK for a subagent call; gh passes unchanged (defer).
@@ -435,7 +450,7 @@ test('git: every allowed command runs with the forced read-only options, added b
   const hook = (pm as any).enforceToolBoundary;
   const r = await hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: `git -C ${project} log -n 1`, description: 'x' }, tool_use_id: 't1', agent_id: 'agent-1', agent_type: 'investigator' });
   assert.equal(r.hookSpecificOutput.permissionDecision, 'allow');
-  assert.deepEqual(r.hookSpecificOutput.updatedInput, { command: `git ${forced} -C ${project} log --no-ext-diff --no-textconv -n 1`, description: 'x' });
+  assert.deepEqual(r.hookSpecificOutput.updatedInput, { command: `git ${forced} -C ${project} log --no-ext-diff --no-textconv --full-history --sparse -n 1 -- ${env}`, description: 'x' });
   assert.deepEqual(await hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'gh pr view 1 -R o/r' }, tool_use_id: 't2', agent_id: 'agent-1' }), {});
   const viaGuard = await (pm as any).canUseTool('Bash', { command: `git -C ${project} status` }, { agentID: 'agent-1' });
   assert.equal(viaGuard.updatedInput.command, `git ${forced} -C ${project} status`);
@@ -529,4 +544,329 @@ test('the investigator definition: read-only tools, 15 turns, foreground, model 
   assert.deepEqual([options.agents.investigator.model, options.agents.investigator.effort], ['haiku', 'high']);
   // The hooks that count investigators are registered with the query.
   for (const event of ['PreToolUse', 'SubagentStart', 'SubagentStop', 'PostToolUse', 'PostToolUseFailure']) assert.ok(options.hooks[event]?.length, event);
+});
+
+// --- #198 hardening -----------------------------------------------------------------------------
+// Real checkouts, isolated from the developer's git config; commands run through a shell, exactly as
+// the Bash tool runs the rewritten command.
+const gitEnv = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.invalid', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+const gitIn = (repo: string) => (...args: string[]) => spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', env: gitEnv });
+const sh = (command: string) => spawnSync('sh', ['-c', command], { encoding: 'utf8', env: gitEnv });
+const newRepo = (prefix: string) => {
+  const repo = mkdtempSync(join(root, prefix)); const git = gitIn(repo);
+  assert.equal(git('init', '-q').status, 0);
+  assert.equal(git('symbolic-ref', 'HEAD', 'refs/heads/main').status, 0);
+  return { repo, git };
+};
+
+test('git -C: a gitfile, commondir or alternates entry pointing into a protected directory, or a work tree containing one, is refused (#198)', (t) => {
+  const base = mkdtempSync(join(root, 'gitfile-'));
+  // A gitfile naming a directory under FOREMAN_HOME (absolute), and one naming the stand-in ~/.ssh (relative).
+  const intoState = join(base, 'into-state'); mkdirSync(intoState);
+  writeFileSync(join(intoState, '.git'), `gitdir: ${join(TEMP_FOREMAN_HOME, 'pm')}\n`);
+  const intoSsh = join(base, 'into-ssh'); mkdirSync(join(intoSsh, 'src'), { recursive: true });
+  writeFileSync(join(intoSsh, '.git'), `gitdir: ${relative(intoSsh, join(home, '.ssh'))}\n`);
+  // A decoy that only looks like a git directory (git rejects its HEAD and keeps walking up to the gitfile).
+  const decoy = join(intoSsh, 'decoy'); mkdirSync(join(decoy, 'objects'), { recursive: true }); writeFileSync(join(decoy, 'HEAD'), 'not a ref\n');
+  // A git directory whose commondir, or whose object alternates, name a protected directory.
+  const viaCommon = join(base, 'via-commondir'); mkdirSync(join(viaCommon, '.git'), { recursive: true });
+  writeFileSync(join(viaCommon, '.git', 'commondir'), `${join(home, '.claude')}\n`);
+  const viaAlternates = join(base, 'via-alternates'); mkdirSync(join(viaAlternates, '.git', 'objects', 'info'), { recursive: true });
+  writeFileSync(join(viaAlternates, '.git', 'objects', 'info', 'alternates'), `# objects\n${join(home, '.aws')}\n`);
+  // A .git symlink into a protected directory, and a gitfile git cannot parse.
+  const viaSymlink = join(base, 'via-symlink'); mkdirSync(viaSymlink); symlinkSync(join(home, '.codex'), join(viaSymlink, '.git'));
+  const badGitfile = join(base, 'bad-gitfile'); mkdirSync(badGitfile); writeFileSync(join(badGitfile, '.git'), 'not a gitfile\n');
+  // A dotfiles checkout rooted at the home directory: `git status` there would read ~/.ssh, so a subdirectory is refused too.
+  mkdirSync(join(home, '.git')); mkdirSync(join(home, 'dotfiles-sub'));
+  t.after(() => { rmSync(join(home, '.git'), { recursive: true, force: true }); rmSync(join(home, 'dotfiles-sub'), { recursive: true, force: true }); });
+  for (const dir of [intoState, intoSsh, join(intoSsh, 'src'), decoy, viaCommon, viaAlternates, viaSymlink, badGitfile, join(home, 'dotfiles-sub')]) {
+    for (const sub of ['log', 'status', 'show HEAD', 'diff']) assert.notEqual(investigatorBashDenial(`git -C ${dir} ${sub}`), null, `git -C ${dir} ${sub}`);
+  }
+  assert.match(investigatorBashDenial(`git -C ${intoState} log`)!, /git would read .*state and credential/);
+  assert.match(investigatorBashDenial(`git -C ${join(home, 'dotfiles-sub')} status`)!, /contains Foreman's state or a credential directory/);
+  // Controls: a plain checkout, a real linked worktree (gitfile and commondir inside the main checkout)
+  // and a subdirectory of each pass, and git actually runs there.
+  const { repo, git } = newRepo('main-');
+  writeFileSync(join(repo, 'a.txt'), 'a\n'); git('add', '.'); assert.equal(git('commit', '-qm', 'one').status, 0);
+  const linked = join(base, 'linked');
+  assert.equal(git('worktree', 'add', '-q', linked).status, 0);
+  assert.match(readFileSync(join(linked, '.git'), 'utf8'), /^gitdir: /);
+  for (const [dir, sub] of [[repo, 'log --oneline'], [repo, 'status'], [linked, 'log --oneline'], [linked, 'status'], [join(repo, '.git'), 'log --oneline']]) {
+    const r = sh(rewritten(`git -C ${dir} ${sub}`));
+    assert.equal(r.status, 0, `${dir} ${sub}: ${r.stderr}`);
+  }
+  assert.match(sh(rewritten(`git -C ${linked} log --oneline`)).stdout, /one/);
+});
+
+test('a hard link to a file inside a protected directory is refused: no regular file with more than one link is readable (#198)', (t) => {
+  // The protected identities cover ~/.ssh itself, not id_ed25519 inside it: only the link count gives the alias away.
+  const link = join(project, 'id-copy.txt');
+  linkSync(join(home, '.ssh', 'id_ed25519'), link);
+  const plain = join(project, 'id-plain.txt'); writeFileSync(plain, 'PRIVATE KEY');
+  t.after(() => { rmSync(link, { force: true }); rmSync(plain, { force: true }); });
+  assert.match(investigatorPathDenial(link, 'file')!, /hard-linked/);
+  denied('Read', { file_path: link });
+  denied('Grep', { pattern: 'KEY', path: link, output_mode: 'content' });
+  denied('Grep', { pattern: 'KEY', path: link, output_mode: 'count' });
+  denied('Glob', { pattern: '*', path: link });
+  // Control: the same content in an ordinary single-link file is readable.
+  allowed('Read', { file_path: plain });
+  allowed('Grep', { pattern: 'KEY', path: plain, output_mode: 'content' });
+});
+
+test('git: status never rewrites .git/index, status -v is refused, and formats from repository config cannot run a signature program (#198)', () => {
+  const { repo, git } = newRepo('locks-');
+  writeFileSync(join(repo, 'a.txt'), 'one\n'); writeFileSync(join(repo, '.gitattributes'), 'a.txt diff=conv\n');
+  git('add', '.'); assert.equal(git('commit', '-qm', 'one').status, 0);
+  // --no-optional-locks: a stat change makes a plain `git status` refresh and rewrite the index.
+  const index = join(repo, '.git', 'index');
+  const old = new Date('2020-01-01T00:00:00Z');
+  utimesSync(join(repo, 'a.txt'), old, old);
+  const before = readFileSync(index);
+  assert.equal(sh(rewritten(`git -C ${repo} status`)).status, 0);
+  assert.ok(readFileSync(index).equals(before), 'the rewritten git status left .git/index untouched');
+  assert.equal(git('status').status, 0);
+  assert.ok(!readFileSync(index).equals(before), 'control: a plain git status rewrites .git/index');
+
+  // A commit carrying a (fake) PGP signature, and repository config that asks for its signature through
+  // formats: `format.pretty` (every plain log) and a `pretty.<alias>`, with gpg.program naming a program.
+  const marker = join(repo, '..', `${basename(repo)}-gpg-ran`);
+  const program = join(repo, '..', `${basename(repo)}-gpg.sh`);
+  writeFileSync(program, `#!/bin/sh\ntouch ${marker}\ncat >/dev/null\nexit 1\n`); chmodSync(program, 0o755);
+  const tree = git('rev-parse', 'HEAD^{tree}').stdout.trim(); const parent = git('rev-parse', 'HEAD').stdout.trim();
+  const body = `tree ${tree}\nparent ${parent}\nauthor t <t@example.invalid> 1700000000 +0000\ncommitter t <t@example.invalid> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n\nsigned\n`;
+  const signed = spawnSync('git', ['-C', repo, 'hash-object', '-t', 'commit', '-w', '--stdin'], { input: body, encoding: 'utf8', env: gitEnv }).stdout.trim();
+  assert.equal(git('update-ref', 'HEAD', signed).status, 0);
+  for (const [key, value] of [['gpg.program', program], ['format.pretty', 'format:%h %GS %s'], ['pretty.sig', 'format:%h %GK %s']]) assert.equal(git('config', key, value).status, 0);
+  const ran = (command: string) => { rmSync(marker, { force: true }); const r = sh(command); return { ran: existsSync(marker), status: r.status }; };
+  assert.equal(ran(`git -C ${repo} log -1`).ran, true, 'control: format.pretty makes a plain git log run gpg.program');
+  assert.equal(ran(`git -C ${repo} log -1 --format=sig`).ran, true, 'control: a pretty alias makes git log run gpg.program');
+  assert.equal(ran(`git -C ${repo} show HEAD`).ran, true, 'control: format.pretty makes a plain git show run gpg.program');
+  for (const command of [`git -C ${repo} log -1`, `git -C ${repo} log -1 --format=sig`, `git -C ${repo} log --pretty=sig`, `git -C ${repo} show HEAD`, `git -C ${repo} log -p`]) {
+    assert.deepEqual(ran(rewritten(command)), { ran: false, status: 0 }, command);
+  }
+
+  // status -v prints the staged diff through the repository's textconv driver: refused in every spelling.
+  assert.equal(git('config', 'diff.conv.textconv', program).status, 0);
+  writeFileSync(join(repo, 'a.txt'), 'two\n'); git('add', 'a.txt');
+  assert.equal(ran(`git -C ${repo} status -v`).ran, true, 'control: a plain git status -v runs textconv');
+  for (const arg of ['-v', '-vv', '--verbose', '--verb', '-sv', '-vs']) assert.match(investigatorBashDenial(`git -C ${repo} status ${arg}`) ?? '', /status -v/, arg);
+  for (const arg of ['-s', '--short', '-sb', '--branch', '--porcelain']) assert.equal(investigatorBashDenial(`git -C ${repo} status ${arg}`), null, arg);
+});
+
+test('git: a committed or staged .env never appears in log/show/diff output (patch, stat, raw, pickaxe), and listings are unchanged (#198)', () => {
+  const { repo, git } = newRepo('history-');
+  mkdirSync(join(repo, 'src')); mkdirSync(join(repo, 'cfg', '.env.d'), { recursive: true });
+  writeFileSync(join(repo, 'src', 'a.txt'), 'a\n'); writeFileSync(join(repo, '.env'), 'SECRET=one\n');
+  writeFileSync(join(repo, 'cfg', '.ENV.local'), 'SECRET=two\n'); writeFileSync(join(repo, 'cfg', '.env.d', 'x'), 'SECRET=dir\n'); writeFileSync(join(repo, 'cfg', 'app.txt'), 'app\n');
+  git('add', '-A'); assert.equal(git('commit', '-qm', 'one').status, 0);
+  assert.equal(git('checkout', '-qb', 'feat').status, 0);
+  writeFileSync(join(repo, 'src', 'a.txt'), 'a\nb\n'); writeFileSync(join(repo, 'cfg', '.ENV.local'), 'SECRET=feat\n');
+  assert.equal(git('commit', '-qam', 'two').status, 0);
+  assert.equal(git('checkout', '-q', 'main').status, 0);
+  assert.equal(git('merge', '-q', '--no-ff', 'feat', '-m', 'merge').status, 0);
+  const merge = git('rev-parse', 'HEAD').stdout.trim();
+  writeFileSync(join(repo, '.env'), 'SECRET=three\n'); assert.equal(git('commit', '-qam', 'envonly').status, 0);
+  // Uncommitted: a changed .env in the work tree and a staged .env change.
+  writeFileSync(join(repo, '.env'), 'SECRET=four\n'); writeFileSync(join(repo, 'cfg', '.ENV.local'), 'SECRET=five\n'); git('add', 'cfg');
+  writeFileSync(join(repo, 'src', 'a.txt'), 'a\nb\nc\n');
+  const first = git('rev-list', '--max-parents=0', 'HEAD').stdout.trim();
+  const leak = /SECRET|\.env/i;
+  for (const [dir, command] of [
+    [repo, 'log -p'], [repo, 'log --stat'], [repo, 'log --raw'], [repo, 'log -p -m'], [repo, 'log --cc'], [repo, 'log -p -S SECRET --pickaxe-all'],
+    [repo, 'log -p -G SECRET'], [repo, 'show HEAD'], [repo, `show ${first}`], [repo, `show --stat -m ${merge}`], [repo, `diff ${first} HEAD`], [repo, 'diff'],
+    [repo, 'diff --cached'], [repo, 'diff HEAD'], [repo, 'diff --stat HEAD'], [repo, 'log -p -- cfg'], [repo, 'log -p cfg'], [join(repo, 'src'), 'log -p'],
+    [join(repo, 'src'), 'diff HEAD'], [join(repo, 'cfg'), `diff ${first}:cfg HEAD:cfg`],
+  ] as const) {
+    const plain = sh(`git -C ${dir} ${command}`);
+    assert.match(plain.stdout, leak, `control: plain git ${command} in ${dir} shows the .env`);
+    const r = sh(rewritten(`git -C ${dir} ${command}`));
+    assert.equal(r.status, 0, `${command}: ${r.stderr}`);
+    assert.doesNotMatch(r.stdout, leak, `git ${command} in ${dir}`);
+  }
+  // The other changes are still there, and listings (merges, the .env-only commit) match plain git.
+  assert.match(sh(rewritten(`git -C ${repo} diff HEAD`)).stdout, /\+c/);
+  assert.match(sh(rewritten(`git -C ${repo} log -p`)).stdout, /\+b/);
+  for (const [dir, command] of [[repo, 'log --oneline'], [repo, 'log --graph --oneline'], [repo, 'log --oneline -- src'], [repo, 'log --oneline src'],
+    [join(repo, 'src'), 'log --oneline'], [repo, 'show -s --oneline HEAD'], [repo, 'show HEAD:src/a.txt'], [repo, `log --format=%s ${first}..main`]] as const) {
+    const r = sh(rewritten(`git -C ${dir} ${command}`));
+    assert.equal(r.status, 0, `${command}: ${r.stderr}`);
+    assert.equal(r.stdout, sh(`git -C ${dir} ${command}`).stdout, `git ${command} in ${dir}`);
+  }
+  assert.match(sh(rewritten(`git -C ${repo} log --oneline`)).stdout, /envonly[\s\S]*merge/);
+  // Options that cannot take the exclusion, or would bypass it, are refused.
+  for (const command of ['log --follow -- src/a.txt', 'log --foll src/a.txt', 'log -L1,2:src/a.txt', 'log -L 1,2:src/a.txt', 'log -pL1,2:src/a.txt', 'show -L1,2:src/a.txt',
+    'log -p --full-diff -- src', 'log -p --full-d -- src', 'show --full-diff HEAD -- src']) {
+    assert.notEqual(investigatorBashDenial(`git -C ${repo} ${command}`), null, command);
+  }
+  for (const command of ['log --full-history', 'log --full-index -p', 'log --format=%H', 'log --oneline -n 5']) assert.equal(investigatorBashDenial(`git -C ${repo} ${command}`), null, command);
+});
+
+test('the protected list covers other credential stores: cloud CLIs, shell histories, browser and app data (#198)', () => {
+  for (const entry of ['.config/wrangler', '.config/.wrangler', '.wrangler', 'Library/Preferences/.wrangler', '.cloudflared', '.zsh_history', '.bash_history', '.zsh_sessions',
+    '.local/share/fish', 'Library/Application Support', 'Library/Cookies', 'Library/Containers', 'Library/Group Containers', '.mozilla', '.config/google-chrome',
+    '.pgpass', '.terraform.d', '.vault-token', '.docker', '.netrc']) {
+    assert.ok((PROTECTED_HOME_ENTRIES as readonly string[]).includes(entry), entry);
+  }
+  const files = ['.config/wrangler/config/default.toml', '.config/.wrangler/config/default.toml', 'Library/Preferences/.wrangler/config/default.toml', '.zsh_history',
+    '.bash_history', 'Library/Application Support/Google/Chrome/Default/Cookies', 'Library/Cookies/Cookies.binarycookies', '.local/share/fish/fish_history',
+    '.docker/config.json', '.pgpass', '.terraform.d/credentials.tfrc.json'];
+  for (const file of files) { mkdirSync(dirname(join(home, file)), { recursive: true }); writeFileSync(join(home, file), 'token = "secret"'); }
+  for (const file of files) {
+    assert.match(investigatorPathDenial(join(home, file), 'file') ?? '', /credential/, file);
+    denied('Read', { file_path: `~/${file}` });
+  }
+  for (const dir of ['Library/Application Support', 'Library/Application Support/Google', '.config/wrangler', '.local/share/fish']) {
+    denied('Grep', { pattern: 'token', path: join(home, dir) });
+    denied('Glob', { pattern: '**', path: join(home, dir) });
+  }
+  // Their parents contain a protected location now, and are refused as search roots.
+  for (const dir of ['Library', 'Library/Preferences', '.local/share']) denied('Grep', { pattern: 'token', path: join(home, dir) });
+  // Controls: an ordinary preference file, a note in the home directory and project files stay readable.
+  writeFileSync(join(home, 'Library', 'Preferences', 'com.example.plist'), 'x');
+  allowed('Read', { file_path: join(home, 'Library', 'Preferences', 'com.example.plist') });
+  allowed('Read', { file_path: join(home, 'notes.md') });
+  allowed('Read', { file_path: join(project, 'README.md') });
+  allowed('Grep', { pattern: 'export', path: project });
+});
+
+test('an empty or non-string agent_id is refused, never given the Coordinator main-thread rules (#198)', async () => {
+  const pm = new ProjectManager({} as any);
+  const hook = (pm as any).enforceToolBoundary; const guard = (pm as any).canUseTool;
+  const run = (tool_name: string, tool_input: any, extra: Record<string, unknown>) => hook({ hook_event_name: 'PreToolUse', tool_name, tool_input, tool_use_id: `e-${Math.random()}`, ...extra });
+  const decision = (r: any) => r.hookSpecificOutput?.permissionDecision ?? 'defer';
+  const mainThreadTools: [string, any][] = [['mcp__leads__list_leads', {}], ['mcp__fleet__list_sessions', {}], ['Read', { file_path: join(project, 'README.md') }],
+    ['Agent', { subagent_type: 'investigator', description: 'x', prompt: 'x' }]];
+  for (const agent_id of ['', null, 0, false, {}]) {
+    for (const [tool, input] of mainThreadTools) {
+      const r = await run(tool, input, { agent_id, agent_type: 'investigator' });
+      assert.equal(decision(r), 'deny', `${tool} with agent_id ${JSON.stringify(agent_id)}`);
+      assert.match(r.hookSpecificOutput.permissionDecisionReason, /subagent id/);
+    }
+    if (typeof agent_id === 'string' || agent_id === null) assert.equal((await guard('mcp__leads__list_leads', {}, { agentID: agent_id })).behavior, 'deny', JSON.stringify(agent_id));
+  }
+  // Controls: an absent agent_id is the main thread (the Coordinator's own rules), and a real one the investigator rules.
+  assert.equal(decision(await run('mcp__leads__list_leads', {}, {})), 'defer');
+  assert.equal(decision(await run('Read', { file_path: join(project, 'README.md') }, {})), 'defer');
+  assert.equal((await guard('mcp__leads__list_leads', {}, {})).behavior, 'allow');
+  assert.equal((await guard('mcp__leads__list_leads', {}, { agentID: undefined })).behavior, 'allow');
+  assert.equal(decision(await run('mcp__leads__list_leads', {}, { agent_id: 'agent-1' })), 'deny');
+  assert.equal(decision(await run('Read', { file_path: join(project, 'src', 'index.ts') }, { agent_id: 'agent-1' })), 'defer');
+  // An empty agent_id never takes, binds or frees an investigator slot.
+  const slots: InstanceType<typeof InvestigatorSlots> = (pm as any).slots;
+  const hooks = slots.hooks();
+  const fire = (event: string, input: any) => (hooks as any)[event][0].hooks[0]({ hook_event_name: event, ...input });
+  assert.equal(decision(await hook({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { subagent_type: 'investigator', description: 'x', prompt: 'x' }, tool_use_id: 'slot-a' })), 'allow');
+  await fire('SubagentStart', { agent_id: '', agent_type: 'investigator' });
+  await fire('PostToolUse', { tool_name: 'Agent', tool_use_id: 'slot-a', agent_id: '' });
+  assert.equal(slots.inUse, 1, 'a call with an empty agent_id is not the Coordinator ending its Agent call');
+  await fire('PostToolUse', { tool_name: 'Agent', tool_use_id: 'slot-a' });
+  assert.equal(slots.inUse, 0);
+});
+
+// --- #217 review: the .env exclusions, submodules, bare repositories and git metadata parsing -----
+const envRepo = () => {
+  const { repo, git } = newRepo('review-');
+  writeFileSync(join(repo, 'README'), 'hi\n'); writeFileSync(join(repo, '.env'), 'SECRET=topsecret\n');
+  git('add', '-A'); assert.equal(git('commit', '-qm', 'init').status, 0);
+  writeFileSync(join(repo, '.env'), 'SECRET=changed\n'); writeFileSync(join(repo, 'README'), 'hi\nmore\n');
+  assert.equal(git('commit', '-qam', 'two').status, 0);
+  return { repo, git };
+};
+
+test('git: a trailing value-taking option can never take the .env exclusions as its value (#217 review)', () => {
+  const { repo } = envRepo();
+  const leak = /SECRET|\.env/i;
+  // Control: exclusions placed right after a value-taking option, as the first #205 version did, leak.
+  for (const tail of ['log -p --src-prefix', 'show HEAD --line-prefix', 'log -p --invert-grep -F --grep']) {
+    assert.match(sh(`git -C ${repo} ${tail} ${envSuffix}`).stdout, leak, `control: ${tail} takes the first exclusion as its value`);
+  }
+  // Now: a value-taking option right before the pathspec separator is refused, in every placement.
+  for (const command of ['log -p --src-prefix', 'show HEAD --line-prefix', 'log -p --invert-grep -F --grep', 'log -p --dst-prefix', 'log -p --author',
+    'log -p -S', 'log -p -G', 'log -p -n', 'log -pn', 'diff HEAD --src-prefix', 'log -p --src-prefix -- README', 'log -p --grep -- README', 'show HEAD --line-prefix --']) {
+    assert.match(investigatorBashDenial(`git -C ${repo} ${command}`) ?? '', /may take a value/, command);
+  }
+  // Allowed forms put the exclusions after a real `--` and show no .env.
+  for (const command of ['log -p --src-prefix=x/', 'show HEAD --line-prefix=Z', 'log -p --invert-grep -F --grep=zzz', 'log -p -n 2', 'log -p -n2', 'log -p -Shi',
+    'log -p -S hi', 'log -p README', 'log -p -- README', 'log -p --stat', 'show HEAD -p', 'diff HEAD~1', 'log -p --grep hi']) {
+    if (/[~]/.test(command)) continue; // not in the safe character set
+    const once = rewritten(`git -C ${repo} ${command}`);
+    assert.ok(once.endsWith(` ${envSuffix}`) && once.split(' ').includes('--'), once);
+    const r = sh(once);
+    assert.equal(r.status, 0, `${command}: ${r.stderr}`);
+    assert.doesNotMatch(r.stdout, leak, command);
+  }
+  assert.match(sh(rewritten(`git -C ${repo} log -p --src-prefix=x/`)).stdout, /x\/README/);
+});
+
+test('git: submodules show as commit ids only, so a submodule .env never leaks (#217 review)', () => {
+  const { repo: sub, git: subGit } = envRepo();
+  const { repo, git } = newRepo('super-');
+  writeFileSync(join(repo, 'a.txt'), 'a\n'); git('add', '.'); assert.equal(git('commit', '-qm', 'base').status, 0);
+  const [first, second] = subGit('rev-list', '--reverse', 'HEAD').stdout.trim().split('\n');
+  assert.equal(git('-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub, 'mod').status, 0);
+  const mod = gitIn(join(repo, 'mod'));
+  assert.equal(mod('checkout', '-q', first).status, 0); git('add', 'mod'); assert.equal(git('commit', '-qm', 'add mod').status, 0);
+  assert.equal(mod('checkout', '-q', second).status, 0); git('add', 'mod'); assert.equal(git('commit', '-qm', 'bump mod').status, 0);
+  const leak = /SECRET/;
+  // Controls: --submodule=diff, and the repository's own diff.submodule=diff on a plain log -p, show the submodule's .env.
+  assert.match(sh(`git -C ${repo} log -p --submodule=diff`).stdout, leak, 'control: --submodule=diff');
+  for (const arg of ['--submodule=diff', '--submodule=log', '--submodule', '--submod=diff', '--submo']) {
+    assert.match(investigatorBashDenial(`git -C ${repo} log -p ${arg}`) ?? '', /submodule/, arg);
+    assert.notEqual(investigatorBashDenial(`git -C ${repo} diff ${arg}`), null, arg);
+  }
+  assert.equal(git('config', 'diff.submodule', 'diff').status, 0);
+  assert.match(sh(`git -C ${repo} log -p`).stdout, leak, 'control: diff.submodule=diff in repository config');
+  for (const command of ['log -p', 'log -p --submodule=short', 'show HEAD', 'diff HEAD~1 HEAD', 'status']) {
+    if (/[~]/.test(command)) continue;
+    const r = sh(rewritten(`git -C ${repo} ${command}`));
+    assert.equal(r.status, 0, `${command}: ${r.stderr}`);
+    assert.doesNotMatch(r.stdout, leak, command);
+  }
+  assert.match(sh(rewritten(`git -C ${repo} log -p`)).stdout, /Subproject commit/);
+});
+
+test('git -C: a bare repository (or a directory inside one) outside any checkout is refused, as before #198 (#217 review)', () => {
+  const { repo, git } = newRepo('bare-src-');
+  writeFileSync(join(repo, 'f'), 'x\n'); git('add', 'f'); assert.equal(git('commit', '-qm', 'c').status, 0);
+  const bare = join(dirname(repo), `${basename(repo)}-bare.git`);
+  assert.equal(spawnSync('git', ['clone', '-q', '--bare', repo, bare], { env: gitEnv }).status, 0);
+  for (const dir of [bare, join(bare, 'objects'), join(bare, 'refs')]) {
+    assert.match(investigatorBashDenial(`git -C ${dir} log --oneline -n 1`) ?? '', /not a directory inside a git checkout/, dir);
+  }
+  // Control: the git directory of a checkout is still inside that checkout.
+  assert.equal(investigatorBashDenial(`git -C ${join(repo, '.git')} log --oneline -n 1`), null);
+});
+
+test('git -C: gitfile, commondir and alternates values are read exactly as git reads them; stray whitespace or quoting is refused (#217 review)', () => {
+  const base = mkdtempSync(join(root, 'parse-'));
+  const checkout = (name: string, gitfile: string, extra?: (at: string) => void) => {
+    const at = join(base, name); mkdirSync(join(at, 'decoy.git'), { recursive: true }); mkdirSync(join(at, 'gd', 'cd'), { recursive: true });
+    extra?.(at); writeFileSync(join(at, '.git'), gitfile); return at;
+  };
+  // Each names a path git keeps whitespace in (` decoy.git`, `decoy.git `, ` cd`); the host must not trim it to the harmless decoy.
+  const refused = [
+    checkout('two-spaces', 'gitdir:  decoy.git\n', (at) => symlinkSync(join(home, '.ssh'), join(at, ' decoy.git'))),
+    checkout('trailing-space', 'gitdir: decoy.git \n', (at) => symlinkSync(join(home, '.ssh'), join(at, 'decoy.git '))),
+    checkout('no-space', 'gitdir:decoy.git\n'),
+    checkout('two-lines', 'gitdir: decoy.git\ngitdir: decoy.git\n'),
+    checkout('commondir-space', 'gitdir: gd\n', (at) => { writeFileSync(join(at, 'gd', 'commondir'), ' cd\n'); symlinkSync(join(home, '.ssh'), join(at, 'gd', ' cd')); }),
+    checkout('commondir-empty', 'gitdir: gd\n', (at) => writeFileSync(join(at, 'gd', 'commondir'), '\n')),
+    checkout('alternates-quoted', 'gitdir: gd\n', (at) => { mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), '"../../decoy.git"\n'); }),
+    checkout('alternates-space', 'gitdir: gd\n', (at) => { mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), ' ../../decoy.git\n'); }),
+    // git splits alternates on \n only: `decoy\r` (a symlink into ~/.ssh), not the empty `decoy`, is what it reads.
+    checkout('alternates-crlf', 'gitdir: gd\n', (at) => {
+      mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); mkdirSync(join(at, 'decoy'));
+      symlinkSync(join(home, '.ssh'), join(at, 'decoy\r'));
+      writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), `${join(at, 'decoy')}\r\n`);
+    }),
+  ];
+  for (const at of refused) assert.match(investigatorBashDenial(`git -C ${at} log`) ?? '', /not (a )?plain/, at);
+  // Controls: the exact forms git writes, including a CRLF line ending and a commondir/alternates entry, pass.
+  const plain = [
+    checkout('plain', 'gitdir: decoy.git\n'), checkout('crlf', 'gitdir: decoy.git\r\n'), checkout('no-newline', 'gitdir: decoy.git'),
+    checkout('commondir', 'gitdir: gd\n', (at) => writeFileSync(join(at, 'gd', 'commondir'), 'cd\n')),
+    checkout('alternates', 'gitdir: gd\n', (at) => { mkdirSync(join(at, 'gd', 'objects', 'info'), { recursive: true }); writeFileSync(join(at, 'gd', 'objects', 'info', 'alternates'), '# c\n\n../../decoy.git\n'); }),
+  ];
+  for (const at of plain) assert.equal(investigatorBashDenial(`git -C ${at} log`), null, at);
 });
