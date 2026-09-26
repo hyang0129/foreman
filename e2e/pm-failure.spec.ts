@@ -26,12 +26,15 @@ async function fixture(page: Page, options: { pmHistory?: any[]; auth?: any } = 
       { role: "assistant", text: "How can I help the fleet?" },
     ],
     calls: [] as { path: string; search: string; at: number }[],
+    // While set, /api/sessions answers only once it resolves: holds a poll in flight.
+    sessionsGate: null as Promise<void> | null,
   };
   await page.route("**/api/**", async (route) => {
     const request = route.request(),
       url = new URL(request.url()),
       path = url.pathname;
     state.calls.push({ path, search: url.search, at: Date.now() });
+    if (path === "/api/sessions" && state.sessionsGate) await state.sessionsGate;
     if (path === "/api/pm/history" && url.search === "?summary=1" && state.summaryFailure) {
       if (state.summaryFailure === "network") await route.abort("failed");
       else await route.fulfill({ status: 500, json: { error: "Internal relay failure" } });
@@ -89,6 +92,10 @@ const summaryCalls = (state: Awaited<ReturnType<typeof fixture>>) =>
   );
 const fullPmCalls = (state: Awaited<ReturnType<typeof fixture>>) =>
   state.calls.filter((c) => c.path === "/api/pm/history" && c.search === "");
+// Ask for a poll now instead of waiting for the 3 s timer. A poll already in flight may have read
+// the mock before the test changed it, so the app runs the requested poll right after it (#148):
+// either way a poll that starts after this call reads the new state.
+const pollNow = (page: Page) => page.evaluate(() => window.dispatchEvent(new Event("online")));
 
 for (const colorScheme of ["light", "dark"] as const) {
   test(`persisted PM error entry is distinct and labelled (${colorScheme})`, async ({
@@ -186,8 +193,9 @@ test("rail flags a PM failure from the summary read and clears it", async ({
   await expect(pmRow).not.toHaveClass(/has-error/);
   await expect(page.getByRole("button", { name: "Project manager, has an error" })).toHaveCount(0);
 
-  // Error appears on a later poll.
+  // Error appears on the next poll.
   state.pmError = "Project manager failed: provider outage";
+  await pollNow(page);
   await expect(indicator).toHaveCount(1);
   await expect(indicator).toHaveText(/Project manager has an error/);
   await expect(
@@ -201,11 +209,13 @@ test("rail flags a PM failure from the summary read and clears it", async ({
   await page.getByRole("button", { name: /Fix sign-in/ }).click();
   await expect(page.getByRole("heading", { name: "Fix sign-in", exact: true })).toBeVisible();
   const before = summaryCalls(state).length;
+  await pollNow(page);
   await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(before);
   await expect(indicator).toHaveCount(1);
 
   // The error clears: the flag and its accessible name go away.
   state.pmError = null;
+  await pollNow(page);
   await expect(indicator).toHaveCount(0);
   await expect(pmRow).not.toHaveClass(/has-error/);
   expect(await pmRow.getAttribute("aria-label")).toBeNull();
@@ -223,15 +233,19 @@ test("summary is not requested while the PM is selected", async ({ page }) => {
   await expect(page.getByText("How can I help the fleet?")).toBeVisible();
   // The #28 banner still shows for the selected PM.
   await expect(page.locator("#error-text")).toHaveText(/provider outage/);
-  // The full history keeps the indicator in sync without a summary read.
+  // The full history keeps the indicator in sync without a summary read, over two more polls.
   const selectedAt = Date.now();
-  const fullBefore = fullPmCalls(state).length;
-  await expect.poll(() => fullPmCalls(state).length, { timeout: 10000 }).toBeGreaterThan(fullBefore + 1);
+  for (let polls = 0; polls < 2; polls++) {
+    const fullBefore = fullPmCalls(state).length;
+    await pollNow(page);
+    await expect.poll(() => fullPmCalls(state).length).toBeGreaterThan(fullBefore);
+  }
   expect(summaryCalls(state).filter((c) => c.at > selectedAt)).toHaveLength(0);
   await expect(page.locator("#select-pm .pm-alert")).toHaveCount(1);
 
   // Full history reports recovery: the flag clears with no summary read.
   state.pmError = null;
+  await pollNow(page);
   await expect(page.locator("#select-pm .pm-alert")).toHaveCount(0);
   expect(summaryCalls(state).filter((c) => c.at > selectedAt)).toHaveLength(0);
 });
@@ -242,10 +256,11 @@ test("each poll requests the PM summary exactly once", async ({ page }) => {
   const state = await fixture(page);
   await page.goto(SESSION_URL);
   const hosts = () => state.calls.filter((c) => c.path === "/api/host").length;
-  // Start extra polls instead of waiting for the timer; a poll already in flight ignores them.
+  // Start extra polls instead of waiting for the timer; one asked for while a poll is in flight
+  // runs after it, never alongside it.
   for (let polls = 1; polls <= 4; polls++) {
     await expect.poll(() => summaryCalls(state).length).toBeGreaterThanOrEqual(polls);
-    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await pollNow(page);
     await expect.poll(hosts).toBeGreaterThan(polls);
   }
   const windows: string[][] = [];
@@ -261,6 +276,38 @@ test("each poll requests the PM summary exactly once", async ({ page }) => {
   expect(fullPmCalls(state)).toHaveLength(0);
 });
 
+// #148: a poll asked for while another is in flight is not dropped; it runs as soon as the
+// in-flight one finishes. The page clock is paused, so the 3 s timer never fires and only that
+// follow-up poll can make the next read.
+test("a poll requested while one is in flight runs right after it", async ({ page }) => {
+  const state = await fixture(page);
+  // Paused before the page loads, so none of its timers fire; the first poll runs on load.
+  await page.clock.install({ time: new Date("2026-09-25T10:00:00Z") });
+  await page.clock.pauseAt(new Date("2026-09-25T10:00:01Z"));
+  await page.goto(SESSION_URL);
+  await expect.poll(() => summaryCalls(state).length).toBe(1);
+  const hosts = () => state.calls.filter((c) => c.path === "/api/host").length;
+  const sessionReads = () => state.calls.filter((c) => c.path === "/api/sessions").length;
+
+  // Hold the next poll at its session read, then ask for another poll while it waits.
+  let release!: () => void;
+  state.sessionsGate = new Promise<void>((resolve) => { release = resolve; });
+  const hostsBefore = hosts(), sessionsBefore = sessionReads();
+  await pollNow(page);
+  await expect.poll(sessionReads).toBe(sessionsBefore + 1);
+  expect(hosts()).toBe(hostsBefore + 1);
+  await pollNow(page);
+
+  // The requested poll starts once the held one has finished: one more complete poll, then the
+  // paused timer again.
+  const summariesBefore = summaryCalls(state).length;
+  state.sessionsGate = null;
+  release();
+  await expect.poll(hosts).toBe(hostsBefore + 2);
+  await expect.poll(() => summaryCalls(state).length).toBe(summariesBefore + 2);
+  expect(hosts()).toBe(hostsBefore + 2);
+});
+
 for (const failure of [500, "network"] as const) {
   test(`a failed PM summary read (${failure}) leaves the UI usable and the indicator unset`, async ({ page }) => {
     const state = await fixture(page);
@@ -269,7 +316,7 @@ for (const failure of [500, "network"] as const) {
     // The failing read was really made, and more than once: polling continues after it.
     await expect.poll(() => summaryCalls(state).length).toBeGreaterThanOrEqual(1);
     const failedAt = summaryCalls(state).length;
-    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await pollNow(page);
     await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(failedAt);
     await expect(page.locator("#select-pm .pm-alert")).toHaveCount(0);
     await expect(page.locator("#select-pm")).not.toHaveClass(/has-error/);
@@ -287,6 +334,7 @@ for (const failure of [500, "network"] as const) {
     await page.getByRole("button", { name: /Fix sign-in/ }).click();
     state.summaryFailure = null;
     state.pmError = "Project manager failed: provider outage";
+    await pollNow(page);
     await expect(page.locator("#select-pm .pm-alert")).toHaveCount(1);
   });
 }
@@ -298,7 +346,7 @@ test("a known indicator survives a failed summary read", async ({ page }) => {
   await expect(page.locator("#select-pm .pm-alert")).toHaveCount(1);
   state.summaryFailure = 500;
   const before = summaryCalls(state).length;
-  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await pollNow(page);
   await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(before);
   await expect(page.locator("#select-pm .pm-alert")).toHaveCount(1);
   await expect(page.locator("#error-banner")).toBeHidden();
@@ -310,10 +358,12 @@ test("the rail indicator appears even when the PM row has no PINNED tag", async 
   await expect.poll(() => summaryCalls(state).length).toBeGreaterThan(0);
   await page.locator("#select-pm .pinned").evaluate((el) => el.remove());
   state.pmError = "Project manager failed: provider outage";
+  await pollNow(page);
   const indicator = page.locator("#select-pm .pm-alert");
   await expect(indicator).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Project manager, has an error" })).toBeVisible();
   state.pmError = null;
+  await pollNow(page);
   await expect(indicator).toHaveCount(0);
 });
 
@@ -327,6 +377,7 @@ test("a PM error entry that gains its error flag re-renders as a failure", async
   await expect(entry).not.toHaveClass(/\berror\b/);
   // Same role, text and timestamp: only the error flag changes.
   state.pmHistory = [{ role: "system", error: true, text: "Project manager stopped.", at }];
+  await pollNow(page);
   await expect(entry).toHaveClass(/\berror\b/);
   await expect(entry.locator(".message-label")).toHaveText(/^Project manager error/);
 });
