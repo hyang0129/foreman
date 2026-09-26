@@ -148,7 +148,7 @@ test("the conversation view has no model or settings controls, no per-message ch
   await expect(main.getByRole("combobox")).toHaveCount(0);
   for (const selector of ["#pm-model", "#pm-model-control", "#pm-host", "#pm-host-label", "#control-note", "#header-model", "#move-pm", "#provider"])
     await expect(page.locator(selector)).toBeHidden();
-  for (const text of ["Model details", "Session details", "Project manager model", "Model ·", "PM on machine-a"])
+  for (const text of ["Model details", "Session details", "Coordinator model", "Model ·", "Coordinator on machine-a"])
     await expect(main.getByText(text)).toHaveCount(0);
   // No per-message Copy buttons, and no desktop keyboard hint on a touch screen.
   await expect(page.getByRole("button", { name: "Copy message" })).toHaveCount(0);
@@ -177,19 +177,19 @@ test("every control moved out of the conversation is reachable from the header's
   await openPm(page);
   await page.getByRole("button", { name: "Conversation options" }).tap();
   await expect(page.getByRole("menu", { name: "Conversation options" })).toBeVisible();
-  await page.getByRole("menuitem", { name: "Project manager info and model" }).tap();
-  const info = page.getByRole("dialog", { name: "Claude · Project manager" });
+  await page.getByRole("menuitem", { name: "Coordinator info and model" }).tap();
+  const info = page.getByRole("dialog", { name: "Claude · Coordinator" });
   await expect(info).toBeVisible();
   // The model picker, its help text and hint, the model details, the PM machine line, Move PM,
   // and the control note.
-  const picker = info.getByRole("combobox", { name: "Project manager model · Claude" });
+  const picker = info.getByRole("combobox", { name: "Coordinator model · Claude" });
   await expect(picker).toBeEnabled();
   await expect(info.locator(".pm-model-help")).toBeVisible();
-  await expect(info.locator("#pm-model-hint")).toHaveText("Changes apply to the next turn and are saved with the PM.");
+  await expect(info.locator("#pm-model-hint")).toHaveText("Changes apply to the next turn and are saved with the Coordinator.");
   await expect(info.locator("#header-model")).toHaveText("Model · Provider default");
   await expect(info.locator("#conversation-subtitle")).toContainText("Runs on");
-  await expect(info.locator("#pm-host-label")).toHaveText("PM on machine-a · online");
-  await expect(info.getByRole("button", { name: "Move PM…" })).toBeVisible();
+  await expect(info.locator("#pm-host-label")).toHaveText("Coordinator on machine-a · online");
+  await expect(info.getByRole("button", { name: "Move Coordinator…" })).toBeVisible();
   await expect(info.locator("#control-note")).toContainText("delegates to session agents");
   // It fills the phone screen, like a contact-info screen, and the picker works.
   const box = (await info.boundingBox())!;
@@ -198,11 +198,11 @@ test("every control moved out of the conversation is reachable from the header's
   await expect.poll(() => state.pmModel).toBe("haiku");
   await expect(info.locator("#pm-model-hint")).toContainText("Saved");
   // Move PM opens from here.
-  await info.getByRole("button", { name: "Move PM…" }).tap();
-  await expect(page.getByRole("dialog", { name: "Move PM" })).toBeVisible();
+  await info.getByRole("button", { name: "Move Coordinator…" }).tap();
+  await expect(page.getByRole("dialog", { name: "Move Coordinator" })).toBeVisible();
   // Back closes Move PM, then the info screen, and stays in the conversation.
   await page.goBack();
-  await expect(page.getByRole("dialog", { name: "Move PM" })).toBeHidden();
+  await expect(page.getByRole("dialog", { name: "Move Coordinator" })).toBeHidden();
   await expect(info).toBeVisible();
   await page.goBack();
   await expect(info).toBeHidden();
@@ -234,7 +234,7 @@ test("the PM machine's offline warning stays in the conversation as a banner", a
   const state = await fixture(page);
   state.machineAOnline = false;
   await openPm(page);
-  await expect(page.locator("main").getByRole("status").filter({ hasText: "Your PM's machine (machine-a) is offline." })).toBeVisible();
+  await expect(page.locator("main").getByRole("status").filter({ hasText: "Your Coordinator's machine (machine-a) is offline." })).toBeVisible();
   const m = await measure(page);
   expect(m.lastVisible).toBe(true);
 });
