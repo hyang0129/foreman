@@ -1,7 +1,12 @@
 // A single host-bound tool implementation for Claude MCP, Codex dynamic tools, and PM.
 // No HTTP endpoint, provider credentials, or caller-supplied sender identity.
 import { createHash } from 'node:crypto';
-import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
+import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance } from '@anthropic-ai/claude-agent-sdk';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { roleOf } from '../shared/roles.ts';
+import { LEAD_ALLOWED_TOOLS, LEAD_SERVER_NAME } from './lead-tools.ts';
+import type { ProviderSetup } from './session-service.ts';
 import { z } from 'zod';
 
 export type PeerSource = 'user' | { sender: string; chain: string[] };
@@ -124,7 +129,38 @@ export function makePeerMcpServer(service: PeerService, sender: string) {
 
 export const PEER_ALLOWED_TOOLS = Object.keys(schemas).map((name) => `mcp__peers__${name}`);
 
-export function preparePeerTools(service: PeerService, session: { session_key: string; provider: string }) {
+export interface SessionToolOptions {
+  /** Builds a Lead's `lead` MCP server bound to its session key (CL-05 `makeLeadTools(...).leadServer`). */
+  leadServer?: (leadKey: string) => McpSdkServerConfigWithInstance;
+  /** Override for the Lead system prompt text (tests); default: agents/lead-system-prompt.md. */
+  leadPrompt?: string;
+}
+
+export const LEAD_PROMPT_FILE = fileURLToPath(new URL('../agents/lead-system-prompt.md', import.meta.url));
+/** The Lead system prompt, read per launch so an edit applies to the next Lead without a restart. */
+export function leadSystemPrompt(): string { return readFileSync(LEAD_PROMPT_FILE, 'utf8'); }
+
+type PreparedSession = { session_key: string; provider: string; role?: unknown };
+
+/**
+ * Role-aware provider setup for a managed session (the SessionService `prepare` hook):
+ * - `role: 'lead'` (Claude only): peer tools, the Lead's own `lead` MCP server (write_handoff,
+ *   spawn_session, list_workers) bound by the host to its session key, and the Lead system prompt
+ *   appended after the peer instructions.
+ * - `role: 'worker'` and `'session'` (and rows written before roles existed): peer tools only,
+ *   exactly as before. Workers never get a spawn tool.
+ */
+export function prepareSessionTools(service: PeerService, session: PreparedSession, options: SessionToolOptions = {}): ProviderSetup {
+  if (roleOf(session) === 'lead') {
+    if (session.provider !== 'claude') throw new Error('Leads run on Claude only');
+    if (!options.leadServer) throw new Error('Lead tools are unavailable on this host');
+    const prompt = options.leadPrompt ?? leadSystemPrompt();
+    return { claude: {
+      mcpServers: { peers: makePeerMcpServer(service, session.session_key), [LEAD_SERVER_NAME]: options.leadServer(session.session_key) },
+      allowedTools: [...PEER_ALLOWED_TOOLS, ...LEAD_ALLOWED_TOOLS],
+      systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: `${PEER_INSTRUCTIONS}\n\n${prompt}` },
+    } };
+  }
   const bound = bindPeerTools(service, session.session_key);
   if (session.provider === 'claude') return { claude: {
     mcpServers: { peers: makePeerMcpServer(service, session.session_key) },
@@ -139,4 +175,14 @@ export function preparePeerTools(service: PeerService, session: { session_key: s
       catch (error) { return { contentItems: [{ type: 'inputText', text: error instanceof Error ? error.message : String(error) }], success: false }; }
     },
   } };
+}
+
+/** `prepare` hook factory: `sessions.setPrepare(makeSessionPrep(sessions, { leadServer: leadTools.leadServer }))`. */
+export function makeSessionPrep(service: PeerService, options: SessionToolOptions = {}): (session: PreparedSession) => ProviderSetup {
+  return (session: PreparedSession) => prepareSessionTools(service, session, options);
+}
+
+/** Kept until CL-06 rewires server/main.ts: `prepareSessionTools` without Lead tools (a Lead row is refused). */
+export function preparePeerTools(service: PeerService, session: PreparedSession): ProviderSetup {
+  return prepareSessionTools(service, session);
 }

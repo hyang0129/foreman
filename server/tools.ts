@@ -29,10 +29,17 @@ export function runClaude(args: string[], cwd?: string): Promise<{ code: number;
   });
 }
 
+export interface FleetServerOptions {
+  /** Include `spawn_session` (default true). The Coordinator's fleet server omits it (epic #157): everything goes to a Lead. */
+  spawn?: boolean;
+  /** Peer sender identity for the fleet's peer-backed reads (default `foreman-pm`; the Coordinator passes `coordinator`). */
+  sender?: string;
+}
+
 // `memory` (epic #26): when given, the portable memory tools (memory_read, memory_write,
 // memory_edit, log_note; see PM_MEMORY_TOOLS) are added. Without it there are no memory tools.
-export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService, projects?: ProjectRegistry, memory?: PmMemory) {
-  const peers = sessions ? bindPeerTools(sessions, 'foreman-pm') : undefined;
+export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService, projects?: ProjectRegistry, memory?: PmMemory, options: FleetServerOptions = {}) {
+  const peers = sessions ? bindPeerTools(sessions, options.sender ?? 'foreman-pm') : undefined;
   const list_sessions = tool(
     "list_sessions",
     "List tracked Claude Code and Codex sessions on this machine with its state (needs_input, working, turn_finished, idle, ended, dead), name, directory, last message and last error. Same data the user sees in the session rail.",
@@ -138,5 +145,5 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService, pr
     },
   );
 
-  return createSdkMcpServer({ name: "fleet", version: "0.1.0", tools: [list_sessions, list_models, list_projects, resolve_project, register_project, spawn_session, session_tail, stop_session, ...(memory ? makeMemoryTools(memory) : [])] });
+  return createSdkMcpServer({ name: "fleet", version: "0.1.0", tools: [list_sessions, list_models, list_projects, resolve_project, register_project, ...(options.spawn === false ? [] : [spawn_session]), session_tail, stop_session, ...(memory ? makeMemoryTools(memory) : [])] });
 }

@@ -2,7 +2,8 @@
 import './fixtures/temp-foreman-home.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { bindPeerTools, peerMessageId, preparePeerTools, type PeerService, type PeerSource } from '../server/peer-tools.ts';
+import { bindPeerTools, leadSystemPrompt, makeSessionPrep, peerMessageId, PEER_ALLOWED_TOOLS, PEER_INSTRUCTIONS, preparePeerTools, prepareSessionTools, type PeerService, type PeerSource } from '../server/peer-tools.ts';
+import { LEAD_ALLOWED_TOOLS } from '../server/lead-tools.ts';
 import { ProjectManager } from '../server/pm.ts';
 import { SessionService } from '../server/session-service.ts';
 import { EventEmitter } from 'node:events';
@@ -142,4 +143,35 @@ test('peer summaries distinguish managed presets from observed provider modes', 
   assert.equal(result.sessions[0].permission_mode,'bypass');
   assert.equal(result.sessions[3].permission_mode,undefined);
   assert.equal(result.sessions[3].provider_permission_mode,'bypassPermissions');
+});
+
+test('prepareSessionTools: a Lead gets peer tools, its bound lead server and the Lead prompt; workers and sessions get peer tools only', async () => {
+  const { service } = fixture();
+  const bound: string[] = [];
+  const leadServer = (key: string) => { bound.push(key); return { type: 'sdk', name: 'lead', instance: {} } as any; };
+  const lead = prepareSessionTools(service, { session_key: 'a', provider: 'claude', role: 'lead' }, { leadServer });
+  assert.deepEqual(Object.keys(lead.claude!.mcpServers!).sort(), ['lead', 'peers']);
+  assert.deepEqual(bound, ['a']);
+  assert.deepEqual(lead.claude!.allowedTools, [...PEER_ALLOWED_TOOLS, ...LEAD_ALLOWED_TOOLS]);
+  const append = (lead.claude!.systemPrompt as any).append as string;
+  assert.ok(append.startsWith(PEER_INSTRUCTIONS));
+  assert.ok(append.includes(leadSystemPrompt().trim()));
+  assert.match(leadSystemPrompt(), /write_handoff/);
+  assert.match(leadSystemPrompt(), /Never put a filesystem path in a handoff/);
+  for (const role of ['worker', 'session', undefined]) {
+    const prepared = prepareSessionTools(service, { session_key: 'b', provider: 'claude', role }, { leadServer });
+    assert.deepEqual(Object.keys(prepared.claude!.mcpServers!), ['peers']);
+    assert.deepEqual(prepared.claude!.allowedTools, PEER_ALLOWED_TOOLS);
+    assert.equal((prepared.claude!.systemPrompt as any).append, PEER_INSTRUCTIONS);
+    assert.ok(!JSON.stringify(prepared.claude!.allowedTools).includes('spawn'));
+  }
+  assert.deepEqual(bound, ['a']);
+  // Codex workers keep the dynamic peer tools unchanged; no spawn tool is ever offered.
+  const codex = prepareSessionTools(service, { session_key: 'b', provider: 'codex', role: 'worker' }, { leadServer });
+  assert.deepEqual(codex.codexTools!.dynamicTools.map((t: any) => t.name), PEER_ALLOWED_TOOLS.map((n) => n.replace('mcp__peers__', '')));
+  // A Lead needs its tools and Claude; the legacy alias never grants Lead tools.
+  assert.throws(() => prepareSessionTools(service, { session_key: 'a', provider: 'claude', role: 'lead' }), /Lead tools are unavailable/);
+  assert.throws(() => preparePeerTools(service, { session_key: 'a', provider: 'claude', role: 'lead' }), /Lead tools are unavailable/);
+  assert.throws(() => prepareSessionTools(service, { session_key: 'a', provider: 'codex', role: 'lead' }, { leadServer }), /Claude only/);
+  assert.deepEqual(Object.keys(makeSessionPrep(service, { leadServer })({ session_key: 'c', provider: 'claude', role: 'lead' }).claude!.mcpServers!).sort(), ['lead', 'peers']);
 });
