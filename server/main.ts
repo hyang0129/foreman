@@ -22,9 +22,10 @@ import { PM_HOST_LOCAL_ONLY_ERROR, type MemoryResponse, type PmHostResponse } fr
 import { localAuth } from './local-auth.ts';
 
 ensureDirs();
-// #155: the Claude CLI every Claude use runs, and its version, reported by `npm run status`.
-// Probed once: the binary is chosen at startup, so a CLI upgrade takes effect on restart.
-const claudeCli = claudeVersion(CLAUDE_BIN_CHOICE.path).then((version) => ({ path: CLAUDE_BIN_CHOICE.path, source: CLAUDE_BIN_CHOICE.source, source_text: describeClaudeSource(CLAUDE_BIN_CHOICE.source), version }));
+// #155: the Claude CLI every Claude use runs, and its version, reported by `npm run status`. The path
+// is chosen at startup; the version is probed per request, because an updater can repoint the path
+// (e.g. the ~/.local/bin/claude symlink) and new sessions then run the new version without a restart.
+const claudeCli = async () => ({ path: CLAUDE_BIN_CHOICE.path, source: CLAUDE_BIN_CHOICE.source, source_text: describeClaudeSource(CLAUDE_BIN_CHOICE.source), version: await claudeVersion(CLAUDE_BIN_CHOICE.path) });
 const auth = localAuth(FOREMAN_HOME);
 // Epic #26: PM memory lives in the PM state store (the relay DO, or pm/state.json in local-only
 // mode). The daemon no longer seeds or reads memory/PROJECTS.md or LOG.md; the store imports them once.
@@ -91,7 +92,7 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname.startsWith('/api/') && url.pathname !== '/api/health' && !auth.accepts(req)) return json(res, 401, { error: 'Local API token required' });
     if (url.pathname === '/api/host' && req.method === 'GET') return json(res, 200, { online: true, host: HOST });
-    if (url.pathname === '/api/claude-cli' && req.method === 'GET') return json(res, 200, await claudeCli);
+    if (url.pathname === '/api/claude-cli' && req.method === 'GET') return json(res, 200, await claudeCli());
     if (url.pathname === "/api/health" && req.method === "GET") return json(res, 200, { ok: true, pid: process.pid, uptime: process.uptime(), pm_enabled: process.env.FOREMAN_PM_DISABLED !== "1" });
     if (url.pathname === "/api/events") {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -202,7 +203,7 @@ function pmHost(res: ServerResponse) {
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`foreman: http://localhost:${PORT}`);
   console.log(`foreman: local API token file: ${auth.path}`);
-  void claudeCli.then((cli) => console.log(`foreman: Claude CLI: ${cli.path} (${cli.source_text}), version ${cli.version ?? 'unknown (could not run --version)'}`));
+  void claudeCli().then((cli) => console.log(`foreman: Claude CLI: ${cli.path} (${cli.source_text}), version ${cli.version ?? 'unknown (could not run --version)'}`));
   fleet.start();
   // Every hello lists the PM's open turns, so a socket blip is never reported as a restart.
   bridge = startHostBridge(PORT, auth.token, identity ? { identity, pmOpenTurns: () => store?.openTurnIds() ?? [] } : {});

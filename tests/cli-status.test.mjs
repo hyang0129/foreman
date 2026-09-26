@@ -44,6 +44,7 @@ test('npm run status authenticates with the local API token against a real daemo
     }
     assert.equal(health?.ok, true);
     assert.equal((await fetch(`${origin}/api/sessions`)).status, 401, 'the sessions API must require auth, or this test proves nothing');
+    assert.equal((await fetch(`${origin}/api/claude-cli`)).status, 401, 'the Claude CLI report must require auth');
 
     const ok = await status({ FOREMAN_HOME:home, CLAUDE_CONFIG_DIR:join(home, 'claude'), FOREMAN_PORT:String(port) });
     assert.equal(ok.code, 0, `status must succeed against a healthy daemon; stderr: ${ok.stderr}`);
