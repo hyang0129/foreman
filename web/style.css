@@ -390,27 +390,23 @@ select:focus-visible,
   display: flex;
   gap: 12px;
   align-items: center;
-  padding: 22px 32px;
+  padding: 8px 20px;
   border-bottom: 1px solid var(--line);
   background: var(--surface);
-  min-height: 88px;
+  min-height: 60px;
 }
 .conversation-heading {
   flex: 1;
   min-width: 0;
 }
-.title-line {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.title-line h1 {
+.conversation-heading h1 {
   font-size: 1rem;
   letter-spacing: -0.25px;
   font-weight: 650;
   margin: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .badge {
   display: inline-block;
@@ -866,12 +862,12 @@ label textarea {
     z-index: 20;
   }
   .conversation-head {
-    padding: 16px 14px;
-    min-height: 79px;
-    gap: 8px;
+    padding: 4px 4px;
+    min-height: 56px;
+    gap: 4px;
   }
-  .title-line h1 {
-    font-size: 0.875rem;
+  .conversation-heading h1 {
+    font-size: 1rem;
   }
   .conversation-head p {
     font-size: 0.75rem;
@@ -999,8 +995,6 @@ input:disabled, textarea:disabled, select:disabled { opacity: 1; color: var(--se
 summary { cursor: pointer; color: var(--secondary); font-size: .75rem; padding-block: .625rem; }
 summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .conversation-head { max-height: 40%; overflow-y: auto; }
-.conversation-heading > details { overflow-wrap: anywhere; }
-.conversation-head p { overflow: visible; }
 .session-meta, .session-sub, .rail-footer, .approval, .banner, .form-error, .action-feedback, .field-hint { overflow-wrap: anywhere; min-width: 0; }
 .approval-actions, .dialog-actions, .composer-footer { flex-wrap: wrap; }
 .composer-footer .btn { margin-left: auto; }
@@ -1021,8 +1015,7 @@ dialog { max-height: calc(var(--viewport-height, 100dvh) - 24px); scroll-padding
 #local-auth-form { max-width: 100%; display: grid; gap: .75rem; padding: 1rem; }
 #local-auth-form input { color: var(--ink); background: var(--surface); border: 1px solid var(--control-line); }
 @media (max-width: 760px) {
-  .conversation-head { padding: 8px max(10px, env(safe-area-inset-right)) 8px max(10px, env(safe-area-inset-left)); align-items: flex-start; }
-  .title-line h1 { font-size: .875rem; }
+  .conversation-head { padding: 4px max(4px, env(safe-area-inset-right)) 4px max(4px, env(safe-area-inset-left)); padding-top: max(4px, env(safe-area-inset-top)); }
   .timeline { padding: 16px; }
   .rail .brand { padding: 12px; gap: 8px; }
   .pm-row { flex-wrap: wrap; margin-bottom: 8px; }
@@ -1154,4 +1147,115 @@ label.machine-choice input[type="radio"] { flex-shrink: 0; width: 20px; height: 
 .machine-list > .field-hint { margin: 4px 0 0; }
 @media (max-width: 760px) {
   .pm-host { padding: 2px max(13px, env(safe-area-inset-right)) 2px max(13px, env(safe-area-inset-left)); }
+}
+
+/* Messaging layout (#154): the conversation fills the screen, the header is one name and one
+   status line, and configuration lives on the info screen. */
+.conversation-heading { cursor: pointer; display: grid; gap: 1px; padding-block: 2px; }
+.conversation-heading .activity-status { min-width: 0; }
+.conversation-heading #activity-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#conversation-menu-button { font-size: 1.375rem; line-height: 1; }
+.pm-host-offline { font-weight: 600; }
+/* Message bubbles with no permanent controls; the menu opens on long-press or from the keyboard. */
+.message { border-radius: 13px; -webkit-touch-callout: none; }
+.message:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.message.assistant {
+  align-self: flex-start;
+  max-width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  padding: 10px 14px;
+  border-radius: 13px 13px 13px 3px;
+}
+.message .message-label { margin-bottom: 2px; }
+.message .code-block:last-child pre { margin-bottom: 0; }
+.menu {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 48px;
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-size: .875rem;
+}
+.menu-item:hover, .menu-item:focus-visible { background: var(--accent-soft); }
+.menu-item:focus-visible { outline-offset: -3px; }
+.toast {
+  position: fixed;
+  z-index: 40;
+  left: 50%;
+  bottom: calc(96px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  max-width: min(420px, calc(100vw - 32px));
+  margin: 0;
+  padding: 10px 16px;
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--surface);
+  font-size: .8125rem;
+  overflow-wrap: anywhere;
+  box-shadow: var(--shadow);
+}
+.toast.error { background: var(--error-soft); color: var(--error); border: 1px solid var(--error); }
+/* Info screen: a sheet on desktop, the whole screen on a phone (like a contact-info screen). */
+.info-dialog { max-width: 520px; }
+.info-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 12px 0 0; }
+.info-identity .header-model { font: .75rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--muted); max-width: 100%; }
+.info-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+.info-heading { margin: 0 0 6px; font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.info-dialog .pm-host { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 14px 0 0; border-bottom: 0; max-height: none; background: transparent; color: var(--secondary); }
+.info-dialog .pm-host[hidden] { display: none; }
+.info-dialog .pm-host .info-heading { flex-basis: 100%; }
+.info-dialog .pm-host.is-offline { color: var(--warning); }
+.info-dialog .model-control { padding: 14px 0 0; border-top: 1px solid var(--line); max-height: none; }
+.info-dialog .model-control[hidden] { display: none; }
+.info-dialog .control-note { padding: 14px 0 0; max-height: none; min-height: 0; font-size: .8125rem; }
+.info-dialog .control-note:empty { display: none; }
+.info-dialog .header-metadata { margin: 0; }
+@media (max-width: 760px) {
+  .info-dialog {
+    width: 100%;
+    max-width: none;
+    height: var(--viewport-height, 100dvh);
+    max-height: var(--viewport-height, 100dvh);
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    padding: max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+  .timeline { padding: 12px 12px 8px; }
+  .messages { gap: 12px; }
+  .date-separator { margin-block: 4px; }
+  .banner { padding: 8px 12px; }
+  /* The composer is one row pinned above the keyboard: the text box and Send. */
+  .composer {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    margin: 0 8px max(8px, env(safe-area-inset-bottom));
+    border-radius: 22px;
+  }
+  .composer > .action-feedback { grid-column: 1 / -1; }
+  .composer textarea { min-height: 44px; height: 44px; padding: 11px 4px 9px 16px; }
+  .composer-footer { padding: 2px 4px 2px 0; }
+  .composer-footer .btn { border-radius: 22px; min-height: 44px; padding: 6px 14px; }
+}
+/* Keyboard hints are for physical keyboards: never on touch screens or in the phone layout. */
+@media (hover: none) and (pointer: coarse), (max-width: 760px) {
+  #composer-hint { display: none; }
 }

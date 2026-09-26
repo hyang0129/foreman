@@ -134,6 +134,13 @@ async function openPm(page: Page) {
   await page.goto("/?view=pm");
   await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
 }
+// The machine line, Move PM and the model details live on the PM's info screen (#154), reached
+// from the header's overflow menu. The offline warning stays in the conversation as a banner.
+async function openInfo(page: Page) {
+  await page.locator("#conversation-menu-button").click();
+  await page.getByRole("menuitem", { name: /info/ }).click();
+  await expect(page.locator("#info-dialog")).toBeVisible();
+}
 const label = (page: Page) => page.locator("#pm-host-label");
 const moveButton = (page: Page) => page.getByRole("button", { name: "Move PM…", exact: true });
 const dialog = (page: Page) => page.getByRole("dialog", { name: "Move PM" });
@@ -142,12 +149,13 @@ const machineRadio = (page: Page, name: string) => dialog(page).getByRole("radio
 test("the PM view names the PM's machine, online and offline", async ({ page }) => {
   const state = await fixture(page);
   await openPm(page);
+  await openInfo(page);
   await expect(label(page)).toHaveText("PM on machine-a · online");
+  await expect(label(page)).toBeVisible();
   await expect(page.locator("#pm-host-dot")).toHaveClass(/\bonline\b/);
   await expect(page.locator("#pm-host-offline")).toBeHidden();
   await expect(moveButton(page)).toBeHidden();
-  // Model details name the machine too.
-  await page.getByText("Model details", { exact: true }).click();
+  // The model details name the machine too.
   await expect(page.locator("#conversation-subtitle")).toContainText("Runs on");
   await expect(page.locator("#conversation-subtitle")).toContainText("machine-a · online");
 
@@ -169,6 +177,7 @@ test("the PM view names the PM's machine, online and offline", async ({ page }) 
   await expect(page.locator("#pm-host-offline")).toBeHidden();
 
   // The machine line belongs to the PM view only.
+  await page.getByRole("button", { name: "Close info", exact: true }).click();
   await page.getByRole("button", { name: /Fix sign-in/ }).click();
   await expect(page.getByRole("heading", { name: "Fix sign-in", exact: true })).toBeVisible();
   await expect(page.locator("#pm-host")).toBeHidden();
@@ -182,6 +191,7 @@ test("Move PM is offered only while another machine is online", async ({ page })
     ],
   });
   await openPm(page);
+  await openInfo(page);
   await expect(label(page)).toHaveText("PM on machine-a · online");
   await expect(moveButton(page)).toBeHidden();
 
@@ -214,6 +224,8 @@ test("the dialog lists machines, allows only online standbys, and moves the PM",
   });
   await openPm(page);
   await expect(page.locator("#pm-host-offline")).toHaveText("Your PM's machine (machine-a) is offline.");
+  await expect(page.locator("#pm-host-offline")).toBeVisible();
+  await openInfo(page);
   await moveButton(page).click();
   const modal = dialog(page);
   await expect(modal).toBeVisible();
@@ -250,9 +262,9 @@ test("the dialog lists machines, allows only online standbys, and moves the PM",
   // The new machine's conversation is empty, which is not an error.
   await expect(page.getByRole("heading", { name: "New conversation.", exact: true })).toBeVisible();
   await expect(page.locator("#error-banner")).toBeHidden();
-  // No other machine is online now, so Move is gone and focus lands in the conversation.
+  // No other machine is online now, so Move is gone and focus lands on the info screen.
   await expect(moveButton(page)).toBeHidden();
-  await expect(page.locator("#timeline")).toBeFocused();
+  await expect(page.locator("#close-info")).toBeFocused();
 });
 
 test("a 409 shows the server's reason and refreshes the list", async ({ page }) => {
@@ -265,6 +277,7 @@ test("a 409 shows the server's reason and refreshes the list", async ({ page }) 
     ],
   });
   await openPm(page);
+  await openInfo(page);
   await moveButton(page).click();
   await machineRadio(page, "machine-b").check();
   // Meanwhile the PM was moved to machine-b from another device, and machine-c went offline.
@@ -314,6 +327,7 @@ for (const [status, error] of [
       ],
     });
     await openPm(page);
+    await openInfo(page);
     await moveButton(page).click();
     await machineRadio(page, "machine-b").check();
     state.moveReply = { status, error };
@@ -336,6 +350,7 @@ test("the dialog traps focus, works from the keyboard, and returns focus", async
     ],
   });
   await openPm(page);
+  await openInfo(page);
   const inDialog = () => page.evaluate(() => document.getElementById("move-pm-dialog")!.contains(document.activeElement));
   await moveButton(page).focus();
   await page.keyboard.press("Enter");
@@ -380,6 +395,8 @@ test("Move PM and the dialog fit a phone with 44px touch targets", async ({ brow
   });
   await openPm(page);
   await expect(page.locator("#pm-host-offline")).toBeVisible();
+  await page.locator("#conversation-menu-button").tap();
+  await page.getByRole("menuitem", { name: /info/ }).tap();
   const move = moveButton(page);
   expect((await move.boundingBox())!.height).toBeGreaterThanOrEqual(44);
   await move.tap();
@@ -405,10 +422,15 @@ test("Back closes the Move PM dialog before leaving the PM", async ({ page }) =>
   });
   await page.goto("/");
   await page.locator("#select-pm").click();
+  await openInfo(page);
   await moveButton(page).click();
   await expect(dialog(page)).toBeVisible();
+  // Back steps down one layer at a time: Move PM, then the info screen.
   await page.goBack();
   await expect(dialog(page)).toBeHidden();
+  await expect(page.locator("#info-dialog")).toBeVisible();
+  await page.goBack();
+  await expect(page.locator("#info-dialog")).toBeHidden();
   // The PM is the home view, at "/".
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("heading", { name: "Claude · Project manager", exact: true })).toBeVisible();
@@ -462,7 +484,8 @@ test("local-only mode shows the single machine and hides Move", async ({ page })
   await expect.poll(() => pmHostGets(state).length).toBeGreaterThan(1);
   await expect(moveButton(page)).toBeHidden();
   await expect(page.locator("#move-pm")).toBeHidden();
-  await page.getByText("Model details", { exact: true }).click();
+  await openInfo(page);
+  await expect(page.locator("#move-pm")).toBeHidden();
   await expect(page.locator("#conversation-subtitle")).toContainText("this machine only (no cloud relay)");
   expect(movePosts(state)).toHaveLength(0);
 });
@@ -525,6 +548,7 @@ test("the machine line holds its place until the first /api/pm/host answer", asy
   const state = await fixture(page);
   const release = state.hold("GET /api/pm/host");
   await openPm(page);
+  await openInfo(page);
   await expect(page.locator("#pm-host")).toBeVisible();
   await expect(label(page)).toHaveText("Checking which machine runs the PM…");
   await expect(page.locator("#pm-host")).toHaveAttribute("aria-busy", "true");
