@@ -97,6 +97,7 @@ let sessions = [],
   authSDK;
 let pollTimer,
   polling = false,
+  pollAgain = false,
   sending = false,
   creating = false,
   authEpoch = 0,
@@ -1746,8 +1747,16 @@ ui.messages.addEventListener("keydown", (event) => {
 
 async function poll() {
   clearTimeout(pollTimer);
-  if (!authorized || polling) return;
+  if (!authorized) return;
+  // A poll asked for while one is in flight (the browser coming back online, a PM move, a
+  // sign-in) runs as soon as that one finishes: the in-flight poll may have read the state from
+  // before the change, so dropping the request would leave the view stale until the timer.
+  if (polling) {
+    pollAgain = true;
+    return;
+  }
   polling = true;
+  pollAgain = false;
   const epoch = authEpoch;
   let pmHostRead;
   try {
@@ -1797,8 +1806,9 @@ async function poll() {
     // One PM machine read per poll: the next poll starts only after this one's answer.
     await pmHostRead?.catch(() => { /* Display only; the next poll reads it again. */ });
     polling = false;
-    if (authorized)
-      pollTimer = setTimeout(poll, document.hidden ? 10000 : 3000);
+    if (!authorized) pollAgain = false;
+    else if (pollAgain) void poll();
+    else pollTimer = setTimeout(poll, document.hidden ? 10000 : 3000);
   }
 }
 function autosize() {

@@ -19,11 +19,19 @@ const commit = 'c'.repeat(40);
 const idle = 'setInterval(() => {}, 1000); console.log("ready");\n';
 // Harmless stand-in for server/main.ts: records its PID, reports a graceful
 // SIGTERM, and otherwise idles. It never listens on any port.
-const fakeMain = `import { writeFileSync } from 'node:fs';
+// Each marker is written to a temporary file and renamed into place, so a
+// marker that exists is complete: a reader never sees it created but still
+// empty (#149).
+const fakeMain = `import { writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 const home = process.env.FOREMAN_HOME;
-process.on('SIGTERM', () => { writeFileSync(join(home, 'daemon-sigterm'), String(process.pid)); process.exit(0); });
-writeFileSync(join(home, 'daemon-ready'), String(process.pid));
+function publish(name, text) {
+  const temp = join(home, \`.\${name}.\${process.pid}.tmp\`);
+  writeFileSync(temp, text);
+  renameSync(temp, join(home, name));
+}
+process.on('SIGTERM', () => { publish('daemon-sigterm', String(process.pid)); process.exit(0); });
+publish('daemon-ready', String(process.pid));
 setInterval(() => {}, 1000);
 `;
 
@@ -266,4 +274,61 @@ test('processIdentity asks ps for an untruncated command line (-ww), like findOr
   assert.deepEqual(calls, [['ps', ['-p', String(process.pid), '-ww', '-o', 'stat=,lstart=,command=']]]);
   // The real ps with -ww still yields this process's identity.
   assert.ok(processIdentity(process.pid).includes(process.execPath));
+});
+
+// #149: the tests above treat an existing marker as complete. Run the stand-in
+// daemon with a preload that records every file write and rename it makes, and
+// prove each marker only ever appears by a rename of a fully written file. A
+// control run of the old in-place version must be caught by the same check.
+async function markerWrites(t, source) {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'foreman-dev-marker-')));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const home = join(dir, 'home'), log = join(dir, 'fs-log.json'), main = join(dir, 'main.mjs'), preload = join(dir, 'trace.mjs');
+  mkdirSync(home);
+  writeFileSync(main, source);
+  writeFileSync(preload, `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const { writeFileSync, renameSync, readFileSync } = fs;
+// Kept in memory and saved once at exit: fs's own helpers call fs.writeFileSync.
+const entries = [], record = (entry) => entries.push(entry);
+process.on('exit', () => writeFileSync(${JSON.stringify(log)}, JSON.stringify(entries)));
+fs.writeFileSync = (path, ...rest) => { record({ op: 'write', path: String(path) }); return writeFileSync(path, ...rest); };
+fs.renameSync = (from, to) => { record({ op: 'rename', from: String(from), to: String(to), content: readFileSync(from, 'utf8') }); return renameSync(from, to); };
+syncBuiltinESMExports();
+`);
+  const child = spawn(process.execPath, ['--import', pathToFileURL(preload).href, main], { stdio: 'ignore', env: { ...cleanEnv(), FOREMAN_HOME: home } });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  await until(() => existsSync(join(home, 'daemon-ready')), 'traced daemon readiness');
+  child.kill('SIGTERM');
+  await once(child, 'exit');
+  assert.equal(child.exitCode, 0);
+  const ops = JSON.parse(readFileSync(log, 'utf8'));
+  return { pid: child.pid, home, ops };
+}
+function nonAtomicMarkers({ pid, home, ops }) {
+  const problems = [];
+  for (const name of ['daemon-ready', 'daemon-sigterm']) {
+    const path = join(home, name);
+    if (ops.some((op) => op.op === 'write' && op.path === path)) problems.push(`${name} written in place`);
+    const renames = ops.filter((op) => op.op === 'rename' && op.to === path);
+    if (renames.length !== 1 || renames[0].content !== String(pid)) problems.push(`${name} not renamed into place with its full content`);
+  }
+  return problems;
+}
+
+test('the stand-in daemon publishes its readiness and SIGTERM markers atomically (#149)', async (t) => {
+  const traced = await markerWrites(t, fakeMain);
+  // The mechanism ran: the tracer saw the daemon's writes and renames.
+  assert.equal(traced.ops.filter((op) => op.op === 'write').length, 2, JSON.stringify(traced.ops));
+  assert.deepEqual(nonAtomicMarkers(traced), []);
+  assert.equal(readFileSync(join(traced.home, 'daemon-ready'), 'utf8'), String(traced.pid));
+  assert.equal(readFileSync(join(traced.home, 'daemon-sigterm'), 'utf8'), String(traced.pid));
+
+  // Control: the pre-#149 stand-in, which wrote each marker in place, is caught.
+  const direct = fakeMain.replace(/publish\('([a-z-]+)', /g, "writeFileSync(join(home, '$1'), ");
+  assert.notEqual(direct, fakeMain);
+  assert.deepEqual(nonAtomicMarkers(await markerWrites(t, direct)), [
+    'daemon-ready written in place', 'daemon-ready not renamed into place with its full content',
+    'daemon-sigterm written in place', 'daemon-sigterm not renamed into place with its full content',
+  ]);
 });
