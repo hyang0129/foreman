@@ -42,7 +42,7 @@ export class ClaudeControl extends EventEmitter {
   private readonly policy: PermissionMode;
   get permission_mode() { return this.policy; }
 
-  constructor(options: Pick<Options, "cwd" | "resume" | "model" | "maxBudgetUsd" | "maxTurns" | "tools" | "settingSources" | "settings" | "systemPrompt" | "persistSession" | "pathToClaudeCodeExecutable" | "mcpServers" | "allowedTools"> & { permission_mode?: PermissionMode },
+  constructor(options: Pick<Options, "cwd" | "resume" | "model" | "maxBudgetUsd" | "maxTurns" | "tools" | "settingSources" | "settings" | "systemPrompt" | "persistSession" | "pathToClaudeCodeExecutable" | "mcpServers" | "allowedTools" | "effort"> & { permission_mode?: PermissionMode },
     factory: QueryFactory = query) {
     super();
     this.policy = permissionMode(options.permission_mode);
@@ -55,7 +55,8 @@ export class ClaudeControl extends EventEmitter {
           ...providerOptions,
           permissionMode: claudePolicy(this.policy),
           allowDangerouslySkipPermissions: this.policy === 'bypass',
-          // Bypass explicitly disables the provider sandbox; Native inherits provider settings.
+          // Bypass explicitly disables the provider sandbox; Native and Auto inherit provider settings.
+          // Auto is verified like every mode: init must report `auto`, else the launch fails.
           ...(this.policy === 'bypass' ? { sandbox: { enabled: false } } : {}),
           includePartialMessages: true,
           canUseTool: (tool, input, context) => this.requestApproval(tool, input, context),

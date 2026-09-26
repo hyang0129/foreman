@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-function harness(policy?: "native" | "bypass") {
+function harness(policy?: "native" | "bypass" | "auto", extra: Record<string, unknown> = {}) {
   let opts: any;
   let input: AsyncIterator<any>;
   let wake: (() => void) | undefined;
@@ -22,7 +22,7 @@ function harness(policy?: "native" | "bypass") {
       }
     }, close() { closed = true; wake?.(); }, async interrupt() {} };
   };
-  const control = new ClaudeControl({ cwd: "/tmp", tools: [], permission_mode: policy }, factory as any);
+  const control = new ClaudeControl({ cwd: "/tmp", tools: [], permission_mode: policy, ...extra }, factory as any);
   return { control, options: () => opts, nextInput: () => input.next(), emit(message: any) { messages.push(message); wake?.(); } };
 }
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -103,12 +103,12 @@ test("does not acknowledge a result correlated to another prompt", async () => {
   h.control.close(); await h.control.finished;
 });
 
-for (const policy of ['native', 'bypass'] as const) {
+for (const policy of ['native', 'bypass', 'auto'] as const) {
   test(`Claude ${policy} uses provider permissions without a custom guard`, async () => {
     const h = harness(policy); await tick();
     try {
       assert.equal(h.control.permission_mode, policy);
-      assert.equal(h.options().permissionMode, policy === 'bypass' ? 'bypassPermissions' : 'default');
+      assert.equal(h.options().permissionMode, policy === 'bypass' ? 'bypassPermissions' : policy === 'auto' ? 'auto' : 'default');
       assert.equal(h.options().allowDangerouslySkipPermissions, policy === 'bypass');
       assert.deepEqual(h.options().sandbox, policy === 'bypass' ? {enabled:false} : undefined);
       assert.equal(h.options().hooks, undefined);
@@ -123,6 +123,25 @@ test('Claude refuses an effective provider mode different from its launch policy
   h.emit({type:'system',subtype:'init',session_id:'test',permissionMode:'bypassPermissions'});
   await h.control.finished;
   assert.equal(h.control.state, 'failed');
+});
+
+for (const [policy, reported, ok] of [['auto', 'auto', true], ['auto', 'default', false], ['auto', 'bypassPermissions', false], ['bypass', 'auto', false], ['native', 'auto', false]] as const) {
+  test(`Claude ${policy} launch ${ok ? 'is verified when' : 'fails when'} init reports ${reported}`, {timeout:1000}, async (t) => {
+    const h = harness(policy); await tick();
+    t.after(() => h.control.close());
+    h.emit({type:'system',subtype:'init',session_id:'verified',permissionMode:reported});
+    await tick();
+    if (ok) { assert.equal(h.control.state, 'idle'); assert.equal(h.control.sessionId, 'verified'); }
+    else { await h.control.finished; assert.equal(h.control.state, 'failed'); assert.equal(h.control.sessionId, null); }
+  });
+}
+
+test('effort reaches the SDK options unchanged, and is absent when not given', async (t) => {
+  const withEffort = harness('auto', { effort: 'medium' }); await tick();
+  const without = harness('native'); await tick();
+  t.after(() => { withEffort.control.close(); without.control.close(); });
+  assert.equal(withEffort.options().effort, 'medium');
+  assert.equal('effort' in without.options(), false);
 });
 
 test('approval responses cannot replace the pending command', async (t) => {
