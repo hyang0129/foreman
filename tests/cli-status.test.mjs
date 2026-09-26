@@ -44,11 +44,15 @@ test('npm run status authenticates with the local API token against a real daemo
     }
     assert.equal(health?.ok, true);
     assert.equal((await fetch(`${origin}/api/sessions`)).status, 401, 'the sessions API must require auth, or this test proves nothing');
+    assert.equal((await fetch(`${origin}/api/claude-cli`)).status, 401, 'the Claude CLI report must require auth');
 
     const ok = await status({ FOREMAN_HOME:home, CLAUDE_CONFIG_DIR:join(home, 'claude'), FOREMAN_PORT:String(port) });
     assert.equal(ok.code, 0, `status must succeed against a healthy daemon; stderr: ${ok.stderr}`);
     assert.equal(ok.stderr, '');
     assert.match(ok.stdout, /\(index\)/, 'status must print the sessions table');
+    // #155: status names the Claude CLI the daemon runs and that binary's real `--version` output.
+    // FOREMAN_CLAUDE_BIN is node here, so the version is node's, proving the binary actually ran.
+    assert.ok(ok.stdout.includes(`Claude CLI: ${process.execPath} (FOREMAN_CLAUDE_BIN), version ${process.version}`), ok.stdout);
 
     const missing = await status({ FOREMAN_HOME:emptyHome, CLAUDE_CONFIG_DIR:join(emptyHome, 'claude'), FOREMAN_PORT:String(port) });
     assert.equal(missing.code, 1);
