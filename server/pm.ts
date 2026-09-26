@@ -167,7 +167,7 @@ export const INVESTIGATOR_PROMPT = [
   'Answer the question you were given, concisely, with the facts you found and where you found them (file, issue, PR, commit).',
   'You are read-only. You can Read, Grep and Glob files outside Foreman\'s own state and credential directories, fetch web pages, and run only these read-only commands, exactly, with no shell operators, quotes, variables, globs or redirection:',
   '`gh issue view|list ...`, `gh pr view|list|diff|checks ...`, `gh run view|list ...` (pass `-R owner/repo`), and `git -C <absolute checkout directory> log|show|status|diff|branch ...`.',
-  'Grep and Glob need an explicit `path`; Grep with `output_mode: "content"` needs a single file, and a directory Grep always skips .env files. Git commands run with `--no-pager -c core.fsmonitor=false -c log.showSignature=false` and log/show/diff with `--no-ext-diff --no-textconv` (added for you). Never try to change anything. If the answer needs more than a lookup, say so and stop.',
+  'Grep and Glob need an explicit `path`; Grep with `output_mode: "content"` needs a single file, and a directory Grep always skips .env files. Git commands run with forced read-only options (no pager, no optional locks, no fsmonitor, signature or external-diff programs), and log/show/diff always leave out .env files (all added for you; `--follow`, `-L` and `status -v` are not available). Never try to change anything. If the answer needs more than a lookup, say so and stop.',
 ].join('\n');
 
 /**
@@ -193,6 +193,16 @@ export const PROTECTED_HOME_ENTRIES = [
   '.ssh', '.claude', '.claude.json', '.claude.json.backup', '.codex', '.codex.json', '.config/gh', '.config/hub', '.config/git/credentials',
   '.config/gcloud', '.config/op', '.aws', '.azure', '.gnupg', '.docker', '.kube', '.netrc', '.npmrc', '.yarnrc', '.yarnrc.yml', '.pypirc',
   '.git-credentials', '.gem/credentials', '.cargo/credentials', '.cargo/credentials.toml', '.password-store', 'Library/Keychains',
+  // Cloud and service CLIs (#198): wrangler (legacy, XDG and macOS locations), cloudflared, Terraform, Vault, databases, Maven/Gradle, Copilot.
+  '.wrangler', '.config/.wrangler', '.config/wrangler', 'Library/Preferences/.wrangler', '.cloudflared', '.config/configstore', '.config/github-copilot',
+  '.config/rclone', '.config/doctl', '.terraform.d', '.vault-token', '.pgpass', '.my.cnf', '.s3cfg', '.boto', '.oci', '.m2/settings.xml',
+  '.gradle/gradle.properties', '.composer/auth.json', '.config/composer/auth.json', '.local/share/keyrings', '.pki',
+  // Shell and REPL histories (commands typed with tokens in them).
+  '.zsh_history', '.zhistory', '.zsh_sessions', '.bash_history', '.sh_history', '.history', '.local/share/fish', '.python_history',
+  '.node_repl_history', '.psql_history', '.mysql_history', '.sqlite_history', '.rediscli_history', '.lesshst', '.viminfo',
+  // Browser profiles (cookies, saved passwords) and macOS per-app data and cookie stores.
+  'Library/Application Support', 'Library/Cookies', 'Library/Containers', 'Library/Group Containers', '.mozilla', '.config/google-chrome',
+  '.config/chromium', '.config/BraveSoftware',
 ] as const;
 
 /** Directories and files no investigator may read, search or run git in (also canonical when they exist). */
@@ -241,6 +251,12 @@ function protectedIdentities(locations: string[], containers: string[] = []): { 
   for (const dir of containers) { const id = identity(dir); if (id) ancestors.add(id); }
   return { locations: ids, ancestors };
 }
+/** The protected locations and their identities, taken once for the several paths one git command checks. */
+type ProtectedSnapshot = { list: string[]; ids: { locations: Set<string>; ancestors: Set<string> } };
+const protectedSnapshot = (ctx: InvestigatorContext): ProtectedSnapshot => {
+  const list = protectedDirs(ctx);
+  return { list, ids: protectedIdentities(list, investigatorHomes(ctx)) };
+};
 /** True when `actual` (a realpath) or any of its ancestors is one of the protected identities. */
 const insideProtected = (actual: string, ids: Set<string>) => selfAndAncestors(actual).some((p) => { const id = identity(p); return id !== null && ids.has(id); });
 
@@ -251,7 +267,7 @@ const insideProtected = (actual: string, ids: Set<string>) => selfAndAncestors(a
  * alias (a firmlink, `/.nofollow`, a symlinked parent, a hard link to a protected file) is refused
  * too. A directory that contains a protected location (e.g. the home directory) is refused as well.
  */
-export function investigatorPathDenial(raw: unknown, kind: 'file' | 'any', ctx: InvestigatorContext = {}): string | null {
+export function investigatorPathDenial(raw: unknown, kind: 'file' | 'any', ctx: InvestigatorContext = {}, snapshot?: ProtectedSnapshot): string | null {
   if (typeof raw !== 'string' || !raw.trim()) return 'an explicit path is required';
   if (/[\0\n\r]/.test(raw)) return 'invalid path';
   const lexical = resolve(ctx.cwd ?? FOREMAN_HOME, expandFrom(ctx.home ?? home, raw));
@@ -259,15 +275,18 @@ export function investigatorPathDenial(raw: unknown, kind: 'file' | 'any', ctx: 
   let actual: string;
   try { actual = realpath(lexical); } catch { return 'the path must exist'; }
   if (isAliasPath(actual)) return 'system volume alias paths (/System/Volumes, /.nofollow, /.resolve) are not readable by investigators';
-  const protectedList = protectedDirs(ctx);
+  const { list: protectedList, ids } = snapshot ?? protectedSnapshot(ctx);
   if (isEnvFile(actual) || isEnvFile(lexical)) return '.env files are not readable by investigators';
   const credentials = "Foreman's state and credential directories are not readable by investigators";
   if (protectedList.some((dir) => under(actual, dir) || under(lexical, dir))) return credentials;
-  const ids = protectedIdentities(protectedList, investigatorHomes(ctx));
   if (insideProtected(actual, ids.locations)) return credentials;
   let stat;
   try { stat = statSync(actual); } catch { return 'the path must exist'; }
   if (kind === 'file' && !stat.isFile()) return 'the path must be a file';
+  // A hard link to a file *inside* a protected directory has its own inode entry nowhere in the
+  // protected identities (only the protected locations themselves are), so any regular file with
+  // more than one link is refused: its other names cannot be found without walking every protected tree.
+  if (stat.isFile() && stat.nlink > 1) return 'hard-linked files (link count above 1) are not readable by investigators: another name of the file may be a credential';
   if (stat.isDirectory() && (protectedList.some((dir) => under(dir, actual)) || ids.ancestors.has(identity(actual) ?? ''))) {
     return "this directory contains Foreman's state or a credential directory; search a project directory instead";
   }
@@ -286,7 +305,8 @@ const GIT_BRANCH_VALUE_FLAGS = /^--(contains|no-contains|merged|no-merged|points
 // Long options that write files, run external programs or read files outside the repository. Git
 // accepts unambiguous abbreviations of long options, so any prefix of these at least 4 characters
 // long (e.g. `--outp`, `--no-inde`) is refused too.
-const GIT_BLOCKED_LONG = ['--output', '--output-directory', '--ext-diff', '--textconv', '--no-index', '--open-files-in-pager', '--orderfile', '--show-signature', '--exec', '--upload-pack', '--config-env'];
+// `--full-diff` shows every file of a commit a pathspec matched, past the forced .env exclusion.
+const GIT_BLOCKED_LONG = ['--output', '--output-directory', '--ext-diff', '--textconv', '--no-index', '--open-files-in-pager', '--orderfile', '--show-signature', '--exec', '--upload-pack', '--config-env', '--full-diff'];
 // Exact options that are prefixes of a blocked option but harmless on their own.
 const GIT_SAFE_PREFIXES = ['--text'];
 // `-O<orderfile>`, the short form of --orderfile, also inside a short-option cluster (`-pO/etc/x`).
@@ -296,17 +316,101 @@ const GIT_BLOCKED_SHORT = /^-[^-]*O/;
 const GIT_SIGNATURE_FORMAT = /%G|%\(signature/;
 /**
  * Prepended to every allowed git command by the hook itself (never taken from input): no pager, no
- * fsmonitor hook program, no gpg program for signatures. log/show/diff also get `--no-ext-diff
- * --no-textconv`, so repository config cannot make a read run a program.
+ * optional locks (`git status` never rewrites `.git/index`), no fsmonitor hook program, and no
+ * signature program: every gpg/x509/ssh verifier is forced to `/usr/bin/false`, because a format
+ * from repository config (`format.pretty`, a `pretty.<alias>`) can still ask for a signature.
+ * log/show/diff also get `--no-ext-diff --no-textconv`, so repository config cannot make a read
+ * run a program.
  */
-export const GIT_FORCED_GLOBALS = ['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'log.showSignature=false'] as const;
+export const GIT_FORCED_GLOBALS = [
+  '--no-pager', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'log.showSignature=false',
+  '-c', 'gpg.program=/usr/bin/false', '-c', 'gpg.x509.program=/usr/bin/false', '-c', 'gpg.ssh.program=/usr/bin/false',
+] as const;
 export const GIT_FORCED_DIFF_OPTIONS = ['--no-ext-diff', '--no-textconv'] as const;
+/**
+ * Exclusion pathspecs appended (single-quoted) to every log/show/diff, so a `.env` file (any case,
+ * any depth, or a `.env*` directory) never appears in a patch, a stat, a raw listing or a pickaxe
+ * search, including one committed in history. They are relative to the repository top, not `-C`.
+ */
+export const GIT_ENV_EXCLUSIONS = [':(top,exclude,glob,icase)**/.env*', ':(top,exclude,glob,icase)**/.env*/**'] as const;
+const GIT_ENV_EXCLUSION_SUFFIX = GIT_ENV_EXCLUSIONS.map((p) => `'${p}'`).join(' ');
+/**
+ * With only exclusion pathspecs, git's history simplification would hide merges and commits that
+ * only touched `.env`; these keep the listing of log/show the same as without a pathspec. Added only
+ * when the command has no pathspec of its own (which keeps its usual simplification).
+ */
+export const GIT_FORCED_HISTORY_OPTIONS = ['--full-history', '--sparse'] as const;
 
-function insideWorkTree(dir: string): boolean {
+const isDir = (p: string) => { try { return statSync(p).isDirectory(); } catch { return false; } };
+const isFile = (p: string) => { try { return statSync(p).isFile(); } catch { return false; } };
+const readText = (p: string) => { try { return readFileSync(p, 'utf8'); } catch { return null; } };
+
+/**
+ * What git reads for a command run in `dir` (a realpath), found the way git's discovery walks up:
+ * the work tree root and its `.git` entry, the git directory a gitfile (`gitdir: <path>`) points
+ * at, or a directory that is itself a git directory; then that git directory's `commondir` and its
+ * object `alternates` (recursively). A directory that only looks like a git directory (git may
+ * reject it and keep walking) does not stop the walk: every candidate up to the first `.git` entry
+ * is included. Null when `dir` is not inside a checkout; a string when git's metadata cannot be
+ * checked. Each location gets the investigator path denial, so a gitfile, commondir or alternates
+ * entry pointing into a protected directory (or a work tree that contains one, like a dotfiles
+ * repository in `~`) is refused.
+ */
+function gitLocations(dir: string): { locations: string[] } | { invalid: string } | null {
+  const out: string[] = [];
+  const addGitDir = (gitDir: string): string | null => {
+    const dirs = [gitDir];
+    const common = readText(join(gitDir, 'commondir'))?.trim();
+    if (common) dirs.push(resolve(gitDir, common));
+    out.push(...dirs);
+    // Object alternates, followed recursively (git itself stops at depth 5).
+    const objectDirs = dirs.map((d) => join(d, 'objects'));
+    for (let i = 0; i < objectDirs.length; i++) {
+      if (objectDirs.length > 64) return 'too many object alternates to check';
+      for (const line of (readText(join(objectDirs[i], 'info', 'alternates')) ?? '').split('\n')) {
+        const entry = line.trim();
+        if (!entry || entry.startsWith('#')) continue;
+        const alt = resolve(objectDirs[i], entry);
+        if (!objectDirs.includes(alt)) { objectDirs.push(alt); out.push(alt); }
+      }
+    }
+    return null;
+  };
+  let candidate = false;
   for (let at = dir; ; at = dirname(at)) {
-    if (existsSync(join(at, '.git'))) return true;
-    if (dirname(at) === at) return false;
+    const dotGit = join(at, '.git');
+    if (existsSync(dotGit)) {
+      out.push(at, dotGit);
+      let gitDir = dotGit;
+      if (isFile(dotGit)) {
+        // Exactly one `gitdir: <path>` line, as git requires; anything else makes git fail and is refused here.
+        const target = /^gitdir: *(.+?)\s*$/.exec(readText(dotGit) ?? '')?.[1];
+        if (!target) return { invalid: 'its .git file is not a valid gitfile' };
+        gitDir = resolve(at, target);
+      }
+      const invalid = addGitDir(gitDir);
+      return invalid ? { invalid } : { locations: out };
+    }
+    if (isFile(join(at, 'HEAD')) && (isDir(join(at, 'objects')) || isFile(join(at, 'commondir')))) {
+      // `dir` is inside what may be a git directory (a bare repository, or `.git` itself).
+      candidate = true;
+      const invalid = addGitDir(at);
+      if (invalid) return { invalid };
+    }
+    if (dirname(at) === at) return candidate ? { locations: out } : null;
   }
+}
+
+/** Why `git -C dir` may not run in `dir` (a realpath): a location git would read is refused, or it is no checkout. */
+function gitLocationDenial(dir: string, ctx: InvestigatorContext, snapshot: ProtectedSnapshot): string | null {
+  const found = gitLocations(dir);
+  if (!found) return 'not a directory inside a git checkout';
+  if ('invalid' in found) return found.invalid;
+  for (const location of found.locations) {
+    const why = investigatorPathDenial(location, 'any', ctx, snapshot);
+    if (why) return `git would read ${location}: ${why}`;
+  }
+  return null;
 }
 
 const blockedLongOption = (arg: string): boolean => {
@@ -318,6 +422,16 @@ const blockedLongOption = (arg: string): boolean => {
 };
 // A value that could name a file outside the checkout (`--opt=/abs`, `--opt=~/x`, `--opt=../x`).
 const outsideValue = (value: string) => isAbsolute(value) || value.startsWith('~') || value.split('/').includes('..');
+/**
+ * True when git arguments carry a pathspec of their own: anything after `--`, or (git's own rule
+ * without `--`) a non-option argument naming an existing path under `dir`. Only decides whether
+ * GIT_FORCED_HISTORY_OPTIONS keep the listing unchanged; the .env exclusion is added either way.
+ */
+const hasPathspec = (opts: string[], dir: string) => {
+  const end = opts.indexOf('--');
+  if (end >= 0) return end < opts.length - 1;
+  return opts.some((a) => !a.startsWith('-') && existsSync(join(dir, a)));
+};
 
 /**
  * Checks one investigator Bash command. An allowed command comes back as the command to run: gh
@@ -325,10 +439,14 @@ const outsideValue = (value: string) => isAbsolute(value) || value.startsWith('~
  * A command that already starts with exactly the forced prefix (the hook's own rewrite) is accepted
  * and normalised, so the check is idempotent.
  */
-export function investigatorBashCheck(command: unknown, ctx: InvestigatorContext = {}): { denial: string } | { command: string } {
+export function investigatorBashCheck(input: unknown, ctx: InvestigatorContext = {}): { denial: string } | { command: string } {
   const no = (denial: string) => ({ denial });
-  if (typeof command !== 'string' || !command.trim()) return no('a command is required');
-  if (command.length > 2000) return no('the command is too long');
+  if (typeof input !== 'string' || !input.trim()) return no('a command is required');
+  if (input.length > 2000) return no('the command is too long');
+  // The hook's own .env exclusion (the only quoted words it ever writes), if present at the very
+  // end of a git command, is stripped here and re-applied below.
+  const excluded = input.startsWith('git ') && input.endsWith(` ${GIT_ENV_EXCLUSION_SUFFIX}`);
+  const command = excluded ? input.slice(0, -(GIT_ENV_EXCLUSION_SUFFIX.length + 1)) : input;
   if (!SAFE_COMMAND.test(command)) return no('shell operators, quotes, variables, globs, redirection and newlines are not allowed');
   let words = command.split(' ').filter(Boolean);
   if (words.some((w) => w.startsWith('='))) return no('shell operators are not allowed');
@@ -350,12 +468,25 @@ export function investigatorBashCheck(command: unknown, ctx: InvestigatorContext
     if (args[0] !== '-C') return no('git needs -C <absolute checkout directory> first');
     const dir = args[1];
     if (!dir || !isAbsolute(dir)) return no('git -C needs an absolute checkout directory');
-    const denial = investigatorPathDenial(dir, 'any', ctx);
+    const snapshot = protectedSnapshot(ctx);
+    const denial = investigatorPathDenial(dir, 'any', ctx, snapshot);
     if (denial) return no(`git -C ${dir}: ${denial}`);
     const real = realpath(dir);
-    if (!statSync(real).isDirectory() || !insideWorkTree(real)) return no(`git -C ${dir}: not a directory inside a git checkout`);
+    if (!statSync(real).isDirectory()) return no(`git -C ${dir}: not a directory inside a git checkout`);
+    const gitDenial = gitLocationDenial(real, ctx, snapshot);
+    if (gitDenial) return no(`git -C ${dir}: ${gitDenial}`);
     const [sub, ...opts] = args.slice(2);
     if (!GIT_SUBCOMMANDS.includes(sub ?? '')) return no('only git log|show|status|diff|branch are allowed');
+    const history = ['log', 'show', 'diff'].includes(sub!);
+    if (history) {
+      // Both need exactly one pathspec, so they cannot take the .env exclusion.
+      for (const a of opts) {
+        const name = a.split('=')[0];
+        if ((name.length >= 5 && '--follow'.startsWith(name)) || /^-[^-]*L/.test(a)) return no(`git ${sub} ${name.startsWith('--') ? '--follow' : '-L'} is not available to investigators (it cannot be combined with the .env exclusion)`);
+      }
+    }
+    // `status -v` prints staged diffs through the repository's diff drivers (textconv) and could show a staged .env.
+    if (sub === 'status' && opts.some((a) => /^--v/.test(a) || /^-[^-]*v/.test(a))) return no('git status -v is not allowed (it runs diff drivers from repository config and can print .env content)');
     for (const a of opts) {
       if (!a.startsWith('-')) {
         // A path argument outside the checkout would make `git diff` compare files on disk (no-index).
@@ -374,8 +505,9 @@ export function investigatorBashCheck(command: unknown, ctx: InvestigatorContext
         else if (!listing) return no('git branch only lists branches (pass --list with a pattern)');
       }
     }
-    const diffOptions = ['log', 'show', 'diff'].includes(sub!) ? GIT_FORCED_DIFF_OPTIONS.filter((o) => !opts.includes(o)) : [];
-    return { command: ['git', ...GIT_FORCED_GLOBALS, '-C', dir, sub!, ...diffOptions, ...opts].join(' ') };
+    if (!history) return { command: ['git', ...GIT_FORCED_GLOBALS, '-C', dir, sub!, ...opts].join(' ') };
+    const forcedOptions = [...GIT_FORCED_DIFF_OPTIONS, ...(sub !== 'diff' && !hasPathspec(opts, real) ? GIT_FORCED_HISTORY_OPTIONS : [])].filter((o) => !opts.includes(o));
+    return { command: `${['git', ...GIT_FORCED_GLOBALS, '-C', dir, sub!, ...forcedOptions, ...opts].join(' ')} ${GIT_ENV_EXCLUSION_SUFFIX}` };
   }
   return no('only read-only gh and git commands are allowed');
 }
@@ -397,6 +529,9 @@ export function investigatorBashDenial(command: unknown, ctx: InvestigatorContex
  * whitespace and commas into separate `--glob` arguments.
  */
 export const GREP_ENV_EXCLUSION = '!.[eE][nN][vV]*';
+
+/** A tool call whose subagent id is present but empty or not a string: refused, never treated as the main thread. */
+export const UNIDENTIFIED_SUBAGENT = 'Denied: this tool call carries an empty or invalid subagent id, so neither the investigator nor the Coordinator rules can be applied.';
 
 export type InvestigatorVerdict = { behavior: 'allow'; updatedInput?: Record<string, any> } | { behavior: 'deny'; message: string };
 
@@ -478,9 +613,10 @@ export class InvestigatorSlots {
   /** The SDK hooks that keep the count: SubagentStart/SubagentStop, and PostToolUse(+Failure) for Agent. */
   hooks(): Record<'SubagentStart' | 'SubagentStop' | 'PostToolUse' | 'PostToolUseFailure', { matcher?: string; hooks: HookCallback[] }[]> {
     const track: HookCallback = async (input: any) => {
-      if (input.hook_event_name === 'SubagentStart' && typeof input.agent_id === 'string') this.started(input.agent_id);
-      else if (input.hook_event_name === 'SubagentStop' && typeof input.agent_id === 'string') this.stopped(input.agent_id);
-      else if ((input.hook_event_name === 'PostToolUse' || input.hook_event_name === 'PostToolUseFailure') && input.tool_name === 'Agent' && !input.agent_id && typeof input.tool_use_id === 'string') this.release(input.tool_use_id);
+      // Only a non-empty agent_id names a subagent; only an absent one is the Coordinator's own call.
+      if (input.hook_event_name === 'SubagentStart' && typeof input.agent_id === 'string' && input.agent_id) this.started(input.agent_id);
+      else if (input.hook_event_name === 'SubagentStop' && typeof input.agent_id === 'string' && input.agent_id) this.stopped(input.agent_id);
+      else if ((input.hook_event_name === 'PostToolUse' || input.hook_event_name === 'PostToolUseFailure') && input.tool_name === 'Agent' && input.agent_id === undefined && typeof input.tool_use_id === 'string') this.release(input.tool_use_id);
       return {};
     };
     return { SubagentStart: [{ hooks: [track] }], SubagentStop: [{ hooks: [track] }], PostToolUse: [{ matcher: 'Agent', hooks: [track] }], PostToolUseFailure: [{ matcher: 'Agent', hooks: [track] }] };
@@ -1041,7 +1177,10 @@ export class ProjectManager extends EventEmitter {
   private canUseTool = async (name: string, input: Record<string, any>, options?: { agentID?: string }) => {
     const allow = (updated: Record<string, any> = input) => ({ behavior: "allow" as const, updatedInput: updated });
     const deny = (message: string) => ({ behavior: "deny" as const, message });
-    if (options?.agentID) {
+    // Only an absent agentID is the main thread. A present but empty (or non-string) one is refused
+    // outright, never given the Coordinator's rules.
+    if (options?.agentID !== undefined) {
+      if (typeof options.agentID !== 'string' || !options.agentID) return deny(UNIDENTIFIED_SUBAGENT);
       const decision = investigatorDecision(name, input, this.investigatorContext);
       return decision.behavior === 'allow' ? allow(decision.updatedInput ?? input) : deny(decision.message);
     }
@@ -1086,10 +1225,12 @@ export class ProjectManager extends EventEmitter {
   // MAX_INVESTIGATORS at once) and is forced to the foreground.
   private enforceToolBoundary: HookCallback = async (input: any) => {
     if (input.hook_event_name !== 'PreToolUse') return {};
-    const agentId = typeof input.agent_id === 'string' && input.agent_id ? input.agent_id : undefined;
+    const denied = (reason: string) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'deny' as const, permissionDecisionReason: reason } });
+    // Only an absent agent_id is the main thread; a present but empty (or non-string) one is refused.
+    if (input.agent_id !== undefined && (typeof input.agent_id !== 'string' || !input.agent_id)) return denied(UNIDENTIFIED_SUBAGENT);
+    const agentId: string | undefined = input.agent_id;
     const toolInput = (input.tool_input ?? {}) as Record<string, any>;
     const decision = await this.canUseTool(input.tool_name, toolInput, agentId ? { agentID: agentId } : undefined);
-    const denied = (reason: string) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'deny' as const, permissionDecisionReason: reason } });
     const allowed = (updatedInput: Record<string, any>) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'allow' as const, updatedInput } });
     if (decision.behavior === 'deny') return denied(decision.message);
     if (input.tool_name === 'Agent' && !agentId) {
