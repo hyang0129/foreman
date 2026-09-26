@@ -145,7 +145,9 @@ those launches run Auto.
 **The grant is on by default.** Until the developer changes it, the grant is
 `{ coordinator, *, allow: true }` and `{ lead, *, allow: true }`, and
 "Ask me before each Bypass launch" is off. A stored value that fails validation
-fails toward lower privilege: grants read as none (Auto) and "ask" reads as on.
+fails toward lower privilege: grants read as none (Auto). A corrupt "ask" value
+also turns every grant off and reads as off, so agent launches run Auto rather
+than being held for an approval card.
 
 The developer changes these in **Settings** in the hosted app (⋮ → Settings):
 one checkbox per role for all projects, per-project overrides (on or off), and

@@ -571,14 +571,20 @@ export function parseDevSetting<K extends DevSettingKey>(key: K, value: unknown)
  * Applies defaults to stored settings. A key that was never written takes its default (grant on
  * for coordinator and lead on `'*'`, `bypass_ask` false, no role overrides). A stored value that
  * fails validation fails toward LOWER privilege: `bypass_grants` → `[]` (grant off → Auto),
- * `bypass_ask` → `true` (hold), `roles` → `{}`.
+ * `roles` → `{}`, and a corrupt `bypass_ask` turns the grants off too (`bypass_grants` → `[]`,
+ * `bypass_ask` → `false`): agent launches then run Auto rather than being held for a card whose
+ * approval would give Bypass.
  */
 export function effectiveDevSettings(stored: Partial<Record<DevSettingKey, unknown>> | null | undefined): DevSettings {
   const out = defaultDevSettings();
   const s = isPlainObject(stored) ? stored : {};
   if (s.roles !== undefined) { const r = parseDevSetting('roles', s.roles); out.roles = r.ok ? r.value : {}; }
   if (s.bypass_grants !== undefined) { const r = parseDevSetting('bypass_grants', s.bypass_grants); out.bypass_grants = r.ok ? r.value : []; }
-  if (s.bypass_ask !== undefined) { const r = parseDevSetting('bypass_ask', s.bypass_ask); out.bypass_ask = r.ok ? r.value : true; }
+  if (s.bypass_ask !== undefined) {
+    const r = parseDevSetting('bypass_ask', s.bypass_ask);
+    if (r.ok) out.bypass_ask = r.value;
+    else { out.bypass_grants = []; out.bypass_ask = false; }
+  }
   return out;
 }
 

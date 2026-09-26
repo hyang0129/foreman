@@ -186,9 +186,27 @@ test('effectiveDevSettings applies defaults (grant on for both roles, ask off) a
   d.bypass_grants.push({ role: 'lead', project: 'x', allow: false });
   assert.equal(effectiveDevSettings({}).bypass_grants.length, 2, 'defaults are fresh copies');
   assert.deepEqual(effectiveDevSettings({ bypass_ask: true, bypass_grants: [], roles: { lead: { effort: 'high' } } }), { roles: { lead: { effort: 'high' } }, bypass_grants: [], bypass_ask: true });
-  // Corrupt stored values: grants → off, ask → on, roles → none.
-  assert.deepEqual(effectiveDevSettings({ bypass_grants: 'yes', bypass_ask: 'no', roles: 5 }), { roles: {}, bypass_grants: [], bypass_ask: true });
+  // Corrupt stored values: grants → off, roles → none, and a corrupt ask turns the grants off (ask → off).
+  assert.deepEqual(effectiveDevSettings({ bypass_grants: 'yes', bypass_ask: 'no', roles: 5 }), { roles: {}, bypass_grants: [], bypass_ask: false });
   assert.equal(resolveAgentLaunchPolicy({ requesterRole: 'lead', project: 'x', settings: effectiveDevSettings({ bypass_grants: [{ role: 'lead', project: '/etc', allow: true }] }) }).decision, 'auto');
+});
+
+test('#197: a corrupt stored bypass_ask turns the grants off (Auto, no held launch), even beside valid grants', () => {
+  const grants = [{ role: 'lead', project: '*', allow: true }, { role: 'coordinator', project: 'foreman', allow: true }];
+  for (const bad of ['yes', 'false', 1, 0, null, {}, [true]]) {
+    const eff = effectiveDevSettings({ bypass_grants: grants, bypass_ask: bad, roles: { lead: { effort: 'high' } } });
+    assert.deepEqual(eff, { roles: { lead: { effort: 'high' } }, bypass_grants: [], bypass_ask: false }, JSON.stringify(bad));
+    // Never written grants (the standing default) are turned off too.
+    assert.deepEqual(effectiveDevSettings({ bypass_ask: bad }).bypass_grants, [], JSON.stringify(bad));
+    for (const requesterRole of ['coordinator', 'lead'] as const) {
+      assert.deepEqual(resolveAgentLaunchPolicy({ requesterRole, project: 'foreman', settings: eff }), { decision: 'auto', policy_reason: 'grant_off' });
+    }
+  }
+  // Every shape that parsed before still parses to the same value (no change for valid stored values).
+  for (const ask of [true, false]) {
+    assert.deepEqual(effectiveDevSettings({ bypass_grants: grants, bypass_ask: ask }), { roles: {}, bypass_grants: grants, bypass_ask: ask });
+    assert.deepEqual(effectiveDevSettings({ bypass_ask: ask }).bypass_grants, [...DEFAULT_BYPASS_GRANTS]);
+  }
 });
 
 test('parseDevSetting validates each key strictly and drops unknown nested fields', () => {
