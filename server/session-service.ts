@@ -9,6 +9,7 @@ import { normalizeModel } from './models.ts';
 import { CodexControl } from './codex-control.ts';
 import { Fleet, transcriptTail, type Session } from './fleet.ts';
 import { CLAUDE_BIN, FOREMAN_HOME, HOST } from './paths.ts';
+import { redactSecrets } from '../shared/redact.ts';
 import {
   approvedLaunchPolicy, isEffort, isLeadKey, isSessionKey, isSessionName, isWorkstream, launchedBy, leadLimits, normalizeLeadKey,
   parseDevSettingsView, parseLaunchApprovalInput, parseRequestedAgentMode, resolveAgentLaunchPolicy, roleOf, truncateFirstTask,
@@ -19,7 +20,11 @@ import {
 
 export type Source = 'user' | { sender: string; chain: string[] };
 export interface Receipt { id: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'uncertain'; text: string; at: string; error?: string; source: Source }
-export interface History { id: string; role: 'user' | 'assistant' | 'system' | 'tool'; text: string; at: string; source?: Source }
+/**
+ * A history entry. Claude tool entries (#221) also carry `name` (the provider tool name, e.g.
+ * `mcp__lead__spawn_session`) and `summary` (short and redacted; `text` repeats it for older clients).
+ */
+export interface History { id: string; role: 'user' | 'assistant' | 'system' | 'tool'; text: string; at: string; source?: Source; name?: string; summary?: string }
 export interface Approval { id: string; kind: 'permission' | 'question' | 'unsupported'; tool: string; input: Record<string, any>; reason?: string; questions?: { id: string; question: string; options?: string[] }[] }
 export type SessionRow = Session & SessionRoleFields & { managed: boolean; model?: string; project_name?: string; capabilities: { message: boolean; interrupt: boolean; approvals: boolean }; control_reason?: string };
 /**
@@ -58,7 +63,9 @@ export interface ProviderSetup {
   codexTools?: { dynamicTools: any[]; developerInstructions?: string; call: (name: string, args: any) => Promise<any> };
   cleanup?: () => void;
 }
-interface Runtime { claude?: ClaudeControl; codex?: CodexControl; ready: boolean; stopped?: boolean; active?: string; turn?: string; dispatching: boolean; interrupting?: boolean; setup?: ProviderSetup }
+interface Runtime { claude?: ClaudeControl; codex?: CodexControl; ready: boolean; stopped?: boolean; active?: string; turn?: string; dispatching: boolean; interrupting?: boolean; setup?: ProviderSetup;
+  /** Claude tool calls of the main thread that have not returned yet: tool_use id → tool name (#221). */
+  tools?: Map<string, string> }
 interface Options {
   home?: string; projects?: ProjectRegistry; fleet?: Fleet; claudeFactory?: (options: ConstructorParameters<typeof ClaudeControl>[0]) => ClaudeControl; codexFactory?: (options: ConstructorParameters<typeof CodexControl>[0]) => CodexControl; prepare?: (session: SessionRow) => ProviderSetup | Promise<ProviderSetup>;
   /** Developer settings (standing grants). Absent, failing, or slower than 5 s → unavailable → Auto. */
@@ -71,13 +78,50 @@ interface Options {
 const INACTIVE_STATES = ['ended', 'dead', 'unknown'];
 const now = () => new Date().toISOString();
 const clone = <T>(value: T): T => structuredClone(value);
-function bounded<T extends { text: string }>(items: T[], bytes = 180000): T[] {
+function bounded<T extends { text: string; role?: string }>(items: T[], bytes = 180000): T[] {
   const output: T[] = [];
-  for (let i = items.length - 1; i >= 0 && output.length < 200 && bytes > 0; i--) {
+  // #221: tool entries have their own count, so a long run of tool calls never pushes the
+  // conversation (messages, replies) out of the 200-entry window. Older tool entries are dropped.
+  let entries = 0, tools = 0;
+  for (let i = items.length - 1; i >= 0 && entries < 200 && bytes > 0; i--) {
+    const tool = items[i].role === 'tool';
+    if (tool && tools >= MAX_TOOL_ENTRIES) continue;
     const item = clone(items[i]); item.text = item.text.slice(-Math.min(bytes, 32000)); bytes -= Buffer.byteLength(item.text);
+    if (tool) tools++; else entries++;
     output.unshift(item);
   }
   return output;
+}
+/** Tool entries kept in a snapshot, and in a stored history, at most (#221). */
+const MAX_TOOL_ENTRIES = 200;
+/** Longest tool summary, as the Coordinator's (server/pm.ts). */
+const TOOL_SUMMARY_CHARS = 160;
+const safe = (text: string, max: number) => redactSecrets(text).slice(0, max);
+/**
+ * A short, redacted one-line summary of a Claude tool call (#221), in the Coordinator's shape
+ * (server/pm.ts): `<subagent_type>: <description>` for a subagent, `→ <to>` for SendMessage.
+ * Tools whose input carries file contents, prompts or edits are summarised by the one field that
+ * names the target (a path, a command, a pattern, a worker's name), never by the payload; any
+ * other tool by its input as JSON. Always redacted with shared/redact.ts, then cut to 160 characters.
+ */
+export function claudeToolSummary(name: string, input: unknown): string {
+  const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
+  const field = (...keys: string[]) => { for (const key of keys) if (typeof args[key] === 'string' && args[key]) return args[key] as string; return ''; };
+  const base = String(name).replace(/^mcp__.+?__/, '');
+  let summary: string;
+  if (name === 'Agent' || name === 'Task') summary = `${field('subagent_type') || 'agent'}: ${field('description')}`;
+  else if (name === 'SendMessage') summary = `→ ${field('to')}${args.notify_when_idle ? ' (notify when idle)' : ''}`;
+  else if (name === 'Bash') summary = field('command');
+  else if (['Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(name)) summary = field('file_path', 'notebook_path');
+  else if (['Grep', 'Glob'].includes(name)) summary = field('pattern');
+  else if (name === 'WebFetch') summary = field('url');
+  else if (name === 'WebSearch') summary = field('query');
+  else if (name === 'TodoWrite') summary = '';
+  else if (base === 'spawn_session') summary = field('name');
+  else if (base === 'write_handoff') summary = [field('kind'), field('status')].filter(Boolean).join(' · ');
+  else if (base === 'send_message') summary = `→ ${field('to', 'session_key', 'target')}`;
+  else { try { summary = JSON.stringify(args); } catch { summary = ''; } }
+  return safe(summary.replace(/\s+/g, ' ').trim(), TOOL_SUMMARY_CHARS);
 }
 const textValue = (value: unknown, name: string, limit: number) => {
   if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value) > limit) throw new Error(`${name} must contain 1–${limit} bytes`);
@@ -123,7 +167,7 @@ export class SessionService extends EventEmitter implements AgentSessionService 
         expired.push(this.decision(data, hold, 'expired', LAUNCH_EXPIRED));
       } else if (data.session.state !== 'ended') {
         for (const receipt of data.receipts) if (['queued', 'running'].includes(receipt.status)) { receipt.status = 'uncertain'; receipt.error = 'Foreman restarted; delivery cannot be confirmed. Message was not replayed.'; }
-        data.session.state = 'unknown'; data.session.alive = false;
+        data.session.state = 'unknown'; data.session.alive = false; data.session.current_tool = null;
         data.session.control_reason = 'Foreman restarted. History is retained; start a new session to continue safely.';
       }
       this.records.set(data.session.session_key, data); this.save(data);
@@ -363,7 +407,7 @@ export class SessionService extends EventEmitter implements AgentSessionService 
       if (receipt.status === 'queued') { receipt.status = 'failed'; receipt.error = reason; }
       else if (receipt.status === 'running') { receipt.status = 'uncertain'; receipt.error = reason; }
     }
-    Object.assign(data.session, { state: 'ended', alive: false, reason: null, ended_at: now(), end_reason: reason, control_reason: reason });
+    Object.assign(data.session, { state: 'ended', alive: false, reason: null, current_tool: null, ended_at: now(), end_reason: reason, control_reason: reason });
   }
   /**
    * Retires a managed session (e.g. a superseded Lead): closes its provider and marks it `ended`
@@ -431,6 +475,7 @@ export class SessionService extends EventEmitter implements AgentSessionService 
             const text = (message.message?.content ?? []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n');
             if (text) this.history(data, `claude:${message.uuid ?? randomUUID()}`, 'assistant', text);
           }
+          this.claudeTools(data, runtime, message);
           this.changed(data);
         });
         control.on('state', (state: string) => {
@@ -469,12 +514,45 @@ export class SessionService extends EventEmitter implements AgentSessionService 
       this.changed(data); void this.dispatch(data, runtime);
     } catch (error) { this.unavailable(data, runtime, `Could not start provider: ${String(error)}`, true); }
   }
+  /**
+   * #221: a managed Claude session's tool activity, in the shape the web reads for the Coordinator.
+   * Each main-thread tool call is recorded once as `{ role: 'tool', name, summary }` (a subagent's
+   * own calls are not), and `current_tool` names the latest call still running until its result
+   * arrives or the turn ends. Summaries are short and redacted (`claudeToolSummary`).
+   */
+  private claudeTools(data: RecordData, runtime: Runtime, message: any) {
+    if (message?.parent_tool_use_id) return;
+    const content = Array.isArray(message?.message?.content) ? message.message.content : [];
+    const tools = runtime.tools ??= new Map();
+    if (message.type === 'assistant') {
+      for (const block of content) {
+        if (block?.type !== 'tool_use' || typeof block.name !== 'string' || !block.name) continue;
+        const name = block.name.slice(0, 200), id = String(block.id ?? randomUUID());
+        if (!data.history.some((entry) => entry.id === `claude-tool:${id}`)) {
+          const summary = claudeToolSummary(name, block.input);
+          data.history.push({ id: `claude-tool:${id}`, role: 'tool', name, summary, text: summary, at: now() });
+          this.trimHistory(data);
+        }
+        tools.delete(id); tools.set(id, name);
+      }
+    } else if (message.type === 'user') {
+      for (const block of content) if (block?.type === 'tool_result') tools.delete(String(block.tool_use_id));
+    }
+    data.session.current_tool = [...tools.values()].at(-1) ?? null;
+  }
+  /** Ends tool activity: no call is running once a turn ends or the session stops. */
+  private clearTools(data: RecordData, runtime: Runtime) { runtime.tools?.clear(); data.session.current_tool = null; }
+  private trimHistory(data: RecordData) {
+    // Keep snapshots bounded while retaining all receipts for deduplication; tool entries have their own cap.
+    const tools = data.history.filter((entry) => entry.role === 'tool');
+    if (tools.length > MAX_TOOL_ENTRIES) { const drop = new Set(tools.slice(0, tools.length - MAX_TOOL_ENTRIES)); data.history = data.history.filter((entry) => !drop.has(entry)); }
+    if (data.history.length > 2000) data.history.splice(0, data.history.length - 2000);
+  }
   private history(data: RecordData, id: string, role: History['role'], text: string) {
     const previous = data.history.find((entry) => entry.id === id);
     if (previous) previous.text = text.slice(0, 128000);
     else data.history.push({ id, role, text: text.slice(0, 128000), at: now() });
-    // Keep snapshots bounded while retaining all receipts for deduplication.
-    if (data.history.length > 2000) data.history.splice(0, data.history.length - 2000);
+    this.trimHistory(data);
     if (role === 'assistant') data.session.last_message = text.slice(-2000);
   }
   private async dispatch(data: RecordData, runtime: Runtime) {
@@ -494,7 +572,7 @@ export class SessionService extends EventEmitter implements AgentSessionService 
   private complete(data: RecordData, runtime: Runtime, status: 'completed' | 'failed', error?: string) {
     const receipt = data.receipts.find((r) => r.id === runtime.active); if (!receipt) return;
     receipt.status = status; if (error) receipt.error = error;
-    runtime.active = undefined; runtime.turn = undefined; data.session.state = status === 'completed' ? 'turn_finished' : 'idle'; this.changed(data);
+    runtime.active = undefined; runtime.turn = undefined; this.clearTools(data, runtime); data.session.state = status === 'completed' ? 'turn_finished' : 'idle'; this.changed(data);
     void this.dispatch(data, runtime);
   }
   private codexEvent(data: RecordData, runtime: Runtime, event: any) {
@@ -514,7 +592,7 @@ export class SessionService extends EventEmitter implements AgentSessionService 
   private unavailable(data: RecordData, runtime: Runtime, reason: string, definite = false) {
     if (runtime.stopped) return;
     runtime.stopped = true;
-    runtime.ready = false; runtime.active = undefined; runtime.turn = undefined;
+    runtime.ready = false; runtime.active = undefined; runtime.turn = undefined; this.clearTools(data, runtime);
     data.session.alive = false; data.session.state = 'unknown'; data.session.control_reason = reason; data.session.last_error = reason;
     for (const receipt of data.receipts) if (['running', 'queued'].includes(receipt.status)) { receipt.status = definite ? 'failed' : 'uncertain'; receipt.error = reason; }
     this.changed(data);

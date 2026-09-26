@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SessionService } from '../server/session-service.ts';
+import { SessionService, claudeToolSummary } from '../server/session-service.ts';
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 class FakeClaude extends EventEmitter {
@@ -386,4 +386,65 @@ test('retire: a session still starting is refused without force, and with force 
   assert.deepEqual([detail.session.state, detail.session.alive, detail.session.capabilities.message], ['ended', false, false]);
   assert.deepEqual(detail.receipts.map((r) => r.status), ['failed']);
   assert.equal(f.claude.sent.length, 0); assert.equal(cleaned, 1); assert.deepEqual(frames, []);
+});
+
+// #221: managed Claude sessions expose tool activity in the shape the web reads for the Coordinator.
+const toolUse = (uuid: string, blocks: any[], extra: Record<string, any> = {}) => ({ type: 'assistant', uuid, session_id: 'native-claude', parent_tool_use_id: null, message: { content: blocks }, ...extra });
+const toolResult = (id: string) => ({ type: 'user', session_id: 'native-claude', parent_tool_use_id: null, message: { content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } });
+
+test('a managed Claude session records its tool calls as short redacted tool entries and sets then clears current_tool', async (t) => {
+  const { service, claude, input } = fixture(t); const session = await service.create(input); await tick();
+  const key = session.session_key;
+  const prompt = `Fix the login bug. Use token=${'a'.repeat(40)} and write a very long brief ${'x'.repeat(5000)}`;
+  claude.emit('message', toolUse('m1', [{ type: 'text', text: 'Starting a worker.' }, { type: 'tool_use', id: 'tu-spawn', name: 'mcp__lead__spawn_session', input: { name: 'fix-login', prompt, cwd: '/work/app' } }]));
+  let detail = service.detail(key);
+  assert.equal(detail.session.current_tool, 'mcp__lead__spawn_session');
+  assert.equal(service.list().find((s) => s.session_key === key)!.current_tool, 'mcp__lead__spawn_session');
+  const spawn = detail.history.find((entry) => entry.role === 'tool')!;
+  assert.deepEqual({ role: spawn.role, name: spawn.name, summary: spawn.summary, text: spawn.text }, { role: 'tool', name: 'mcp__lead__spawn_session', summary: 'fix-login', text: 'fix-login' });
+  assert.equal(JSON.stringify(detail.history).includes('Fix the login bug'), false, 'the worker prompt is not recorded');
+  // The result ends that call; a redelivered assistant message does not record it twice.
+  claude.emit('message', toolResult('tu-spawn'));
+  assert.equal(service.detail(key).session.current_tool, null);
+  claude.emit('message', toolUse('m1', [{ type: 'tool_use', id: 'tu-spawn', name: 'mcp__lead__spawn_session', input: { name: 'fix-login', prompt } }]));
+  claude.emit('message', toolResult('tu-spawn'));
+  assert.equal(service.detail(key).history.filter((entry) => entry.id === 'claude-tool:tu-spawn').length, 1);
+  // Commands are redacted and bounded; a subagent's own tool calls are not recorded.
+  claude.emit('message', toolUse('m2', [{ type: 'tool_use', id: 'tu-bash', name: 'Bash', input: { command: `curl -H "Authorization: Bearer ${'s3cr3t'.repeat(8)}" https://api.example.com/${'p'.repeat(400)}` } }]));
+  claude.emit('message', toolUse('m3', [{ type: 'tool_use', id: 'tu-sub', name: 'Read', input: { file_path: '/inside/subagent.ts' } }], { parent_tool_use_id: 'tu-bash' }));
+  detail = service.detail(key);
+  assert.equal(detail.session.current_tool, 'Bash');
+  const bash = detail.history.find((entry) => entry.id === 'claude-tool:tu-bash')!;
+  assert.equal(bash.name, 'Bash'); assert.match(bash.summary!, /^curl -H "Authorization: Bearer \[REDACTED\]"/); assert.ok(bash.summary!.length <= 160);
+  assert.equal(detail.history.some((entry) => entry.id === 'claude-tool:tu-sub'), false);
+  assert.equal(JSON.stringify(detail.history).includes('s3cr3t'), false);
+  // The turn ends while the call never returned: current_tool is cleared.
+  claude.complete(); await tick();
+  detail = service.detail(key);
+  assert.equal(detail.session.current_tool, null); assert.equal(detail.session.state, 'turn_finished');
+  assert.deepEqual(detail.history.map((entry) => entry.role), ['user', 'assistant', 'tool', 'tool', 'assistant']);
+});
+
+test('Claude tool summaries name the target, never the payload, in the Coordinator shape', () => {
+  const secret = `password=${'hunter2'.repeat(3)}`;
+  assert.equal(claudeToolSummary('Write', { file_path: '/work/app/.env', content: secret }), '/work/app/.env');
+  assert.equal(claudeToolSummary('Edit', { file_path: '/work/app/a.ts', old_string: secret, new_string: 'x' }), '/work/app/a.ts');
+  assert.equal(claudeToolSummary('Agent', { subagent_type: 'investigator', description: 'Check PR #156', prompt: secret }), 'investigator: Check PR #156');
+  assert.equal(claudeToolSummary('SendMessage', { to: 'fm:abc', message: secret }), '→ fm:abc');
+  assert.equal(claudeToolSummary('mcp__lead__write_handoff', { kind: 'final', status: 'done', summary: secret }), 'final · done');
+  assert.equal(claudeToolSummary('TodoWrite', { todos: [{ content: secret }] }), '');
+  assert.equal(claudeToolSummary('ToolSearch', { query: 'select:mcp__lead__spawn_session' }), '{"query":"select:mcp__lead__spawn_session"}');
+  const other = claudeToolSummary('mcp__custom__tool', { token: 'a'.repeat(50), data: 'y'.repeat(1000) });
+  assert.match(other, /"token":"\[REDACTED\]"/); assert.equal(other.length, 160);
+});
+
+test('tool entries never push the conversation out of a managed session snapshot', async (t) => {
+  const { service, claude, input } = fixture(t); const session = await service.create(input); await tick();
+  const key = session.session_key;
+  for (let i = 0; i < 450; i++) claude.emit('message', toolUse(`m${i}`, [{ type: 'tool_use', id: `tu-${i}`, name: 'Read', input: { file_path: `/work/app/file-${i}.ts` } }]));
+  claude.complete(); await tick();
+  const history = service.detail(key).history;
+  assert.equal(history[0].text, 'First task'); assert.equal(history.at(-1)!.text, 'Finished work');
+  const tools = history.filter((entry) => entry.role === 'tool');
+  assert.equal(tools.length, 200); assert.equal(tools.at(-1)!.id, 'claude-tool:tu-449');
 });
