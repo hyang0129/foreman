@@ -277,6 +277,13 @@ test("the session list reads like a chat list: PM pinned, then name, time, previ
   await expect(first.locator(".session-sub")).toHaveText("Can I run the test suite?");
   await expect(first.locator(".session-age")).toHaveText("1h");
   await expect(first.locator(".attention-badge")).toHaveText("Needs you");
+  // The badge is one short pill at the end of the preview line, inside the row.
+  const badge = (await first.locator(".attention-badge").boundingBox())!;
+  const preview = (await first.locator(".session-sub").boundingBox())!;
+  const row = (await first.boundingBox())!;
+  expect(badge.height).toBeLessThan(32);
+  expect(badge.x).toBeGreaterThan(preview.x);
+  expect(badge.x + badge.width).toBeLessThanOrEqual(row.x + row.width);
   await expect(rows.nth(1).locator(".session-sub")).toHaveText("Done: tokens are consolidated.");
   await expect(rows.nth(1).locator(".attention-badge")).toHaveCount(0);
   // No console-style metadata line in the list.

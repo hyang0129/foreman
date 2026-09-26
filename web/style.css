@@ -1259,3 +1259,18 @@ label.machine-choice input[type="radio"] { flex-shrink: 0; width: 20px; height: 
 @media (hover: none) and (pointer: coarse), (max-width: 760px) {
   #composer-hint { display: none; }
 }
+/* Chat-list rows: the needs-you badge sits at the end of the preview line. */
+.session-row:has(.attention-badge) .session-sub { grid-column: 2 / 3; }
+.attention-badge {
+  grid-column: 3;
+  justify-self: end;
+  white-space: nowrap;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  border: 1px solid var(--warning);
+  font-size: .75rem;
+  font-weight: 650;
+}
+.session-age { justify-self: end; }
