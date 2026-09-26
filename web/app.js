@@ -144,6 +144,7 @@ let sessions = [],
   authSDK;
 let pollTimer,
   polling = false,
+  pollAgain = false,
   sending = false,
   creating = false,
   authEpoch = 0,
@@ -2234,8 +2235,16 @@ async function refreshLeads(epoch) {
 }
 async function poll() {
   clearTimeout(pollTimer);
-  if (!authorized || polling) return;
+  if (!authorized) return;
+  // A poll asked for while one is in flight (the browser coming back online, a PM move, a
+  // sign-in) runs as soon as that one finishes: the in-flight poll may have read the state from
+  // before the change, so dropping the request would leave the view stale until the timer.
+  if (polling) {
+    pollAgain = true;
+    return;
+  }
   polling = true;
+  pollAgain = false;
   const epoch = authEpoch;
   let pmHostRead, leadsRead;
   try {
@@ -2287,8 +2296,9 @@ async function poll() {
     await pmHostRead?.catch(() => { /* Display only; the next poll reads it again. */ });
     await leadsRead?.catch(() => { /* Display only; the next poll reads it again. */ });
     polling = false;
-    if (authorized)
-      pollTimer = setTimeout(poll, document.hidden ? 10000 : 3000);
+    if (!authorized) pollAgain = false;
+    else if (pollAgain) void poll();
+    else pollTimer = setTimeout(poll, document.hidden ? 10000 : 3000);
   }
 }
 function autosize() {
