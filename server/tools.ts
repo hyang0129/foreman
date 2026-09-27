@@ -145,5 +145,7 @@ export function makeFleetServer(fleet: Fleet, sessions?: ManagedFleetService, pr
     },
   );
 
-  return createSdkMcpServer({ name: "fleet", version: "0.1.0", tools: [list_sessions, list_models, list_projects, resolve_project, register_project, ...(options.spawn === false ? [] : [spawn_session]), session_tail, stop_session, ...(memory ? makeMemoryTools(memory) : [])] });
+  // #233: alwaysLoad keeps these tools out of the CLI's tool-search deferral. The Coordinator (this
+  // server's only user) is denied ToolSearch, so a deferred tool could never be loaded or called.
+  return createSdkMcpServer({ name: "fleet", version: "0.1.0", alwaysLoad: true, tools: [list_sessions, list_models, list_projects, resolve_project, register_project, ...(options.spawn === false ? [] : [spawn_session]), session_tail, stop_session, ...(memory ? makeMemoryTools(memory) : [])] });
 }

@@ -742,7 +742,8 @@ export function makeLeadTools(deps: LeadToolsDeps) {
   }
 
   function mcp<T extends string>(serverName: string, names: readonly T[], table: Record<T, z.ZodObject<any>>, desc: Record<T, string>, invoke: (name: string, input: unknown) => Promise<any>, readOnly: readonly string[]) {
-    return createSdkMcpServer({ name: serverName, version: '0.1.0', tools: names.map((name) => tool(
+    // #233: the Coordinator is denied ToolSearch, so its tools must never be deferred behind it.
+    return createSdkMcpServer({ name: serverName, version: '0.1.0', alwaysLoad: serverName === COORDINATOR_LEAD_SERVER_NAME, tools: names.map((name) => tool(
       name, desc[name], table[name].shape,
       async (args: unknown) => { try { return text(await invoke(name, args)); } catch (error) { return failure(error); } },
       { annotations: { readOnlyHint: readOnly.includes(name) } },
