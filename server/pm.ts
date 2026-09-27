@@ -1424,7 +1424,7 @@ export class ProjectManager extends EventEmitter {
             includePartialMessages: true,
             mcpServers: {
               fleet: makeFleetServer(this.fleet, this.sessions, this.projects, store, { spawn: false, sender: COORDINATOR_SENDER }),
-              ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, COORDINATOR_SENDER) } : {}),
+              ...(this.sessions ? { peers: makePeerMcpServer(this.sessions, COORDINATOR_SENDER, true) } : {}),
               ...(leads?.tools ? { [COORDINATOR_LEAD_SERVER_NAME]: leads.tools.server() } : {}),
             },
             allowedTools: ["mcp__fleet__list_projects", "mcp__fleet__resolve_project", "mcp__fleet__register_project", "mcp__fleet__list_sessions", "mcp__fleet__list_models", "mcp__fleet__session_tail", ...PM_MEMORY_TOOLS, "ListAgents", "WebFetch", "WebSearch", ...(this.sessions ? PEER_ALLOWED_TOOLS : []), ...(leads?.tools ? READ_ONLY_LEAD_TOOLS : [])],

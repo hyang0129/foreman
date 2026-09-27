@@ -120,9 +120,10 @@ export function bindPeerTools(service: PeerService, sender: string) {
   })) };
 }
 
-export function makePeerMcpServer(service: PeerService, sender: string) {
+/** `alwaysLoad`: never defer these tools behind ToolSearch (#233: the Coordinator may not call ToolSearch). */
+export function makePeerMcpServer(service: PeerService, sender: string, alwaysLoad = false) {
   const bound = bindPeerTools(service, sender);
-  return createSdkMcpServer({ name: 'peers', version: '0.1.0', tools: Object.entries(schemas).map(([name, schema]) => tool(
+  return createSdkMcpServer({ name: 'peers', version: '0.1.0', alwaysLoad, tools: Object.entries(schemas).map(([name, schema]) => tool(
     name, descriptions[name as ToolName], schema.shape,
     async (args) => {
       try { return { content: [{ type: 'text' as const, text: JSON.stringify(await bound.call(name, args)) }] }; }
