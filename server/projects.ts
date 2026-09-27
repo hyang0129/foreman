@@ -1,5 +1,6 @@
-import { accessSync, constants, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { basename, isAbsolute, join, normalize } from 'node:path';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { FOREMAN_HOME } from './paths.ts';
 
@@ -22,13 +23,50 @@ export function readableDirectory(path: string, pinned?: string): string {
   return canonical;
 }
 
+/** Where seed() never auto-registers (#234). Tests override `tmp`, since their fixtures live under it. */
+export interface SeedRoots { tmp: string[]; home: string; state: string[] }
+const real = (path: string) => { try { return realpathSync(path); } catch { return path; } };
+export function seedRoots(override: Partial<SeedRoots> = {}): SeedRoots {
+  const tmp = tmpdir();
+  return { tmp: [tmp, real(tmp), '/tmp', '/private/tmp', '/var/folders', '/private/var/folders'], home: homedir(), state: [FOREMAN_HOME, real(FOREMAN_HOME)], ...override };
+}
+const within = (path: string, root: string) => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+/** The main checkout owning a linked git worktree at `dir`, or null (not a worktree, or a bare repo's). */
+function worktreeOwner(dir: string): string | null {
+  try {
+    const match = /^gitdir: (.+)$/m.exec(readFileSync(join(dir, '.git'), 'utf8')); if (!match) return null;
+    const gitdir = resolve(dir, match[1].trim()); if (basename(dirname(gitdir)) !== 'worktrees') return null;
+    let common: string;
+    try { common = resolve(gitdir, readFileSync(join(gitdir, 'commondir'), 'utf8').trim()); } catch { common = dirname(dirname(gitdir)); }
+    if (/^\s*bare\s*=\s*true\s*$/m.test(readFileSync(join(common, 'config'), 'utf8'))) return null;
+    return real(dirname(common));
+  } catch { return null; }
+}
+/**
+ * True for a session cwd that is not a project root: a linked git worktree of a registered repo
+ * (`registered(mainCheckout)`), anything under `.claude/worktrees/`, a temp directory, $HOME
+ * itself, or Foreman state (FOREMAN_HOME, `~/.foreman*`). Worktrees of a bare repo, or of a repo
+ * not registered, are projects. Checks the lexical and the canonical path. register() does not consult it.
+ */
+export function notAProject(path: string, roots: SeedRoots = seedRoots(), registered: (path: string) => boolean = () => false): boolean {
+  const canonical = real(path), homes = [roots.home, real(roots.home)], owner = worktreeOwner(canonical);
+  if (owner && registered(owner)) return true;
+  return [path, canonical].some((p) => {
+    const parts = p.split(sep);
+    return parts.some((part, i) => part === '.claude' && parts[i + 1] === 'worktrees')
+      || [...roots.tmp, ...roots.state].some((root) => within(p, root))
+      || homes.some((home) => p === home || (within(p, home) && relative(home, p).split(sep)[0].startsWith('.foreman')));
+  });
+}
+
 /** Owner-local names. Lexical paths and their canonical targets are retained together. */
 export class ProjectRegistry {
   private entries: Project[] = [];
   private removed: string[] = [];
   private file: string;
-  constructor(home = FOREMAN_HOME) {
-    mkdirSync(home, { recursive: true, mode: 0o700 }); this.file = join(home, 'projects.json');
+  private roots: SeedRoots;
+  constructor(home = FOREMAN_HOME, roots = seedRoots()) {
+    this.roots = roots; mkdirSync(home, { recursive: true, mode: 0o700 }); this.file = join(home, 'projects.json');
     try {
       const data = JSON.parse(readFileSync(this.file, 'utf8'));
       if (data.version !== 1 || !Array.isArray(data.projects) || !Array.isArray(data.removed)) throw new Error('Invalid project registry');
@@ -42,6 +80,7 @@ export class ProjectRegistry {
   }
   list(): Project[] { return structuredClone(this.entries).sort((a, b) => (b.lastUsed ?? '').localeCompare(a.lastUsed ?? '') || a.name.localeCompare(b.name)); }
   forPath(path: string | null | undefined) { return this.entries.find((p) => p.path === path || p.canonicalPath === path || !!path && p.registeredPaths?.includes(path)); }
+  private isRegistered = (path: string) => !!this.forPath(path);
   register(input: { name: string; path: string; aliases?: string[] }): Project {
     const name = label(input.name, 'Project name');
     if (typeof input.path !== 'string' || input.path.length > 4096) throw new Error('Project path must be an absolute directory');
@@ -79,7 +118,9 @@ export class ProjectRegistry {
     for (const row of rows) {
       if (!row.cwd || !isAbsolute(row.cwd)) continue;
       try {
-        const path = normalize(row.cwd), prior = this.forPath(path), canonicalPath = readableDirectory(path, prior?.canonicalPath);
+        const path = normalize(row.cwd), prior = this.forPath(path);
+        if (!prior && notAProject(path, this.roots, this.isRegistered)) continue;
+        const canonicalPath = readableDirectory(path, prior?.canonicalPath);
         if (this.removed.includes(path) || this.removed.includes(canonicalPath)) continue;
         let project = prior ?? this.entries.find((p) => p.canonicalPath === canonicalPath);
         if (!project) {
@@ -99,6 +140,15 @@ export class ProjectRegistry {
       } catch { /* Unavailable recent directories remain visible if already registered. */ }
     }
     if (changed) this.save();
+  }
+  /**
+   * Drops entries seed() would not create, or whose directory is gone (#234). Pruned entries are
+   * not added to `removed`, which records deliberate user removals. Returns what it dropped.
+   */
+  prune({ dryRun = false } = {}): Project[] {
+    const dropped = this.entries.filter((p) => !existsSync(p.canonicalPath) || [p.path, p.canonicalPath].some((path) => notAProject(path, this.roots, this.isRegistered)));
+    if (!dryRun && dropped.length) { this.entries = this.entries.filter((p) => !dropped.includes(p)); this.save(); }
+    return structuredClone(dropped);
   }
   private validate(project: Project) {
     for (const path of project.registeredPaths ?? [project.path]) readableDirectory(path, project.canonicalPath);
